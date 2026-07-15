@@ -22,6 +22,10 @@ var allowedPaths = map[string]string{
 	"/livez":                              "/livez",
 	"/readyz":                             "/readyz",
 	"/metrics":                            "/metrics",
+	"/api/v1/auth/register":               "/api/v1/auth/register",
+	"/api/v1/auth/login":                  "/api/v1/auth/login",
+	"/api/v1/auth/refresh":                "/api/v1/auth/refresh",
+	"/api/v1/auth/logout":                 "/api/v1/auth/logout",
 	"/api/v1/stations":                    "/api/v1/stations",
 	"/api/v1/routes":                      "/api/v1/routes",
 	"/api/v1/train-runs/search":           "/api/v1/train-runs/search",
@@ -34,6 +38,19 @@ var allowedPaths = map[string]string{
 	"/api/v1/reservations/:reservation_id/confirm":  "/api/v1/reservations/:reservation_id/confirm",
 	"/api/v1/reservations/:id/cancel":               "/api/v1/reservations/:reservation_id/cancel",
 	"/api/v1/reservations/:reservation_id/cancel":   "/api/v1/reservations/:reservation_id/cancel",
+	"/api/v1/passengers":                            "/api/v1/passengers",
+	"/api/v1/passengers/:id":                        "/api/v1/passengers/:passenger_id",
+	"/api/v1/ticket-orders":                         "/api/v1/ticket-orders",
+	"/api/v1/ticket-orders/:id":                     "/api/v1/ticket-orders/:ticket_order_id",
+	"/api/v1/admin/stations":                        "/api/v1/admin/stations",
+	"/api/v1/admin/routes":                          "/api/v1/admin/routes",
+	"/api/v1/admin/trains":                          "/api/v1/admin/trains",
+	"/api/v1/admin/coaches":                         "/api/v1/admin/coaches",
+	"/api/v1/admin/seats":                           "/api/v1/admin/seats",
+	"/api/v1/admin/fares":                           "/api/v1/admin/fares",
+	"/api/v1/operator/train-runs":                   "/api/v1/operator/train-runs",
+	"/api/v1/operator/train-runs/:id/inventory":     "/api/v1/operator/train-runs/:train_run_id/inventory",
+	"/api/v1/operator/train-runs/:id/status":        "/api/v1/operator/train-runs/:train_run_id/status",
 }
 
 var allowedEventTypes = set(
@@ -41,8 +58,8 @@ var allowedEventTypes = set(
 	"reservation.confirmed",
 	"reservation.cancelled",
 	"reservation.expired",
-	"ticket.issued",
-	"train_run.cancelled",
+	"ticket.created",
+	"trainrun.cancelled",
 	"outbox.dead_lettered",
 )
 

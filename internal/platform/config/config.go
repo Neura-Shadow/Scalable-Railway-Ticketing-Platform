@@ -37,6 +37,8 @@ type Config struct {
 	JWTAudience   string
 
 	AccessTokenTTL              time.Duration
+	RefreshTokenTTL             time.Duration
+	BcryptCost                  int
 	HoldTTL                     time.Duration
 	MaxPassengersPerReservation int
 	WorkerBatchSize             int
@@ -74,6 +76,8 @@ func Defaults() Config {
 		JWTIssuer:                   "scalable-railway-ticketing-platform",
 		JWTAudience:                 "railway-api",
 		AccessTokenTTL:              15 * time.Minute,
+		RefreshTokenTTL:             7 * 24 * time.Hour,
+		BcryptCost:                  12,
 		HoldTTL:                     10 * time.Minute,
 		MaxPassengersPerReservation: 6,
 		WorkerBatchSize:             100,
@@ -121,6 +125,8 @@ func (c Config) Validate() error {
 		positive bool
 	}{
 		{"JWT_ACCESS_TTL", c.AccessTokenTTL > 0},
+		{"JWT_REFRESH_TTL", c.RefreshTokenTTL > 0},
+		{"BCRYPT_COST", c.BcryptCost >= 4 && c.BcryptCost <= 31},
 		{"RESERVATION_HOLD_TTL", c.HoldTTL > 0},
 		{"MAX_PASSENGERS_PER_RESERVATION", c.MaxPassengersPerReservation > 0},
 		{"WORKER_BATCH_SIZE", c.WorkerBatchSize > 0},
@@ -232,6 +238,7 @@ func LoadFrom(lookup LookupFunc) (Config, error) {
 		target *time.Duration
 	}{
 		{"JWT_ACCESS_TTL", &cfg.AccessTokenTTL},
+		{"JWT_REFRESH_TTL", &cfg.RefreshTokenTTL},
 		{"RESERVATION_HOLD_TTL", &cfg.HoldTTL},
 		{"HTTP_READ_TIMEOUT", &cfg.HTTPReadTimeout},
 		{"HTTP_WRITE_TIMEOUT", &cfg.HTTPWriteTimeout},
@@ -269,6 +276,7 @@ func LoadFrom(lookup LookupFunc) (Config, error) {
 		{"HOLD_EXPIRER_BATCH_SIZE", &cfg.HoldExpirerBatchSize},
 		{"OUTBOX_BATCH_SIZE", &cfg.OutboxBatchSize},
 		{"OUTBOX_MAX_ATTEMPTS", &cfg.OutboxMaxAttempts},
+		{"BCRYPT_COST", &cfg.BcryptCost},
 	} {
 		if err := setInt(lookup, item.name, item.target); err != nil {
 			return Config{}, err

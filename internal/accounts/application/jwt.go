@@ -9,6 +9,7 @@ import (
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/accounts/domain"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
 const MinJWTSecretBytes = 32
@@ -17,6 +18,7 @@ var (
 	ErrInvalidJWTConfiguration = errors.New("invalid JWT configuration")
 	ErrInvalidTokenType        = errors.New("invalid token type")
 	ErrInvalidTokenSubject     = errors.New("invalid token subject")
+	ErrInvalidTokenID          = errors.New("invalid token id")
 	ErrInvalidTokenVersion     = errors.New("invalid token version")
 	ErrUnexpectedSigningMethod = errors.New("unexpected JWT signing method")
 	ErrUserInactive            = errors.New("user is inactive")
@@ -78,6 +80,9 @@ type wireTokenClaims struct {
 func (c wireTokenClaims) Validate() error {
 	if c.Subject == "" {
 		return ErrInvalidTokenSubject
+	}
+	if _, err := uuid.Parse(c.ID); err != nil {
+		return ErrInvalidTokenID
 	}
 	if c.ExpiresAt == nil || c.NotBefore == nil || c.IssuedAt == nil {
 		return jwt.ErrTokenRequiredClaimMissing
@@ -178,6 +183,7 @@ func (s *JWTService) issueToken(subject string, role domain.Role, tokenType Toke
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    s.issuer,
 			Subject:   subject,
+			ID:        uuid.NewString(),
 			Audience:  jwt.ClaimStrings{s.audience},
 			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
 			NotBefore: jwt.NewNumericDate(now),

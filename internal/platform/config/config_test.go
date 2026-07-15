@@ -23,6 +23,9 @@ func TestDefaultsProvideSafeOperationalValues(t *testing.T) {
 	if cfg.AccessTokenTTL != 15*time.Minute {
 		t.Fatalf("AccessTokenTTL = %s, want 15m", cfg.AccessTokenTTL)
 	}
+	if cfg.RefreshTokenTTL != 7*24*time.Hour || cfg.BcryptCost != 12 {
+		t.Fatalf("authentication defaults = refresh %s cost %d", cfg.RefreshTokenTTL, cfg.BcryptCost)
+	}
 	if cfg.HoldTTL != 10*time.Minute {
 		t.Fatalf("HoldTTL = %s, want 10m", cfg.HoldTTL)
 	}
@@ -204,6 +207,9 @@ func TestLoadFromSupportsCommittedEnvironmentContract(t *testing.T) {
 		"REDIS_PASSWORD":                    "sentinel-redis-secret",
 		"JWT_ISSUER":                        "railway-issuer",
 		"JWT_AUDIENCE":                      "railway-users",
+		"JWT_ACCESS_TTL":                    "20m",
+		"JWT_REFRESH_TTL":                   "240h",
+		"BCRYPT_COST":                       "11",
 		"RESERVATION_HOLD_TTL_SECONDS":      "420",
 		"RESERVATION_MAX_PASSENGERS":        "8",
 		"HOLD_EXPIRER_ENABLED":              "true",
@@ -231,6 +237,9 @@ func TestLoadFromSupportsCommittedEnvironmentContract(t *testing.T) {
 	}
 	if cfg.JWTIssuer != "railway-issuer" || cfg.JWTAudience != "railway-users" {
 		t.Fatal("JWT metadata not loaded")
+	}
+	if cfg.AccessTokenTTL != 20*time.Minute || cfg.RefreshTokenTTL != 240*time.Hour || cfg.BcryptCost != 11 {
+		t.Fatal("authentication runtime settings not loaded")
 	}
 	if cfg.HoldTTL != 420*time.Second || cfg.MaxPassengersPerReservation != 8 {
 		t.Fatal("reservation settings not loaded")

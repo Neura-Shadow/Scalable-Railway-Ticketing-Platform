@@ -317,6 +317,7 @@ func validAccessClaims(now time.Time) application.TokenClaims {
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    testJWTIssuer,
 			Subject:   "user-123",
+			ID:        "313aef88-e233-4bb9-9575-9b4c3ba358ee",
 			Audience:  jwt.ClaimStrings{testJWTAudience},
 			ExpiresAt: jwt.NewNumericDate(now.Add(15 * time.Minute)),
 			NotBefore: jwt.NewNumericDate(now),
@@ -329,6 +330,7 @@ func accessMapClaimsWithoutVersion(now time.Time) jwt.MapClaims {
 	return jwt.MapClaims{
 		"iss":        testJWTIssuer,
 		"sub":        "user-123",
+		"jti":        "313aef88-e233-4bb9-9575-9b4c3ba358ee",
 		"aud":        []string{testJWTAudience},
 		"exp":        now.Add(15 * time.Minute).Unix(),
 		"nbf":        now.Unix(),
@@ -428,6 +430,9 @@ func TestJWTServiceIssuesAndParsesTypedTokenPair(t *testing.T) {
 			}
 			if claims.TokenVersion != 0 {
 				t.Fatalf("TokenVersion = %d, want 0", claims.TokenVersion)
+			}
+			if claims.ID == "" {
+				t.Fatal("token JTI is empty")
 			}
 			if claims.Issuer != "railway-ticketing-api" {
 				t.Fatalf("Issuer = %q", claims.Issuer)

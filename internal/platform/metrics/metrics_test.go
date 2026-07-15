@@ -75,3 +75,22 @@ func TestNormalizersRetainOnlyBoundedValues(t *testing.T) {
 		t.Fatalf("NormalizeReason(unknown) = %q", got)
 	}
 }
+
+func TestEveryHTTPRouteFamilyUsesABoundedCanonicalPattern(t *testing.T) {
+	t.Parallel()
+
+	patterns := []string{
+		"/api/v1/auth/login",
+		"/api/v1/passengers/:id",
+		"/api/v1/ticket-orders/:id",
+		"/api/v1/reservations/:id/confirm",
+		"/api/v1/train-runs/:id/availability",
+		"/api/v1/admin/fares",
+		"/api/v1/operator/train-runs/:id/status",
+	}
+	for _, pattern := range patterns {
+		if got := metrics.NormalizePath(pattern); got == metrics.UnknownPath {
+			t.Fatalf("NormalizePath(%q) = unknown", pattern)
+		}
+	}
+}
