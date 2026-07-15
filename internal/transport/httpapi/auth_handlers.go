@@ -50,7 +50,7 @@ func registerHandler(dependencies Dependencies) gin.HandlerFunc {
 			writeError(c, ErrInvalidInput)
 			return
 		}
-		result, err := dependencies.Auth.Register(c.Request.Context(), RegisterCommand{Email: request.Email, Password: request.Password, DisplayName: request.DisplayName})
+		result, err := dependencies.Auth.Register(c.Request.Context(), RegisterCommand(request))
 		if err != nil {
 			writeError(c, err)
 			return
@@ -78,7 +78,7 @@ func loginHandler(dependencies Dependencies) gin.HandlerFunc {
 			writeError(c, ErrInvalidInput)
 			return
 		}
-		result, err := dependencies.Auth.Login(c.Request.Context(), LoginCommand{Email: request.Email, Password: request.Password})
+		result, err := dependencies.Auth.Login(c.Request.Context(), LoginCommand(request))
 		if err != nil {
 			writeError(c, err)
 			return

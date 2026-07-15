@@ -140,7 +140,7 @@ func (rowErrorDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
 }
 
 func (db rowErrorDB) QueryRow(context.Context, string, ...any) pgx.Row {
-	return rowErrorRow{err: db.err}
+	return rowErrorRow(db)
 }
 
 type rowErrorRow struct {

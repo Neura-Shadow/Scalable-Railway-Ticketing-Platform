@@ -240,10 +240,8 @@ func (s *Store) ConfirmReservation(ctx context.Context, params ReservationComman
 	if err != nil {
 		return ConfirmReservationResult{}, err
 	}
-	resourceID := params.ReservationID
 	if acquisition.Replayed {
-		resourceID = acquisition.ResourceID
-		result, err := tx.loadConfirmationResult(ctx, params.UserID, resourceID)
+		result, err := tx.loadConfirmationResult(ctx, params.UserID, acquisition.ResourceID)
 		if err != nil {
 			return ConfirmReservationResult{}, err
 		}
