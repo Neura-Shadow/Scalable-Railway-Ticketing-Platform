@@ -24,9 +24,11 @@ func TestStoreClaimsAndFinalizesWithoutHoldingPublishTransaction(t *testing.T) {
 
 	aggregateID := uuid.New()
 	eventID := uuid.New()
+	now := time.Now().UTC()
 	_, err = pool.Exec(ctx, `
-INSERT INTO outbox_events (id, aggregate_type, aggregate_id, event_type, payload)
-VALUES ($1, 'reservation', $2, 'reservation.held', '{"status":"held"}')`, eventID, aggregateID)
+INSERT INTO outbox_events (id, aggregate_type, aggregate_id, event_type, payload, next_attempt_at)
+VALUES ($1, 'reservation', $2, 'reservation.held', '{"status":"held"}', $3)`,
+		eventID, aggregateID, now.Add(-time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +38,6 @@ VALUES ($1, 'reservation', $2, 'reservation.held', '{"status":"held"}')`, eventI
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now().UTC()
 	events, err := store.Claim(ctx, "integration-worker", 10, now, now.Add(-time.Minute))
 	if err != nil {
 		t.Fatal(err)
