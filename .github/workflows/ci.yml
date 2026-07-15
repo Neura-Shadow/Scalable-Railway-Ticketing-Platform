@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.25.2"
+  IMAGE_NAME: scalable-railway-ticketing-platform:milestone-1
+
+jobs:
+  quality:
+    name: Go quality and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+      - name: Verify go mod tidy
+        shell: bash
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+      - name: Verify gofmt
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l .)"
+          test -z "$unformatted" || { printf '%s\n' "$unformatted"; exit 1; }
+      - name: Vet
+        run: go vet ./...
+      - name: Unit tests
+        run: go test ./... -count=1 -timeout 300s
+      - name: Race detector
+        run: go test -race ./... -count=1 -timeout 300s
+      - name: Install pinned Go analyzers
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+      - name: Staticcheck
+        run: staticcheck ./...
+      - name: Govulncheck
+        run: govulncheck ./...
+
+  workflow-and-secrets:
+    name: Workflow and secret scanning
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Actionlint
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          actionlint .github/workflows/*.yml
+      - name: Gitleaks
+        run: go run github.com/gitleaks/gitleaks/v8@v8.30.1 git --no-banner --redact
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+  migration-integration:
+    name: Migrations and PostgreSQL integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: railway
+          POSTGRES_USER: railway
+          POSTGRES_PASSWORD: ci-local-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U railway -d railway"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgres://railway:ci-local-password@localhost:5432/railway?sslmode=disable
+      REDIS_ADDR: localhost:6379
+      APP_ENV: test
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+      - name: Apply migrations to an empty database
+        run: go run ./cmd/migrate -path migrations -database "$DATABASE_URL" up
+      - name: Verify migration-up is safe to repeat
+        run: go run ./cmd/migrate -path migrations -database "$DATABASE_URL" up
+      - name: Verify clean migration version
+        run: go run ./cmd/migrate -path migrations -database "$DATABASE_URL" version
+      - name: Run integration and constraint tests
+        run: go test ./... -count=1 -timeout 300s
+
+  container:
+    name: Container build and image scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Build image
+        run: docker build --pull --tag "$IMAGE_NAME" .
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: scalable-railway-ticketing-platform:milestone-1
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
