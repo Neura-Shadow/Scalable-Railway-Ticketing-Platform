@@ -8,7 +8,8 @@
 | Train search | PostgreSQL | normalized hash and bounded TTL; database fallback |
 | Availability count | PostgreSQL seat inventory | very short hint TTL; booking always rechecks |
 | Completed idempotency lookup | PostgreSQL record | optional hashed-key hint; database fallback |
-| Registration/login/create-hold rate limit | Redis atomic Lua | production writes fail closed when limit state is unavailable |
+| Registration/login/passenger-create rate limit | Redis atomic Lua | production writes fail closed when limit state is unavailable |
+| Create-hold admission rate limit | Redis atomic Lua | degrades open on limiter errors; PostgreSQL invariants remain authoritative |
 | Redis Streams | PostgreSQL outbox | optional disabled publisher; at-least-once only |
 | Processed event IDs/failure counters | Consumer contract | bounded TTL/retention; never booking authority |
 
@@ -27,6 +28,6 @@ A search or availability response is a point-in-time observation. Staleness may 
 
 ## Redis outage
 
-Read caches are bypassed. Read-only public browsing can use a documented fail-open policy for its rate counter. Authentication and reservation-create rate limiting fail closed in production because an outage must not remove anti-hoarding/credential-stuffing controls. Already committed reservations and worker database transactions remain correct.
+Read caches are bypassed. Read-only public browsing can use a documented fail-open policy for its rate counter. Authentication and passenger-profile creation fail closed in production. Reservation-create admission degrades open because it is only an availability hint; the PostgreSQL transaction still enforces ownership, one-active-reservation-per-passenger/run, allocation, lifecycle, and idempotency invariants. Durable account/train-run reservation quotas remain a Milestone 2 control. Already committed reservations and worker database transactions remain correct.
 
 Readiness reports Redis failure without secrets. Liveness remains process-only.

@@ -83,7 +83,7 @@ At minimum monitor:
 - HTTP requests, latency, bounded status/error categories, panic recovery, and in-flight work;
 - reservation attempt/success/conflict/confirm/cancel/expire counters;
 - PostgreSQL connections, lock waits, deadlocks, transaction latency, CPU, I/O, disk, and replication/backup health;
-- Redis latency, errors, memory, and rate-limit fail-closed events;
+- Redis latency, errors, memory, authentication/passenger rate-limit fail-closed events, and reservation-admission fail-open events;
 - outbox pending age/count, processing leases, publish failures, retries, and dead letters;
 - worker loop success/failure and last successful pass; and
 - reconciliation failures as correctness incidents.
@@ -96,7 +96,7 @@ Application rollback is safe only while the migrated schema remains compatible w
 
 If reconciliation fails, stop new reservation writes for the affected train run, preserve database evidence, identify the transaction/invariant failure, and repair only through a reviewed operator procedure. Redis cache deletion is not an inventory repair.
 
-If Redis is unavailable, keep browsing fallbacks bounded and maintain the documented production fail-closed policy for authentication/reservation-create controls. If PostgreSQL is unavailable, reservation writes must fail; do not queue speculative bookings elsewhere.
+If Redis is unavailable, keep browsing fallbacks bounded, fail authentication and passenger-profile creation closed, and allow reservation-create admission to degrade open only through the authoritative PostgreSQL transaction. If PostgreSQL is unavailable, reservation writes must fail; do not queue speculative bookings elsewhere.
 
 ## Capacity statement
 

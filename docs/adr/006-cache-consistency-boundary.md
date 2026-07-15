@@ -14,7 +14,7 @@ Redis may store:
 - versioned station metadata;
 - normalized train-search results;
 - short-lived availability hints;
-- login, registration, and reservation-create rate counters;
+- login, registration, passenger-create, and reservation-create rate counters;
 - optional completed-idempotency lookup hints keyed only by hashes;
 - optional Redis Stream events, processed-event IDs, and bounded consumer failure counts.
 
@@ -34,7 +34,8 @@ Availability endpoints may return cached counts, but the response contract ident
 
 Atomic Lua scripts implement rate-limit increments and expiry. Each route has an explicit Redis failure policy:
 
-- authentication and reservation-create limits fail closed in production after a small bounded backend-error response, preventing an outage from becoming an unbounded abuse bypass;
+- authentication and passenger-profile creation limits fail closed in production after a small bounded backend-error response;
+- reservation-create admission degrades open on a limiter error because PostgreSQL still enforces every Milestone 1 booking invariant; durable account/train-run quotas and waiting-room admission remain Milestone 2 controls;
 - read-only public browsing may fail open with metrics when configured, because it does not mutate authoritative state;
 - test/local profiles may use a documented in-memory fallback that is never enabled as a production authority.
 
@@ -43,7 +44,7 @@ Redis connection errors are bounded by short timeouts and surfaced in readiness.
 ## Consequences
 
 - Cache staleness can cause a hold conflict but never overselling.
-- Production write routes can become temporarily unavailable when their anti-abuse dependency is unavailable; this is an explicit security/availability tradeoff.
+- Authentication and passenger-profile creation can become temporarily unavailable when their anti-abuse dependency is unavailable; reservation creation remains available but continues through the authoritative PostgreSQL transaction.
 - Cache invalidation is observable but does not participate in database transactions.
 - Future regional caches can reuse the same hint-only contract.
 
