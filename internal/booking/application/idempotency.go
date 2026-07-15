@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash"
+	"sort"
 	"strings"
 )
 
@@ -13,6 +14,14 @@ const MaxIdempotencyKeyBytes = 256
 var (
 	ErrInvalidIdempotencyKey = errors.New("invalid idempotency key")
 	ErrInvalidHoldRequest    = errors.New("invalid hold request")
+	ErrInvalidCommand        = errors.New("invalid idempotent command")
+)
+
+type IdempotentOperation string
+
+const (
+	OperationReservationConfirm IdempotentOperation = "reservation.confirm"
+	OperationReservationCancel  IdempotentOperation = "reservation.cancel"
 )
 
 // HashIdempotencyKey returns the durable representation of a client key. Raw
@@ -25,8 +34,9 @@ func HashIdempotencyKey(raw string) ([sha256.Size]byte, error) {
 }
 
 // HoldFingerprintInput contains only fields that determine the identity of a
-// reservation-create command. Passenger order is intentional because seats are
-// assigned deterministically in that order.
+// reservation-create command. Passenger identifiers are sorted into a stable
+// order because seat assignment is deterministic and does not preserve caller
+// list ordering.
 type HoldFingerprintInput struct {
 	TrainRunID      string
 	OriginCode      string
@@ -58,8 +68,10 @@ func FingerprintHoldRequest(input HoldFingerprintInput) ([sha256.Size]byte, erro
 		}
 		seen[passengers[index]] = struct{}{}
 	}
+	sort.Strings(passengers)
 
 	digest := sha256.New()
+	writeField(digest, "v1")
 	writeField(digest, "reservation.create")
 	writeField(digest, trainRunID)
 	writeField(digest, origin)
@@ -69,6 +81,20 @@ func FingerprintHoldRequest(input HoldFingerprintInput) ([sha256.Size]byte, erro
 		writeField(digest, passengerID)
 	}
 
+	var result [sha256.Size]byte
+	copy(result[:], digest.Sum(nil))
+	return result, nil
+}
+
+func FingerprintReservationCommand(operation IdempotentOperation, reservationID string) ([sha256.Size]byte, error) {
+	reservationID = strings.ToLower(strings.TrimSpace(reservationID))
+	if reservationID == "" || (operation != OperationReservationConfirm && operation != OperationReservationCancel) {
+		return [sha256.Size]byte{}, ErrInvalidCommand
+	}
+	digest := sha256.New()
+	writeField(digest, "v1")
+	writeField(digest, string(operation))
+	writeField(digest, reservationID)
 	var result [sha256.Size]byte
 	copy(result[:], digest.Sum(nil))
 	return result, nil

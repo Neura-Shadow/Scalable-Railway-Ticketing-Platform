@@ -69,7 +69,7 @@ func TestFingerprintHoldRequestCanonicalizesBoundedFields(t *testing.T) {
 	}
 }
 
-func TestFingerprintHoldRequestIncludesPassengerOrderAndEveryCommandField(t *testing.T) {
+func TestFingerprintHoldRequestSortsPassengersAndIncludesEveryCommandField(t *testing.T) {
 	t.Parallel()
 
 	base := application.HoldFingerprintInput{
@@ -83,13 +83,22 @@ func TestFingerprintHoldRequestIncludesPassengerOrderAndEveryCommandField(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
+	reordered := base
+	reordered.PassengerIDs = []string{"passenger-2", "passenger-1"}
+	reorderedFingerprint, err := application.FingerprintHoldRequest(reordered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reorderedFingerprint != want {
+		t.Fatal("equivalent passenger set produced a different fingerprint")
+	}
 
 	variants := []application.HoldFingerprintInput{
 		{TrainRunID: "run-2", OriginCode: "TPE", DestinationCode: "KHH", SeatClass: "standard", PassengerIDs: []string{"passenger-1", "passenger-2"}},
 		{TrainRunID: "run-1", OriginCode: "TXG", DestinationCode: "KHH", SeatClass: "standard", PassengerIDs: []string{"passenger-1", "passenger-2"}},
 		{TrainRunID: "run-1", OriginCode: "TPE", DestinationCode: "TXG", SeatClass: "standard", PassengerIDs: []string{"passenger-1", "passenger-2"}},
 		{TrainRunID: "run-1", OriginCode: "TPE", DestinationCode: "KHH", SeatClass: "business", PassengerIDs: []string{"passenger-1", "passenger-2"}},
-		{TrainRunID: "run-1", OriginCode: "TPE", DestinationCode: "KHH", SeatClass: "standard", PassengerIDs: []string{"passenger-2", "passenger-1"}},
+		{TrainRunID: "run-1", OriginCode: "TPE", DestinationCode: "KHH", SeatClass: "standard", PassengerIDs: []string{"passenger-1", "passenger-3"}},
 	}
 	for _, variant := range variants {
 		got, err := application.FingerprintHoldRequest(variant)
@@ -114,5 +123,28 @@ func TestFingerprintHoldRequestRejectsInvalidIdentity(t *testing.T) {
 		if _, err := application.FingerprintHoldRequest(input); !errors.Is(err, application.ErrInvalidHoldRequest) {
 			t.Fatalf("FingerprintHoldRequest(%+v) error = %v", input, err)
 		}
+	}
+}
+
+func TestFingerprintReservationCommandSeparatesOperations(t *testing.T) {
+	t.Parallel()
+
+	confirm, err := application.FingerprintReservationCommand(application.OperationReservationConfirm, " RESERVATION-1 ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel, err := application.FingerprintReservationCommand(application.OperationReservationCancel, "reservation-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if confirm == cancel {
+		t.Fatal("confirm and cancel produced the same fingerprint")
+	}
+	canonical, err := application.FingerprintReservationCommand(application.OperationReservationConfirm, "reservation-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical != confirm {
+		t.Fatal("equivalent reservation IDs produced different fingerprints")
 	}
 }
