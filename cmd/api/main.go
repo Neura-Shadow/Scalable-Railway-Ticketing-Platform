@@ -1,0 +1,174 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/app"
+	bookingpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/postgres"
+	offeringpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/offering/postgres"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/clock"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
+	platformmetrics "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/metrics"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/redisx"
+	querypostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/postgres"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/transport/httpapi"
+	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
+)
+
+const (
+	maxRequestBodyBytes = 1 << 20
+	maxHeaderBytes      = 1 << 20
+	defaultIdleTimeout  = 60 * time.Second
+)
+
+func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	if err := run(logger); err != nil {
+		logger.Error("api stopped", "reason", publicReason(err))
+		os.Exit(1)
+	}
+}
+
+func run(logger *slog.Logger) error {
+	if logger == nil {
+		return errors.New("logger unavailable")
+	}
+	cfg, err := config.Load()
+	if err != nil || cfg.DatabaseURL == "" || cfg.RedisAddress == "" || cfg.JWTSecret == "" {
+		return errors.New("configuration invalid")
+	}
+	if cfg.Environment == config.EnvironmentProduction {
+		gin.SetMode(gin.ReleaseMode)
+	}
+
+	runContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	pool, err := pgxpool.New(runContext, cfg.DatabaseURL)
+	if err != nil {
+		return errors.New("postgres configuration invalid")
+	}
+	defer pool.Close()
+
+	redisClient := redis.NewClient(&redis.Options{Addr: cfg.RedisAddress, Password: cfg.RedisPassword})
+	defer func() { _ = redisClient.Close() }()
+
+	registry := prometheus.NewRegistry()
+	metrics, err := platformmetrics.New(registry)
+	if err != nil {
+		return errors.New("metrics initialization failed")
+	}
+	passwordClock := clock.RealClock{}
+	auth, tokenParser, err := app.NewPostgresAuth(pool, cfg, passwordClock)
+	if err != nil {
+		return errors.New("authentication initialization failed")
+	}
+	passengers, err := app.NewPostgresPassengerService(pool, cfg.BcryptCost)
+	if err != nil {
+		return errors.New("passenger service initialization failed")
+	}
+	offeringStore, err := offeringpostgres.NewStore(pool)
+	if err != nil {
+		return errors.New("offering store initialization failed")
+	}
+	queryStore, err := querypostgres.NewStore(pool)
+	if err != nil {
+		return errors.New("query store initialization failed")
+	}
+	bookingStore := bookingpostgres.New(pool)
+	reads := app.NewPostgresReads(pool)
+	rateLimitBackend, err := redisx.NewRateLimiter(redisClient, "railway-api")
+	if err != nil {
+		return errors.New("rate limiter initialization failed")
+	}
+
+	router := httpapi.New(httpapi.Dependencies{
+		Readiness:           app.NewReadinessChecker(pool, redisClient, cfg),
+		ReadinessTimeout:    readinessTimeout(cfg),
+		TokenParser:         tokenParser,
+		Reservations:        app.NewReservationService(bookingStore, queryStore, reads, passwordClock, cfg.HoldTTL, cfg.MaxPassengersPerReservation),
+		MaxRequestBodyBytes: maxRequestBodyBytes,
+		MaxPassengers:       cfg.MaxPassengersPerReservation,
+		HTTPMetrics:         metrics,
+		MetricsHandler:      promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
+		Offering:            app.NewOfferingQueries(queryStore),
+		Auth:                auth,
+		RateLimiter:         app.NewRateLimiter(rateLimitBackend),
+		Passengers:          passengers,
+		Tickets:             app.NewTicketQueries(reads),
+		Admin:               app.NewAdminCommands(offeringStore),
+		Operator:            app.NewOperatorCommands(offeringStore, bookingStore),
+	})
+	if err := router.SetTrustedProxies(cfg.TrustedProxies); err != nil {
+		return errors.New("trusted proxy configuration invalid")
+	}
+
+	server := &http.Server{
+		Addr:              cfg.HTTPAddress,
+		Handler:           router,
+		ReadHeaderTimeout: cfg.HTTPReadTimeout,
+		ReadTimeout:       cfg.HTTPReadTimeout,
+		WriteTimeout:      cfg.HTTPWriteTimeout,
+		IdleTimeout:       defaultIdleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+		BaseContext: func(net.Listener) context.Context {
+			return runContext
+		},
+	}
+	serverErrors := make(chan error, 1)
+	go func() {
+		logger.Info("api listening", "address", cfg.HTTPAddress)
+		serverErrors <- server.ListenAndServe()
+	}()
+
+	select {
+	case err = <-serverErrors:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return errors.New("http listener failed")
+	case <-runContext.Done():
+	}
+
+	shutdownContext, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	defer cancel()
+	if err := server.Shutdown(shutdownContext); err != nil {
+		return errors.New("graceful shutdown failed")
+	}
+	if err = <-serverErrors; err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return errors.New("http listener shutdown failed")
+	}
+	return nil
+}
+
+func readinessTimeout(cfg config.Config) time.Duration {
+	timeout := cfg.DatabaseTimeout
+	if cfg.RedisTimeout > timeout {
+		timeout = cfg.RedisTimeout
+	}
+	if timeout <= 0 || timeout > 10*time.Second {
+		return 2 * time.Second
+	}
+	return timeout
+}
+
+// publicReason deliberately bounds startup errors so connection strings and
+// dependency error details never reach operational logs.
+func publicReason(err error) string {
+	if err == nil {
+		return "none"
+	}
+	return err.Error()
+}
