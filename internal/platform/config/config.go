@@ -52,6 +52,8 @@ type Config struct {
 	OutboxProcessingTimeout     time.Duration
 	OutboxRetryBase             time.Duration
 	OutboxRetryMax              time.Duration
+	WorkerHTTPAddress           string
+	WorkerPassTimeout           time.Duration
 
 	HTTPReadTimeout  time.Duration
 	HTTPWriteTimeout time.Duration
@@ -90,6 +92,8 @@ func Defaults() Config {
 		OutboxProcessingTimeout:     60 * time.Second,
 		OutboxRetryBase:             time.Second,
 		OutboxRetryMax:              time.Minute,
+		WorkerHTTPAddress:           ":9090",
+		WorkerPassTimeout:           60 * time.Second,
 		HTTPReadTimeout:             5 * time.Second,
 		HTTPWriteTimeout:            10 * time.Second,
 		ShutdownTimeout:             15 * time.Second,
@@ -120,6 +124,9 @@ func (c Config) Validate() error {
 	if c.OutboxPublisher != "log" && c.OutboxPublisher != "redis_stream" {
 		problems = append(problems, errors.New("OUTBOX_PUBLISHER must be log or redis_stream"))
 	}
+	if _, _, err := net.SplitHostPort(c.WorkerHTTPAddress); err != nil {
+		problems = append(problems, errors.New("WORKER_HTTP_ADDRESS must be a host:port listen address"))
+	}
 	for _, value := range []struct {
 		name     string
 		positive bool
@@ -138,6 +145,7 @@ func (c Config) Validate() error {
 		{"OUTBOX_PROCESSING_TIMEOUT_SECONDS", c.OutboxProcessingTimeout > 0},
 		{"OUTBOX_RETRY_BASE_SECONDS", c.OutboxRetryBase > 0},
 		{"OUTBOX_RETRY_MAX_SECONDS", c.OutboxRetryMax >= c.OutboxRetryBase},
+		{"WORKER_PASS_TIMEOUT", c.WorkerPassTimeout > 0},
 		{"HTTP_READ_TIMEOUT", c.HTTPReadTimeout > 0},
 		{"HTTP_WRITE_TIMEOUT", c.HTTPWriteTimeout > 0},
 		{"SHUTDOWN_TIMEOUT", c.ShutdownTimeout > 0},
@@ -228,6 +236,7 @@ func LoadFrom(lookup LookupFunc) (Config, error) {
 	setString(lookup, "JWT_ISSUER", &cfg.JWTIssuer)
 	setString(lookup, "JWT_AUDIENCE", &cfg.JWTAudience)
 	setString(lookup, "OUTBOX_PUBLISHER", &cfg.OutboxPublisher)
+	setString(lookup, "WORKER_HTTP_ADDRESS", &cfg.WorkerHTTPAddress)
 
 	if value, ok := lookup("APP_ENV"); ok {
 		cfg.Environment = Environment(strings.ToLower(strings.TrimSpace(value)))
@@ -245,6 +254,7 @@ func LoadFrom(lookup LookupFunc) (Config, error) {
 		{"SHUTDOWN_TIMEOUT", &cfg.ShutdownTimeout},
 		{"DATABASE_TIMEOUT", &cfg.DatabaseTimeout},
 		{"REDIS_TIMEOUT", &cfg.RedisTimeout},
+		{"WORKER_PASS_TIMEOUT", &cfg.WorkerPassTimeout},
 	} {
 		if err := setDuration(lookup, item.name, item.target); err != nil {
 			return Config{}, err

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -51,6 +52,17 @@ func TestPassengerServiceKeepsOwnerScopeAndPaginatesAfterSorting(t *testing.T) {
 	}
 	if store.owner != "owner-7" || page.Total != 3 || len(page.Items) != 1 || page.Items[0].DisplayName != "Mike" {
 		t.Fatalf("page = %#v, owner = %q", page, store.owner)
+	}
+}
+
+func TestPassengerServiceHugePageReturnsEmptyWithoutIntegerOverflow(t *testing.T) {
+	store := &passengerStoreFake{items: []accountspostgres.Passenger{{ID: "1", DisplayName: "Rider"}}}
+	page, err := NewPassengerService(store).ListPassengers(context.Background(), "owner", httpapi.PageRequest{Page: math.MaxInt, Limit: 100})
+	if err != nil {
+		t.Fatalf("ListPassengers() error = %v", err)
+	}
+	if len(page.Items) != 0 || page.Total != 1 {
+		t.Fatalf("huge page = %#v", page)
 	}
 }
 

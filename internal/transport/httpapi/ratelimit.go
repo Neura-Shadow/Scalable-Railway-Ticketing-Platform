@@ -26,12 +26,9 @@ func enforceRateLimit(c *gin.Context, limiter RateLimiter, request RateLimitRequ
 }
 
 func directClientKey(c *gin.Context) string {
-	host, _, err := net.SplitHostPort(c.Request.RemoteAddr)
-	if err == nil && net.ParseIP(host) != nil {
-		return host
-	}
-	if net.ParseIP(c.Request.RemoteAddr) != nil {
-		return c.Request.RemoteAddr
+	clientIP := c.ClientIP()
+	if net.ParseIP(clientIP) != nil {
+		return clientIP
 	}
 	return "unknown"
 }

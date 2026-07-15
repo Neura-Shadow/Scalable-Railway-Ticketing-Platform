@@ -3,9 +3,11 @@ package app
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
+	querypostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/postgres"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/transport/httpapi"
 	"github.com/google/uuid"
 )
@@ -48,5 +50,18 @@ func TestTicketQueriesHideCrossOwnerAndPersistenceDetails(t *testing.T) {
 	_, err = NewTicketQueries(store).GetTicketOrder(context.Background(), owner.String(), order.String())
 	if err != httpapi.ErrUnavailable {
 		t.Fatalf("persistence error=%v", err)
+	}
+}
+
+func TestTicketQueriesBoundExtremePageNumbers(t *testing.T) {
+	owner := uuid.New()
+	store := &ticketReadStoreFake{page: TicketOrderRecords{Items: []TicketOrderRecord{}, Total: 0}}
+
+	page, err := NewTicketQueries(store).ListTicketOrders(context.Background(), owner.String(), httpapi.PageRequest{Page: math.MaxInt, Limit: 100})
+	if err != nil {
+		t.Fatalf("list ticket orders: %v", err)
+	}
+	if page.Page != querypostgres.MaxPage {
+		t.Fatalf("page=%d want=%d", page.Page, querypostgres.MaxPage)
 	}
 }

@@ -43,6 +43,18 @@ func TestHoldExpirerReportsStoreFailureWithoutInventingProgress(t *testing.T) {
 	}
 }
 
+func TestHoldExpirerPreservesCommittedPartialProgressWithBatchError(t *testing.T) {
+	store := &expirationStoreStub{ids: []uuid.UUID{uuid.New()}, err: errors.New("one isolated item failed")}
+	expirer, err := application.NewHoldExpirer(store, expirationClockStub{time.Now()}, nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := expirer.RunOnce(context.Background())
+	if err == nil || result.Expired != 1 {
+		t.Fatalf("RunOnce() result=%+v error=%v", result, err)
+	}
+}
+
 type expirationClockStub struct{ now time.Time }
 
 func (c expirationClockStub) Now() time.Time { return c.now }

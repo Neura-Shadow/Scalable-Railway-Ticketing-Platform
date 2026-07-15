@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"time"
@@ -69,11 +70,14 @@ func (w *Worker) RunOnce(ctx context.Context) (Result, error) {
 		return Result{}, fmt.Errorf("claim outbox: %w", err)
 	}
 	result := Result{Claimed: len(events)}
+	for _, event := range events {
+		w.record("claim", event.EventType, "success", "none")
+	}
 	var failures []error
 	for _, event := range events {
 		if err := w.publisher.Publish(ctx, event); err != nil {
 			deadLetter := event.Attempts >= w.config.MaxAttempts
-			nextAttemptAt := now.Add(w.retryDelay(event.Attempts))
+			nextAttemptAt := now.Add(w.retryDelay(event.ID, event.Attempts))
 			if finalizeErr := w.store.MarkFailed(ctx, event.ID, w.config.WorkerID, nextAttemptAt, deadLetter); finalizeErr != nil {
 				w.record("finalize", event.EventType, "failure", "database")
 				failures = append(failures, fmt.Errorf("finalize failed event: %w", finalizeErr))
@@ -99,21 +103,31 @@ func (w *Worker) RunOnce(ctx context.Context) (Result, error) {
 	return result, errors.Join(failures...)
 }
 
-func (w *Worker) retryDelay(attempt int) time.Duration {
+func (w *Worker) retryDelay(eventID uuid.UUID, attempt int) time.Duration {
 	if attempt < 1 {
 		attempt = 1
 	}
 	delay := w.config.RetryBase
 	for count := 1; count < attempt && delay < w.config.RetryMax; count++ {
 		if delay > w.config.RetryMax/2 {
-			return w.config.RetryMax
+			delay = w.config.RetryMax
+			break
 		}
 		delay *= 2
 	}
-	if delay > w.config.RetryMax {
+	if delay >= w.config.RetryMax {
 		return w.config.RetryMax
 	}
-	return delay
+	jitterWindow := delay / 4
+	if jitterWindow <= 0 {
+		return delay
+	}
+	seed := binary.BigEndian.Uint64(eventID[:8]) ^ uint64(attempt)
+	jitter := time.Duration(seed % uint64(jitterWindow+1))
+	if delay > w.config.RetryMax-jitter {
+		return w.config.RetryMax
+	}
+	return delay + jitter
 }
 
 func (w *Worker) record(operation, eventType, result, reason string) {

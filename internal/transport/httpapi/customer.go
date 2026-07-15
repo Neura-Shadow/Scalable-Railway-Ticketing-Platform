@@ -51,6 +51,10 @@ func createPassengerHandler(dependencies Dependencies) gin.HandlerFunc {
 			writeError(c, ErrUnavailable)
 			return
 		}
+		identity, _ := identityFromContext(c)
+		if !enforceRateLimit(c, dependencies.RateLimiter, RateLimitRequest{Scope: RateLimitPassengerCreate, Key: identity.Subject}, false) {
+			return
+		}
 		var request passengerRequest
 		if err := decodeJSON(c, dependencies.MaxRequestBodyBytes, &request); err != nil {
 			writeDecodeError(c, err)
@@ -61,7 +65,6 @@ func createPassengerHandler(dependencies Dependencies) gin.HandlerFunc {
 			writeError(c, ErrInvalidInput)
 			return
 		}
-		identity, _ := identityFromContext(c)
 		result, err := dependencies.Passengers.CreatePassenger(c.Request.Context(), identity.Subject, request.DisplayName)
 		if err != nil {
 			writeError(c, err)

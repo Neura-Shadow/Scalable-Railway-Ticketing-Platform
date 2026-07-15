@@ -15,6 +15,10 @@ spec:
       labels:
         app.kubernetes.io/name: railway-outbox-worker
         app.kubernetes.io/component: worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: /metrics
     spec:
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: 30
@@ -30,6 +34,10 @@ spec:
           image: scalable-railway-ticketing-platform:milestone-1
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/outbox-worker"]
+          ports:
+            - name: worker-http
+              containerPort: 9090
+              protocol: TCP
           envFrom:
             - configMapRef:
                 name: railway-runtime-config
@@ -59,6 +67,27 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: worker-http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: worker-http
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: worker-http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
           resources:
             requests:
               cpu: 50m

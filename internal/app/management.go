@@ -14,6 +14,7 @@ import (
 
 type managementOffering interface {
 	CreateStation(context.Context, offeringpostgres.CreateStationParams) (offeringpostgres.Station, error)
+	CreateRoute(context.Context, offeringpostgres.CreateRouteParams) (offeringpostgres.Route, error)
 	CreateTrain(context.Context, offeringpostgres.CreateTrainParams) (offeringpostgres.Train, error)
 	CreateCoach(context.Context, offeringpostgres.CreateCoachParams) (offeringpostgres.Coach, error)
 	CreateSeat(context.Context, offeringpostgres.CreateSeatParams) (offeringpostgres.Seat, error)
@@ -43,10 +44,30 @@ func (a *AdminCommands) ExecuteAdmin(ctx context.Context, c httpapi.AdminCommand
 		}
 		id = v.ID
 	case httpapi.AdminCreateRoute:
-		// RouteWrite omits the required route name, operating timezone, and
-		// per-stop arrival/departure offsets. Inventing those values would
-		// corrupt the timetable, so Milestone 1 rejects this incomplete shape.
-		return httpapi.ResourceView{}, httpapi.ErrInvalidInput
+		if c.Route == nil || len(c.Route.Stops) < 2 {
+			return httpapi.ResourceView{}, httpapi.ErrInvalidInput
+		}
+		stops := make([]offeringdomain.RouteStop, 0, len(c.Route.Stops))
+		for _, input := range c.Route.Stops {
+			stationCode, err := offeringdomain.NewStationCode(input.StationCode)
+			if err != nil {
+				return httpapi.ResourceView{}, httpapi.ErrInvalidInput
+			}
+			stop, err := offeringdomain.NewRouteStop(stationCode, input.StopIndex, input.ArrivalOffsetMinutes, input.DepartureOffsetMinutes)
+			if err != nil {
+				return httpapi.ResourceView{}, httpapi.ErrInvalidInput
+			}
+			stops = append(stops, stop)
+		}
+		route, err := offeringdomain.NewRoute(c.Route.Code, c.Route.Name, stops)
+		if err != nil {
+			return httpapi.ResourceView{}, httpapi.ErrInvalidInput
+		}
+		v, err := a.store.CreateRoute(ctx, offeringpostgres.CreateRouteParams{Route: route, OperatingTimezone: c.Route.OperatingTimezone})
+		if err != nil {
+			return httpapi.ResourceView{}, mapOfferingError(err)
+		}
+		id = v.ID
 	case httpapi.AdminCreateTrain:
 		if c.Train == nil {
 			return httpapi.ResourceView{}, httpapi.ErrInvalidInput
@@ -103,10 +124,19 @@ type inventoryInitializer interface {
 type OperatorCommands struct {
 	offering  managementOffering
 	inventory inventoryInitializer
+	metrics   interface {
+		RecordOutbox(operation, eventType, result, reason string)
+	}
 }
 
-func NewOperatorCommands(offering managementOffering, inventory inventoryInitializer) *OperatorCommands {
-	return &OperatorCommands{offering: offering, inventory: inventory}
+func NewOperatorCommands(offering managementOffering, inventory inventoryInitializer, metrics ...interface {
+	RecordOutbox(operation, eventType, result, reason string)
+}) *OperatorCommands {
+	commands := &OperatorCommands{offering: offering, inventory: inventory}
+	if len(metrics) > 0 {
+		commands.metrics = metrics[0]
+	}
+	return commands
 }
 func (o *OperatorCommands) ExecuteOperator(ctx context.Context, c httpapi.OperatorCommand) (httpapi.ResourceView, error) {
 	if o == nil || o.offering == nil {
@@ -153,6 +183,9 @@ func (o *OperatorCommands) ExecuteOperator(ctx context.Context, c httpapi.Operat
 		if err != nil {
 			return httpapi.ResourceView{}, mapOfferingError(err)
 		}
+		if v.OutboxCreated && o.metrics != nil {
+			o.metrics.RecordOutbox("create", "trainrun.cancelled", "success", "none")
+		}
 		return httpapi.ResourceView{ID: v.ID}, nil
 	default:
 		return httpapi.ResourceView{}, httpapi.ErrInvalidInput
@@ -165,6 +198,8 @@ func mapOfferingError(err error) error {
 	case errors.Is(err, offeringpostgres.ErrNotFound):
 		return httpapi.ErrNotFound
 	case errors.Is(err, offeringpostgres.ErrConflict):
+		return httpapi.ErrConflict
+	case errors.Is(err, offeringdomain.ErrInvalidTrainRunTransition):
 		return httpapi.ErrConflict
 	default:
 		return httpapi.ErrUnavailable

@@ -26,11 +26,11 @@ func TestReadinessReportsEveryBoundedComponentWithoutLeakingProbeErrors(t *testi
 	}
 }
 
-func TestReadinessRequiresCleanSchemaVersionFour(t *testing.T) {
+func TestReadinessRequiresCleanCurrentSchemaVersion(t *testing.T) {
 	for _, test := range []struct {
 		version      int
 		dirty, ready bool
-	}{{4, false, true}, {3, false, false}, {4, true, false}} {
+	}{{currentSchemaVersion, false, true}, {currentSchemaVersion - 1, false, false}, {currentSchemaVersion, true, false}} {
 		checker := newReadinessChecker(func(context.Context) error { return nil }, func(context.Context) error { return nil }, func(context.Context) (int, bool, error) { return test.version, test.dirty, nil }, func() error { return nil })
 		checks, _ := checker.CheckReadiness(context.Background())
 		if checks[2].Ready != test.ready {

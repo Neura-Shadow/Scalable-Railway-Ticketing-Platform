@@ -60,6 +60,9 @@ func (m SegmentMask) String() string {
 }
 
 func (m SegmentMask) Overlaps(other SegmentMask) (bool, error) {
+	if !m.valid() || !other.valid() {
+		return false, ErrInvalidSegmentMask
+	}
 	if m.bitLength != other.bitLength {
 		return false, ErrSegmentMaskLengthMismatch
 	}
@@ -72,6 +75,9 @@ func (m SegmentMask) Overlaps(other SegmentMask) (bool, error) {
 }
 
 func (m SegmentMask) Union(other SegmentMask) (SegmentMask, error) {
+	if !m.valid() || !other.valid() {
+		return SegmentMask{}, ErrInvalidSegmentMask
+	}
 	if m.bitLength != other.bitLength {
 		return SegmentMask{}, ErrSegmentMaskLengthMismatch
 	}
@@ -83,6 +89,9 @@ func (m SegmentMask) Union(other SegmentMask) (SegmentMask, error) {
 }
 
 func (m SegmentMask) Subtract(other SegmentMask) (SegmentMask, error) {
+	if !m.valid() || !other.valid() {
+		return SegmentMask{}, ErrInvalidSegmentMask
+	}
 	if m.bitLength != other.bitLength {
 		return SegmentMask{}, ErrSegmentMaskLengthMismatch
 	}
@@ -120,4 +129,12 @@ func (m SegmentMask) Equal(other SegmentMask) bool {
 		}
 	}
 	return true
+}
+
+func (m SegmentMask) valid() bool {
+	if m.bitLength <= 0 || len(m.bits) != (m.bitLength+7)/8 {
+		return false
+	}
+	unusedBits := len(m.bits)*8 - m.bitLength
+	return unusedBits == 0 || m.bits[len(m.bits)-1]&byte((1<<unusedBits)-1) == 0
 }

@@ -19,6 +19,7 @@ type TrainRun struct {
 	Status               domain.TrainRunStatus
 	SegmentCount         int
 	InventoryRows        int64
+	OutboxCreated        bool
 	CreatedAt            time.Time
 	UpdatedAt            time.Time
 }
@@ -42,10 +43,11 @@ func (s *Store) CommissionTrainRun(ctx context.Context, params CommissionTrainRu
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var trainActive, routeActive bool
+	var operatingTimezone string
 	if err := tx.QueryRow(ctx, `SELECT active FROM trains WHERE id = $1 FOR SHARE`, params.TrainID).Scan(&trainActive); err != nil {
 		return TrainRun{}, safeError(err)
 	}
-	if err := tx.QueryRow(ctx, `SELECT active FROM routes WHERE id = $1 FOR SHARE`, params.RouteID).Scan(&routeActive); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT active, operating_timezone FROM routes WHERE id = $1 FOR SHARE`, params.RouteID).Scan(&routeActive, &operatingTimezone); err != nil {
 		return TrainRun{}, safeError(err)
 	}
 	if !trainActive || !routeActive {
@@ -66,6 +68,19 @@ func (s *Store) CommissionTrainRun(ctx context.Context, params CommissionTrainRu
 		return TrainRun{}, safeError(err)
 	}
 	if segmentCount <= 0 {
+		return TrainRun{}, ErrInvalidInput
+	}
+	var firstDepartureOffset int
+	if err := tx.QueryRow(ctx, `
+		SELECT departure_offset_minutes
+		FROM route_stops
+		WHERE route_id = $1 AND stop_index = 0
+		FOR SHARE
+	`, params.RouteID).Scan(&firstDepartureOffset); err != nil {
+		return TrainRun{}, safeError(err)
+	}
+	expectedDeparture, err := materializeDeparture(params.ServiceDate, operatingTimezone, firstDepartureOffset)
+	if err != nil || !params.ScheduledDepartureAt.Equal(expectedDeparture) {
 		return TrainRun{}, ErrInvalidInput
 	}
 
@@ -127,17 +142,24 @@ func (s *Store) UpdateTrainRunStatus(ctx context.Context, trainRunID string, nex
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var lockedID string
+	var lockedID, previousStatus string
 	if err := tx.QueryRow(ctx, `
-		SELECT id::text
+		SELECT id::text, status
 		FROM train_runs
 		WHERE id = $1
 		FOR UPDATE
-	`, trainRunID).Scan(&lockedID); err != nil {
+	`, trainRunID).Scan(&lockedID, &previousStatus); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return TrainRun{}, ErrNotFound
 		}
 		return TrainRun{}, safeError(err)
+	}
+	current, err := domain.ParseTrainRunStatus(previousStatus)
+	if err != nil {
+		return TrainRun{}, ErrPersistence
+	}
+	if err := domain.ValidateTrainRunTransition(current, next); err != nil {
+		return TrainRun{}, err
 	}
 
 	var run TrainRun
@@ -154,6 +176,18 @@ func (s *Store) UpdateTrainRunStatus(ctx context.Context, trainRunID string, nex
 	)
 	if err != nil {
 		return TrainRun{}, safeError(err)
+	}
+	if next == domain.TrainRunStatusCancelled && current != domain.TrainRunStatusCancelled {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload)
+			VALUES ('train_run', $1::uuid, 'trainrun.cancelled', jsonb_build_object(
+				'trainRunId', $1::text,
+				'status', 'cancelled'
+			))
+		`, lockedID); err != nil {
+			return TrainRun{}, safeError(err)
+		}
+		run.OutboxCreated = true
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return TrainRun{}, safeError(err)
@@ -172,4 +206,30 @@ func normalizeTrainRunTimes(run *TrainRun) {
 	run.ScheduledDepartureAt = run.ScheduledDepartureAt.UTC()
 	run.CreatedAt = run.CreatedAt.UTC()
 	run.UpdatedAt = run.UpdatedAt.UTC()
+}
+
+func materializeDeparture(serviceDate time.Time, timezone string, offsetMinutes int) (time.Time, error) {
+	if serviceDate.IsZero() || offsetMinutes < 0 {
+		return time.Time{}, ErrInvalidInput
+	}
+	location, err := time.LoadLocation(timezone)
+	if err != nil {
+		return time.Time{}, ErrInvalidInput
+	}
+	naive := time.Date(serviceDate.Year(), serviceDate.Month(), serviceDate.Day(), 0, 0, 0, 0, time.UTC).Add(time.Duration(offsetMinutes) * time.Minute)
+	candidate := time.Date(naive.Year(), naive.Month(), naive.Day(), naive.Hour(), naive.Minute(), naive.Second(), 0, location)
+	localized := candidate.In(location)
+	if localized.Year() != naive.Year() || localized.Month() != naive.Month() || localized.Day() != naive.Day() || localized.Hour() != naive.Hour() || localized.Minute() != naive.Minute() {
+		return time.Time{}, ErrInvalidInput
+	}
+	for delta := -3 * time.Hour; delta <= 3*time.Hour; delta += time.Minute {
+		if delta == 0 {
+			continue
+		}
+		alternative := candidate.Add(delta).In(location)
+		if alternative.Year() == naive.Year() && alternative.Month() == naive.Month() && alternative.Day() == naive.Day() && alternative.Hour() == naive.Hour() && alternative.Minute() == naive.Minute() {
+			return time.Time{}, ErrInvalidInput
+		}
+	}
+	return candidate.UTC(), nil
 }

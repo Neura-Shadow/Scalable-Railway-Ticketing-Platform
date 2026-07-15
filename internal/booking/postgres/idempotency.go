@@ -51,7 +51,16 @@ INSERT INTO idempotency_records (
     user_id, operation, key_hash, request_fingerprint, expires_at
 )
 VALUES ($1, $2, $3, $4, $5)
-ON CONFLICT (user_id, operation, key_hash) DO NOTHING
+ON CONFLICT (user_id, operation, key_hash) DO UPDATE
+SET id = gen_random_uuid(),
+    request_fingerprint = EXCLUDED.request_fingerprint,
+    status = 'in_progress',
+    resource_type = NULL,
+    resource_id = NULL,
+    expires_at = EXCLUDED.expires_at,
+    created_at = clock_timestamp(),
+    updated_at = clock_timestamp()
+WHERE idempotency_records.expires_at <= clock_timestamp()
 RETURNING id`, input.UserID, input.Operation, input.KeyHash, input.RequestFingerprint, input.ExpiresAt.UTC()).Scan(&insertedID)
 	inserted := err == nil
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {

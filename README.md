@@ -93,12 +93,13 @@ The API is versioned under `/api/v1`. Customer reservation routes derive ownersh
 | `GET` | `/api/v1/reservations/:id` | Read an owned reservation |
 | `POST` | `/api/v1/reservations/:id/confirm` | Confirm an owned hold |
 | `POST` | `/api/v1/reservations/:id/cancel` | Cancel an owned held/confirmed reservation |
+| `POST` | `/api/v1/admin/routes` | Create a named, timezone-bound route with ordered station codes and arrival/departure offsets |
 
 Errors use bounded public codes and do not expose SQL, DSNs, credentials, tokens, raw idempotency keys, or passenger data.
 
 ## Health and metrics
 
-`/livez` does not call PostgreSQL or Redis. `/readyz` checks PostgreSQL, Redis, migration version, and required production configuration with short timeouts and structured, sanitized component states. Outbox backlog and dead-letter conditions are metrics/alert signals rather than direct readiness failures.
+The API `/livez` does not call PostgreSQL or Redis. API `/readyz` checks PostgreSQL, Redis, migration version, and required production configuration with short timeouts and structured, sanitized component states. Each worker has a private `:9090` `/livez`, `/readyz`, and `/metrics` surface; its readiness check is PostgreSQL-bounded and its pass duration is capped. Outbox backlog and dead-letter conditions are metrics/alert signals rather than direct readiness failures.
 
 Prometheus labels use bounded operations, normalized route templates, result/status classes, and bounded reasons. User, passenger, reservation, train-run, seat, ticket, event, and arbitrary input values are excluded from labels.
 
@@ -120,7 +121,7 @@ make migrate-down
 
 Requirements:
 
-- Go 1.25.2+
+- Go 1.25.12+
 - Docker Engine with Compose v2
 - GNU Make for the documented shortcuts (or run the underlying Go/Docker commands)
 

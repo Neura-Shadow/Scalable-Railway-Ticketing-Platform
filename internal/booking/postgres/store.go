@@ -9,6 +9,7 @@ import (
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/domain"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -19,6 +20,7 @@ var (
 	ErrNotFound              = errors.New("booking resource not found")
 	ErrNotBookable           = errors.New("train run is not bookable")
 	ErrReservationExpired    = errors.New("reservation expired")
+	ErrPassengerConflict     = errors.New("passenger already has an active reservation for this train run")
 	ErrInvalidState          = errors.New("invalid reservation state")
 	ErrPersistenceInvariant  = errors.New("booking persistence invariant violated")
 )
@@ -32,6 +34,14 @@ type Store struct {
 
 func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
+}
+
+func isRetryableTransactionError(err error) bool {
+	var pgError *pgconn.PgError
+	if !errors.As(err, &pgError) {
+		return false
+	}
+	return pgError.Code == "40001" || pgError.Code == "40P01"
 }
 
 type Tx struct {
@@ -160,6 +170,7 @@ WITH candidates AS MATERIALIZED (
     JOIN coaches AS c ON c.id = s.coach_id
     WHERE si.train_run_id = $1
       AND si.seat_class = $2
+      AND s.active
       AND CASE
             WHEN bit_length(si.occupied_segments) = bit_length($3::bit varying)
             THEN bit_count($3::bit varying) > 0

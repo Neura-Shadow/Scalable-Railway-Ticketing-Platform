@@ -31,6 +31,28 @@ func TestWorkerPublishesOutsideClaimAndFinalizesEachEvent(t *testing.T) {
 	}
 }
 
+func TestWorkerRecordsSuccessfulClaimForEachClaimedEvent(t *testing.T) {
+	now := time.Now().UTC()
+	store := &fakeStore{events: []domain.Event{
+		{ID: uuid.New(), EventType: "reservation.held", Attempts: 1},
+		{ID: uuid.New(), EventType: "ticket.created", Attempts: 1},
+	}}
+	metrics := &metricsSpy{}
+	worker, err := application.NewWorker(store, &fakePublisher{store: store}, fixedClock{now}, metrics, application.Config{
+		WorkerID: "worker-1", BatchSize: 10, MaxAttempts: 5,
+		ProcessingTimeout: time.Minute, RetryBase: time.Second, RetryMax: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if metrics.claimSuccess != 2 {
+		t.Fatalf("successful claim metrics = %d, want 2", metrics.claimSuccess)
+	}
+}
+
 func TestWorkerContinuesAfterPublishFailureAndSchedulesRetry(t *testing.T) {
 	t.Parallel()
 
@@ -110,6 +132,14 @@ type fakePublisher struct {
 	store                *fakeStore
 	fail                 map[uuid.UUID]error
 	publishedDuringClaim bool
+}
+
+type metricsSpy struct{ claimSuccess int }
+
+func (s *metricsSpy) RecordOutbox(operation, _, result, _ string) {
+	if operation == "claim" && result == "success" {
+		s.claimSuccess++
+	}
 }
 
 func (p *fakePublisher) Publish(_ context.Context, event domain.Event) error {

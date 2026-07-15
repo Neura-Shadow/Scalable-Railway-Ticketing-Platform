@@ -81,6 +81,7 @@ func TestRateLimiterMapsScopesToBoundedLuaPolicies(t *testing.T) {
 		{httpapi.RateLimitRegister, "register", 5, 15 * time.Minute},
 		{httpapi.RateLimitLogin, "login", 10, 15 * time.Minute},
 		{httpapi.RateLimitReservationCreate, "reservation_create", 10, time.Minute},
+		{httpapi.RateLimitPassengerCreate, "passenger_create", 12, time.Hour},
 	}
 	for _, test := range tests {
 		t.Run(string(test.scope), func(t *testing.T) {
@@ -99,11 +100,11 @@ func TestRateLimiterMapsScopesToBoundedLuaPolicies(t *testing.T) {
 	}
 }
 
-func TestRateLimiterFailsOpenOnBackendOutageButDeniesExceededLimit(t *testing.T) {
+func TestRateLimiterPropagatesBackendOutageForTransportPolicyAndDeniesExceededLimit(t *testing.T) {
 	outage := &rateLimitBackendFake{err: redisx.ErrRateLimiterBackend}
 	allowed, err := NewRateLimiter(outage).Allow(context.Background(), httpapi.RateLimitRequest{Scope: httpapi.RateLimitLogin, Key: "subject"})
-	if err != nil || !allowed {
-		t.Fatalf("backend outage should fail open, got %v, %v", allowed, err)
+	if allowed || !errors.Is(err, redisx.ErrRateLimiterBackend) {
+		t.Fatalf("backend outage should propagate, got %v, %v", allowed, err)
 	}
 
 	exceeded := &rateLimitBackendFake{result: redisx.RateLimitResult{Allowed: false}}

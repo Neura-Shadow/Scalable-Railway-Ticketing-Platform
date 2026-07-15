@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"sort"
 	"strings"
 	"time"
@@ -67,6 +68,25 @@ type ReservationRecord struct {
 }
 
 func (s *Store) CreateHold(ctx context.Context, params CreateHoldParams) (CreateHoldResult, error) {
+	const maxAttempts = 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		result, err := s.createHoldOnce(ctx, params)
+		if err == nil || !isRetryableTransactionError(err) || attempt == maxAttempts-1 {
+			return result, err
+		}
+		delay := time.Duration(5*(1<<attempt)+rand.IntN(5)) * time.Millisecond
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return CreateHoldResult{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return CreateHoldResult{}, ErrPersistenceInvariant
+}
+
+func (s *Store) createHoldOnce(ctx context.Context, params CreateHoldParams) (CreateHoldResult, error) {
 	if err := validateCreateHoldParams(params); err != nil {
 		return CreateHoldResult{}, err
 	}
@@ -115,7 +135,7 @@ func (s *Store) CreateHold(ctx context.Context, params CreateHoldParams) (Create
 SELECT route_id, segment_count, status, clock_timestamp()
 FROM train_runs
 WHERE id = $1
-FOR UPDATE`, params.TrainRunID).Scan(&routeID, &segmentCount, &status, &databaseNow)
+FOR SHARE`, params.TrainRunID).Scan(&routeID, &segmentCount, &status, &databaseNow)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return CreateHoldResult{}, ErrNotFound
@@ -139,6 +159,9 @@ FOR UPDATE`, params.TrainRunID).Scan(&routeID, &segmentCount, &status, &database
 	}
 	if len(ownedPassengers) != len(passengerIDs) {
 		return CreateHoldResult{}, ErrNotFound
+	}
+	if err := tx.ensurePassengersAvailable(ctx, params.TrainRunID, ownedPassengers); err != nil {
+		return CreateHoldResult{}, err
 	}
 
 	var fareAmountMinor int64
@@ -191,10 +214,10 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, 'held', $8, $9, $10)`,
 	for index, seat := range allocated {
 		_, err := tx.tx.Exec(ctx, `
 INSERT INTO reservation_seats (
-    reservation_id, segment_count, seat_id, passenger_id, segment_mask,
+    reservation_id, train_run_id, segment_count, seat_id, passenger_id, segment_mask,
     fare_amount_minor, currency
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7)`, reservationID, segmentCount, seat.SeatID,
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, reservationID, params.TrainRunID, segmentCount, seat.SeatID,
 			ownedPassengers[index], encodedMask, fare.AmountMinor(), fare.Currency())
 		if err != nil {
 			return CreateHoldResult{}, fmt.Errorf("insert reservation seat: %w", err)
@@ -252,7 +275,7 @@ func (s *Store) ConfirmReservation(ctx context.Context, params ReservationComman
 		return result, nil
 	}
 
-	status, expiresAt, totalAmount, currency, err := tx.lockOwnedReservation(ctx, params.UserID, params.ReservationID)
+	status, _, totalAmount, currency, err := tx.lockOwnedReservation(ctx, params.UserID, params.ReservationID)
 	if err != nil {
 		return ConfirmReservationResult{}, err
 	}
@@ -272,19 +295,17 @@ func (s *Store) ConfirmReservation(ctx context.Context, params ReservationComman
 	if status != "held" {
 		return ConfirmReservationResult{}, ErrInvalidState
 	}
-	if !params.Now.Before(expiresAt) {
-		return ConfirmReservationResult{}, ErrReservationExpired
-	}
-
 	commandTag, err := tx.tx.Exec(ctx, `
 UPDATE reservations
 SET status = 'confirmed'
-WHERE id = $1 AND status = 'held'`, params.ReservationID)
+WHERE id = $1
+  AND status = 'held'
+  AND expires_at > clock_timestamp()`, params.ReservationID)
 	if err != nil {
 		return ConfirmReservationResult{}, fmt.Errorf("confirm reservation: %w", err)
 	}
 	if commandTag.RowsAffected() != 1 {
-		return ConfirmReservationResult{}, ErrPersistenceInvariant
+		return ConfirmReservationResult{}, ErrReservationExpired
 	}
 
 	orderID := uuid.New()
@@ -425,7 +446,7 @@ func (s *Store) ExpireDue(ctx context.Context, now time.Time, limit int) ([]uuid
 		failures []error
 	)
 	for len(expired)+len(failed) < limit {
-		id, found, err := s.expireOneDue(ctx, now.UTC(), failed)
+		id, found, err := s.expireOneDue(ctx, failed)
 		if !found && err == nil {
 			break
 		}
@@ -439,13 +460,39 @@ func (s *Store) ExpireDue(ctx context.Context, now time.Time, limit int) ([]uuid
 		}
 		expired = append(expired, id)
 	}
+	if err := s.cleanupExpiredIdempotency(ctx, 1000); err != nil {
+		failures = append(failures, err)
+	}
 	return expired, errors.Join(failures...)
+}
+
+func (s *Store) cleanupExpiredIdempotency(ctx context.Context, limit int) error {
+	if limit <= 0 {
+		return ErrInvalidArgument
+	}
+	_, err := s.pool.Exec(ctx, `
+		WITH expired AS (
+			SELECT id
+			FROM idempotency_records
+			WHERE expires_at <= clock_timestamp()
+			ORDER BY expires_at, id
+			FOR UPDATE SKIP LOCKED
+			LIMIT $1
+		)
+		DELETE FROM idempotency_records AS record
+		USING expired
+		WHERE record.id = expired.id
+	`, limit)
+	if err != nil {
+		return fmt.Errorf("clean expired idempotency records: %w", err)
+	}
+	return nil
 }
 
 // expireOneDue gives each claimed reservation its own transaction. A rollback
 // releases the row for another worker; the caller excludes that ID only from
 // its current batch so one corrupt item cannot starve the remaining batch.
-func (s *Store) expireOneDue(ctx context.Context, now time.Time, excluded []uuid.UUID) (uuid.UUID, bool, error) {
+func (s *Store) expireOneDue(ctx context.Context, excluded []uuid.UUID) (uuid.UUID, bool, error) {
 	tx, err := s.Begin(ctx)
 	if err != nil {
 		return uuid.Nil, false, err
@@ -461,11 +508,11 @@ func (s *Store) expireOneDue(ctx context.Context, now time.Time, excluded []uuid
 SELECT id
 FROM reservations
 WHERE status = 'held'
-  AND expires_at <= $1
-  AND NOT (id = ANY($2::uuid[]))
+  AND expires_at <= clock_timestamp()
+  AND NOT (id = ANY($1::uuid[]))
 ORDER BY expires_at, id
 FOR UPDATE SKIP LOCKED
-LIMIT 1`, now, excludedStrings).Scan(&id)
+LIMIT 1`, excludedStrings).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, false, nil
 	}
@@ -476,7 +523,9 @@ LIMIT 1`, now, excludedStrings).Scan(&id)
 	commandTag, err := tx.tx.Exec(ctx, `
 UPDATE reservations
 SET status = 'expired'
-WHERE id = $1 AND status = 'held' AND expires_at <= $2`, id, now)
+WHERE id = $1
+  AND status = 'held'
+  AND expires_at <= clock_timestamp()`, id)
 	if err != nil {
 		return id, true, fmt.Errorf("transition to expired: %w", err)
 	}
@@ -580,7 +629,8 @@ func (tx *Tx) ownedPassengerIDs(ctx context.Context, userID uuid.UUID, requested
 SELECT id
 FROM passengers
 WHERE user_id = $1 AND id = ANY($2::uuid[])
-ORDER BY id`, userID, ids)
+ORDER BY id
+FOR UPDATE`, userID, ids)
 	if err != nil {
 		return nil, fmt.Errorf("load owned passengers: %w", err)
 	}
@@ -597,6 +647,27 @@ ORDER BY id`, userID, ids)
 		return nil, fmt.Errorf("iterate owned passengers: %w", err)
 	}
 	return result, nil
+}
+
+func (tx *Tx) ensurePassengersAvailable(ctx context.Context, trainRunID uuid.UUID, passengerIDs []uuid.UUID) error {
+	ids := make([]string, len(passengerIDs))
+	for index, id := range passengerIDs {
+		ids[index] = id.String()
+	}
+	var conflicts int
+	if err := tx.tx.QueryRow(ctx, `
+SELECT count(*)::integer
+FROM reservation_seats AS rs
+JOIN reservations AS r ON r.id = rs.reservation_id
+WHERE r.train_run_id = $1
+  AND r.status IN ('held', 'confirmed')
+  AND rs.passenger_id = ANY($2::uuid[])`, trainRunID, ids).Scan(&conflicts); err != nil {
+		return fmt.Errorf("check active passenger reservations: %w", err)
+	}
+	if conflicts != 0 {
+		return ErrPassengerConflict
+	}
+	return nil
 }
 
 func (tx *Tx) reservationSeatIDs(ctx context.Context, reservationID uuid.UUID) ([]uuid.UUID, error) {

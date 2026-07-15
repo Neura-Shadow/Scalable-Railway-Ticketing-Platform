@@ -27,7 +27,7 @@ The command transaction inserts an `in_progress` record. It is not committed sep
 
 Resource creation, idempotency completion, and the outbox event commit in the same transaction. A rollback removes the uncommitted record and every domain mutation, so a committed abandoned `in_progress` state is not part of the normal design. Completion stores only `resource_type` and `resource_id`, never a full response containing sensitive data.
 
-Records have bounded retention. Cleanup never removes a record before the documented retry window and does not affect already committed resource uniqueness.
+Records have bounded retention. Database time allows an expired key to be atomically reacquired, and every hold-expiration pass deletes at most 1,000 expired rows through the expiry index with `SKIP LOCKED`. Cleanup never removes a record before the documented retry window and does not affect already committed resource uniqueness.
 
 Redis may cache a completed lookup keyed by the hashed tuple with a bounded TTL. A miss or outage always falls back to PostgreSQL. Redis never grants command ownership.
 

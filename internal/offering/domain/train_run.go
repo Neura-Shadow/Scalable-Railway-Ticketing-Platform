@@ -6,10 +6,11 @@ import (
 )
 
 var (
-	ErrInvalidTrainRunStatus = errors.New("invalid train run status")
-	ErrInvalidSegmentCount   = errors.New("invalid train run segment count")
-	ErrSegmentCountMismatch  = errors.New("train run segment count does not match route")
-	ErrTrainRunNotBookable   = errors.New("train run is not bookable")
+	ErrInvalidTrainRunStatus     = errors.New("invalid train run status")
+	ErrInvalidSegmentCount       = errors.New("invalid train run segment count")
+	ErrSegmentCountMismatch      = errors.New("train run segment count does not match route")
+	ErrTrainRunNotBookable       = errors.New("train run is not bookable")
+	ErrInvalidTrainRunTransition = errors.New("invalid train run status transition")
 )
 
 type TrainRunStatus string
@@ -45,6 +46,32 @@ func (s TrainRunStatus) IsValid() bool {
 
 func (s TrainRunStatus) String() string {
 	return string(s)
+}
+
+// ValidateTrainRunTransition keeps terminal runs terminal and makes repeated
+// operator commands idempotent.
+func ValidateTrainRunTransition(current, next TrainRunStatus) error {
+	if !current.IsValid() || !next.IsValid() {
+		return ErrInvalidTrainRunStatus
+	}
+	if current == next {
+		return nil
+	}
+	switch current {
+	case TrainRunStatusScheduled:
+		if next == TrainRunStatusBoarding || next == TrainRunStatusCancelled {
+			return nil
+		}
+	case TrainRunStatusBoarding:
+		if next == TrainRunStatusDeparted || next == TrainRunStatusCancelled {
+			return nil
+		}
+	case TrainRunStatusDeparted:
+		if next == TrainRunStatusCompleted {
+			return nil
+		}
+	}
+	return ErrInvalidTrainRunTransition
 }
 
 type TrainRun struct {

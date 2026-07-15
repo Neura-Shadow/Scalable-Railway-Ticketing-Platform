@@ -18,3 +18,11 @@ func TestRateLimiterLuaCounterIsAtomicAndBounded(t *testing.T) {
 		t.Fatal("rate limiter must not use the Redis KEYS command")
 	}
 }
+
+func TestRateLimiterOperationAllowlistIncludesEveryTransportPolicy(t *testing.T) {
+	for _, operation := range []string{"register", "login", "reservation_create", "passenger_create"} {
+		if normalized := normalizeOperation(operation); normalized != operation {
+			t.Fatalf("normalizeOperation(%q) = %q", operation, normalized)
+		}
+	}
+}

@@ -60,14 +60,14 @@ export function baseOptions(extraThresholds = {}) {
   };
 }
 
-export function oneAttemptPerVUOptions(extraThresholds = {}) {
+export function oneAttemptPerVUOptions(extraThresholds = {}, minimumDurationSeconds = 0) {
   return {
     scenarios: {
       one_attempt_per_vu: {
         executor: 'per-vu-iterations',
         vus: virtualUsers(),
         iterations: 1,
-        maxDuration: duration(),
+        maxDuration: minimumDurationSeconds > 0 ? `${minimumDurationSeconds}s` : duration(),
       },
     },
     summaryTrendStats: ['avg', 'min', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],

@@ -178,3 +178,17 @@ func TestSegmentMaskRejectsDifferentLengths(t *testing.T) {
 		t.Fatalf("Subtract() error = %v, want ErrSegmentMaskLengthMismatch", err)
 	}
 }
+
+func TestSegmentMaskAlgebraRejectsZeroValueOperands(t *testing.T) {
+	valid, _ := domain.NewSegmentMask(3, 0, 1)
+	var zero domain.SegmentMask
+	if _, err := zero.Overlaps(zero); !errors.Is(err, domain.ErrInvalidSegmentMask) {
+		t.Fatalf("zero Overlaps error = %v", err)
+	}
+	if _, err := zero.Union(valid); !errors.Is(err, domain.ErrInvalidSegmentMask) {
+		t.Fatalf("zero Union error = %v", err)
+	}
+	if _, err := valid.Subtract(zero); !errors.Is(err, domain.ErrInvalidSegmentMask) {
+		t.Fatalf("zero Subtract error = %v", err)
+	}
+}

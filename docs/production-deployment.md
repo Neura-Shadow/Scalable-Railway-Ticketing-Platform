@@ -55,10 +55,13 @@ Production must not use the local Compose passwords or development JWT default. 
 
 Migrations must remain backward compatible with the currently running application during rolling deployment. Destructive column/table removal requires a later release after all readers and writers have stopped using the old shape.
 
+Migration 5 is an expand migration: a compatibility trigger derives `reservation_seats.train_run_id` for a version-4 writer that omits the new column, while version-5 writers provide it directly. Do not remove that trigger until every version-4 process has drained and rollback to version 4 is no longer permitted.
+
 ## Health and rollout behavior
 
-- `/livez` is process-only and must not depend on PostgreSQL or Redis.
-- `/readyz` uses short checks for PostgreSQL, Redis, migrations, and required configuration without exposing credentials.
+- The API `/livez` is process-only and must not depend on PostgreSQL or Redis.
+- The API `/readyz` uses short checks for PostgreSQL, Redis, migrations, and required configuration without exposing credentials.
+- Each worker exposes a private `WORKER_HTTP_ADDRESS` (default `:9090`) with process-only `/livez`, PostgreSQL-backed `/readyz`, and its own `/metrics`; Kubernetes probes use this surface and each pass is bounded by `WORKER_PASS_TIMEOUT`.
 - Outbox backlog, pending consumer work, or a dead-letter item is alertable but is not by itself a readiness failure.
 - `/metrics` must remain internal or protected by the platform network boundary.
 - Use graceful termination with a pre-stop/drain window long enough for the configured HTTP shutdown timeout.
@@ -69,7 +72,7 @@ The baseline Kubernetes deployment runs as a non-root numeric user with a read-o
 
 PostgreSQL needs automated backups, point-in-time recovery, tested restore procedures, connection limits, statement/lock timeouts, slow-query and deadlock visibility, disk/replication alerts, and scheduled vacuum/analyze management. A replica may serve suitable read-only queries only when the resulting staleness is explicit; booking commands remain on the primary.
 
-Redis needs authentication, network isolation, bounded memory/eviction policy, command latency and error alerts, and persistence appropriate to the chosen uses. Redis loss may reduce read performance or cause protected write routes to fail closed, but it must not alter committed seat authority.
+Redis needs authentication, network isolation, bounded memory/eviction policy, command latency and error alerts, and persistence appropriate to the chosen uses. Authentication and passenger-profile creation fail closed when their limiter is unavailable; reservation creation intentionally degrades open because PostgreSQL remains authoritative and the durable reservation quota is deferred to Milestone 2. Redis loss must not alter committed seat authority.
 
 Never use Redis `KEYS` in production. Never treat a cache hit as proof that a seat can be sold.
 

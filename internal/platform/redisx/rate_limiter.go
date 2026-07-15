@@ -86,7 +86,7 @@ func (l *RateLimiter) Allow(ctx context.Context, operation, subject string, limi
 
 func normalizeOperation(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "login", "register", "reservation_create":
+	case "login", "register", "reservation_create", "passenger_create":
 		return strings.ToLower(strings.TrimSpace(value))
 	default:
 		return ""

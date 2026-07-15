@@ -2,10 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/eventrelay/application"
 	eventpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/eventrelay/postgres"
@@ -13,6 +17,7 @@ import (
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/clock"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
 	platformmetrics "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/metrics"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/workerhttp"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
@@ -54,11 +59,25 @@ func main() {
 		logger.Error("outbox publisher initialization failed")
 		os.Exit(1)
 	}
-	metrics, err := platformmetrics.New(prometheus.NewRegistry())
+	registry := prometheus.NewRegistry()
+	metrics, err := platformmetrics.New(registry)
 	if err != nil {
 		logger.Error("outbox metrics initialization failed")
 		os.Exit(1)
 	}
+	healthServer, err := workerhttp.New(cfg.WorkerHTTPAddress, registry, pool.Ping, cfg.DatabaseTimeout)
+	if err != nil {
+		logger.Error("outbox health server invalid")
+		os.Exit(1)
+	}
+	listener, err := net.Listen("tcp", cfg.WorkerHTTPAddress)
+	if err != nil {
+		logger.Error("outbox health listener unavailable")
+		os.Exit(1)
+	}
+	serverErrors := make(chan error, 1)
+	go func() { serverErrors <- healthServer.Serve(listener) }()
+	defer shutdownWorkerHTTP(healthServer, cfg.ShutdownTimeout)
 	worker, err := application.NewWorker(store, eventPublisher, clock.RealClock{}, metrics, application.Config{
 		WorkerID:          "outbox-" + uuid.NewString(),
 		BatchSize:         cfg.OutboxBatchSize,
@@ -73,7 +92,9 @@ func main() {
 	}
 
 	run := func() {
-		result, runErr := worker.RunOnce(ctx)
+		passContext, cancel := context.WithTimeout(ctx, cfg.WorkerPassTimeout)
+		defer cancel()
+		result, runErr := worker.RunOnce(passContext)
 		if runErr != nil {
 			logger.Error("outbox pass completed with finalize failures")
 			return
@@ -87,8 +108,21 @@ func main() {
 		select {
 		case <-ctx.Done():
 			return
+		case serverErr := <-serverErrors:
+			if serverErr != nil && !errors.Is(serverErr, http.ErrServerClosed) {
+				logger.Error("outbox health server failed")
+			}
+			return
 		case <-ticker.C():
 			run()
 		}
+	}
+}
+
+func shutdownWorkerHTTP(server *http.Server, timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		_ = server.Close()
 	}
 }

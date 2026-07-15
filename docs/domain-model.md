@@ -90,7 +90,7 @@ An operator-local date plus route/operator IANA timezone; it is distinct from a 
 1. A requested interval satisfies `0 <= from < to <= segment_count`.
 2. The origin and destination stations occupy those ordered route positions.
 3. Segment masks combined in any operation have identical positive length.
-4. Every ReservationSeat has one unique owned passenger, one unique class-matching seat, and the reservation's exact interval mask.
+4. Every ReservationSeat has one unique owned passenger, one unique class-matching seat, and the reservation's exact interval mask; one passenger cannot have two held/confirmed reservations on the same train run.
 5. All reservation seat allocations commit or roll back together.
 6. Only held and confirmed ReservationSeats contribute to SeatInventory occupancy.
 7. Confirmation retains occupancy; cancellation and expiration clear exact stored masks once.
@@ -98,7 +98,7 @@ An operator-local date plus route/operator IANA timezone; it is distinct from a 
 9. Durable command completion and outbox creation commit with the domain mutation.
 10. Reconciliation proves stored occupancy equals the active-mask union and that active masks do not overlap per seat.
 
-Passenger deletion is restricted once a ReservationSeat references the passenger. Train-run cancellation stops new holds but does not infer mass cancellation or automatic release of existing held/confirmed reservations in Milestone 1.
+Passenger deletion is restricted once a ReservationSeat references the passenger. Train-run status advances only through `scheduled -> boarding -> departed -> completed`, with cancellation allowed before departure and terminal states unable to reopen. Cancellation stops new holds but does not infer mass cancellation or automatic release of existing held/confirmed reservations in Milestone 1.
 
 ## Dependency rule
 

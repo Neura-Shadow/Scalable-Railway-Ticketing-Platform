@@ -53,10 +53,12 @@ func run(logger *slog.Logger) error {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
-	runContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	signalContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	handlerContext, cancelHandlers := context.WithCancel(context.Background())
+	defer cancelHandlers()
 
-	pool, err := pgxpool.New(runContext, cfg.DatabaseURL)
+	pool, err := pgxpool.New(signalContext, cfg.DatabaseURL)
 	if err != nil {
 		return errors.New("postgres configuration invalid")
 	}
@@ -98,7 +100,7 @@ func run(logger *slog.Logger) error {
 		Readiness:           app.NewReadinessChecker(pool, redisClient, cfg),
 		ReadinessTimeout:    readinessTimeout(cfg),
 		TokenParser:         tokenParser,
-		Reservations:        app.NewReservationService(bookingStore, queryStore, reads, passwordClock, cfg.HoldTTL, cfg.MaxPassengersPerReservation),
+		Reservations:        app.NewReservationService(bookingStore, queryStore, reads, passwordClock, cfg.HoldTTL, cfg.MaxPassengersPerReservation, metrics),
 		MaxRequestBodyBytes: maxRequestBodyBytes,
 		MaxPassengers:       cfg.MaxPassengersPerReservation,
 		HTTPMetrics:         metrics,
@@ -109,7 +111,7 @@ func run(logger *slog.Logger) error {
 		Passengers:          passengers,
 		Tickets:             app.NewTicketQueries(reads),
 		Admin:               app.NewAdminCommands(offeringStore),
-		Operator:            app.NewOperatorCommands(offeringStore, bookingStore),
+		Operator:            app.NewOperatorCommands(offeringStore, bookingStore, metrics),
 	})
 	if err := router.SetTrustedProxies(cfg.TrustedProxies); err != nil {
 		return errors.New("trusted proxy configuration invalid")
@@ -124,30 +126,42 @@ func run(logger *slog.Logger) error {
 		IdleTimeout:       defaultIdleTimeout,
 		MaxHeaderBytes:    maxHeaderBytes,
 		BaseContext: func(net.Listener) context.Context {
-			return runContext
+			// The signal context must not be used here: Shutdown needs active
+			// request contexts so in-flight database transactions can drain.
+			return handlerContext
 		},
 	}
+	listener, err := net.Listen("tcp", cfg.HTTPAddress)
+	if err != nil {
+		return errors.New("http listener failed")
+	}
+	logger.Info("api listening", "address", listener.Addr().String())
+	return serveUntilShutdown(server, listener, signalContext.Done(), cfg.ShutdownTimeout)
+}
+
+func serveUntilShutdown(server *http.Server, listener net.Listener, shutdown <-chan struct{}, timeout time.Duration) error {
+	if server == nil || listener == nil || shutdown == nil || timeout <= 0 {
+		return errors.New("http lifecycle configuration invalid")
+	}
 	serverErrors := make(chan error, 1)
-	go func() {
-		logger.Info("api listening", "address", cfg.HTTPAddress)
-		serverErrors <- server.ListenAndServe()
-	}()
+	go func() { serverErrors <- server.Serve(listener) }()
 
 	select {
-	case err = <-serverErrors:
+	case err := <-serverErrors:
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
 		return errors.New("http listener failed")
-	case <-runContext.Done():
+	case <-shutdown:
 	}
 
-	shutdownContext, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	shutdownContext, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	if err := server.Shutdown(shutdownContext); err != nil {
+		_ = server.Close()
 		return errors.New("graceful shutdown failed")
 	}
-	if err = <-serverErrors; err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := <-serverErrors; err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return errors.New("http listener shutdown failed")
 	}
 	return nil

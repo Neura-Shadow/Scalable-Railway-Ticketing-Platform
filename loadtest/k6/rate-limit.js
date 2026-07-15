@@ -3,7 +3,7 @@ import { check } from 'k6';
 import { baseOptions } from './lib/config.js';
 import { cancelReservation, createHold, iterationKey, reservationID } from './lib/requests.js';
 
-export const options = baseOptions();
+export const options = baseOptions({ rate_limited: ['count>0'] });
 
 export default function () {
   const hold = createHold(iterationKey('rate-limit'));

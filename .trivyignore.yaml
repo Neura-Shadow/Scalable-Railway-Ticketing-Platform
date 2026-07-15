@@ -1,0 +1,7 @@
+misconfigurations:
+  - id: KSV-0109
+    paths:
+      - "deploy/kubernetes/base/configmap.yaml"
+    statement: >-
+      False positive: RESERVATION_MAX_PASSENGERS and WORKER_PASS_TIMEOUT are
+      bounded numeric runtime settings. Credentials remain in Secret references.

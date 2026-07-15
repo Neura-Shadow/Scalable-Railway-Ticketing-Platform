@@ -44,6 +44,7 @@ services:
   api:
     build:
       context: .
+      target: api
     environment:
       APP_ENV: development
       HTTP_ADDR: :8080
@@ -53,7 +54,7 @@ services:
       JWT_ISSUER: scalable-railway-ticketing-platform
       JWT_AUDIENCE: railway-api
       RESERVATION_HOLD_TTL_SECONDS: 600
-      RESERVATION_MAX_PASSENGERS: 8
+      RESERVATION_MAX_PASSENGERS: 6
       HOLD_EXPIRER_ENABLED: "false"
       OUTBOX_PUBLISHER: log
       TRUSTED_PROXIES: 127.0.0.1
@@ -78,13 +79,15 @@ services:
     profiles: ["workers"]
     build:
       context: .
-    entrypoint: ["/usr/local/bin/hold-expirer"]
+      target: hold-expirer
     environment:
       APP_ENV: development
       DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
       HOLD_EXPIRER_ENABLED: "true"
       HOLD_EXPIRER_BATCH_SIZE: 50
       HOLD_EXPIRER_INTERVAL_SECONDS: 30
+      WORKER_HTTP_ADDRESS: :9090
+      WORKER_PASS_TIMEOUT: 60s
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -100,7 +103,7 @@ services:
     profiles: ["workers"]
     build:
       context: .
-    entrypoint: ["/usr/local/bin/outbox-worker"]
+      target: outbox-worker
     environment:
       APP_ENV: development
       DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
@@ -108,6 +111,8 @@ services:
       OUTBOX_PUBLISHER: log
       OUTBOX_BATCH_SIZE: 100
       OUTBOX_POLL_INTERVAL_SECONDS: 2
+      WORKER_HTTP_ADDRESS: :9090
+      WORKER_PASS_TIMEOUT: 60s
     depends_on:
       migrate:
         condition: service_completed_successfully

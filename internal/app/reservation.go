@@ -34,6 +34,11 @@ type reservationReader interface {
 	GetReservationDetail(context.Context, uuid.UUID, uuid.UUID) (ReservationDetail, error)
 }
 
+type reservationMetrics interface {
+	RecordReservation(operation, result, reason string)
+	RecordOutbox(operation, eventType, result, reason string)
+}
+
 type ReservationService struct {
 	commands      reservationCommands
 	journeys      journeyResolver
@@ -41,10 +46,15 @@ type ReservationService struct {
 	clock         appClock
 	holdTTL       time.Duration
 	maxPassengers int
+	metrics       reservationMetrics
 }
 
-func NewReservationService(commands reservationCommands, journeys journeyResolver, reader reservationReader, clock appClock, holdTTL time.Duration, maxPassengers int) *ReservationService {
-	return &ReservationService{commands: commands, journeys: journeys, reader: reader, clock: clock, holdTTL: holdTTL, maxPassengers: maxPassengers}
+func NewReservationService(commands reservationCommands, journeys journeyResolver, reader reservationReader, clock appClock, holdTTL time.Duration, maxPassengers int, metrics ...reservationMetrics) *ReservationService {
+	service := &ReservationService{commands: commands, journeys: journeys, reader: reader, clock: clock, holdTTL: holdTTL, maxPassengers: maxPassengers}
+	if len(metrics) > 0 {
+		service.metrics = metrics[0]
+	}
+	return service
 }
 
 func (s *ReservationService) CreateHold(ctx context.Context, c httpapi.CreateReservationCommand) (httpapi.ReservationView, error) {
@@ -87,6 +97,10 @@ func (s *ReservationService) CreateHold(ctx context.Context, c httpapi.CreateRes
 	if err != nil {
 		return httpapi.ReservationView{}, mapBookingError(err)
 	}
+	if s.metrics != nil && !result.Replayed {
+		s.metrics.RecordReservation("hold", "success", "none")
+		s.metrics.RecordOutbox("create", "reservation.held", "success", "none")
+	}
 	return s.readUUID(ctx, owner, result.ReservationID)
 }
 
@@ -98,8 +112,16 @@ func (s *ReservationService) ConfirmReservation(ctx context.Context, c httpapi.R
 	if err != nil {
 		return httpapi.ReservationView{}, err
 	}
-	if _, err = s.commands.ConfirmReservation(ctx, input); err != nil {
+	result, err := s.commands.ConfirmReservation(ctx, input)
+	if err != nil {
 		return httpapi.ReservationView{}, mapBookingError(err)
+	}
+	if s.metrics != nil && !result.Replayed {
+		s.metrics.RecordReservation("confirm", "success", "none")
+		s.metrics.RecordOutbox("create", "reservation.confirmed", "success", "none")
+		for range result.TicketCount {
+			s.metrics.RecordOutbox("create", "ticket.created", "success", "none")
+		}
 	}
 	return s.readUUID(ctx, owner, reservation)
 }
@@ -108,8 +130,13 @@ func (s *ReservationService) CancelReservation(ctx context.Context, c httpapi.Re
 	if err != nil {
 		return httpapi.ReservationView{}, err
 	}
-	if _, err = s.commands.CancelReservation(ctx, input); err != nil {
+	result, err := s.commands.CancelReservation(ctx, input)
+	if err != nil {
 		return httpapi.ReservationView{}, mapBookingError(err)
+	}
+	if s.metrics != nil && !result.Replayed {
+		s.metrics.RecordReservation("cancel", "success", "none")
+		s.metrics.RecordOutbox("create", "reservation.cancelled", "success", "none")
 	}
 	return s.readUUID(ctx, owner, reservation)
 }
@@ -173,7 +200,7 @@ func mapBookingError(err error) error {
 		return httpapi.ErrInvalidInput
 	case errors.Is(err, bookingpostgres.ErrNotFound):
 		return httpapi.ErrNotFound
-	case errors.Is(err, bookingpostgres.ErrInsufficientInventory), errors.Is(err, bookingpostgres.ErrNotBookable), errors.Is(err, bookingpostgres.ErrReservationExpired), errors.Is(err, bookingpostgres.ErrInvalidState), errors.Is(err, bookingpostgres.ErrIdempotencyConflict), errors.Is(err, bookingpostgres.ErrIdempotencyInProgress):
+	case errors.Is(err, bookingpostgres.ErrInsufficientInventory), errors.Is(err, bookingpostgres.ErrNotBookable), errors.Is(err, bookingpostgres.ErrReservationExpired), errors.Is(err, bookingpostgres.ErrPassengerConflict), errors.Is(err, bookingpostgres.ErrInvalidState), errors.Is(err, bookingpostgres.ErrIdempotencyConflict), errors.Is(err, bookingpostgres.ErrIdempotencyInProgress):
 		return httpapi.ErrConflict
 	default:
 		return httpapi.ErrUnavailable

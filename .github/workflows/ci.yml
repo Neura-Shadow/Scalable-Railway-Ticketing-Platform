@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VERSION: "1.25.2"
+  GO_VERSION: "1.25.12"
   IMAGE_NAME: scalable-railway-ticketing-platform:milestone-1
 
 jobs:
@@ -79,7 +79,7 @@ jobs:
       - name: Gitleaks
         run: go run github.com/gitleaks/gitleaks/v8@v8.30.1 git --no-banner --redact
       - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -87,6 +87,7 @@ jobs:
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: "1"
+          trivyignores: .trivyignore.yaml
 
   migration-integration:
     name: Migrations and PostgreSQL integration
@@ -137,6 +138,8 @@ jobs:
         run: go run ./cmd/migrate -path migrations -database "$DATABASE_URL" version
       - name: Run integration and constraint tests
         run: go test ./... -count=1 -timeout 300s
+      - name: Run race-enabled persistence and concurrency tests
+        run: go test -race ./internal/accounts/postgres ./internal/booking/postgres ./internal/offering/postgres ./internal/eventrelay/postgres -count=1 -timeout 300s
 
   container:
     name: Container build and image scan
@@ -149,11 +152,16 @@ jobs:
           persist-credentials: false
       - name: Build image
         run: docker build --pull --tag "$IMAGE_NAME" .
+      - name: Verify runtime identity and timezone database
+        run: |
+          docker run --rm --entrypoint /bin/sh "$IMAGE_NAME" -c \
+            'test "$(id -u)" -ne 0 && test -f /usr/share/zoneinfo/Asia/Taipei'
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: scalable-railway-ticketing-platform:milestone-1
           format: table
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: "1"
+          trivyignores: .trivyignore.yaml

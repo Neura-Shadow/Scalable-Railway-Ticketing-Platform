@@ -4,7 +4,7 @@ import { expirationWaitSeconds, oneAttemptPerVUOptions } from './lib/config.js';
 import { expiredHolds } from './lib/metrics.js';
 import { createHold, getReservation, iterationKey, reservationID } from './lib/requests.js';
 
-export const options = oneAttemptPerVUOptions();
+export const options = oneAttemptPerVUOptions({}, expirationWaitSeconds() + 30);
 
 export default function () {
   const hold = createHold(iterationKey('expiration-storm'));

@@ -3,6 +3,7 @@ package httpapi_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -79,5 +80,40 @@ func TestRegistrationRateLimitDenialReturns429(t *testing.T) {
 	}
 	if auth.registered {
 		t.Fatal("registration port called after rate-limit denial")
+	}
+}
+
+func TestRegistrationRateLimitUsesForwardedClientOnlyFromTrustedProxy(t *testing.T) {
+	auth := &authServiceStub{}
+	limiter := &rateLimiterStub{allowed: false}
+	router := httpapi.New(httpapi.Dependencies{Auth: auth, RateLimiter: limiter})
+	if err := router.SetTrustedProxies([]string{"10.0.0.0/8"}); err != nil {
+		t.Fatalf("set trusted proxies: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/register", bytes.NewReader([]byte(`{"email":"customer@example.test","password":"correct-horse-battery-staple"}`)))
+	request.RemoteAddr = "10.1.2.3:12345"
+	request.Header.Set("X-Forwarded-For", "198.51.100.25")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("rate-limited registration status = %d, want 429", response.Code)
+	}
+	if limiter.input.Key != "198.51.100.25" {
+		t.Fatalf("rate-limit key = %q, want forwarded client IP", limiter.input.Key)
+	}
+}
+
+func TestRegistrationFailsClosedWhenRateLimiterBackendFails(t *testing.T) {
+	auth := &authServiceStub{}
+	limiter := &rateLimiterStub{err: errors.New("redis unavailable")}
+	router := httpapi.New(httpapi.Dependencies{Auth: auth, RateLimiter: limiter})
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/register", bytes.NewReader([]byte(`{"email":"customer@example.test","password":"correct-horse-battery-staple"}`)))
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("registration limiter outage status = %d, want 503", response.Code)
+	}
+	if auth.registered {
+		t.Fatal("registration reached auth service after limiter outage")
 	}
 }

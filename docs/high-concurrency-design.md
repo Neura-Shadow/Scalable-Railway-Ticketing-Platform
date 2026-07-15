@@ -6,7 +6,8 @@ The platform must prevent overlapping active reservations for the same seat and 
 
 ## Serialization points
 
-- Train-run row: serializes bookable-status decisions with new holds when status may change.
+- Train-run row: compatible shared locks allow holds to proceed concurrently while still serializing them against operator status updates.
+- Passenger row: deterministic locks serialize the one-active-reservation-per-passenger/train-run rule.
 - Seat-inventory row: serializes occupancy changes for one physical seat and train run.
 - Reservation row: serializes confirm, cancel, and expire.
 - Idempotency unique key/row: serializes retries of one customer command.
@@ -14,7 +15,7 @@ The platform must prevent overlapping active reservations for the same seat and 
 
 ## Allocation algorithm
 
-Create-hold uses one Read Committed transaction. It locks the idempotency record and then the train-run row before reading passengers/fare and mutating inventory. A data-modifying CTE selects candidates in `(coach_number, seat_number, seat_id)` order with `FOR UPDATE OF seat_inventory SKIP LOCKED`. The update applies `occupied_segments | requested_mask` only to candidates whose equal-length intersection is zero.
+Create-hold uses one Read Committed transaction. It locks the idempotency record, takes a shared train-run lock, and locks canonical owned passenger rows before reading fare and mutating inventory. It rejects a passenger already present in a held/confirmed reservation on that run. A data-modifying CTE selects candidates in `(coach_number, seat_number, seat_id)` order with `FOR UPDATE OF seat_inventory SKIP LOCKED`. The update applies `occupied_segments | requested_mask` only to active-seat candidates whose equal-length intersection is zero.
 
 The returned row count must exactly equal passenger count. Any shortfall returns a bounded availability conflict by rolling back the transaction. Passenger-to-seat assignment follows returned deterministic seat order and canonical passenger order.
 

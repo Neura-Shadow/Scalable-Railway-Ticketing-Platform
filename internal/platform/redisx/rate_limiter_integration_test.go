@@ -34,13 +34,16 @@ func TestRateLimiterIntegrationUsesAtomicWindowAndHashedSubject(t *testing.T) {
 			t.Fatalf("attempt %d allowed=%t, want %t", attempt, got, want)
 		}
 	}
+	if result, err := limiter.Allow(context.Background(), "passenger_create", "customer-id", RateLimit{Limit: 12, Window: time.Hour}); err != nil || !result.Allowed {
+		t.Fatalf("passenger_create policy integration = %#v, %v", result, err)
+	}
 
 	keys, _, err := client.Scan(context.Background(), 0, "ratelimit:"+namespace+":v1:*", 10).Result()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(keys) != 1 || strings.Contains(keys[0], rawSubject) {
-		t.Fatalf("rate limit keys = %q; expected one hashed key with no raw subject", keys)
+	if len(keys) != 2 || strings.Contains(strings.Join(keys, "|"), rawSubject) || strings.Contains(strings.Join(keys, "|"), "customer-id") {
+		t.Fatalf("rate limit keys = %q; expected two hashed keys with no raw subject", keys)
 	}
 	_ = client.Del(context.Background(), keys...).Err()
 }

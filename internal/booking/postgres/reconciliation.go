@@ -14,9 +14,20 @@ func (s *Store) ReconcileTrainRun(ctx context.Context, trainRunID uuid.UUID) err
 	if s == nil || s.pool == nil || trainRunID == uuid.Nil {
 		return ErrInvalidArgument
 	}
-	var violations int
+	var inventoryViolations, orphanedActiveSeats int
 	err := s.pool.QueryRow(ctx, `
-SELECT count(*)::integer
+SELECT count(*)::integer,
+       (
+           SELECT count(*)::integer
+           FROM reservation_seats AS orphan_rs
+           JOIN reservations AS orphan_r ON orphan_r.id = orphan_rs.reservation_id
+           LEFT JOIN seat_inventory AS orphan_si
+             ON orphan_si.train_run_id = orphan_r.train_run_id
+            AND orphan_si.seat_id = orphan_rs.seat_id
+           WHERE orphan_r.train_run_id = $1
+             AND orphan_r.status IN ('held', 'confirmed')
+             AND orphan_si.seat_id IS NULL
+       )
 FROM seat_inventory AS si
 LEFT JOIN LATERAL (
     SELECT count(*)::integer AS total_masks,
@@ -43,12 +54,12 @@ WHERE si.train_run_id = $1
         THEN si.occupied_segments = active.expected_mask
          AND active.individual_bit_count = bit_count(active.expected_mask)
         ELSE false
-      END`, trainRunID).Scan(&violations)
+      END`, trainRunID).Scan(&inventoryViolations, &orphanedActiveSeats)
 	if err != nil {
 		return fmt.Errorf("reconcile train-run inventory: %w", err)
 	}
-	if violations != 0 {
-		return fmt.Errorf("%w: train run %s has %d inconsistent inventory rows", ErrPersistenceInvariant, trainRunID, violations)
+	if inventoryViolations != 0 || orphanedActiveSeats != 0 {
+		return fmt.Errorf("%w: train run %s has %d inconsistent inventory rows and %d orphaned active reservation seats", ErrPersistenceInvariant, trainRunID, inventoryViolations, orphanedActiveSeats)
 	}
 	return nil
 }

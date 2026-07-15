@@ -104,6 +104,7 @@ Redis provides bounded-TTL read hints, rate limits, and optional event transport
 ### Reservations and tickets
 
 - Create one reservation for one or more unique owned passengers and allocate exactly one deterministic, class-matching seat per passenger.
+- Prevent one passenger from appearing in more than one held/confirmed reservation on the same train run by locking owned passenger rows before the active-reservation check.
 - Allocate all requested seats or roll back the entire transaction.
 - Store held, confirmed, expired, and cancelled reservations.
 - Permit `held -> confirmed`, `held -> expired`, `held -> cancelled`, and `confirmed -> cancelled`; reject all other state changes except specified idempotent repeats.
@@ -119,6 +120,7 @@ Redis provides bounded-TTL read hints, rate limits, and optional event transport
 - Complete the idempotency record in the same transaction as the resource and outbox event.
 - Return the same resource for the same key/fingerprint and `409 Conflict` for a different fingerprint.
 - Allow Redis only as an optional completed-result cache.
+- Reacquire an expired PostgreSQL idempotency key using database-authoritative time while preserving non-expired replay/conflict behavior.
 
 ### Outbox and workers
 
@@ -132,7 +134,7 @@ Redis provides bounded-TTL read hints, rate limits, and optional event transport
 ### APIs
 
 - Provide station listing, train-run search, availability, reservation create/read/confirm/cancel, and ticket-order list/read endpoints.
-- Provide authenticated admin/operator write endpoints for the resources in their permissions.
+- Provide authenticated admin/operator write endpoints for the resources in their permissions; route creation accepts name, operating timezone, and ordered station-code stops with explicit arrival/departure offsets.
 - Normalize pagination, bound page size, and use an allowlist for sort order.
 - Return a stable JSON envelope with machine-readable error code, safe message, request ID, and field details where appropriate.
 - Do not expose raw database or internal errors.
@@ -146,7 +148,7 @@ Redis provides bounded-TTL read hints, rate limits, and optional event transport
 
 ### Health, metrics, and lifecycle
 
-- Provide process-only `/livez`, dependency/config/migration-aware `/readyz`, and `/metrics`.
+- Provide API process-only `/livez`, dependency/config/migration-aware `/readyz`, and `/metrics`, plus a private worker health/metrics listener with process liveness, bounded PostgreSQL readiness, and bounded pass timeouts.
 - Coordinate the HTTP server, optional workers, and publisher from one signal-derived root context.
 - Bound metric label values and normalize Gin route patterns.
 - Never label by user, reservation, ticket, train-run, seat, event, idempotency, passenger, or arbitrary station/request data.
@@ -186,7 +188,7 @@ Redis provides bounded-TTL read hints, rate limits, and optional event transport
 
 ### Operability
 
-- Use Go 1.25.2, the verified stable local toolchain, and document that it differs from the preferred 1.26.x baseline.
+- Use Go 1.25.12, the verified secure patch of the local stable toolchain line, and document that it differs from the preferred 1.26.x baseline.
 - Target PostgreSQL 16+, Redis 7+, Gin, pgx/v5/pgxpool, golang-migrate, Prometheus `client_golang`, k6, and Docker Compose.
 - Build a multi-stage non-root container with a minimal runtime image and read-only-root-filesystem support.
 - Keep production secrets environment-driven and local-development defaults explicitly scoped.

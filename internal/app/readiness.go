@@ -12,6 +12,9 @@ import (
 
 type readinessProbe func(context.Context) error
 type migrationProbe func(context.Context) (int, bool, error)
+
+const currentSchemaVersion = 5
+
 type ReadinessChecker struct {
 	postgres, redis readinessProbe
 	migrations      migrationProbe
@@ -54,7 +57,7 @@ func (r *ReadinessChecker) CheckReadiness(ctx context.Context) ([]httpapi.Readin
 	checks[1].Ready = r.redis != nil && r.redis(ctx) == nil
 	if r.migrations != nil {
 		version, dirty, err := r.migrations(ctx)
-		checks[2].Ready = err == nil && version == 4 && !dirty
+		checks[2].Ready = err == nil && version == currentSchemaVersion && !dirty
 	}
 	checks[3].Ready = r.configuration != nil && r.configuration() == nil
 	return checks, nil

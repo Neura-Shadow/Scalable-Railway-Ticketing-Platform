@@ -165,6 +165,7 @@ const (
 	RateLimitRegister          RateLimitScope = "auth_register"
 	RateLimitLogin             RateLimitScope = "auth_login"
 	RateLimitReservationCreate RateLimitScope = "reservation_create"
+	RateLimitPassengerCreate   RateLimitScope = "passenger_create"
 )
 
 type RateLimitRequest struct {
@@ -239,8 +240,17 @@ type StationWrite struct {
 }
 
 type RouteWrite struct {
-	Code       string   `json:"code"`
-	StationIDs []string `json:"station_ids"`
+	Code              string           `json:"code"`
+	Name              string           `json:"name"`
+	OperatingTimezone string           `json:"operating_timezone"`
+	Stops             []RouteStopWrite `json:"stops"`
+}
+
+type RouteStopWrite struct {
+	StationCode            string `json:"station_code"`
+	StopIndex              int    `json:"stop_index"`
+	ArrivalOffsetMinutes   int    `json:"arrival_offset_minutes"`
+	DepartureOffsetMinutes int    `json:"departure_offset_minutes"`
 }
 
 type TrainWrite struct {

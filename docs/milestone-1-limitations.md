@@ -34,7 +34,7 @@ Milestone 1 proves the core reservation correctness model in a production-minded
 
 - Reconciliation is an acceptance/audit invariant, not an automatic production repair mechanism.
 - Production ingress, certificate management, cloud database/Redis provisioning, secret-manager integration, network policy, backups, restore automation, alert routing, and dashboards are deployment-environment responsibilities.
-- Redis outage behavior depends on route class: cache reads may fall back, while protected write-route controls fail closed in production.
+- Redis outage behavior depends on route class: authentication and passenger-profile creation limiters fail closed, while reservation creation degrades open and still enforces all PostgreSQL invariants.
 - Outbox publication is at least once; consumers must deduplicate by event ID.
 - No payment, email, SMS, or notification side effects are emitted.
 

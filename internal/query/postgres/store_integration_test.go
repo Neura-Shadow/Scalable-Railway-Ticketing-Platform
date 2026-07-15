@@ -46,8 +46,8 @@ func TestStoreSearchAndAvailabilityUseDirectionOverlapAndRunFarePrecedence(t *te
 	if results[0].OriginDepartureOffsetMinutes != 5 || results[0].DestinationArrivalOffsetMinutes != 1500 {
 		t.Fatalf("SearchTrainRuns() offsets = %d/%d", results[0].OriginDepartureOffsetMinutes, results[0].DestinationArrivalOffsetMinutes)
 	}
-	if !results[0].DepartureAt.Equal(time.Date(2026, time.July, 19, 22, 5, 0, 0, time.UTC)) ||
-		!results[0].ArrivalAt.Equal(time.Date(2026, time.July, 20, 23, 0, 0, 0, time.UTC)) {
+	if !results[0].DepartureAt.Equal(time.Date(2026, time.July, 19, 16, 5, 0, 0, time.UTC)) ||
+		!results[0].ArrivalAt.Equal(time.Date(2026, time.July, 20, 17, 0, 0, 0, time.UTC)) {
 		t.Fatalf("SearchTrainRuns() journey times = %v/%v", results[0].DepartureAt, results[0].ArrivalAt)
 	}
 
@@ -167,7 +167,7 @@ func seedOffering(t *testing.T, conn *pgx.Conn) offeringFixture {
 	serviceDate := time.Date(2026, time.July, 20, 0, 0, 0, 0, time.UTC)
 	run, err := store.CommissionTrainRun(ctx, offeringpostgres.CommissionTrainRunParams{
 		TrainID: train.ID, RouteID: route.ID, ServiceDate: serviceDate,
-		ScheduledDepartureAt: time.Date(2026, time.July, 19, 22, 0, 0, 0, time.UTC),
+		ScheduledDepartureAt: time.Date(2026, time.July, 19, 16, 5, 0, 0, time.UTC),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -224,7 +224,7 @@ func openQueryTestDatabase(t *testing.T) *pgx.Conn {
 		t.Fatal("resolve integration test path")
 	}
 	root := filepath.Join(filepath.Dir(currentFile), "..", "..", "..")
-	for _, name := range []string{"000001_accounts.up.sql", "000002_railway_offering.up.sql", "000003_booking.up.sql"} {
+	for _, name := range []string{"000001_accounts.up.sql", "000002_railway_offering.up.sql", "000003_booking.up.sql", "000004_idempotency_outbox.up.sql", "000005_inventory_and_route_integrity.up.sql"} {
 		migration, err := os.ReadFile(filepath.Join(root, "migrations", name))
 		if err != nil {
 			t.Fatal(err)

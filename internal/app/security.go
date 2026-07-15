@@ -77,9 +77,9 @@ func (l *RateLimiter) Allow(ctx context.Context, request httpapi.RateLimitReques
 	}
 	result, err := l.backend.Allow(ctx, operation, request.Key, limit)
 	if err != nil {
-		// Rate limiting is an availability aid, not an authorization boundary.
-		// The required transport policy is explicitly fail-open on Redis outage.
-		return true, nil
+		// The transport owns the scope-specific outage policy: authentication
+		// fails closed while reservation admission may fail open.
+		return false, err
 	}
 	return result.Allowed, nil
 }
@@ -92,6 +92,8 @@ func rateLimitPolicy(scope httpapi.RateLimitScope) (string, redisx.RateLimit, bo
 		return "login", redisx.RateLimit{Limit: 10, Window: 15 * time.Minute}, true
 	case httpapi.RateLimitReservationCreate:
 		return "reservation_create", redisx.RateLimit{Limit: 10, Window: time.Minute}, true
+	case httpapi.RateLimitPassengerCreate:
+		return "passenger_create", redisx.RateLimit{Limit: 12, Window: time.Hour}, true
 	default:
 		return "", redisx.RateLimit{}, false
 	}

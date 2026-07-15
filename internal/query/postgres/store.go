@@ -105,12 +105,13 @@ func (s *Store) SearchTrainRuns(ctx context.Context, request SearchRequest) ([]S
 		       tr.scheduled_departure_at, tr.status, tr.segment_count,
 		       origin.stop_index, destination.stop_index,
 		       origin.departure_offset_minutes, destination.arrival_offset_minutes,
-		       tr.scheduled_departure_at + make_interval(mins => origin.departure_offset_minutes) AS departure_at,
-		       tr.scheduled_departure_at + make_interval(mins => destination.arrival_offset_minutes) AS arrival_at,
+		       tr.scheduled_departure_at + make_interval(mins => origin.departure_offset_minutes - route_origin.departure_offset_minutes) AS departure_at,
+		       tr.scheduled_departure_at + make_interval(mins => destination.arrival_offset_minutes - route_origin.departure_offset_minutes) AS arrival_at,
 		       selected_fare.amount_minor, selected_fare.currency
 		FROM train_runs AS tr
 		JOIN trains AS t ON t.id = tr.train_id AND t.active
 		JOIN routes AS r ON r.id = tr.route_id AND r.active
+		JOIN route_stops AS route_origin ON route_origin.route_id = tr.route_id AND route_origin.stop_index = 0
 		JOIN route_stops AS origin ON origin.route_id = tr.route_id
 		JOIN stations AS origin_station ON origin_station.id = origin.station_id AND origin_station.code = $1 AND origin_station.active
 		JOIN route_stops AS destination ON destination.route_id = tr.route_id
@@ -232,14 +233,15 @@ func (s *Store) Availability(ctx context.Context, request AvailabilityRequest) (
 			       destination.stop_index AS to_stop_index,
 			       origin.departure_offset_minutes,
 			       destination.arrival_offset_minutes,
-			       tr.scheduled_departure_at + make_interval(mins => origin.departure_offset_minutes) AS departure_at,
-			       tr.scheduled_departure_at + make_interval(mins => destination.arrival_offset_minutes) AS arrival_at,
+			       tr.scheduled_departure_at + make_interval(mins => origin.departure_offset_minutes - route_origin.departure_offset_minutes) AS departure_at,
+			       tr.scheduled_departure_at + make_interval(mins => destination.arrival_offset_minutes - route_origin.departure_offset_minutes) AS arrival_at,
 			       repeat('0', origin.stop_index)::bit varying
 			       || repeat('1', destination.stop_index - origin.stop_index)::bit varying
 			       || repeat('0', tr.segment_count - destination.stop_index)::bit varying AS requested_mask
 			FROM train_runs AS tr
 			JOIN trains AS t ON t.id = tr.train_id AND t.active
 			JOIN routes AS r ON r.id = tr.route_id AND r.active
+			JOIN route_stops AS route_origin ON route_origin.route_id = tr.route_id AND route_origin.stop_index = 0
 			JOIN route_stops AS origin ON origin.route_id = tr.route_id
 			JOIN stations AS origin_station ON origin_station.id = origin.station_id AND origin_station.code = $2 AND origin_station.active
 			JOIN route_stops AS destination ON destination.route_id = tr.route_id

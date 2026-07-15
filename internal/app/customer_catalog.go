@@ -223,6 +223,9 @@ func normalizePage(value int) int {
 	if value < 1 {
 		return 1
 	}
+	if value > querypostgres.MaxPage {
+		return querypostgres.MaxPage
+	}
 	return value
 }
 func normalizeLimit(value int) int {
@@ -236,9 +239,12 @@ func normalizeLimit(value int) int {
 }
 func pageBounds(page httpapi.PageRequest, total int) (int, int, int, int) {
 	p, l := normalizePage(page.Page), normalizeLimit(page.Limit)
-	start := (p - 1) * l
-	if start > total {
-		start = total
+	start := total
+	if p <= total/l+1 {
+		start = (p - 1) * l
+		if start > total {
+			start = total
+		}
 	}
 	end := start + l
 	if end > total {

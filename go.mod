@@ -1,6 +1,6 @@
 module github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform
 
-go 1.25.2
+go 1.25.12
 
 require (
 	github.com/gin-gonic/gin v1.12.0
@@ -43,7 +43,7 @@ require (
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/quic-go/quic-go v0.59.0 // indirect
+	github.com/quic-go/quic-go v0.59.1 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/ugorji/go/codec v1.3.1 // indirect
 	go.mongodb.org/mongo-driver/v2 v2.5.0 // indirect
