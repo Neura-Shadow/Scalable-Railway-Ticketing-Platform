@@ -241,6 +241,27 @@ func TestLoadFromForRedisOutboxRequiresRedisWithoutJWT(t *testing.T) {
 	}
 }
 
+func TestRedisOutboxValidationNeverEchoesRedisCredentials(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Defaults()
+	cfg.Environment = config.EnvironmentProduction
+	cfg.DatabaseURL = "postgres://worker@db.example/railway"
+	cfg.OutboxPublisher = "redis_stream"
+	cfg.RedisAddress = "sentinel-m11-redis-address-secret"
+	cfg.RedisPassword = "sentinel-m11-redis-password-secret"
+
+	err := cfg.ValidateFor(config.ProcessOutboxWorker)
+	if err == nil || !strings.Contains(err.Error(), "REDIS_ADDRESS") {
+		t.Fatalf("ValidateFor(outbox-worker) error = %v, want bounded Redis address error", err)
+	}
+	for _, forbidden := range []string{cfg.RedisAddress, cfg.RedisPassword} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Fatalf("ValidateFor(outbox-worker) exposed Redis credential %q", forbidden)
+		}
+	}
+}
+
 func TestEveryProcessRequiresDatabaseConfiguration(t *testing.T) {
 	t.Parallel()
 
