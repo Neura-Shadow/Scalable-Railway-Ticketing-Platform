@@ -40,7 +40,7 @@ spec:
               protocol: TCP
           envFrom:
             - configMapRef:
-                name: railway-runtime-config
+                name: railway-outbox-worker-config
           env:
             - name: DATABASE_URL
               valueFrom:
@@ -57,11 +57,6 @@ spec:
                 secretKeyRef:
                   name: railway-runtime-secrets
                   key: redis-password
-            - name: JWT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: railway-runtime-secrets
-                  key: jwt-secret
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

@@ -23,8 +23,8 @@ import (
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	cfg, err := config.Load()
-	if err != nil || cfg.DatabaseURL == "" {
+	cfg, err := config.LoadFor(config.ProcessHoldExpirer)
+	if err != nil {
 		logger.Error("hold expirer configuration invalid")
 		os.Exit(1)
 	}

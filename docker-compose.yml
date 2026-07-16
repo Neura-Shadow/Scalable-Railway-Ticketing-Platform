@@ -29,16 +29,15 @@ services:
     restart: unless-stopped
 
   migrate:
-    image: migrate/migrate:v4.19.1
-    command:
-      - -path=/migrations
-      - -database=postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
-      - up
+    build:
+      context: .
+      target: migrate
+    environment:
+      DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
+    command: ["up"]
     depends_on:
       postgres:
         condition: service_healthy
-    volumes:
-      - ./migrations:/migrations:ro
     restart: "no"
 
   api:
@@ -55,8 +54,6 @@ services:
       JWT_AUDIENCE: railway-api
       RESERVATION_HOLD_TTL_SECONDS: 600
       RESERVATION_MAX_PASSENGERS: 6
-      HOLD_EXPIRER_ENABLED: "false"
-      OUTBOX_PUBLISHER: log
       TRUSTED_PROXIES: 127.0.0.1
     depends_on:
       migrate:
@@ -107,7 +104,7 @@ services:
     environment:
       APP_ENV: development
       DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
-      REDIS_ADDR: redis:6379
+      OUTBOX_PUBLISHER_ENABLED: "true"
       OUTBOX_PUBLISHER: log
       OUTBOX_BATCH_SIZE: 100
       OUTBOX_POLL_INTERVAL_SECONDS: 2
@@ -116,8 +113,6 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-      redis:
-        condition: service_healthy
     read_only: true
     security_opt:
       - no-new-privileges:true

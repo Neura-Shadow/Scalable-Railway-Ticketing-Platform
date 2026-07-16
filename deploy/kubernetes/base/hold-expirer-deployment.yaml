@@ -40,30 +40,13 @@ spec:
               protocol: TCP
           envFrom:
             - configMapRef:
-                name: railway-runtime-config
+                name: railway-hold-expirer-config
           env:
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: railway-runtime-secrets
                   key: database-url
-            - name: REDIS_ADDR
-              valueFrom:
-                secretKeyRef:
-                  name: railway-runtime-secrets
-                  key: redis-address
-            - name: REDIS_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: railway-runtime-secrets
-                  key: redis-password
-            - name: JWT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: railway-runtime-secrets
-                  key: jwt-secret
-            - name: HOLD_EXPIRER_ENABLED
-              value: "true"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
