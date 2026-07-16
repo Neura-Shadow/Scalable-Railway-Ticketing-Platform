@@ -44,17 +44,20 @@ func (s *Store) ResolveJourney(ctx context.Context, trainRunID, rawOrigin, rawDe
 
 	var journey Journey
 	var status string
+	// scheduled_departure_at is already the UTC departure instant at stop 0.
+	// Later stop times therefore use offsets relative to that first departure.
 	err = s.db.QueryRow(ctx, `
 		SELECT tr.id::text, tr.train_id::text, t.code,
 		       tr.route_id::text, r.code, tr.service_date,
 		       tr.scheduled_departure_at, tr.status, tr.segment_count,
 		       origin.stop_index, destination.stop_index,
 		       origin.departure_offset_minutes, destination.arrival_offset_minutes,
-		       tr.scheduled_departure_at + make_interval(mins => origin.departure_offset_minutes),
-		       tr.scheduled_departure_at + make_interval(mins => destination.arrival_offset_minutes)
+		       tr.scheduled_departure_at + make_interval(mins => origin.departure_offset_minutes - route_origin.departure_offset_minutes),
+		       tr.scheduled_departure_at + make_interval(mins => destination.arrival_offset_minutes - route_origin.departure_offset_minutes)
 		FROM train_runs AS tr
 		JOIN trains AS t ON t.id = tr.train_id AND t.active
 		JOIN routes AS r ON r.id = tr.route_id AND r.active
+		JOIN route_stops AS route_origin ON route_origin.route_id = tr.route_id AND route_origin.stop_index = 0
 		JOIN route_stops AS origin ON origin.route_id = tr.route_id
 		JOIN stations AS origin_station ON origin_station.id = origin.station_id AND origin_station.code = $2 AND origin_station.active
 		JOIN route_stops AS destination ON destination.route_id = tr.route_id
