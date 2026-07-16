@@ -15,7 +15,7 @@ HTTP transport
             -> PostgreSQL, Redis, Prometheus, and publisher adapters
 ```
 
-PostgreSQL is authoritative for train-run status, seat inventory, reservation lifecycle, tickets, durable idempotency, and outbox state. Redis is limited to bounded caches, rate controls, and optional event transport; cached availability is only a point-in-time hint. Booking always rechecks PostgreSQL.
+PostgreSQL is authoritative for train-run status, seat inventory, reservation lifecycle, tickets, durable idempotency, outbox state, and all current station/search/availability reads. Redis currently provides rate controls and optional event transport. Station, search, and availability Redis caches are deferred to a later read-model/cache milestone; any future cached availability remains only a point-in-time hint, and booking always rechecks PostgreSQL.
 
 ### Module boundaries
 
@@ -24,7 +24,7 @@ PostgreSQL is authoritative for train-run status, seat inventory, reservation li
 | Accounts | Password hashing, JWT lifecycle, roles, users, and owner-scoped passengers |
 | Railway Offering | Stations, ordered routes/stops, trains/coaches/seats, fares, and dated train runs |
 | Booking | Segment masks, atomic allocation, holds, lifecycle transitions, tickets, idempotency, and reconciliation |
-| Query | Read-only browse, search, and availability projections/hints |
+| Query | Direct PostgreSQL browse, search, and availability projections/hints; Redis read caches deferred |
 | Event Relay | Outbox claim, publish, retry, stale-lease recovery, and finalize |
 | Platform | Configuration, pools, metrics, clock, middleware, and process lifecycle |
 
@@ -86,6 +86,8 @@ The API is versioned under `/api/v1`. Customer reservation routes derive ownersh
 | `GET` | `/livez` | Process-only liveness |
 | `GET` | `/readyz` | Bounded dependency/configuration readiness |
 | `GET` | `/metrics` | Prometheus exposition; keep internal in production |
+| `POST` | `/api/v1/auth/register` | Create a customer account; always returns the same `202 Accepted` message for new/existing valid email |
+| `POST` | `/api/v1/auth/login` | Authenticate an existing customer and issue access/refresh credentials |
 | `GET` | `/api/v1/stations` | Station browse |
 | `GET` | `/api/v1/train-runs/search` | Train-run search |
 | `GET` | `/api/v1/train-runs/:id/availability` | Point-in-time availability hint |
@@ -97,9 +99,13 @@ The API is versioned under `/api/v1`. Customer reservation routes derive ownersh
 
 Errors use bounded public codes and do not expose SQL, DSNs, credentials, tokens, raw idempotency keys, or passenger data.
 
+Registration and login are intentionally separate. Registration never returns access/refresh tokens, and its generic accepted response does not reveal whether the email was already registered. Database timing can still differ and is not claimed to be constant-time; the registration rate limit remains part of the abuse boundary.
+
+The focused registration/login response contract is recorded in [docs/openapi.yaml](docs/openapi.yaml). It is intentionally scoped and is not a complete platform API specification.
+
 ## Health and metrics
 
-The API `/livez` does not call PostgreSQL or Redis. API `/readyz` checks PostgreSQL, Redis, migration version, and required production configuration with short timeouts and structured, sanitized component states. Each worker has a private `:9090` `/livez`, `/readyz`, and `/metrics` surface; its readiness check is PostgreSQL-bounded and its pass duration is capped. Outbox backlog and dead-letter conditions are metrics/alert signals rather than direct readiness failures.
+The API `/livez` does not call PostgreSQL or Redis. API `/readyz` checks PostgreSQL, Redis, migration version, and required production configuration with short timeouts and structured, sanitized component states. Each worker has a private `:9090` `/livez`, `/readyz`, and `/metrics` surface. Hold-expirer readiness checks only PostgreSQL; Redis Streams outbox readiness checks PostgreSQL and Redis, while log publishing checks only PostgreSQL. Worker pass duration is capped. Outbox backlog and dead-letter conditions are metrics/alert signals rather than direct readiness failures.
 
 Prometheus labels use bounded operations, normalized route templates, result/status classes, and bounded reasons. User, passenger, reservation, train-run, seat, ticket, event, and arbitrary input values are excluded from labels.
 
@@ -116,6 +122,8 @@ make migrate-down
 ```
 
 `migrate-down` is a local/development command, not an automatic production rollback strategy. Production releases use a separate migration principal and backward-compatible schema changes.
+
+Migration 5 requires the production procedure in [migration-5-production-rollout.md](docs/migrations/migration-5-production-rollout.md); the SQL checks under `docs/migrations/sql` are read-only operator aids, not automatic schema changes.
 
 ## Local setup
 
@@ -185,7 +193,7 @@ See [load-testing.md](docs/load-testing.md) for commands and correctness gates. 
 ## Current limitations
 
 - Single-region PostgreSQL primary for all authoritative writes.
-- Redis availability and search results are hints, not booking guarantees.
+- Station, search, and availability Redis read caches are not implemented; current reads use PostgreSQL and future cached values remain hints.
 - No real payment authorization/capture/refund integration.
 - No waiting room, durable reservation quota, or complete anti-bot/fraud system.
 - No multi-region active-active booking writes.

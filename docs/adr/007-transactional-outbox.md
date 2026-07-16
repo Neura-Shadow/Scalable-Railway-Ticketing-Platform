@@ -28,7 +28,7 @@ The publisher implements:
 
 Stale `processing` rows are reclaimable after `outbox_processing_timeout_seconds`. Finalization predicates include event ID, `processing` state, and lock owner so an obsolete worker cannot finalize a reclaimed event.
 
-Publisher adapters are `log` and optional `redis_stream`. Redis Streams is disabled by default. Delivery is at least once. Downstream consumers deduplicate by event ID. No payment, email, SMS, or notification consumer is implemented.
+Publisher adapters are `log` and `redis_stream`. Development may use metadata-only `log`; an enabled production worker rejects `log` unless an explicit emergency override is set, and the production Kubernetes baseline selects `redis_stream`. Publication may also be explicitly disabled. Redis Streams delivery is at least once, and downstream consumers deduplicate by event ID. No payment, email, SMS, or notification consumer is implemented.
 
 Payloads contain only the minimum fields downstream needs. They are validated against bounded event types, size-limited, and never logged in full. Metrics use normalized event type/result/reason values; unknowns collapse to `unknown`.
 

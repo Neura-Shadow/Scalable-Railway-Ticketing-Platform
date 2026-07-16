@@ -14,6 +14,12 @@ Railway services are marketed by an operating date in a local timezone, while ro
 - Store each station's IANA timezone for display and validation, but a Milestone 1 route has one configured operating timezone that defines its service date.
 - Store route-stop arrival/departure offsets as non-negative minutes from the service-date origin. Offsets are non-decreasing and may exceed 1,440 for overnight or multi-day journeys.
 - Materialize `scheduled_departure_at` as the first stop's UTC departure instant when creating the train run, and reject a caller-supplied instant that does not equal `service_date + first departure offset` in the route timezone. Later arrival/departure instants add the difference from that first departure offset.
+
+  ```text
+  target instant = scheduled_departure_at + (target offset - first-stop departure offset)
+  ```
+
+  `scheduled_departure_at` is therefore not service-date midnight and not a zero-offset route anchor. Search, journey resolution, and availability must use this same formula so the first-stop offset is applied exactly once.
 - Reject ambiguous/nonexistent local departure times caused by daylight-saving transitions unless an explicit offset-disambiguation policy resolves them. The default conservative policy is to reject ambiguous schedules during creation.
 - Use an injected Clock for application comparisons and deterministic tests. A command captures one `now` value per use case. Database claims and transitions use a transaction-consistent database timestamp when the predicate itself must be authoritative.
 
