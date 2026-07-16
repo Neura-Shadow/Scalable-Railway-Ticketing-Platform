@@ -15,17 +15,22 @@ import (
 )
 
 type authAccountsFake struct {
-	registerInput registerCustomerInput
-	registerUser  accountspostgres.User
-	registerErr   error
-	loginInput    httpapi.LoginCommand
-	loginUser     accountspostgres.User
-	loginErr      error
+	registerInput       registerCustomerInput
+	registerErr         error
+	registerCalls       int
+	registeredCustomers int
+	loginInput          httpapi.LoginCommand
+	loginUser           accountspostgres.User
+	loginErr            error
 }
 
-func (f *authAccountsFake) RegisterCustomer(_ context.Context, input registerCustomerInput) (accountspostgres.User, error) {
+func (f *authAccountsFake) RegisterCustomer(_ context.Context, input registerCustomerInput) error {
+	f.registerCalls++
 	f.registerInput = input
-	return f.registerUser, f.registerErr
+	if f.registerErr == nil {
+		f.registeredCustomers++
+	}
+	return f.registerErr
 }
 
 func (f *authAccountsFake) Login(_ context.Context, input httpapi.LoginCommand) (accountspostgres.User, error) {
@@ -55,18 +60,20 @@ func (f *authTokensFake) ParseRefreshToken(_ context.Context, raw string) (accou
 }
 
 type refreshTokensFake struct {
-	registered  accountspostgres.RefreshTokenRecord
-	registerErr error
-	family      uuid.UUID
-	familyErr   error
-	rotated     accountspostgres.RotateRefreshTokenParams
-	rotateErr   error
-	revokedUser uuid.UUID
-	revokedHash []byte
-	revokeErr   error
+	registered    accountspostgres.RefreshTokenRecord
+	registerErr   error
+	registerCalls int
+	family        uuid.UUID
+	familyErr     error
+	rotated       accountspostgres.RotateRefreshTokenParams
+	rotateErr     error
+	revokedUser   uuid.UUID
+	revokedHash   []byte
+	revokeErr     error
 }
 
 func (f *refreshTokensFake) Register(_ context.Context, record accountspostgres.RefreshTokenRecord) error {
+	f.registerCalls++
 	f.registered = record
 	return f.registerErr
 }
@@ -92,10 +99,64 @@ func refreshClaims(subject, id string, role accountsdomain.Role, version int64, 
 	}
 }
 
-func TestAuthRegisterCreatesCustomerAndPersistsOnlyHashedRefreshIdentifier(t *testing.T) {
+func TestAuthRegisterCreatesCustomerWithoutIssuingCredentials(t *testing.T) {
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	accounts := &authAccountsFake{}
+	tokens := &authTokensFake{}
+	refreshes := &refreshTokensFake{}
+	service := NewAuthService(accounts, tokens, refreshes, fixedClock{now}, 15*time.Minute, uuid.New)
+
+	err := service.Register(context.Background(), httpapi.RegisterCommand{Email: "user@example.com", Password: "long-password", DisplayName: "Rider"})
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if accounts.registerCalls != 1 {
+		t.Fatalf("RegisterCustomer() calls = %d, want 1", accounts.registerCalls)
+	}
+	if accounts.registeredCustomers != 1 {
+		t.Fatalf("customers created = %d, want 1", accounts.registeredCustomers)
+	}
+	if accounts.registerInput != (registerCustomerInput{Email: "user@example.com", Password: "long-password", DisplayName: "Rider"}) {
+		t.Fatalf("register input = %#v", accounts.registerInput)
+	}
+	if len(tokens.issueInputs) != 0 {
+		t.Fatalf("IssueTokenPair() calls = %d, want 0", len(tokens.issueInputs))
+	}
+	if refreshes.registerCalls != 0 {
+		t.Fatalf("refresh Register() calls = %d, want 0", refreshes.registerCalls)
+	}
+}
+
+func TestAuthRegisterKeepsDuplicateConflictInternalAndIssuesNoCredentials(t *testing.T) {
+	accounts := &authAccountsFake{registerErr: accountspostgres.ErrEmailAlreadyRegistered}
+	tokens := &authTokensFake{}
+	refreshes := &refreshTokensFake{}
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	service := NewAuthService(accounts, tokens, refreshes, fixedClock{now}, 15*time.Minute, uuid.New)
+
+	err := service.Register(context.Background(), httpapi.RegisterCommand{Email: "user@example.com", Password: "long-password", DisplayName: "Rider"})
+
+	if err != httpapi.ErrConflict {
+		t.Fatalf("Register() error = %v, want exact %v", err, httpapi.ErrConflict)
+	}
+	if accounts.registerCalls != 1 {
+		t.Fatalf("RegisterCustomer() calls = %d, want 1", accounts.registerCalls)
+	}
+	if accounts.registeredCustomers != 0 {
+		t.Fatalf("customers created = %d, want 0", accounts.registeredCustomers)
+	}
+	if len(tokens.issueInputs) != 0 {
+		t.Fatalf("IssueTokenPair() calls = %d, want 0", len(tokens.issueInputs))
+	}
+	if refreshes.registerCalls != 0 {
+		t.Fatalf("refresh Register() calls = %d, want 0", refreshes.registerCalls)
+	}
+}
+
+func TestAuthLoginStillIssuesCredentialsAndPersistsOnlyHashedRefreshIdentifier(t *testing.T) {
 	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	userID, refreshID, familyID := uuid.New(), uuid.New(), uuid.New()
-	accounts := &authAccountsFake{registerUser: accountspostgres.User{ID: userID.String(), Role: accountsdomain.RoleCustomer, TokenVersion: 3}}
+	accounts := &authAccountsFake{loginUser: accountspostgres.User{ID: userID.String(), Role: accountsdomain.RoleCustomer, TokenVersion: 3}}
 	tokens := &authTokensFake{
 		pairs:  []accountsapp.TokenPair{{AccessToken: "access", RefreshToken: "refresh-raw"}},
 		claims: map[string]accountsapp.TokenClaims{"refresh-raw": refreshClaims(userID.String(), refreshID.String(), accountsdomain.RoleCustomer, 3, now.Add(7*24*time.Hour))},
@@ -103,15 +164,15 @@ func TestAuthRegisterCreatesCustomerAndPersistsOnlyHashedRefreshIdentifier(t *te
 	refreshes := &refreshTokensFake{}
 	service := NewAuthService(accounts, tokens, refreshes, fixedClock{now}, 15*time.Minute, func() uuid.UUID { return familyID })
 
-	got, err := service.Register(context.Background(), httpapi.RegisterCommand{Email: "user@example.com", Password: "long-password", DisplayName: "Rider"})
+	got, err := service.Login(context.Background(), httpapi.LoginCommand{Email: "user@example.com", Password: "long-password"})
 	if err != nil {
-		t.Fatalf("Register() error = %v", err)
+		t.Fatalf("Login() error = %v", err)
 	}
-	if accounts.registerInput != (registerCustomerInput{Email: "user@example.com", Password: "long-password", DisplayName: "Rider"}) {
-		t.Fatalf("register input = %#v", accounts.registerInput)
+	if accounts.loginInput != (httpapi.LoginCommand{Email: "user@example.com", Password: "long-password"}) {
+		t.Fatalf("login input = %#v", accounts.loginInput)
 	}
 	if got.AccessToken != "access" || got.RefreshToken != "refresh-raw" || got.TokenType != "Bearer" || got.ExpiresIn != 900 {
-		t.Fatalf("token view = %#v", got)
+		t.Fatal("Login() returned an unexpected token response")
 	}
 	wantHash, _ := accountsapp.HashTokenID(refreshID.String())
 	if refreshes.registered.UserID != userID || refreshes.registered.FamilyID != familyID ||

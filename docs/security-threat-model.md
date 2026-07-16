@@ -127,6 +127,7 @@ flowchart LR
 | TM-008 | Concurrent customer/operator/worker | Racy commands | Stale/double release, terminal-run reopen, or hold after cancellation | Inventory corruption/oversell | Inventory, reservations, tickets | Authoritative locks/predicates, terminal train-run transition policy, exact release counts, inventory FK, reconciliation including orphan scan, barrier races under `-race` | Chaos/failover and multi-primary behavior are out of scope | Continue reconciliation and race gates; stop affected writes on violations | Reconciliation failures and DB lock/deadlock metrics | low | high | medium |
 | TM-009 | Internal defect/privileged writer | Invalid event row | Poison retry loop or payload leak | Event backlog/leak | Outbox, logs, consumers | ADR 007 bounded state/types | Schema/size enforcement unimplemented | Version/type/size constraints; isolate per item; bounded retries; metadata-only logs; durable consumer dedupe | Poison-event integration suite/backlog age | medium | medium | medium |
 | TM-010 | Malicious PR/compromised upstream | CI runs third-party code | Exfiltrate token/secrets or alter image | Release compromise | CI, source, artifact | Read-only workflow permissions, SHA-pinned actions, no `pull_request_target`, non-persisted checkout credentials, Actionlint/Gitleaks/Trivy/Govulncheck gates | Registry signing/provenance policy is deployment-owned | Add protected publication, SBOM, signing, and provenance before release distribution | Scanner and fork-PR policy failures | low | high | medium |
+| TM-011 | Remote unauthenticated client | Registration endpoint access | Compare new and duplicate email responses to enumerate accounts | Account-existence disclosure and targeted credential attacks | Account identifiers | New and existing valid emails receive the same HTTP 202 message; registration does not issue tokens; endpoint rate limiting remains enabled | Database work can still produce timing differences; strict constant-time behavior is not claimed | Monitor bounded registration outcomes internally without raw email labels and retain edge abuse controls | Registration rate-limit and bounded outcome counters | low | low | low |
 
 ## Criticality calibration
 
@@ -139,7 +140,7 @@ flowchart LR
 
 | Path | Why it matters | Related Threat IDs |
 |---|---|---|
-| `internal/accounts/**` | Password, JWT, refresh rotation, roles, passenger ownership | TM-001, TM-002 |
+| `internal/accounts/**` | Password, JWT, refresh rotation, roles, registration enumeration, passenger ownership | TM-001, TM-002, TM-011 |
 | `internal/booking/**` | Allocation, releases, lifecycle, idempotency, ownership | TM-002, TM-003, TM-004, TM-008 |
 | `internal/offering/**` | Train-run commissioning/status and safe query inputs | TM-007, TM-008 |
 | `internal/query/**` | Sort allowlist, pagination, cache hints | TM-005, TM-007 |

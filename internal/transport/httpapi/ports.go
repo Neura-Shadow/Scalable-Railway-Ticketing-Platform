@@ -153,7 +153,7 @@ type TokenPairView struct {
 }
 
 type AuthService interface {
-	Register(ctx context.Context, command RegisterCommand) (TokenPairView, error)
+	Register(ctx context.Context, command RegisterCommand) error
 	Login(ctx context.Context, command LoginCommand) (TokenPairView, error)
 	Refresh(ctx context.Context, refreshToken string) (TokenPairView, error)
 	Logout(ctx context.Context, subject, refreshToken string) error

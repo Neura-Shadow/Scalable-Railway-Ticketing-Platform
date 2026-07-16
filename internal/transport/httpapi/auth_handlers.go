@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 
@@ -21,6 +22,12 @@ type loginRequest struct {
 type refreshRequest struct {
 	RefreshToken string `json:"refresh_token"`
 }
+
+type registrationAcceptedResponse struct {
+	Message string `json:"message"`
+}
+
+const registrationAcceptedMessage = "If the registration request can be processed, the account workflow will continue."
 
 func registerAuthRoutes(group *gin.RouterGroup, dependencies Dependencies) {
 	auth := group.Group("/auth")
@@ -50,12 +57,12 @@ func registerHandler(dependencies Dependencies) gin.HandlerFunc {
 			writeError(c, ErrInvalidInput)
 			return
 		}
-		result, err := dependencies.Auth.Register(c.Request.Context(), RegisterCommand(request))
-		if err != nil {
+		err := dependencies.Auth.Register(c.Request.Context(), RegisterCommand(request))
+		if err != nil && !errors.Is(err, ErrConflict) {
 			writeError(c, err)
 			return
 		}
-		c.JSON(http.StatusCreated, result)
+		c.JSON(http.StatusAccepted, registrationAcceptedResponse{Message: registrationAcceptedMessage})
 	}
 }
 

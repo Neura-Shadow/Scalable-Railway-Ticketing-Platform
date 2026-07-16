@@ -20,7 +20,7 @@ type registerCustomerInput struct {
 }
 
 type authAccounts interface {
-	RegisterCustomer(context.Context, registerCustomerInput) (accountspostgres.User, error)
+	RegisterCustomer(context.Context, registerCustomerInput) error
 	Login(context.Context, httpapi.LoginCommand) (accountspostgres.User, error)
 }
 
@@ -61,15 +61,14 @@ func NewAuthService(accounts authAccounts, tokens authTokens, refreshes refreshT
 	return &AuthService{accounts: accounts, tokens: tokens, refreshes: refreshes, clock: clock, accessTTL: accessTTL, newFamily: newFamily}
 }
 
-func (s *AuthService) Register(ctx context.Context, command httpapi.RegisterCommand) (httpapi.TokenPairView, error) {
+func (s *AuthService) Register(ctx context.Context, command httpapi.RegisterCommand) error {
 	if s == nil || s.accounts == nil || strings.TrimSpace(command.DisplayName) == "" {
-		return httpapi.TokenPairView{}, httpapi.ErrInvalidInput
+		return httpapi.ErrInvalidInput
 	}
-	user, err := s.accounts.RegisterCustomer(ctx, registerCustomerInput(command))
-	if err != nil {
-		return httpapi.TokenPairView{}, mapAccountError(err)
+	if err := s.accounts.RegisterCustomer(ctx, registerCustomerInput(command)); err != nil {
+		return mapAccountError(err)
 	}
-	return s.issueAndRegister(ctx, user, s.newFamilyID())
+	return nil
 }
 
 func (s *AuthService) Login(ctx context.Context, command httpapi.LoginCommand) (httpapi.TokenPairView, error) {

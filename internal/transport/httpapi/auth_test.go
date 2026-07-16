@@ -12,7 +12,8 @@ import (
 )
 
 type authServiceStub struct {
-	registered bool
+	registered  bool
+	registerErr error
 }
 
 type rateLimiterStub struct {
@@ -26,9 +27,9 @@ func (s *rateLimiterStub) Allow(_ context.Context, input httpapi.RateLimitReques
 	return s.allowed, s.err
 }
 
-func (s *authServiceStub) Register(context.Context, httpapi.RegisterCommand) (httpapi.TokenPairView, error) {
+func (s *authServiceStub) Register(context.Context, httpapi.RegisterCommand) error {
 	s.registered = true
-	return httpapi.TokenPairView{}, nil
+	return s.registerErr
 }
 
 func (s *authServiceStub) Login(context.Context, httpapi.LoginCommand) (httpapi.TokenPairView, error) {
@@ -40,6 +41,55 @@ func (s *authServiceStub) Refresh(context.Context, string) (httpapi.TokenPairVie
 }
 
 func (s *authServiceStub) Logout(context.Context, string, string) error { return nil }
+
+func TestRegistrationNewAndDuplicateResponsesAreIndistinguishable(t *testing.T) {
+	t.Parallel()
+
+	newAuth := &authServiceStub{}
+	newResponse := performRegistration(t, newAuth)
+	duplicateAuth := &authServiceStub{registerErr: httpapi.ErrConflict}
+	duplicateResponse := performRegistration(t, duplicateAuth)
+
+	if !newAuth.registered || !duplicateAuth.registered {
+		t.Fatal("registration service was not called for both valid requests")
+	}
+	if newResponse.Code != http.StatusAccepted || duplicateResponse.Code != http.StatusAccepted {
+		t.Fatalf("registration statuses = new %d, duplicate %d; want both %d", newResponse.Code, duplicateResponse.Code, http.StatusAccepted)
+	}
+	const wantBody = `{"message":"If the registration request can be processed, the account workflow will continue."}`
+	if newResponse.Body.String() != wantBody {
+		t.Fatalf("new registration body = %q, want %q", newResponse.Body.String(), wantBody)
+	}
+	if !bytes.Equal(newResponse.Body.Bytes(), duplicateResponse.Body.Bytes()) {
+		t.Fatalf("registration response differs by account existence: new %q, duplicate %q", newResponse.Body.String(), duplicateResponse.Body.String())
+	}
+}
+
+func TestRegistrationUnknownServiceErrorRemainsGenericFailure(t *testing.T) {
+	t.Parallel()
+
+	auth := &authServiceStub{registerErr: errors.New("database secret must not escape")}
+	response := performRegistration(t, auth)
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("registration status = %d, want %d; body = %s", response.Code, http.StatusInternalServerError, response.Body.String())
+	}
+	const wantBody = `{"error":{"code":"internal_error","message":"internal server error"}}`
+	if response.Body.String() != wantBody {
+		t.Fatalf("registration failure body = %q, want %q", response.Body.String(), wantBody)
+	}
+}
+
+func performRegistration(t *testing.T, auth *authServiceStub) *httptest.ResponseRecorder {
+	t.Helper()
+
+	router := httpapi.New(httpapi.Dependencies{Auth: auth})
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/register", bytes.NewReader([]byte(`{"email":"customer@example.test","password":"correct-horse-battery-staple","display_name":"Rider"}`)))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	return response
+}
 
 func TestPublicRegistrationCannotSelectPrivilegedRole(t *testing.T) {
 	t.Parallel()

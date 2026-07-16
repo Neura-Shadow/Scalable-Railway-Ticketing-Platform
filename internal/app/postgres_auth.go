@@ -21,27 +21,27 @@ type postgresAuthAccounts struct {
 	login     *accountspostgres.Store
 }
 
-func (p *postgresAuthAccounts) RegisterCustomer(ctx context.Context, input registerCustomerInput) (accountspostgres.User, error) {
+func (p *postgresAuthAccounts) RegisterCustomer(ctx context.Context, input registerCustomerInput) error {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
-		return accountspostgres.User{}, accountspostgres.ErrPersistence
+		return accountspostgres.ErrPersistence
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 	store, err := accountspostgres.NewStore(tx, p.passwords)
 	if err != nil {
-		return accountspostgres.User{}, err
+		return err
 	}
 	user, err := store.RegisterUser(ctx, accountspostgres.RegisterUserParams{Email: input.Email, Password: input.Password, Role: accountsdomain.RoleCustomer})
 	if err != nil {
-		return accountspostgres.User{}, err
+		return err
 	}
 	if _, err = store.CreatePassenger(ctx, accountspostgres.CreatePassengerParams{UserID: user.ID, DisplayName: input.DisplayName}); err != nil {
-		return accountspostgres.User{}, err
+		return err
 	}
 	if err = tx.Commit(ctx); err != nil {
-		return accountspostgres.User{}, accountspostgres.ErrPersistence
+		return accountspostgres.ErrPersistence
 	}
-	return user, nil
+	return nil
 }
 func (p *postgresAuthAccounts) Login(ctx context.Context, input httpapi.LoginCommand) (accountspostgres.User, error) {
 	return p.login.LookupUserForLogin(ctx, accountspostgres.LoginLookup{Email: input.Email, Password: input.Password})
