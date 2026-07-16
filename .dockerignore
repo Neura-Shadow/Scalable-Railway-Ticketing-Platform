@@ -1,0 +1,15 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+.data
+bin
+coverage
+loadtest/results
+postgres-data
+redis-data
+*.log
+*.out
+README.md
+docs

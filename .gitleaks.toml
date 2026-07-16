@@ -1,0 +1,7 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Threat-model trust-boundary prose, not credential material"
+paths = ['''^docs/security-threat-model\.md$''']
+regexes = ['''JWT/application''']

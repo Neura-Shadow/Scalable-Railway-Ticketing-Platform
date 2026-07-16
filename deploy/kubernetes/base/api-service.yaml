@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: railway-api
+  labels:
+    app.kubernetes.io/name: railway-api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: railway-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP

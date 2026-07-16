@@ -1,0 +1,28 @@
+# Environment and local configuration
+.env
+.env.*
+!.env.example
+
+# Go build and test artifacts
+bin/
+dist/
+*.exe
+*.test
+*.out
+coverage/
+
+# Local runtime data
+.data/
+postgres-data/
+redis-data/
+*.log
+
+# Tool and editor state
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+.omx/
+
+# Temporary benchmark output
+loadtest/results/
