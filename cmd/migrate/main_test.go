@@ -8,6 +8,22 @@ import (
 	"testing"
 )
 
+func TestRunHelpNeverEchoesDatabaseEnvironment(t *testing.T) {
+	const secret = "sentinel-m11-help-password"
+	t.Setenv("DATABASE_URL", "postgres://railway:"+secret+"@db.example/railway?token=help-query-secret")
+	var stdout, stderr bytes.Buffer
+
+	exitCode := run([]string{"-h"}, &stdout, &stderr)
+	if exitCode != 2 {
+		t.Fatalf("run() exit code = %d, want 2", exitCode)
+	}
+	for _, forbidden := range []string{secret, "help-query-secret", "postgres://"} {
+		if strings.Contains(stderr.String(), forbidden) || strings.Contains(stdout.String(), forbidden) {
+			t.Fatalf("run() help exposed %q: stdout=%q stderr=%q", forbidden, stdout.String(), stderr.String())
+		}
+	}
+}
+
 func TestRunRedactsMalformedDatabaseConnectionErrors(t *testing.T) {
 	t.Parallel()
 

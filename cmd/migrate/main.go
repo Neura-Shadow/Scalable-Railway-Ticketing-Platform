@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/safeerror"
 	"github.com/golang-migrate/migrate/v4"
@@ -22,11 +23,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("migrate", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	path := flags.String("path", "migrations", "migration directory")
-	databaseURL := flags.String("database", os.Getenv("DATABASE_URL"), "PostgreSQL connection URL")
+	databaseFlag := flags.String("database", "", "PostgreSQL connection URL (defaults to DATABASE_URL)")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
-	if *databaseURL == "" || flags.NArg() != 1 {
+	databaseURL := strings.TrimSpace(*databaseFlag)
+	if databaseURL == "" {
+		databaseURL = strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	}
+	if databaseURL == "" || flags.NArg() != 1 {
 		fmt.Fprintln(stderr, "usage: migrate -path migrations [-database DATABASE_URL] {up|down|version}")
 		return 2
 	}
@@ -42,7 +47,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	sourceURL := "file://" + filepath.ToSlash(absolutePath)
-	runner, err := migrate.New(sourceURL, *databaseURL)
+	runner, err := migrate.New(sourceURL, databaseURL)
 	if err != nil {
 		fmt.Fprintln(stderr, safeerror.Database(safeerror.MigrationConnectionFailed, err))
 		return 1
