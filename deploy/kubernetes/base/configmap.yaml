@@ -9,8 +9,9 @@ data:
   JWT_AUDIENCE: railway-api
   RESERVATION_HOLD_TTL_SECONDS: "600"
   RESERVATION_MAX_PASSENGERS: "6"
-  # Narrow this to the actual ingress/proxy CIDRs for the target cluster.
-  TRUSTED_PROXIES: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+  # A production overlay must replace this with only the exact ingress/proxy
+  # addresses or narrow CIDRs used by the target cluster.
+  TRUSTED_PROXIES: "127.0.0.1,::1"
   CORS_ALLOWED_ORIGINS: ""
 ---
 apiVersion: v1

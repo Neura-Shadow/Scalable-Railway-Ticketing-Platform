@@ -295,6 +295,112 @@ func TestProductionRejectsDocumentedPlaceholderSecret(t *testing.T) {
 	}
 }
 
+func TestProductionRejectsCommittedDevelopmentCredentials(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		database string
+		secret   string
+		field    string
+	}{
+		{
+			name:     "compose database password",
+			database: "postgres://railway:railway-local@db.example/railway",
+			secret:   strings.Repeat("s", 32),
+			field:    "DATABASE_URL",
+		},
+		{
+			name:     "compose JWT secret",
+			database: "postgres://db.example/railway",
+			secret:   "local-development-secret-change-me-123456789",
+			field:    "JWT_SECRET",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := config.Defaults()
+			cfg.Environment = config.EnvironmentProduction
+			cfg.DatabaseURL = tt.database
+			cfg.RedisAddress = "redis.example:6379"
+			cfg.JWTSecret = tt.secret
+
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), tt.field) {
+				t.Fatalf("Validate() error = %v, want error naming %s", err, tt.field)
+			}
+			if strings.Contains(err.Error(), "railway-local") || strings.Contains(err.Error(), tt.secret) {
+				t.Fatal("validation error exposed a committed development credential")
+			}
+		})
+	}
+}
+
+func TestProductionRejectsCommittedDevelopmentDatabaseCredentialInQuery(t *testing.T) {
+	t.Parallel()
+
+	for name, databaseURL := range map[string]string{
+		"query without user info":   "postgres://db.example/railway?password=railway-local",
+		"query overrides user info": "postgres://railway:strong-secret@db.example/railway?password=railway-local",
+		"encoded query key":         "postgres://db.example/railway?pass%77ord=railway-local",
+		"duplicate query values":    "postgres://db.example/railway?password=strong-secret&password=railway-local",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			cfg := config.Defaults()
+			cfg.Environment = config.EnvironmentProduction
+			cfg.DatabaseURL = databaseURL
+			cfg.RedisAddress = "redis.example:6379"
+			cfg.JWTSecret = strings.Repeat("s", 32)
+
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), "DATABASE_URL") {
+				t.Fatalf("Validate() error = %v, want DATABASE_URL error", err)
+			}
+			if strings.Contains(err.Error(), "railway-local") || strings.Contains(err.Error(), "strong-secret") {
+				t.Fatal("validation error exposed a database credential")
+			}
+		})
+	}
+}
+
+func TestProductionAllowsNonDevelopmentDatabaseCredentialInQuery(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Defaults()
+	cfg.Environment = config.EnvironmentProduction
+	cfg.DatabaseURL = "postgres://db.example/railway?password=strong-secret"
+	cfg.RedisAddress = "redis.example:6379"
+	cfg.JWTSecret = strings.Repeat("s", 32)
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestProductionRejectsUniversalTrustedProxyRanges(t *testing.T) {
+	t.Parallel()
+
+	for _, proxy := range []string{"0.0.0.0/0", "::/0", "::ffff:0:0/96"} {
+		t.Run(proxy, func(t *testing.T) {
+			t.Parallel()
+			cfg := config.Defaults()
+			cfg.Environment = config.EnvironmentProduction
+			cfg.DatabaseURL = "postgres://db.example/railway"
+			cfg.RedisAddress = "redis.example:6379"
+			cfg.JWTSecret = strings.Repeat("s", 32)
+			cfg.TrustedProxies = []string{proxy}
+
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), "TRUSTED_PROXIES") {
+				t.Fatalf("Validate() error = %v, want TRUSTED_PROXIES error", err)
+			}
+		})
+	}
+}
+
 func TestValidateRejectsNonPositiveOperationalLimits(t *testing.T) {
 	t.Parallel()
 

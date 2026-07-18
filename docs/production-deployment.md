@@ -37,7 +37,7 @@ Set `APP_ENV=production` and validate process-owned settings:
 - trusted proxy CIDRs and explicit CORS origins; and
 - request, dependency, and shutdown timeouts.
 
-Production must not use the local Compose passwords or development JWT default. Terminate TLS at a trusted ingress/load balancer, use TLS to managed dependencies where supported, restrict proxy trust, and keep CORS disabled unless explicit origins are required.
+Production configuration validation rejects the committed local Compose database password, the development JWT default, and universal trusted-proxy CIDRs. Terminate TLS at a trusted ingress/load balancer, use TLS to managed dependencies where supported, replace the baseline loopback-only proxy trust with only the exact ingress addresses or narrow topology-specific CIDRs, and keep CORS disabled unless explicit origins are required.
 
 An enabled production outbox worker must use `OUTBOX_PUBLISHER=redis_stream` by default. An enabled `log` publisher is rejected unless `ALLOW_LOG_PUBLISHER_IN_PRODUCTION=true` is explicitly set for an emergency; that override emits a bounded warning and the log adapter never logs event payloads. `OUTBOX_PUBLISHER_ENABLED=false` disables publication without requiring Redis.
 

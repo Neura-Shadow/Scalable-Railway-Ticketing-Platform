@@ -139,6 +139,8 @@ func (c Config) ValidateFor(process Process) error {
 	}
 	if err := validateDatabaseURL(c.DatabaseURL); err != nil {
 		problems = append(problems, err)
+	} else if c.Environment == EnvironmentProduction && usesCommittedDevelopmentDatabaseCredential(c.DatabaseURL) {
+		problems = append(problems, errors.New("DATABASE_URL must not use the committed local development credential in production"))
 	}
 	validatePositive := func(values ...validationCheck) {
 		for _, value := range values {
@@ -162,8 +164,8 @@ func (c Config) ValidateFor(process Process) error {
 	case ProcessAPI:
 		if strings.TrimSpace(c.JWTSecret) == "" {
 			problems = append(problems, errors.New("JWT_SECRET is required"))
-		} else if c.Environment == EnvironmentProduction && (len(c.JWTSecret) < 32 || strings.HasPrefix(strings.ToLower(c.JWTSecret), "replace-with-")) {
-			problems = append(problems, errors.New("JWT_SECRET must contain at least 32 bytes in production"))
+		} else if c.Environment == EnvironmentProduction && (len(c.JWTSecret) < 32 || isCommittedDevelopmentJWTSecret(c.JWTSecret)) {
+			problems = append(problems, errors.New("JWT_SECRET must be a non-development value containing at least 32 bytes in production"))
 		}
 		if err := validateRedisAddress(c.RedisAddress); err != nil {
 			problems = append(problems, err)
@@ -181,6 +183,14 @@ func (c Config) ValidateFor(process Process) error {
 		for range invalidTrustedProxies(c.TrustedProxies) {
 			problems = append(problems, errors.New("TRUSTED_PROXIES entries must be IP addresses or CIDR ranges"))
 			break
+		}
+		if c.Environment == EnvironmentProduction {
+			for _, proxy := range c.TrustedProxies {
+				if isUniversalProxyRange(proxy) {
+					problems = append(problems, errors.New("TRUSTED_PROXIES must not trust a universal CIDR range in production"))
+					break
+				}
+			}
 		}
 		for _, origin := range c.CORSAllowedOrigins {
 			if !validCORSOrigin(origin, c.Environment) {
@@ -233,6 +243,43 @@ func invalidTrustedProxies(values []string) []string {
 		}
 	}
 	return invalid
+}
+
+func isUniversalProxyRange(value string) bool {
+	_, network, err := net.ParseCIDR(value)
+	if err != nil {
+		return false
+	}
+	ones, _ := network.Mask.Size()
+	if ones == 0 {
+		return true
+	}
+	return network.Contains(net.IPv4(0, 0, 0, 0)) &&
+		network.Contains(net.IPv4(255, 255, 255, 255))
+}
+
+func isCommittedDevelopmentJWTSecret(value string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	return strings.HasPrefix(normalized, "replace-with-") ||
+		normalized == "local-development-secret-change-me-123456789"
+}
+
+func usesCommittedDevelopmentDatabaseCredential(value string) bool {
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return false
+	}
+	if parsed.User != nil {
+		if password, ok := parsed.User.Password(); ok && password == "railway-local" {
+			return true
+		}
+	}
+	for _, password := range parsed.Query()["password"] {
+		if password == "railway-local" {
+			return true
+		}
+	}
+	return false
 }
 
 func validCORSOrigin(value string, environment Environment) bool {
