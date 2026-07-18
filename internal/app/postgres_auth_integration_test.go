@@ -37,6 +37,50 @@ func TestPostgresAuthRegistrationDoesNotIssueCredentialsAndLoginStillDoes(t *tes
 	}
 	assertAuthRowCounts(t, pool, command.Email, 1, 1, 0)
 
+	for label, invalidName := range map[string]string{
+		"overlong": strings.Repeat("界", 101),
+		"control":  "Rider\x00",
+	} {
+		for _, email := range []string{command.Email, label + "-new@example.test"} {
+			invalid := command
+			invalid.Email = email
+			invalid.DisplayName = invalidName
+			if err := auth.Register(ctx, invalid); !errors.Is(err, httpapi.ErrInvalidInput) {
+				t.Fatalf("Register(%q, %s display name) error = %v, want %v", email, label, err, httpapi.ErrInvalidInput)
+			}
+		}
+	}
+	assertAuthRowCounts(t, pool, command.Email, 1, 1, 0)
+	assertAuthRowCounts(t, pool, "overlong-new@example.test", 0, 0, 0)
+	assertAuthRowCounts(t, pool, "control-new@example.test", 0, 0, 0)
+
+	for label, invalid := range map[string]httpapi.RegisterCommand{
+		"short-password": {
+			Email: "short-password-new@example.test", Password: strings.Repeat("界", 4), DisplayName: "Rider",
+		},
+		"long-password": {
+			Email: "long-password-new@example.test", Password: strings.Repeat("界", 25), DisplayName: "Rider",
+		},
+		"double-at-email": {
+			Email: "invalid@@example.test", Password: command.Password, DisplayName: "Rider",
+		},
+	} {
+		if err := auth.Register(ctx, invalid); !errors.Is(err, httpapi.ErrInvalidInput) {
+			t.Fatalf("Register(%s invalid credentials) error = %v, want %v", label, err, httpapi.ErrInvalidInput)
+		}
+		assertAuthRowCounts(t, pool, invalid.Email, 0, 0, 0)
+	}
+	for label, invalidPassword := range map[string]string{
+		"short": strings.Repeat("界", 4),
+		"long":  strings.Repeat("界", 25),
+	} {
+		invalid := command
+		invalid.Password = invalidPassword
+		if err := auth.Register(ctx, invalid); !errors.Is(err, httpapi.ErrInvalidInput) {
+			t.Fatalf("Register(existing email, %s password) error = %v, want %v", label, err, httpapi.ErrInvalidInput)
+		}
+	}
+
 	pair, err := auth.Login(ctx, httpapi.LoginCommand{Email: command.Email, Password: command.Password})
 	if err != nil {
 		t.Fatalf("Login() after registration error = %v", err)

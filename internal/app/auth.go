@@ -62,7 +62,10 @@ func NewAuthService(accounts authAccounts, tokens authTokens, refreshes refreshT
 }
 
 func (s *AuthService) Register(ctx context.Context, command httpapi.RegisterCommand) error {
-	if s == nil || s.accounts == nil || strings.TrimSpace(command.DisplayName) == "" {
+	if s == nil || s.accounts == nil ||
+		!accountsdomain.ValidRegistrationEmail(command.Email) ||
+		!accountsdomain.ValidRegistrationPassword(command.Password) ||
+		!accountsdomain.ValidPassengerDisplayName(command.DisplayName) {
 		return httpapi.ErrInvalidInput
 	}
 	if err := s.accounts.RegisterCustomer(ctx, registerCustomerInput(command)); err != nil {

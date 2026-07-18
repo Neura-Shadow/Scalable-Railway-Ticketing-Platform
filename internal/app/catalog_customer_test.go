@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,9 +15,11 @@ import (
 )
 
 type passengerStoreFake struct {
-	owner string
-	items []accountspostgres.Passenger
-	err   error
+	owner       string
+	items       []accountspostgres.Passenger
+	err         error
+	createCalls int
+	updateCalls int
 }
 
 func (f *passengerStoreFake) ListPassengers(_ context.Context, owner string) ([]accountspostgres.Passenger, error) {
@@ -24,6 +27,7 @@ func (f *passengerStoreFake) ListPassengers(_ context.Context, owner string) ([]
 	return f.items, f.err
 }
 func (f *passengerStoreFake) CreatePassenger(_ context.Context, input accountspostgres.CreatePassengerParams) (accountspostgres.Passenger, error) {
+	f.createCalls++
 	f.owner = input.UserID
 	return accountspostgres.Passenger{ID: "p-new", UserID: input.UserID, DisplayName: input.DisplayName}, f.err
 }
@@ -32,6 +36,7 @@ func (f *passengerStoreFake) GetPassenger(_ context.Context, owner, id string) (
 	return accountspostgres.Passenger{ID: id, UserID: owner, DisplayName: "Rider"}, f.err
 }
 func (f *passengerStoreFake) UpdatePassenger(_ context.Context, input accountspostgres.UpdatePassengerParams) (accountspostgres.Passenger, error) {
+	f.updateCalls++
 	f.owner = input.UserID
 	return accountspostgres.Passenger{ID: input.PassengerID, UserID: input.UserID, DisplayName: input.DisplayName}, f.err
 }
@@ -71,6 +76,31 @@ func TestPassengerServiceMapsOwnerMissToSafeNotFound(t *testing.T) {
 	_, err := NewPassengerService(store).GetPassenger(context.Background(), "owner", "someone-elses-passenger")
 	if err != httpapi.ErrNotFound {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestPassengerServiceRejectsInvalidDisplayNameBeforeStore(t *testing.T) {
+	t.Parallel()
+
+	for name, invalid := range map[string]string{
+		"overlong":  strings.Repeat("界", 101),
+		"control":   "Rider\x00",
+		"malformed": string([]byte{0xff}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			store := &passengerStoreFake{}
+			service := NewPassengerService(store)
+			if _, err := service.CreatePassenger(context.Background(), "owner", invalid); err != httpapi.ErrInvalidInput {
+				t.Fatalf("CreatePassenger() error = %v, want %v", err, httpapi.ErrInvalidInput)
+			}
+			if _, err := service.UpdatePassenger(context.Background(), "owner", "passenger", invalid); err != httpapi.ErrInvalidInput {
+				t.Fatalf("UpdatePassenger() error = %v, want %v", err, httpapi.ErrInvalidInput)
+			}
+			if store.createCalls != 0 || store.updateCalls != 0 {
+				t.Fatalf("store calls = create %d, update %d; want zero", store.createCalls, store.updateCalls)
+			}
+		})
 	}
 }
 

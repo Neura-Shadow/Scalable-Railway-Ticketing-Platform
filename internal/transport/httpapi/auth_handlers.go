@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 
+	accountsdomain "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/accounts/domain"
 	"github.com/gin-gonic/gin"
 )
 
@@ -53,7 +54,9 @@ func registerHandler(dependencies Dependencies) gin.HandlerFunc {
 		}
 		request.Email = strings.ToLower(strings.TrimSpace(request.Email))
 		request.DisplayName = strings.TrimSpace(request.DisplayName)
-		if !validEmail(request.Email) || len(request.Password) < 12 {
+		if !accountsdomain.ValidRegistrationEmail(request.Email) ||
+			!accountsdomain.ValidRegistrationPassword(request.Password) ||
+			!accountsdomain.ValidPassengerDisplayName(request.DisplayName) {
 			writeError(c, ErrInvalidInput)
 			return
 		}

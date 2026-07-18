@@ -99,7 +99,7 @@ The API is versioned under `/api/v1`. Customer reservation routes derive ownersh
 
 Errors use bounded public codes and do not expose SQL, DSNs, credentials, tokens, raw idempotency keys, or passenger data.
 
-Registration and login are intentionally separate. Registration never returns access/refresh tokens, and its generic accepted response does not reveal whether the email was already registered. Database timing can still differ and is not claimed to be constant-time; the registration rate limit remains part of the abuse boundary.
+Registration and login are intentionally separate. Registration never returns access/refresh tokens, and its direct generic accepted response does not distinguish a new email from an existing one. Because Milestone 1 creates immediately active accounts without an email-verification workflow, a caller can still attempt a later login with an attacker-chosen registration password and infer whether that new credential took effect. Database timing can also differ and is not claimed to be constant-time. These residuals are rate-limited and documented rather than hidden; stronger activation proof and anti-automation controls remain outside this milestone.
 
 The focused registration/login response contract is recorded in [docs/openapi.yaml](docs/openapi.yaml). It is intentionally scoped and is not a complete platform API specification.
 

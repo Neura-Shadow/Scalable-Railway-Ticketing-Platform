@@ -10,10 +10,14 @@ paths:
     post:
       summary: Request customer account registration
       description: >-
-        A syntactically valid registration request receives the same response
-        whether or not the normalized email address is already registered.
-        Registration never returns access or refresh credentials; the customer
-        must use the login endpoint after the account exists.
+        A syntactically valid registration request receives the same direct
+        response whether or not the normalized email address is already
+        registered. Registration never returns access or refresh credentials;
+        the customer must use the login endpoint after the account exists.
+        Because accounts are immediately active in this milestone, a later
+        login attempt with the submitted password can still reveal whether the
+        credential took effect; no constant-time or email-verification claim is
+        made.
       operationId: registerCustomer
       requestBody:
         required: true
@@ -23,7 +27,7 @@ paths:
               $ref: "#/components/schemas/RegisterRequest"
       responses:
         "202":
-          description: Registration request accepted without disclosing account existence
+          description: Registration request accepted without directly disclosing account existence
           content:
             application/json:
               schema:
@@ -79,13 +83,23 @@ components:
       properties:
         email:
           type: string
-          format: email
+          x-normalization: trim-unicode-whitespace-and-lowercase
+          x-minNormalizedLength: 3
+          x-maxNormalizedLength: 320
+          x-normalizedPattern: '^[^@\s\u0000-\u001F\u007F-\u009F]+@[^@\s\u0000-\u001F\u007F-\u009F]+$'
+          description: Unicode is allowed. After trimming and lowercasing, exactly one at-sign and no whitespace or C0/C1 control character are accepted.
         password:
           type: string
           minLength: 12
+          x-maxUtf8Bytes: 72
+          description: Must contain at least 12 Unicode characters and encode to at most 72 UTF-8 bytes for bcrypt.
         display_name:
           type: string
-          minLength: 1
+          x-normalization: trim-unicode-whitespace
+          x-minNormalizedLength: 1
+          x-maxNormalizedLength: 100
+          x-normalizedDisallows: C0/C1 control characters
+          description: After trimming Unicode whitespace, 1 to 100 Unicode characters and no C0/C1 control character are accepted.
     LoginRequest:
       type: object
       additionalProperties: false
@@ -95,7 +109,12 @@ components:
       properties:
         email:
           type: string
-          format: email
+          x-normalization: trim-unicode-whitespace-and-lowercase
+          x-minNormalizedLength: 3
+          x-maxNormalizedLength: 320
+          x-normalizedRequires: An at-sign that is neither the first nor last byte
+          x-normalizedDisallows: ASCII space, tab, carriage return, and line feed
+          description: Login preserves the legacy account-lookup syntax and therefore does not impose the stricter new-registration email rule.
         password:
           type: string
           minLength: 1

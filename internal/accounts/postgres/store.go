@@ -90,7 +90,7 @@ func NewStore(db DBTX, passwords application.PasswordHasher) (*Store, error) {
 
 func (s *Store) RegisterUser(ctx context.Context, params RegisterUserParams) (User, error) {
 	email := canonicalEmail(params.Email)
-	if !validEmailLength(email) || params.Password == "" {
+	if !domain.ValidRegistrationEmail(email) || !domain.ValidRegistrationPassword(params.Password) {
 		return User{}, ErrInvalidInput
 	}
 	if err := params.Role.Validate(); err != nil {
@@ -147,7 +147,7 @@ func (s *Store) LookupUserForLogin(ctx context.Context, lookup LoginLookup) (Use
 
 func (s *Store) CreatePassenger(ctx context.Context, params CreatePassengerParams) (Passenger, error) {
 	displayName := strings.TrimSpace(params.DisplayName)
-	if params.UserID == "" || !validDisplayName(displayName) {
+	if params.UserID == "" || !domain.ValidPassengerDisplayName(displayName) {
 		return Passenger{}, ErrInvalidInput
 	}
 
@@ -202,7 +202,7 @@ func (s *Store) ListPassengers(ctx context.Context, userID string) ([]Passenger,
 
 func (s *Store) UpdatePassenger(ctx context.Context, params UpdatePassengerParams) (Passenger, error) {
 	displayName := strings.TrimSpace(params.DisplayName)
-	if !validDisplayName(displayName) {
+	if !domain.ValidPassengerDisplayName(displayName) {
 		return Passenger{}, ErrInvalidInput
 	}
 	if params.UserID == "" || params.PassengerID == "" {
@@ -262,11 +262,6 @@ func canonicalEmail(email string) string {
 func validEmailLength(email string) bool {
 	length := utf8.RuneCountInString(email)
 	return length >= 3 && length <= 320
-}
-
-func validDisplayName(displayName string) bool {
-	length := utf8.RuneCountInString(displayName)
-	return length >= 1 && length <= 100
 }
 
 func scanUser(row pgx.Row, uniqueError error) (User, error) {

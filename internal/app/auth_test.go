@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -150,6 +151,71 @@ func TestAuthRegisterKeepsDuplicateConflictInternalAndIssuesNoCredentials(t *tes
 	}
 	if refreshes.registerCalls != 0 {
 		t.Fatalf("refresh Register() calls = %d, want 0", refreshes.registerCalls)
+	}
+}
+
+func TestAuthRegisterRejectsOverlongDisplayNameBeforeAccountLookup(t *testing.T) {
+	accounts := &authAccountsFake{registerErr: accountspostgres.ErrEmailAlreadyRegistered}
+	service := NewAuthService(accounts, &authTokensFake{}, &refreshTokensFake{}, fixedClock{}, time.Minute, uuid.New)
+
+	err := service.Register(context.Background(), httpapi.RegisterCommand{
+		Email:       "user@example.com",
+		Password:    "long-password",
+		DisplayName: strings.Repeat("界", 101),
+	})
+
+	if err != httpapi.ErrInvalidInput {
+		t.Fatalf("Register() error = %v, want exact %v", err, httpapi.ErrInvalidInput)
+	}
+	if accounts.registerCalls != 0 {
+		t.Fatalf("RegisterCustomer() calls = %d, want 0", accounts.registerCalls)
+	}
+}
+
+func TestAuthRegisterRejectsControlRunesBeforeAccountLookup(t *testing.T) {
+	accounts := &authAccountsFake{registerErr: accountspostgres.ErrEmailAlreadyRegistered}
+	service := NewAuthService(accounts, &authTokensFake{}, &refreshTokensFake{}, fixedClock{}, time.Minute, uuid.New)
+
+	err := service.Register(context.Background(), httpapi.RegisterCommand{
+		Email:       "user@example.com",
+		Password:    "long-password",
+		DisplayName: "Rider\x00",
+	})
+
+	if err != httpapi.ErrInvalidInput {
+		t.Fatalf("Register() error = %v, want exact %v", err, httpapi.ErrInvalidInput)
+	}
+	if accounts.registerCalls != 0 {
+		t.Fatalf("RegisterCustomer() calls = %d, want 0", accounts.registerCalls)
+	}
+}
+
+func TestAuthRegisterRejectsInvalidCredentialsBeforeAccountLookup(t *testing.T) {
+	t.Parallel()
+
+	for name, command := range map[string]httpapi.RegisterCommand{
+		"password below rune minimum": {
+			Email: "user@example.com", Password: strings.Repeat("界", 4), DisplayName: "Rider",
+		},
+		"password above bcrypt bytes": {
+			Email: "user@example.com", Password: strings.Repeat("界", 25), DisplayName: "Rider",
+		},
+		"email with two separators": {
+			Email: "user@@example.com", Password: "correct-horse-battery-staple", DisplayName: "Rider",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			accounts := &authAccountsFake{registerErr: accountspostgres.ErrEmailAlreadyRegistered}
+			service := NewAuthService(accounts, &authTokensFake{}, &refreshTokensFake{}, fixedClock{}, time.Minute, uuid.New)
+
+			if err := service.Register(context.Background(), command); err != httpapi.ErrInvalidInput {
+				t.Fatalf("Register() error = %v, want exact %v", err, httpapi.ErrInvalidInput)
+			}
+			if accounts.registerCalls != 0 {
+				t.Fatalf("RegisterCustomer() calls = %d, want 0", accounts.registerCalls)
+			}
+		})
 	}
 }
 
