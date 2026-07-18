@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	accountsdomain "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/accounts/domain"
 	accountspostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/accounts/postgres"
 	offeringdomain "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/offering/domain"
 	querypostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/postgres"
@@ -57,6 +58,9 @@ func (s *PassengerService) CreatePassenger(ctx context.Context, ownerID, display
 	if s == nil || s.store == nil {
 		return httpapi.PassengerView{}, httpapi.ErrUnavailable
 	}
+	if !accountsdomain.ValidPassengerDisplayName(displayName) {
+		return httpapi.PassengerView{}, httpapi.ErrInvalidInput
+	}
 	item, err := s.store.CreatePassenger(ctx, accountspostgres.CreatePassengerParams{UserID: ownerID, DisplayName: displayName})
 	if err != nil {
 		return httpapi.PassengerView{}, mapPassengerError(err)
@@ -78,6 +82,9 @@ func (s *PassengerService) GetPassenger(ctx context.Context, ownerID, passengerI
 func (s *PassengerService) UpdatePassenger(ctx context.Context, ownerID, passengerID, displayName string) (httpapi.PassengerView, error) {
 	if s == nil || s.store == nil {
 		return httpapi.PassengerView{}, httpapi.ErrUnavailable
+	}
+	if !accountsdomain.ValidPassengerDisplayName(displayName) {
+		return httpapi.PassengerView{}, httpapi.ErrInvalidInput
 	}
 	item, err := s.store.UpdatePassenger(ctx, accountspostgres.UpdatePassengerParams{UserID: ownerID, PassengerID: passengerID, DisplayName: displayName})
 	if err != nil {

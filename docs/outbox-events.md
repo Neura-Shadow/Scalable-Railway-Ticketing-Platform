@@ -37,8 +37,10 @@ Claim and finalize are separate short PostgreSQL transactions. Publication happe
 
 ## Publisher adapters
 
-- `log`: default development adapter; logs event metadata only.
-- `redis_stream`: optional and disabled by default; sends the minimized envelope with explicit stream length management.
+- `log`: default development adapter; logs event metadata only. An enabled production worker rejects it unless the explicit emergency override is set.
+- `redis_stream`: production baseline adapter; sends the minimized envelope with explicit stream length management. Worker readiness checks Redis when this adapter is selected.
+
+`OUTBOX_PUBLISHER_ENABLED=false` disables the publisher without requiring Redis. The emergency log override emits a bounded configuration warning and never adds event payloads to logs.
 
 No email, SMS, payment, or notification consumer exists in Milestone 1.
 

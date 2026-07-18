@@ -3,16 +3,19 @@ package httpapi_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/transport/httpapi"
 )
 
 type authServiceStub struct {
-	registered bool
+	registered  bool
+	registerErr error
 }
 
 type rateLimiterStub struct {
@@ -26,9 +29,9 @@ func (s *rateLimiterStub) Allow(_ context.Context, input httpapi.RateLimitReques
 	return s.allowed, s.err
 }
 
-func (s *authServiceStub) Register(context.Context, httpapi.RegisterCommand) (httpapi.TokenPairView, error) {
+func (s *authServiceStub) Register(context.Context, httpapi.RegisterCommand) error {
 	s.registered = true
-	return httpapi.TokenPairView{}, nil
+	return s.registerErr
 }
 
 func (s *authServiceStub) Login(context.Context, httpapi.LoginCommand) (httpapi.TokenPairView, error) {
@@ -40,6 +43,145 @@ func (s *authServiceStub) Refresh(context.Context, string) (httpapi.TokenPairVie
 }
 
 func (s *authServiceStub) Logout(context.Context, string, string) error { return nil }
+
+func TestRegistrationNewAndDuplicateResponsesAreIndistinguishable(t *testing.T) {
+	t.Parallel()
+
+	newAuth := &authServiceStub{}
+	newResponse := performRegistration(t, newAuth)
+	duplicateAuth := &authServiceStub{registerErr: httpapi.ErrConflict}
+	duplicateResponse := performRegistration(t, duplicateAuth)
+
+	if !newAuth.registered || !duplicateAuth.registered {
+		t.Fatal("registration service was not called for both valid requests")
+	}
+	if newResponse.Code != http.StatusAccepted || duplicateResponse.Code != http.StatusAccepted {
+		t.Fatalf("registration statuses = new %d, duplicate %d; want both %d", newResponse.Code, duplicateResponse.Code, http.StatusAccepted)
+	}
+	const wantBody = `{"message":"If the registration request can be processed, the account workflow will continue."}`
+	if newResponse.Body.String() != wantBody {
+		t.Fatalf("new registration body = %q, want %q", newResponse.Body.String(), wantBody)
+	}
+	if !bytes.Equal(newResponse.Body.Bytes(), duplicateResponse.Body.Bytes()) {
+		t.Fatalf("registration response differs by account existence: new %q, duplicate %q", newResponse.Body.String(), duplicateResponse.Body.String())
+	}
+}
+
+func TestRegistrationUnknownServiceErrorRemainsGenericFailure(t *testing.T) {
+	t.Parallel()
+
+	auth := &authServiceStub{registerErr: errors.New("database secret must not escape")}
+	response := performRegistration(t, auth)
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("registration status = %d, want %d; body = %s", response.Code, http.StatusInternalServerError, response.Body.String())
+	}
+	const wantBody = `{"error":{"code":"internal_error","message":"internal server error"}}`
+	if response.Body.String() != wantBody {
+		t.Fatalf("registration failure body = %q, want %q", response.Body.String(), wantBody)
+	}
+}
+
+func TestRegistrationRejectsOverlongDisplayNameBeforeAccountLookup(t *testing.T) {
+	t.Parallel()
+
+	var responses []*httptest.ResponseRecorder
+	for _, registerErr := range []error{nil, httpapi.ErrConflict} {
+		auth := &authServiceStub{registerErr: registerErr}
+		router := httpapi.New(httpapi.Dependencies{Auth: auth})
+		body := []byte(`{"email":"customer@example.test","password":"correct-horse-battery-staple","display_name":"` + strings.Repeat("界", 101) + `"}`)
+		request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/register", bytes.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("overlong registration status = %d, want %d; body = %s", response.Code, http.StatusBadRequest, response.Body.String())
+		}
+		if auth.registered {
+			t.Fatal("overlong registration reached account lookup")
+		}
+		responses = append(responses, response)
+	}
+	if !bytes.Equal(responses[0].Body.Bytes(), responses[1].Body.Bytes()) {
+		t.Fatalf("overlong response differs by configured account outcome: first %q, second %q", responses[0].Body.String(), responses[1].Body.String())
+	}
+}
+
+func TestRegistrationRejectsControlRunesBeforeAccountLookup(t *testing.T) {
+	t.Parallel()
+
+	var responses []*httptest.ResponseRecorder
+	for _, registerErr := range []error{nil, httpapi.ErrConflict} {
+		auth := &authServiceStub{registerErr: registerErr}
+		router := httpapi.New(httpapi.Dependencies{Auth: auth})
+		body := []byte(`{"email":"customer@example.test","password":"correct-horse-battery-staple","display_name":"Rider\u0000"}`)
+		request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/register", bytes.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("control-rune registration status = %d, want %d; body = %s", response.Code, http.StatusBadRequest, response.Body.String())
+		}
+		if auth.registered {
+			t.Fatal("control-rune registration reached account lookup")
+		}
+		responses = append(responses, response)
+	}
+	if !bytes.Equal(responses[0].Body.Bytes(), responses[1].Body.Bytes()) {
+		t.Fatalf("control-rune response differs by configured account outcome: first %q, second %q", responses[0].Body.String(), responses[1].Body.String())
+	}
+}
+
+func TestRegistrationRejectsInvalidCredentialShapeBeforeAccountLookup(t *testing.T) {
+	t.Parallel()
+
+	for name, testCase := range map[string]struct {
+		email    string
+		password string
+	}{
+		"password below rune minimum": {email: "customer@example.test", password: strings.Repeat("界", 4)},
+		"password above bcrypt bytes": {email: "customer@example.test", password: strings.Repeat("界", 25)},
+		"email with two separators":   {email: "customer@@example.test", password: "correct-horse-battery-staple"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			for _, registerErr := range []error{nil, httpapi.ErrConflict} {
+				auth := &authServiceStub{registerErr: registerErr}
+				router := httpapi.New(httpapi.Dependencies{Auth: auth})
+				body, err := json.Marshal(map[string]string{
+					"email": testCase.email, "password": testCase.password, "display_name": "Rider",
+				})
+				if err != nil {
+					t.Fatalf("marshal request: %v", err)
+				}
+				request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/register", bytes.NewReader(body))
+				request.Header.Set("Content-Type", "application/json")
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, request)
+
+				if response.Code != http.StatusBadRequest {
+					t.Fatalf("invalid registration status = %d, want %d; body = %s", response.Code, http.StatusBadRequest, response.Body.String())
+				}
+				if auth.registered {
+					t.Fatal("invalid registration reached account lookup")
+				}
+			}
+		})
+	}
+}
+
+func performRegistration(t *testing.T, auth *authServiceStub) *httptest.ResponseRecorder {
+	t.Helper()
+
+	router := httpapi.New(httpapi.Dependencies{Auth: auth})
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/register", bytes.NewReader([]byte(`{"email":"customer@example.test","password":"correct-horse-battery-staple","display_name":"Rider"}`)))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	return response
+}
 
 func TestPublicRegistrationCannotSelectPrivilegedRole(t *testing.T) {
 	t.Parallel()

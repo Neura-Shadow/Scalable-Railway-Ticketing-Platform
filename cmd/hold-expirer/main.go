@@ -23,8 +23,8 @@ import (
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	cfg, err := config.Load()
-	if err != nil || cfg.DatabaseURL == "" {
+	cfg, err := config.LoadFor(config.ProcessHoldExpirer)
+	if err != nil {
 		logger.Error("hold expirer configuration invalid")
 		os.Exit(1)
 	}
@@ -72,8 +72,12 @@ func main() {
 		}
 		logger.Info("hold expiration pass complete", "expired_count", result.Expired)
 	}
-	run()
+	runInitialExpirationPass(cfg.HoldExpirerEnabled, run)
 	if !cfg.HoldExpirerEnabled {
+		logger.Info("hold expirer disabled", "category", "hold_expirer_disabled")
+		if serverErr := waitForDisabledHoldExpirer(ctx, serverErrors); serverErr != nil {
+			logger.Error("hold expirer health server failed")
+		}
 		return
 	}
 	ticker := clock.RealClock{}.NewTicker(cfg.HoldExpirerInterval)
@@ -90,6 +94,24 @@ func main() {
 		case <-ticker.C():
 			run()
 		}
+	}
+}
+
+func runInitialExpirationPass(enabled bool, run func()) {
+	if enabled {
+		run()
+	}
+}
+
+func waitForDisabledHoldExpirer(ctx context.Context, serverErrors <-chan error) error {
+	select {
+	case <-ctx.Done():
+		return nil
+	case serverErr := <-serverErrors:
+		if serverErr != nil && !errors.Is(serverErr, http.ErrServerClosed) {
+			return serverErr
+		}
+		return nil
 	}
 }
 

@@ -45,8 +45,8 @@ func run(logger *slog.Logger) error {
 	if logger == nil {
 		return errors.New("logger unavailable")
 	}
-	cfg, err := config.Load()
-	if err != nil || cfg.DatabaseURL == "" || cfg.RedisAddress == "" || cfg.JWTSecret == "" {
+	cfg, err := config.LoadFor(config.ProcessAPI)
+	if err != nil {
 		return errors.New("configuration invalid")
 	}
 	if cfg.Environment == config.EnvironmentProduction {
@@ -184,5 +184,23 @@ func publicReason(err error) string {
 	if err == nil {
 		return "none"
 	}
-	return err.Error()
+	switch err.Error() {
+	case "logger unavailable",
+		"configuration invalid",
+		"postgres configuration invalid",
+		"metrics initialization failed",
+		"authentication initialization failed",
+		"passenger service initialization failed",
+		"offering store initialization failed",
+		"query store initialization failed",
+		"rate limiter initialization failed",
+		"trusted proxy configuration invalid",
+		"http listener failed",
+		"http lifecycle configuration invalid",
+		"graceful shutdown failed",
+		"http listener shutdown failed":
+		return err.Error()
+	default:
+		return "startup failure"
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 
+	accountsdomain "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/accounts/domain"
 	"github.com/gin-gonic/gin"
 )
 
@@ -61,7 +62,7 @@ func createPassengerHandler(dependencies Dependencies) gin.HandlerFunc {
 			return
 		}
 		request.DisplayName = strings.TrimSpace(request.DisplayName)
-		if request.DisplayName == "" || len(request.DisplayName) > 200 {
+		if !accountsdomain.ValidPassengerDisplayName(request.DisplayName) {
 			writeError(c, ErrInvalidInput)
 			return
 		}
@@ -97,7 +98,7 @@ func passengerItemHandler(dependencies Dependencies, method string) gin.HandlerF
 				return
 			}
 			request.DisplayName = strings.TrimSpace(request.DisplayName)
-			if request.DisplayName == "" || len(request.DisplayName) > 200 {
+			if !accountsdomain.ValidPassengerDisplayName(request.DisplayName) {
 				writeError(c, ErrInvalidInput)
 				return
 			}

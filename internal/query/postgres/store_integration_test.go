@@ -82,6 +82,25 @@ func TestStoreSearchAndAvailabilityUseDirectionOverlapAndRunFarePrecedence(t *te
 	if journey.TrainRunID != fixture.trainRunID || journey.FromStopIndex != 0 || journey.ToStopIndex != 2 || journey.SegmentCount != 2 {
 		t.Fatalf("ResolveJourney() = %#v", journey)
 	}
+	if !journey.DepartureAt.Equal(results[0].DepartureAt) || !journey.ArrivalAt.Equal(results[0].ArrivalAt) {
+		t.Fatalf("ResolveJourney() journey times = %v/%v, want search times %v/%v", journey.DepartureAt, journey.ArrivalAt, results[0].DepartureAt, results[0].ArrivalAt)
+	}
+	sameDay, err := store.ResolveJourney(ctx, fixture.trainRunID, "TPE", "TXG")
+	if err != nil {
+		t.Fatalf("ResolveJourney() same-day error = %v", err)
+	}
+	if !sameDay.DepartureAt.Equal(time.Date(2026, time.July, 19, 16, 5, 0, 0, time.UTC)) ||
+		!sameDay.ArrivalAt.Equal(time.Date(2026, time.July, 19, 17, 0, 0, 0, time.UTC)) {
+		t.Fatalf("ResolveJourney() same-day times = %v/%v", sameDay.DepartureAt, sameDay.ArrivalAt)
+	}
+	intermediate, err := store.ResolveJourney(ctx, fixture.trainRunID, "TXG", "KHH")
+	if err != nil {
+		t.Fatalf("ResolveJourney() intermediate error = %v", err)
+	}
+	if !intermediate.DepartureAt.Equal(time.Date(2026, time.July, 19, 17, 5, 0, 0, time.UTC)) ||
+		!intermediate.ArrivalAt.Equal(time.Date(2026, time.July, 20, 17, 0, 0, 0, time.UTC)) {
+		t.Fatalf("ResolveJourney() intermediate times = %v/%v", intermediate.DepartureAt, intermediate.ArrivalAt)
+	}
 
 	if _, err := conn.Exec(ctx, `
 		UPDATE seat_inventory
@@ -102,12 +121,36 @@ func TestStoreSearchAndAvailabilityUseDirectionOverlapAndRunFarePrecedence(t *te
 	}
 }
 
+func TestStoreJourneyTimesSupportZeroFirstDepartureOffset(t *testing.T) {
+	conn := openQueryTestDatabase(t)
+	fixture := seedOfferingWithFirstDeparture(t, conn, 0)
+	store, err := querypostgres.NewStore(conn)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	ctx := context.Background()
+	journey, err := store.ResolveJourney(ctx, fixture.trainRunID, "TPE", "KHH")
+	if err != nil {
+		t.Fatalf("ResolveJourney() error = %v", err)
+	}
+	wantDeparture := time.Date(2026, time.July, 19, 16, 0, 0, 0, time.UTC)
+	wantArrival := time.Date(2026, time.July, 20, 17, 0, 0, 0, time.UTC)
+	if !journey.ScheduledDepartureAt.Equal(wantDeparture) || !journey.DepartureAt.Equal(wantDeparture) || !journey.ArrivalAt.Equal(wantArrival) {
+		t.Fatalf("ResolveJourney() zero-offset times = scheduled %v, departure %v, arrival %v", journey.ScheduledDepartureAt, journey.DepartureAt, journey.ArrivalAt)
+	}
+}
+
 type offeringFixture struct {
 	trainRunID  string
 	serviceDate time.Time
 }
 
 func seedOffering(t *testing.T, conn *pgx.Conn) offeringFixture {
+	t.Helper()
+	return seedOfferingWithFirstDeparture(t, conn, 5)
+}
+
+func seedOfferingWithFirstDeparture(t *testing.T, conn *pgx.Conn, firstDepartureOffset int) offeringFixture {
 	t.Helper()
 	ctx := context.Background()
 	store, err := offeringpostgres.NewStore(conn)
@@ -127,7 +170,7 @@ func seedOffering(t *testing.T, conn *pgx.Conn) offeringFixture {
 		code               string
 		arrival, departure int
 	}{
-		{code: "TPE", arrival: 0, departure: 5},
+		{code: "TPE", arrival: 0, departure: firstDepartureOffset},
 		{code: "TXG", arrival: 60, departure: 65},
 		{code: "KHH", arrival: 1500, departure: 1505},
 	}
@@ -167,7 +210,7 @@ func seedOffering(t *testing.T, conn *pgx.Conn) offeringFixture {
 	serviceDate := time.Date(2026, time.July, 20, 0, 0, 0, 0, time.UTC)
 	run, err := store.CommissionTrainRun(ctx, offeringpostgres.CommissionTrainRunParams{
 		TrainID: train.ID, RouteID: route.ID, ServiceDate: serviceDate,
-		ScheduledDepartureAt: time.Date(2026, time.July, 19, 16, 5, 0, 0, time.UTC),
+		ScheduledDepartureAt: time.Date(2026, time.July, 19, 16, 0, 0, 0, time.UTC).Add(time.Duration(firstDepartureOffset) * time.Minute),
 	})
 	if err != nil {
 		t.Fatal(err)

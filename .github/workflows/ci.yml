@@ -131,11 +131,11 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: go.sum
       - name: Apply migrations to an empty database
-        run: go run ./cmd/migrate -path migrations -database "$DATABASE_URL" up
+        run: go run ./cmd/migrate -path migrations up
       - name: Verify migration-up is safe to repeat
-        run: go run ./cmd/migrate -path migrations -database "$DATABASE_URL" up
+        run: go run ./cmd/migrate -path migrations up
       - name: Verify clean migration version
-        run: go run ./cmd/migrate -path migrations -database "$DATABASE_URL" version
+        run: go run ./cmd/migrate -path migrations version
       - name: Run integration and constraint tests
         run: go test ./... -count=1 -timeout 300s
       - name: Run race-enabled persistence and concurrency tests

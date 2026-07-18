@@ -2,12 +2,25 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"testing"
 	"time"
 )
+
+func TestPublicReasonRedactsUnexpectedStartupErrors(t *testing.T) {
+	t.Parallel()
+
+	const secret = "sentinel-m11-database-password"
+	if got := publicReason(errors.New("failed to parse postgres://user:" + secret + "@db/railway")); got != "startup failure" {
+		t.Fatalf("publicReason() = %q, want bounded fallback", got)
+	}
+	if got := publicReason(errors.New("configuration invalid")); got != "configuration invalid" {
+		t.Fatalf("publicReason() = %q, want known category", got)
+	}
+}
 
 func TestServeUntilShutdownDrainsInFlightRequestBeforeCancellingBaseContext(t *testing.T) {
 	baseContext, cancelBase := context.WithCancel(context.Background())

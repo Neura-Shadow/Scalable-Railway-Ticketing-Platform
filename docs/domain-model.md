@@ -9,7 +9,7 @@ Milestone 1 is a production-minded, single-region railway booking backend. Postg
 | Accounts | Credentials, JWT lifecycle, RBAC, customer ownership | User, Passenger | Platform clock/config; PostgreSQL adapter |
 | Railway Offering | Topology, rolling stock, fares, dated services, bookable status, commissioning | Station, Route, RouteStop, Train, Coach, Seat, SeatClass, TrainRun, Fare | PostgreSQL adapter |
 | Booking | Atomic occupancy/allocation, lifecycle commands, tickets, idempotency, reconciliation | SegmentMask, SeatInventory, Reservation, ReservationSeat, TicketOrder, Ticket, IdempotencyRecord | Accounts ownership port; Railway Offering sales-input port; event append port |
-| Query (supporting) | Browse/search/availability hints and Redis decorators | Read models only | Read-only PostgreSQL and Redis adapters |
+| Query (supporting) | Browse/search/availability hints; Redis read caches deferred | Read models only | Current read-only PostgreSQL adapter; future non-authoritative Redis decorators |
 | Event Relay (supporting) | Claim, publish, retry, recover, finalize | OutboxEvent delivery state | PostgreSQL and publisher adapters |
 | Platform (supporting) | Technology adapters and process lifecycle | Config, database/Redis pools, middleware, response, metrics, clock | No railway business rules |
 

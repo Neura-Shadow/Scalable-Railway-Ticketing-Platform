@@ -7,7 +7,7 @@ Deploying these artifacts does not add a real payment integration, waiting room,
 ## Authority and topology
 
 - One regional PostgreSQL primary is authoritative for train-run status, seat occupancy, reservations, tickets, durable idempotency, and outbox rows.
-- Redis provides bounded caches, rate-limit state, and optional event transport. Availability from Redis is a hint; reservation writes always recheck PostgreSQL.
+- Redis currently provides rate-limit state and optional event transport. Station, search, and availability caches are deferred; current reads use PostgreSQL, and any future cached availability remains a hint that reservation writes must recheck.
 - API, hold-expirer, and outbox-worker processes use the same schema and documented lock ordering.
 - Run migrations as an explicit release step before deploying compatible application processes. Do not run automatic schema mutation on application startup.
 
@@ -17,27 +17,29 @@ The manifests under `deploy/kubernetes/base` are a security-conscious baseline, 
 
 Create the referenced `railway-runtime-secrets` object out of band. Never commit its values or render them into CI logs.
 
-Required keys:
+Required keys, scoped to the process that consumes them:
 
-- `database-url`: TLS-enabled PostgreSQL URL with the least privileges required by the runtime;
-- `redis-address`: regional Redis `host:port` endpoint;
-- `redis-password`: Redis credential, if authentication is enabled; and
-- `jwt-secret`: at least 32 random bytes, managed and rotated through the deployment secret system.
+- `database-url`: TLS-enabled PostgreSQL URL required by the API and both workers; a production overlay should replace the baseline shared reference with process-specific least-privilege roles where their grants differ;
+- `redis-address`: regional Redis `host:port` endpoint used by the API and a Redis Streams outbox worker;
+- `redis-password`: Redis credential, if authentication is enabled, used only with those Redis clients; and
+- `jwt-secret`: at least 32 random bytes, managed and rotated through the deployment secret system and mounted only into the API.
 
 The database migration principal should be separate from the runtime principal. The runtime principal must not own the database or create arbitrary schemas in production. Integration tests use separate ephemeral infrastructure because they require isolated schema creation.
 
 ## Configuration
 
-Set `APP_ENV=production` and validate at least:
+Set `APP_ENV=production` and validate process-owned settings:
 
-- `HTTP_ADDR`, `DATABASE_URL`, `REDIS_ADDR`, and `REDIS_PASSWORD`;
-- `JWT_SECRET`, `JWT_ISSUER`, and `JWT_AUDIENCE`;
-- hold TTL, passenger limit, expiration batch/interval;
-- outbox publisher, batch, retry, lease, and poll settings;
+- API: HTTP, PostgreSQL, Redis, JWT, hold TTL, passenger limit, proxy/CORS, dependency, and lifecycle settings;
+- hold-expirer: PostgreSQL, expiration batch/interval, worker health, pass timeout, and lifecycle settings, with no JWT or Redis secret;
+- log outbox-worker: PostgreSQL, outbox loop, worker health, pass timeout, and lifecycle settings, with no JWT or Redis secret;
+- Redis Streams outbox-worker: the log-worker settings plus only its Redis publisher address/credential;
 - trusted proxy CIDRs and explicit CORS origins; and
 - request, dependency, and shutdown timeouts.
 
-Production must not use the local Compose passwords or development JWT default. Terminate TLS at a trusted ingress/load balancer, use TLS to managed dependencies where supported, restrict proxy trust, and keep CORS disabled unless explicit origins are required.
+Production configuration validation rejects the committed local Compose database password, the development JWT default, and universal trusted-proxy CIDRs. Terminate TLS at a trusted ingress/load balancer, use TLS to managed dependencies where supported, replace the baseline loopback-only proxy trust with only the exact ingress addresses or narrow topology-specific CIDRs, and keep CORS disabled unless explicit origins are required.
+
+An enabled production outbox worker must use `OUTBOX_PUBLISHER=redis_stream` by default. An enabled `log` publisher is rejected unless `ALLOW_LOG_PUBLISHER_IN_PRODUCTION=true` is explicitly set for an emergency; that override emits a bounded warning and the log adapter never logs event payloads. `OUTBOX_PUBLISHER_ENABLED=false` disables publication without requiring Redis.
 
 ## Release sequence
 
@@ -57,11 +59,13 @@ Migrations must remain backward compatible with the currently running applicatio
 
 Migration 5 is an expand migration: a compatibility trigger derives `reservation_seats.train_run_id` for a version-4 writer that omits the new column, while version-5 writers provide it directly. Do not remove that trigger until every version-4 process has drained and rollback to version 4 is no longer permitted.
 
+Before applying Migration 5 to a populated database, follow [the Migration 5 production rollout runbook](migrations/migration-5-production-rollout.md) and record every applicable gate in [the release checklist](release-checklist.md). The committed preflight, post-validation, and rollback-check SQL is read-only.
+
 ## Health and rollout behavior
 
 - The API `/livez` is process-only and must not depend on PostgreSQL or Redis.
 - The API `/readyz` uses short checks for PostgreSQL, Redis, migrations, and required configuration without exposing credentials.
-- Each worker exposes a private `WORKER_HTTP_ADDRESS` (default `:9090`) with process-only `/livez`, PostgreSQL-backed `/readyz`, and its own `/metrics`; Kubernetes probes use this surface and each pass is bounded by `WORKER_PASS_TIMEOUT`.
+- Each worker exposes a private `WORKER_HTTP_ADDRESS` (default `:9090`) with process-only `/livez` and its own `/metrics`. Hold-expirer `/readyz` checks PostgreSQL; a Redis Streams outbox-worker checks both PostgreSQL and Redis; a log outbox-worker checks PostgreSQL only. Kubernetes probes use this surface and each pass is bounded by `WORKER_PASS_TIMEOUT`.
 - Outbox backlog, pending consumer work, or a dead-letter item is alertable but is not by itself a readiness failure.
 - `/metrics` must remain internal or protected by the platform network boundary.
 - Use graceful termination with a pre-stop/drain window long enough for the configured HTTP shutdown timeout.

@@ -1,9 +1,11 @@
 package httpapi
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 
+	accountsdomain "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/accounts/domain"
 	"github.com/gin-gonic/gin"
 )
 
@@ -21,6 +23,12 @@ type loginRequest struct {
 type refreshRequest struct {
 	RefreshToken string `json:"refresh_token"`
 }
+
+type registrationAcceptedResponse struct {
+	Message string `json:"message"`
+}
+
+const registrationAcceptedMessage = "If the registration request can be processed, the account workflow will continue."
 
 func registerAuthRoutes(group *gin.RouterGroup, dependencies Dependencies) {
 	auth := group.Group("/auth")
@@ -46,16 +54,18 @@ func registerHandler(dependencies Dependencies) gin.HandlerFunc {
 		}
 		request.Email = strings.ToLower(strings.TrimSpace(request.Email))
 		request.DisplayName = strings.TrimSpace(request.DisplayName)
-		if !validEmail(request.Email) || len(request.Password) < 12 {
+		if !accountsdomain.ValidRegistrationEmail(request.Email) ||
+			!accountsdomain.ValidRegistrationPassword(request.Password) ||
+			!accountsdomain.ValidPassengerDisplayName(request.DisplayName) {
 			writeError(c, ErrInvalidInput)
 			return
 		}
-		result, err := dependencies.Auth.Register(c.Request.Context(), RegisterCommand(request))
-		if err != nil {
+		err := dependencies.Auth.Register(c.Request.Context(), RegisterCommand(request))
+		if err != nil && !errors.Is(err, ErrConflict) {
 			writeError(c, err)
 			return
 		}
-		c.JSON(http.StatusCreated, result)
+		c.JSON(http.StatusAccepted, registrationAcceptedResponse{Message: registrationAcceptedMessage})
 	}
 }
 

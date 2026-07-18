@@ -1,0 +1,191 @@
+openapi: 3.1.0
+info:
+  title: Scalable Railway Ticketing Platform Authentication Contract (Scoped)
+  version: 1.1.0
+  description: >-
+    This document intentionally covers only the public registration and login
+    contract. It is not a complete specification of the platform API.
+paths:
+  /api/v1/auth/register:
+    post:
+      summary: Request customer account registration
+      description: >-
+        A syntactically valid registration request receives the same direct
+        response whether or not the normalized email address is already
+        registered. Registration never returns access or refresh credentials;
+        the customer must use the login endpoint after the account exists.
+        Because accounts are immediately active in this milestone, a later
+        login attempt with the submitted password can still reveal whether the
+        credential took effect; no constant-time or email-verification claim is
+        made.
+      operationId: registerCustomer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+      responses:
+        "202":
+          description: Registration request accepted without directly disclosing account existence
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegistrationAccepted"
+              example:
+                message: If the registration request can be processed, the account workflow will continue.
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /api/v1/auth/login:
+    post:
+      summary: Authenticate an existing account
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Authentication succeeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPair"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          description: Credentials were not accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+components:
+  schemas:
+    RegisterRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - email
+        - password
+        - display_name
+      properties:
+        email:
+          type: string
+          x-normalization: trim-unicode-whitespace-and-lowercase
+          x-minNormalizedLength: 3
+          x-maxNormalizedLength: 320
+          x-normalizedPattern: '^[^@\s\u0000-\u001F\u007F-\u009F]+@[^@\s\u0000-\u001F\u007F-\u009F]+$'
+          description: Unicode is allowed. After trimming and lowercasing, exactly one at-sign and no whitespace or C0/C1 control character are accepted.
+        password:
+          type: string
+          minLength: 12
+          x-maxUtf8Bytes: 72
+          description: Must contain at least 12 Unicode characters and encode to at most 72 UTF-8 bytes for bcrypt.
+        display_name:
+          type: string
+          x-normalization: trim-unicode-whitespace
+          x-minNormalizedLength: 1
+          x-maxNormalizedLength: 100
+          x-normalizedDisallows: C0/C1 control characters
+          description: After trimming Unicode whitespace, 1 to 100 Unicode characters and no C0/C1 control character are accepted.
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          x-normalization: trim-unicode-whitespace-and-lowercase
+          x-minNormalizedLength: 3
+          x-maxNormalizedLength: 320
+          x-normalizedRequires: An at-sign that is neither the first nor last byte
+          x-normalizedDisallows: ASCII space, tab, carriage return, and line feed
+          description: Login preserves the legacy account-lookup syntax and therefore does not impose the stricter new-registration email rule.
+        password:
+          type: string
+          minLength: 1
+    RegistrationAccepted:
+      type: object
+      additionalProperties: false
+      required:
+        - message
+      properties:
+        message:
+          type: string
+          const: If the registration request can be processed, the account workflow will continue.
+    TokenPair:
+      type: object
+      additionalProperties: false
+      required:
+        - access_token
+        - refresh_token
+        - token_type
+        - expires_in
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        token_type:
+          type: string
+          const: Bearer
+        expires_in:
+          type: integer
+          format: int64
+          minimum: 1
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+  responses:
+    InvalidRequest:
+      description: The request is invalid
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    RateLimited:
+      description: Too many requests
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    Unavailable:
+      description: Service is temporarily unavailable
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"

@@ -35,7 +35,7 @@ spec:
               protocol: TCP
           envFrom:
             - configMapRef:
-                name: railway-runtime-config
+                name: railway-api-config
           env:
             - name: DATABASE_URL
               valueFrom:

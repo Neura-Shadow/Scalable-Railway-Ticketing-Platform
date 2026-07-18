@@ -9,6 +9,8 @@ Station lists, train searches, and availability are read-heavy and can benefit f
 
 ## Decision
 
+The station, train-search, availability, and completed-idempotency caches below are permitted future accelerators, not current Milestone 1.1 implementations. Current station, search, and availability reads go directly to PostgreSQL. Adding those Redis read caches is deferred to a later read-model/cache milestone.
+
 Redis may store:
 
 - versioned station metadata;
@@ -30,7 +32,7 @@ cache:availability:v1:{train_run_id}:{from_index}:{to_index}:{seat_class}
 
 Values always have bounded TTLs with jitter. Availability TTL is deliberately short. Write paths prefer exact-key invalidation; broad maintenance uses cursor-based `SCAN`, never `KEYS`. Arbitrary station codes or payload values do not become metric labels.
 
-Availability endpoints may return cached counts, but the response contract identifies them as point-in-time hints. Create-hold always runs the PostgreSQL overlap and train-run-status predicates.
+Future availability caches may return cached counts, but the response contract identifies them as point-in-time hints. Current availability reads query PostgreSQL directly. In either case, create-hold always runs the PostgreSQL overlap and train-run-status predicates.
 
 Atomic Lua scripts implement rate-limit increments and expiry. Each route has an explicit Redis failure policy:
 

@@ -1,6 +1,5 @@
 GO ?= go
 MIGRATE_VERSION ?= v4.19.1
-DATABASE_URL ?= postgres://railway:railway-local@localhost:5432/railway?sslmode=disable
 IMAGE ?= scalable-railway-ticketing-platform:milestone-1
 
 .PHONY: build test test-race vet fmt-check tidy-check migrate-up migrate-down migrate-status migrate-create compose-up compose-down docker-build
@@ -25,13 +24,13 @@ tidy-check:
 	git diff --exit-code -- go.mod go.sum
 
 migrate-up:
-	$(GO) run ./cmd/migrate -path migrations -database "$(DATABASE_URL)" up
+	$(GO) run ./cmd/migrate -path migrations up
 
 migrate-down:
-	$(GO) run ./cmd/migrate -path migrations -database "$(DATABASE_URL)" down
+	$(GO) run ./cmd/migrate -path migrations down
 
 migrate-status:
-	$(GO) run ./cmd/migrate -path migrations -database "$(DATABASE_URL)" version
+	$(GO) run ./cmd/migrate -path migrations version
 
 migrate-create:
 	@test -n "$(name)" || { echo "usage: make migrate-create name=description"; exit 2; }
