@@ -25,6 +25,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	path := flags.String("path", "migrations", "migration directory")
 	databaseFlag := flags.String("database", "", "PostgreSQL connection URL (defaults to DATABASE_URL)")
 	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return 2
 	}
 	databaseURL := strings.TrimSpace(*databaseFlag)

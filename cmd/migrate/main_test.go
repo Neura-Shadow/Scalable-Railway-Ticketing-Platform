@@ -14,8 +14,8 @@ func TestRunHelpNeverEchoesDatabaseEnvironment(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
 	exitCode := run([]string{"-h"}, &stdout, &stderr)
-	if exitCode != 2 {
-		t.Fatalf("run() exit code = %d, want 2", exitCode)
+	if exitCode != 0 {
+		t.Fatalf("run() exit code = %d, want 0", exitCode)
 	}
 	for _, forbidden := range []string{secret, "help-query-secret", "postgres://"} {
 		if strings.Contains(stderr.String(), forbidden) || strings.Contains(stdout.String(), forbidden) {

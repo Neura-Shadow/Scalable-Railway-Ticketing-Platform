@@ -1,7 +1,5 @@
 GO ?= go
 MIGRATE_VERSION ?= v4.19.1
-DATABASE_URL ?= postgres://railway:railway-local@localhost:5432/railway?sslmode=disable
-export DATABASE_URL
 IMAGE ?= scalable-railway-ticketing-platform:milestone-1
 
 .PHONY: build test test-race vet fmt-check tidy-check migrate-up migrate-down migrate-status migrate-create compose-up compose-down docker-build
