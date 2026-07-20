@@ -176,7 +176,10 @@ services:
     restart: unless-stopped
 
   load-balancer:
-    image: nginx:1.29-alpine
+    build:
+      context: .
+      dockerfile: deploy/nginx/Dockerfile
+    image: scalable-railway-ticketing-proxy:milestone-2
     user: "101:101"
     depends_on:
       - api-1
@@ -184,8 +187,6 @@ services:
       - api-3
     ports:
       - "127.0.0.1::8080"
-    volumes:
-      - ./deploy/nginx/multi-replica.conf:/etc/nginx/nginx.conf:ro
     read_only: true
     tmpfs:
       - /var/cache/nginx:size=16m,mode=0755,uid=101,gid=101

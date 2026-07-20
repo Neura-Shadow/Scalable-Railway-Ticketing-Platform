@@ -25,8 +25,10 @@ replica reads the same durable policy rows and uses the same Redis policy
 generation. The bounded evidence Nginx uses deterministic round robin and sets
 no affinity cookie or hash rule, so every healthy replica remains observable
 without depending on transient connection counts. The local evidence proxy
-emits `X-Upstream-Addr` so k6 can demonstrate distribution; production ingress
-must not expose internal topology.
+is digest-pinned, disables upstream keepalive explicitly, re-resolves API
+service names through Docker DNS, and emits `X-Upstream-Addr` so k6 can
+demonstrate distribution; production ingress must not expose internal
+topology.
 
 ## Global limits
 

@@ -1000,8 +1000,10 @@ $started = $false
 $succeeded = $false
 $customers = @()
 $upstreams = New-Object 'System.Collections.Generic.HashSet[string]'
+$initialUpstreams = New-Object 'System.Collections.Generic.HashSet[string]'
 $apiTerminationUpstreams = New-Object 'System.Collections.Generic.HashSet[string]'
 $apiTerminationReadyReplicas = New-Object 'System.Collections.Generic.HashSet[string]'
+$apiRecoveryUpstreams = New-Object 'System.Collections.Generic.HashSet[string]'
 $reservationIDs = New-Object 'System.Collections.Generic.HashSet[string]'
 $entryIDs = New-Object 'System.Collections.Generic.HashSet[string]'
 $admissionTimes = New-Object 'System.Collections.Generic.List[DateTimeOffset]'
@@ -1118,6 +1120,7 @@ try {
                 passenger_count          = 1
             }
         Add-Upstream -Set $upstreams -Response $join
+        Add-Upstream -Set $initialUpstreams -Response $join
         if ($join.StatusCode -ne 201) {
             throw "duplicate join returned unexpected HTTP status $($join.StatusCode)"
         }
@@ -1132,6 +1135,9 @@ try {
     }
     if ($entryIDs.Count -ne $CustomerCount) {
         throw "shared queue produced $($entryIDs.Count) unique entries for $CustomerCount customers"
+    }
+    if ($initialUpstreams.Count -ne 3) {
+        throw "initial topology probe observed $($initialUpstreams.Count) final upstreams; want exactly three API replicas"
     }
     $queuedStatusCustomer = $customers |
         Where-Object { $_.EntryStatus -eq 'queued' } |
@@ -1186,8 +1192,39 @@ try {
         }
         Start-Sleep -Seconds 1
     }
-    # Nginx's default passive-failure window is ten seconds.
-    Start-Sleep -Seconds 11
+    $apiRecoveryStartedAt = [DateTimeOffset]::UtcNow
+    $apiRecoveryDeadline = $apiRecoveryStartedAt.AddSeconds(30)
+    $apiRecoveryAttempts = 0
+    while (
+        $apiRecoveryUpstreams.Count -lt 3 -and
+        [DateTimeOffset]::UtcNow -lt $apiRecoveryDeadline
+    ) {
+        $apiRecoveryAttempts++
+        $join = Invoke-API -Method POST -Path '/api/v1/waiting-room/entries' `
+            -AccessToken $customers[0].AccessToken `
+            -Body @{
+                train_run_id             = $hotTrainRunID
+                origin_station_code      = $originCode
+                destination_station_code = $destinationCode
+                seat_class               = $seatClass
+                passenger_count          = 1
+            }
+        Add-Upstream -Set $apiRecoveryUpstreams -Response $join
+        Add-Upstream -Set $upstreams -Response $join
+        $joinBody = Convert-ResponseBody -Response $join
+        if ($join.StatusCode -ne 201 -or [string]$joinBody.entry_id -ne $expectedEntryID) {
+            throw 'API recovery changed or lost the shared duplicate entry'
+        }
+        if ($apiRecoveryUpstreams.Count -lt 3) {
+            Start-Sleep -Seconds 1
+        }
+    }
+    $apiRecoveryMilliseconds = [int][Math]::Ceiling(
+        ([DateTimeOffset]::UtcNow - $apiRecoveryStartedAt).TotalMilliseconds
+    )
+    if ($apiRecoveryUpstreams.Count -ne 3) {
+        throw "API recovery probe observed $($apiRecoveryUpstreams.Count) final upstreams after $apiRecoveryAttempts bounded attempts; want exactly three recovered replicas"
+    }
 
     Write-Host 'Starting both admission workers for the global-rate and inflight-cap probe'
     Invoke-DockerCompose -Arguments @(
@@ -1484,9 +1521,6 @@ try {
     if ($maximumSlidingAdmissions -gt $configuredAdmissionRate) {
         throw "observed $maximumSlidingAdmissions admissions in a sliding second; configured bound is $configuredAdmissionRate"
     }
-    if ($upstreams.Count -ne 3) {
-        throw "end-to-end probes observed $($upstreams.Count) final upstreams; want exactly three API replicas"
-    }
     $crossReplicaTokenFlows = @(
         $customers | Where-Object {
             $replicas = @(
@@ -1574,9 +1608,10 @@ try {
         topology = [ordered]@{
             api_replicas = 3
             admission_worker_replicas = 2
-            api_upstreams_observed = $upstreams.Count
+            api_upstreams_observed = $initialUpstreams.Count
             surviving_upstreams_during_api_termination = $apiTerminationUpstreams.Count
             surviving_api_replicas_ready_during_termination = $apiTerminationReadyReplicas.Count
+            recovered_upstreams_after_api_restart = $apiRecoveryUpstreams.Count
             cross_replica_token_flows = $crossReplicaTokenFlows
         }
         steady_state_smoke = [ordered]@{
@@ -1605,6 +1640,7 @@ try {
             booking_retry_traversed_shared_topology = $true
             booking_retry_attempts_after_recovery_wait = $bookingTerminationRetryAttempts
             bounded_lease_recovery_wait_milliseconds = $bookingTerminationRecoveryMilliseconds
+            bounded_api_recovery_wait_milliseconds = $apiRecoveryMilliseconds
             worker_termination_preserved_progress = $true
             stopped_worker_restarted_ready = $workerOneRestarted
             redis_outage_hot_join_failed_closed = $redisOutageHotFailClosed

@@ -16,6 +16,7 @@ concurrency:
 env:
   GO_VERSION: "1.25.12"
   IMAGE_NAME: scalable-railway-ticketing-platform:milestone-2
+  EVIDENCE_PROXY_IMAGE: scalable-railway-ticketing-proxy:milestone-2
 
 jobs:
   quality:
@@ -243,7 +244,10 @@ jobs:
         with:
           persist-credentials: false
       - name: Build image
-        run: docker build --pull --tag "$IMAGE_NAME" .
+        run: |
+          docker build --pull --tag "$IMAGE_NAME" .
+          docker build --pull --file deploy/nginx/Dockerfile \
+            --tag "$EVIDENCE_PROXY_IMAGE" .
       - name: Verify runtime identity and timezone database
         run: |
           docker run --rm --entrypoint /bin/sh "$IMAGE_NAME" -c \
@@ -252,6 +256,15 @@ jobs:
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: scalable-railway-ticketing-platform:milestone-2
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          trivyignores: .trivyignore.yaml
+      - name: Trivy evidence proxy image scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: scalable-railway-ticketing-proxy:milestone-2
           format: table
           severity: CRITICAL,HIGH
           ignore-unfixed: true

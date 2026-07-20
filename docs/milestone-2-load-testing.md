@@ -84,8 +84,11 @@ booking probe use Compose-assigned ephemeral loopback ports, so parallel or
 unrelated local services do not compete for a fixed host port.
 
 Nginx may report a comma-delimited `$upstream_addr` retry chain. The harness
-counts only the final successful address, requires exactly two surviving API
-addresses while one replica is stopped, and exactly three after recovery.
+counts only the final successful address, requires exactly three addresses in
+the initial phase, exactly two while one replica is stopped, and exactly three
+in a separate post-restart probe within a 30-second bounded recovery window.
+Phase-local sets allow a restarted container to receive a new private address
+without being miscounted as a fourth replica.
 It also checks both surviving services' `/readyz` endpoints directly before
 the load-balancer probe. Retry-chain strings are never counted as additional
 replicas.
@@ -93,7 +96,14 @@ replicas.
 The bounded evidence Nginx configuration deliberately avoids upstream
 connection reuse so each `X-Upstream-Addr` value represents a fresh
 round-robin decision. Production ingress balancing and connection-pooling
-policy remain deployment concerns.
+policy remain deployment concerns. The evidence image is digest-pinned and
+sets `keepalive 0` explicitly because recent Nginx releases otherwise enable a
+local upstream keepalive cache by default. Its passive failure window is fixed
+at 10 seconds; the harness allows up to 30 seconds for exact three-replica
+recovery. A shared upstream zone and Docker DNS resolver let the proxy discover
+a restarted Compose container even if its private address changes. The proxy
+image upgrades the pinned slim base packages during its build, and CI scans the
+resulting image for fixed Critical/High findings.
 
 Run from the repository root:
 
