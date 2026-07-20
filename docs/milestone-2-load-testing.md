@@ -88,6 +88,11 @@ counts only the final successful address, requires exactly two surviving API
 addresses while one replica is stopped, and exactly three after recovery.
 Retry-chain strings are never counted as additional replicas.
 
+The bounded evidence Nginx configuration deliberately avoids upstream
+connection reuse so each `X-Upstream-Addr` value represents a fresh
+`least_conn` decision. Production ingress connection-pooling policy remains a
+deployment concern.
+
 Run from the repository root:
 
 ```powershell
