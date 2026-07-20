@@ -66,7 +66,7 @@ The versioned admission fingerprint canonicalizes train-run ID, ordered origin a
 
 Fairness is first-come order within one policy generation, as observed by the atomic Redis sequence. It does not promise cross-policy, cross-region, or network-arrival fairness. Expired or cancelled entries are skipped. Approximate position is computed from bounded sorted-set rank and can change immediately because of cancellation, expiry, or admission.
 
-Cancellation and status operations validate JWT-derived ownership inside their atomic script. Cancellation removes the entry from the queue and active user mapping and marks bounded terminal metadata. A terminal entry cannot be admitted.
+Cancellation and status operations validate JWT-derived ownership inside their atomic script. A never-issued queued cancellation removes the queue/user/cleanup members and all entry hash fields immediately; the adapter then deletes the exact external entry locator under a bounded best-effort context. Issued cancellation retains bounded terminal entry/token metadata. Neither form can be admitted.
 
 All state has a TTL derived from the durable policy and a small documented cleanup margin. Old policy generations expire naturally. Complete Redis loss can lose queue order, entries, and tokens, but cannot alter a PostgreSQL seat mask or durable reservation.
 

@@ -48,6 +48,7 @@ Production deployment requires Redis AOF persistence with an explicitly reviewed
 - Non-hot PostgreSQL booking remains independent of the waiting-room control plane.
 - Redis restart or total loss may require customers to rejoin, but PostgreSQL inventory remains correct.
 - Readiness and alerts can distinguish Redis health, policy-version readiness, and PostgreSQL health without treating queue depth as a readiness failure.
+- Detect-only admission reconciliation reports both an absent current continuity key and a missing or mismatched shared policy-version/current-continuity marker pair for every initialized enabled policy.
 - Operators must provision, monitor, back up, and test recovery of Redis persistence.
 - Recovery alerts distinguish ordinary Redis unavailability from a missing continuity sentinel or generation marker.
 

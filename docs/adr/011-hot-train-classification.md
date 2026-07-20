@@ -36,8 +36,8 @@ Add the Admission bounded context inside the modular monolith. Admission owns th
 | `max_queue_size` | 1–100,000 |
 | `admission_rate_per_second` | 1–10,000 |
 | `max_inflight_admissions` | 1–10,000 |
-| `admission_token_ttl_seconds` | 5–900 |
-| `processing_lease_seconds` | 1–120 and less than token TTL |
+| `admission_token_ttl_seconds` | 6–900 |
+| `processing_lease_seconds` | 5–120 and less than token TTL |
 | `queue_entry_ttl_seconds` | 60–86,400 |
 
 The documented safe maximum for inflight admission is 10,000 per policy. A policy may select a lower operational bound after load testing.
@@ -57,9 +57,11 @@ Every reservation command performs two policy checks:
 
 The application passes a bounded admission decision containing the acquired policy ID and version into Booking. If the transaction sees a newly enabled or newer policy version, it rejects before inventory mutation. This closes the disabled-to-enabled activation race without making a Redis call inside a PostgreSQL transaction.
 
+The final recheck and every policy mutation use one versioned PostgreSQL advisory-lock tuple derived from `train_run_id` and canonical `seat_class`. Booking takes the shared transaction-scoped mode, while policy create, update, and disable take the exclusive mode. The exclusive side covers the absent-row creation race that row locks cannot represent; the shared side allows same-scope bookings to remain concurrent rather than serializing them behind one another.
+
 Redis state is generation-scoped by policy version. A worker installs only the PostgreSQL-current version with an atomic monotonic compare operation; an older version can never replace a newer marker. After successful first install, it records the matching `redis_initialized_version` durably. A missing Redis marker when PostgreSQL already records that version as initialized is treated as continuity loss, not a fresh bootstrap, and remains fail closed until an operator deliberately reopens a new generation.
 
-A policy change starts a fresh generation; old entries and tokens become unusable and expire under bounded TTLs. This deliberate customer disruption keeps update semantics fail closed and avoids a blocking deletion of a large old generation. Policy mutations are separately rate-limited, record actor and correlation metadata in the audit/outbox envelope, and return the current bounded queue/inflight impact in a preview field so operators can confirm disruption. Generation churn and stale/downgrade attempts are monitored.
+A policy change starts a fresh generation; old entries and tokens become unusable and expire under bounded TTLs. This deliberate customer disruption keeps update semantics fail closed and avoids a blocking deletion of a large old generation. Policy mutations are separately rate-limited and record actor and correlation metadata in the audit/outbox envelope. The current mutation response returns the durable policy and new version only. A point-in-time queue/inflight impact preview is deliberately deferred: it requires a separate bounded read of the previous Redis generation with explicit partial-failure semantics. Operators currently have bounded issue/cancel/expiry counters and detect-only admission-state reconciliation for drift; neither is represented as a current-impact preview. Generation churn and stale/downgrade attempts are monitored.
 
 Admission permits one booking attempt. It does not reserve a seat. PostgreSQL remains authoritative for train-run bookability, durable quotas, passenger ownership, fares, segment overlap, reservation state, tickets, idempotency, and outbox intent.
 

@@ -125,8 +125,8 @@ Non-hot train runs preserve the Milestone 1 booking path and do not require admi
 - Valid transitions are `issued -> processing -> consumed`, `issued -> expired`, `processing -> issued` after safe lease recovery, `processing -> expired`, and `issued|processing -> cancelled`.
 - Tokens contain at least 256 bits of cryptographically secure randomness.
 - Only the raw token is returned to the authenticated owner, once.
-- The worker builds a self-authenticating raw token from a fresh 32-byte nonce and a process-owned HMAC key; Redis stores only the SHA-256 token hash, nonce, signed issuance metadata, and bounded bindings, never the raw token.
-- The API validates the issuance MAC before returning the raw token once; delivery is at-most-once, so a lost response requires bounded cancellation or expiry and rejoin.
+- The worker builds a self-authenticating raw token from a fresh 32-byte nonce and a process-owned HMAC key; Redis stores only the SHA-256 token hash, nonce, immutable claims, and bounded bindings, never the raw token or issuance MAC.
+- The API reconstructs and hash-verifies the raw token during a read-only preflight before atomically claiming delivery, then verifies the claimed fields again; delivery is at-most-once, so a lost response requires bounded cancellation or expiry and rejoin.
 - The admission fingerprint covers train run, ordered interval, seat class, and passenger count. It remains distinct from the durable booking fingerprint, which also binds passenger IDs.
 - First acquisition atomically binds user, admission fingerprint, durable booking fingerprint, and durable idempotency-key hash; the binding cannot be replaced.
 - Same-request processing retries may query completed durable idempotency, but cannot enter another PostgreSQL create while the lease is active; changed data conflicts.

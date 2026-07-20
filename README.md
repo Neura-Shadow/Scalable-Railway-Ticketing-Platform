@@ -1,8 +1,8 @@
 # Scalable Railway Ticketing Platform
 
-A production-minded, single-region Go backend that proves the correctness-critical core of railway booking: route-segment seat allocation, temporary holds, confirmation/cancellation/expiration, durable idempotency, and transactional outbox events under concurrency.
+A production-minded, single-region Go backend for railway booking with Redis-backed hot-train waiting-room admission, PostgreSQL-authoritative route-segment seat allocation, temporary holds, durable quotas, idempotency, and transactional outbox events under concurrency.
 
-Milestone 1 is intentionally bounded. It is not a national-scale capacity claim, does not implement a real payment gateway or waiting room, does not support multi-region active-active writes, and does not perform real passenger identity verification. See [Milestone 1 limitations](docs/milestone-1-limitations.md).
+Milestone 2 is intentionally bounded. Admission permits a booking attempt; it does not guarantee a seat. This is not a national-scale capacity claim and does not implement real payment, a complete anti-bot platform, or multi-region active-active writes. See [Milestone 2 limitations](docs/milestone-2-limitations.md).
 
 ## Architecture
 
@@ -15,7 +15,7 @@ HTTP transport
             -> PostgreSQL, Redis, Prometheus, and publisher adapters
 ```
 
-PostgreSQL is authoritative for train-run status, seat inventory, reservation lifecycle, tickets, durable idempotency, outbox state, and all current station/search/availability reads. Redis currently provides rate controls and optional event transport. Station, search, and availability Redis caches are deferred to a later read-model/cache milestone; any future cached availability remains only a point-in-time hint, and booking always rechecks PostgreSQL.
+PostgreSQL is authoritative for policies, train-run status, seat inventory, reservation lifecycle, durable quotas, tickets, idempotency, outbox state, and all current station/search/availability reads. Redis provides rate controls, optional event transport, and ephemeral waiting-room/token control state. Redis never allocates a seat. Station, search, and availability Redis caches remain deferred to Milestone 3; any future cached availability remains only a hint and booking always rechecks PostgreSQL.
 
 ### Module boundaries
 
@@ -23,12 +23,15 @@ PostgreSQL is authoritative for train-run status, seat inventory, reservation li
 |---|---|
 | Accounts | Password hashing, JWT lifecycle, roles, users, and owner-scoped passengers |
 | Railway Offering | Stations, ordered routes/stops, trains/coaches/seats, fares, and dated train runs |
+| Admission | Durable hot policy resolution, bounded waiting-room control, token lifecycle, and global admission limits |
 | Booking | Segment masks, atomic allocation, holds, lifecycle transitions, tickets, idempotency, and reconciliation |
 | Query | Direct PostgreSQL browse, search, and availability projections/hints; Redis read caches deferred |
 | Event Relay | Outbox claim, publish, retry, stale-lease recovery, and finalize |
 | Platform | Configuration, pools, metrics, clock, middleware, and process lifecycle |
 
 Booking owns each reservation transaction. Event Relay delivers already committed events and never decides booking state. Domain packages do not depend on Gin, pgx, Redis, Prometheus, Docker, or HTTP status codes.
+
+For an enabled hot policy, the API requires one short-lived, owner/request-bound admission token before attempting the existing booking transaction. Redis Lua scripts atomically enforce duplicate joins, monotonic policy-local FIFO ordering, queue capacity, worker-global issue rate, inflight capacity, token leases, and single-use transitions. Hot-run Redis failure fails closed rather than bypassing admission. Complete Redis loss may lose queue continuity, but it cannot corrupt PostgreSQL inventory. See [waiting-room-design.md](docs/waiting-room-design.md) and [hot-train-protection.md](docs/hot-train-protection.md).
 
 The detailed model is in [domain-model.md](docs/domain-model.md); design decisions are under [docs/adr](docs/adr).
 
@@ -91,11 +94,16 @@ The API is versioned under `/api/v1`. Customer reservation routes derive ownersh
 | `GET` | `/api/v1/stations` | Station browse |
 | `GET` | `/api/v1/train-runs/search` | Train-run search |
 | `GET` | `/api/v1/train-runs/:id/availability` | Point-in-time availability hint |
-| `POST` | `/api/v1/reservations` | Create a temporary hold; requires `Idempotency-Key` |
+| `POST` | `/api/v1/waiting-room/entries` | Join a selected hot-run policy queue |
+| `GET` | `/api/v1/waiting-room/entries/:id` | Read owned approximate position/state; may deliver one token header |
+| `DELETE` | `/api/v1/waiting-room/entries/:id` | Cancel an owned active queue entry |
+| `POST` | `/api/v1/reservations` | Create a temporary hold; requires `Idempotency-Key` and, for a hot policy, `X-Admission-Token` |
 | `GET` | `/api/v1/reservations/:id` | Read an owned reservation |
 | `POST` | `/api/v1/reservations/:id/confirm` | Confirm an owned hold |
 | `POST` | `/api/v1/reservations/:id/cancel` | Cancel an owned held/confirmed reservation |
 | `POST` | `/api/v1/admin/routes` | Create a named, timezone-bound route with ordered station codes and arrival/departure offsets |
+| `GET/POST` | `/api/v1/operator/hot-train-policies` | List/create bounded policies as operator or admin |
+| `GET/PUT/DELETE` | `/api/v1/operator/hot-train-policies/:id` | Read, version-update, or soft-disable a policy |
 
 Errors use bounded public codes and do not expose SQL, DSNs, credentials, tokens, raw idempotency keys, or passenger data.
 
@@ -105,7 +113,7 @@ The focused registration/login response contract is recorded in [docs/openapi.ya
 
 ## Health and metrics
 
-The API `/livez` does not call PostgreSQL or Redis. API `/readyz` checks PostgreSQL, Redis, migration version, and required production configuration with short timeouts and structured, sanitized component states. Each worker has a private `:9090` `/livez`, `/readyz`, and `/metrics` surface. Hold-expirer readiness checks only PostgreSQL; Redis Streams outbox readiness checks PostgreSQL and Redis, while log publishing checks only PostgreSQL. Worker pass duration is capped. Outbox backlog and dead-letter conditions are metrics/alert signals rather than direct readiness failures.
+The API `/livez` does not call PostgreSQL or Redis. API `/readyz` checks PostgreSQL, Redis, migration version, and required production configuration with short timeouts and structured, sanitized component states. Each worker has a private `:9090` `/livez`, `/readyz`, and `/metrics` surface. Admission-worker readiness checks PostgreSQL, Redis, schema version, and its process-owned keyring/configuration; queue backlog alone does not fail readiness. Hold-expirer readiness checks only PostgreSQL; Redis Streams outbox readiness checks PostgreSQL and Redis, while log publishing checks only PostgreSQL. Worker pass duration is capped. Outbox backlog and dead-letter conditions are metrics/alert signals rather than direct readiness failures.
 
 Prometheus labels use bounded operations, normalized route templates, result/status classes, and bounded reasons. User, passenger, reservation, train-run, seat, ticket, event, and arbitrary input values are excluded from labels.
 
@@ -124,6 +132,26 @@ make migrate-down
 `migrate-down` is a local/development command, not an automatic production rollback strategy. Production releases use a separate migration principal and backward-compatible schema changes.
 
 Migration 5 requires the production procedure in [migration-5-production-rollout.md](docs/migrations/migration-5-production-rollout.md); the SQL checks under `docs/migrations/sql` are read-only operator aids, not automatic schema changes.
+
+Migration 6 adds the durable hot-train policy, safe bound/uniqueness constraints, policy outbox event types, and indexes for derived held-reservation quota checks. Follow [migration-6-production-rollout.md](docs/migrations/migration-6-production-rollout.md); its down migration removes policy audit events and is not an automatic production rollback.
+
+## Read-only reconciliation
+
+`cmd/reconcile` provides detect-only correctness checks. It never repairs
+production state, returns non-zero for violations or unavailable dependencies,
+and emits bounded JSON summaries without customer or token identifiers.
+
+```powershell
+go run ./cmd/reconcile seat-inventory --train-run-id <canonical-uuid>
+go run ./cmd/reconcile reservation-quotas
+go run ./cmd/reconcile admission-state
+```
+
+All commands require `DATABASE_URL`; `admission-state` also requires
+`REDIS_ADDRESS` or `REDIS_ADDR`. Quota checks use the same bounded
+`RESERVATION_MAX_ACTIVE_*` settings as the API unless explicit CLI limits are
+supplied. The container build exposes an optional `reconcile` target while the
+default image remains the API.
 
 ## Local setup
 
@@ -146,14 +174,28 @@ Start the optional workers with:
 docker compose --profile workers up --build
 ```
 
+The workers profile includes admission-worker, hold-expirer, and outbox-worker. The committed admission derivation key is synthetic local-test material only. Production must inject an independent 32-byte keyring. A local three-API, two-admission-worker topology with Redis AOF and a non-sticky load balancer is available with:
+
+```powershell
+docker compose -f docker-compose.multi-replica.yml up --build
+```
+
 Then verify:
 
 ```powershell
-Invoke-RestMethod http://localhost:8080/livez
-Invoke-RestMethod http://localhost:8080/readyz
+$loadBalancerPort = (
+    docker compose -f docker-compose.multi-replica.yml port load-balancer 8080
+) -replace '^.*:', ''
+Invoke-RestMethod "http://127.0.0.1:$loadBalancerPort/livez"
+Invoke-RestMethod "http://127.0.0.1:$loadBalancerPort/readyz"
 ```
 
-Compose credentials are explicit local-development defaults only. There is no committed production secret, default production database, or production-ready customer bootstrap token.
+The multi-replica load balancer uses a Compose-assigned ephemeral loopback port
+so parallel evidence projects cannot collide. The bounded automated procedure
+is documented in [Milestone 2 load testing](docs/milestone-2-load-testing.md).
+Compose credentials are explicit local-development defaults only. There is no
+committed production secret, default production database, or production-ready
+customer bootstrap token.
 
 ## Tests and validation
 
@@ -175,16 +217,20 @@ make migrate-up
 make migrate-up
 make migrate-status
 docker compose config
-docker build -t scalable-railway-ticketing-platform:milestone-1 .
+docker compose -f docker-compose.multi-replica.yml config
+docker build -t scalable-railway-ticketing-platform:milestone-2 .
 ```
 
-CI also verifies tidy/gofmt, action syntax, secret scanning, filesystem/image vulnerabilities, a clean migration-up path, integration tests, and the Docker build.
+CI also verifies tidy/gofmt, action syntax, secret scanning,
+filesystem/image vulnerabilities, populated Migration 5-to-6 and destructive
+down/reapply rehearsals, integration tests, the Docker build, and a bounded
+three-API/two-worker smoke with API, worker, and real Redis failure recovery.
 
 ## Load tests
 
-Nine k6 scenarios cover station browse, train search, availability, ordinary reservations, a hot train, idempotency, confirmation, expiration storms, and rate limiting. They accept configuration only through environment variables and contain no real tokens.
+The original nine k6 scenarios remain, and eight Milestone 2 scenarios cover waiting-room join/status, admission, hot reservation, admission idempotency, durable quota, Redis outage, and multi-replica shared state. They accept configuration only through environment variables and contain no credentials or tokens.
 
-See [load-testing.md](docs/load-testing.md) for commands and correctness gates. [benchmark-report-milestone-1.md](docs/benchmark-report-milestone-1.md) intentionally records no capacity numbers until a controlled run is executed. A smoke run is not evidence of production or national-scale throughput.
+See [Milestone 2 load testing](docs/milestone-2-load-testing.md) for setup and correctness gates. [benchmark-report-milestone-2.md](docs/benchmark-report-milestone-2.md) intentionally records no capacity numbers until a controlled run is executed. A smoke run is not evidence of production or national-scale throughput.
 
 ## Deployment
 
@@ -193,14 +239,16 @@ See [load-testing.md](docs/load-testing.md) for commands and correctness gates. 
 ## Current limitations
 
 - Single-region PostgreSQL primary for all authoritative writes.
+- Redis AOF reduces loss risk but does not guarantee waiting-room continuity; hot-run Redis loss fails closed.
+- Admission does not guarantee a seat and token delivery is at-most-once.
 - Station, search, and availability Redis read caches are not implemented; current reads use PostgreSQL and future cached values remain hints.
 - No real payment authorization/capture/refund integration.
-- No waiting room, durable reservation quota, or complete anti-bot/fraud system.
+- No complete anti-bot/fraud system or real identity proof; account quotas do not prevent Sybil identities.
 - No multi-region active-active booking writes.
 - No accepted sustained benchmark or national-scale capacity claim.
 - No government-ID or real passenger identity verification.
 
-The complete list is in [milestone-1-limitations.md](docs/milestone-1-limitations.md). Future multi-region ideas are design direction only in [future-multi-region-design.md](docs/future-multi-region-design.md); none are implemented in Milestone 1.
+The complete list is in [milestone-2-limitations.md](docs/milestone-2-limitations.md). Future multi-region ideas are design direction only in [future-multi-region-design.md](docs/future-multi-region-design.md); none are implemented in Milestone 2.
 
 ## License
 

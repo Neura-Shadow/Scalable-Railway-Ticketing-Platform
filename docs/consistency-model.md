@@ -32,7 +32,12 @@ Station metadata, train search, availability counts, and event-driven read model
 ## Failure semantics
 
 - Any booking-transaction failure rolls back every changed row.
-- Redis failure never changes committed authority; authentication and passenger-profile creation fail closed, while reservation-create admission degrades open and still executes every authoritative PostgreSQL check.
+- Redis failure never changes committed authority. Authentication and
+  passenger-profile creation fail closed. A non-hot reservation's existing
+  rate limiter may degrade open, but the request still executes every
+  authoritative PostgreSQL check. An enabled hot policy is never downgraded:
+  waiting-room, token, and hot-reservation admission fail closed with bounded
+  retry guidance when Redis or its required continuity state is unavailable.
 - A response timeout after commit is resolved through durable idempotency.
 - Outbox publish failure retries independently and does not roll back domain state.
 - Dead letters and backlog are alertable conditions, not direct readiness failures.

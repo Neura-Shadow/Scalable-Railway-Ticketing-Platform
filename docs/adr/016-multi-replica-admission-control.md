@@ -23,7 +23,9 @@ The train-run component is a server-validated canonical UUID and the seat-class 
 
 Queue join uses an atomic monotonic sequence as the sorted-set score. The sequence, not an API clock, establishes first-come ordering within a policy. Duplicate detection, capacity checking, sequence allocation, metadata storage, user mapping, and TTL application happen together.
 
-Admission workers load a bounded set of enabled policies from PostgreSQL and pass a bounded batch of cryptographically generated token candidates with application-verifiable issuance MACs to the policy script. For each policy the script:
+Admission workers load at most 100 enabled policies per pass from PostgreSQL using an immutable-policy-ID keyset cursor. Each worker rotates its in-memory cursor to the beginning after reaching the tail; it never uses an unbounded list or an `OFFSET` scan. Concurrent `RunOnce` calls on the same worker instance are serialized so cursor advancement and per-policy side effects remain deterministic. Replicas keep independent cursors because Redis, not cursor coordination, enforces the policy-wide limits.
+
+For each selected policy the worker passes a bounded batch of cryptographically generated token candidates with SHA-256 bearer commitments, nonces, and immutable claims to the policy script. Redis never receives an issuance MAC; API and worker processes recompute it from their keyring. For each policy the script:
 
 1. validates the expected enabled policy version and continuity sentinel;
 2. reads Redis `TIME` as the common time source;
@@ -45,6 +47,8 @@ A worker crash before the issuance script has no effect. A crash after the scrip
 Failure for one policy is bounded and does not stop a worker from processing other policies. Policy scripts never modify PostgreSQL seat inventory. Admission permits a booking attempt; PostgreSQL can still reject the attempt because inventory has changed.
 
 The admission worker is another executable role over the modular monolith's shared admission modules. Its application interface is `RunOnce(ctx)` and its Redis and PostgreSQL adapters remain behind existing module seams. This deployment role does not create a network microservice interface.
+
+Worker lifecycle metrics expose bounded success/failure pass counts, pass duration, and the last successful pass timestamp. They intentionally carry no policy, train-run, customer, queue-entry, or token identifiers.
 
 ## Consequences
 
