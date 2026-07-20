@@ -246,6 +246,32 @@ jobs:
               Write-Host '::endgroup::'
             }
           }
+          Write-Host '::group::bounded k6 and runner-network diagnostics'
+          foreach ($name in @('multi-replica-summary.json', 'waiting-room-status-summary.json')) {
+            $path = Join-Path $evidence $name
+            if (Test-Path -LiteralPath $path) {
+              $summary = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
+              [ordered]@{
+                summary = $name
+                http_reqs_count = $summary.metrics.http_reqs.count
+                http_reqs_rate = $summary.metrics.http_reqs.rate
+                iterations_count = $summary.metrics.iterations.count
+                iterations_rate = $summary.metrics.iterations.rate
+              } | ConvertTo-Json -Compress
+            }
+          }
+          $conntrack = [ordered]@{}
+          foreach ($name in @('nf_conntrack_count', 'nf_conntrack_max')) {
+            $path = "/proc/sys/net/netfilter/$name"
+            if (Test-Path -LiteralPath $path) {
+              $conntrack[$name] = (Get-Content -Raw -LiteralPath $path).Trim()
+            }
+          }
+          $conntrack | ConvertTo-Json -Compress
+          if (Get-Command ss -ErrorAction SilentlyContinue) {
+            ss -s
+          }
+          Write-Host '::endgroup::'
 
   container:
     name: Container build and image scan

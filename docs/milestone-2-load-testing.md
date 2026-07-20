@@ -79,9 +79,12 @@ a clean non-hot reservation still creates exactly one PostgreSQL reservation.
 It then restores Redis, waits for API and both workers, runs hot and non-hot
 seat reconciliation plus quota/admission reconciliation, writes sanitized
 artifacts under the operating-system temporary directory, and removes the
-project and its volumes by default. The load balancer and the direct `api-1`
-booking probe use Compose-assigned ephemeral loopback ports, so parallel or
-unrelated local services do not compete for a fixed host port.
+project and its volumes by default. On Linux hosts, the load balancer and the
+direct `api-1` booking probe use their private addresses on the isolated
+Compose bridge. On Windows/Docker Desktop, the same probes use
+Compose-assigned ephemeral loopback ports. Neither path competes for a fixed
+host port. The k6 one-off clients use `--no-deps`, so their lifecycle cannot
+restart or recreate the already-validated evidence services.
 
 Nginx may report a comma-delimited `$upstream_addr` retry chain. The harness
 counts only the final successful address, requires exactly three addresses in

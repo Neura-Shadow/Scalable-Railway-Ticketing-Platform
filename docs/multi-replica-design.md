@@ -81,9 +81,10 @@ v2 behavior. The committed admission key is obviously synthetic local material.
 Never reuse it outside this isolated environment.
 
 The evidence-only load balancer and direct `api-1` endpoint bind to
-Compose-assigned ephemeral `127.0.0.1` ports. The harness resolves those
-published ports at runtime; it does not expose the other API replicas directly
-or reserve a fixed host port.
+Compose-assigned ephemeral `127.0.0.1` ports for Windows/Docker Desktop. On
+Linux hosts, the harness instead resolves their private addresses on the
+isolated Compose bridge and avoids the host-published path. It does not expose
+the other API replicas directly or reserve a fixed host port.
 
 This topology does not prove multi-region behavior, regional Redis
 replication, global fairness, national-scale capacity, or production sizing.
