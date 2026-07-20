@@ -5,7 +5,7 @@ topology, not a production deployment manifest:
 
 ```text
 client
-  -> nginx (least connections, no sticky sessions)
+  -> nginx (round robin, no sticky sessions)
        -> api-1
        -> api-2
        -> api-3
@@ -22,9 +22,11 @@ outbox-worker --/
 
 The APIs and workers are stateless with respect to queue and token state. Every
 replica reads the same durable policy rows and uses the same Redis policy
-generation. Nginx uses `least_conn` and sets no affinity cookie or hash rule.
-The local evidence proxy emits `X-Upstream-Addr` so k6 can demonstrate
-distribution; production ingress must not expose internal topology.
+generation. The bounded evidence Nginx uses deterministic round robin and sets
+no affinity cookie or hash rule, so every healthy replica remains observable
+without depending on transient connection counts. The local evidence proxy
+emits `X-Upstream-Addr` so k6 can demonstrate distribution; production ingress
+must not expose internal topology.
 
 ## Global limits
 

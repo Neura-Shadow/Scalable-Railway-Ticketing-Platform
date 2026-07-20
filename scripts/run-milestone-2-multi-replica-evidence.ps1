@@ -339,6 +339,27 @@ function Wait-APIReady {
     throw 'load balancer did not become ready within the bounded startup window'
 }
 
+function Wait-APIServiceReady {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Service,
+
+        [int]$Attempts = 30
+    )
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        $probe = Invoke-NativeProbe -Command {
+            & docker @script:composeArguments exec -T $Service `
+                wget -q -T 2 -O /dev/null http://127.0.0.1:8080/readyz
+        }
+        if ($probe.ExitCode -eq 0) {
+            return
+        }
+        Start-Sleep -Seconds 1
+    }
+    throw "$Service did not remain ready during the bounded API termination probe"
+}
+
 function Wait-WorkerReady {
     param(
         [Parameter(Mandatory = $true)]
@@ -980,6 +1001,7 @@ $succeeded = $false
 $customers = @()
 $upstreams = New-Object 'System.Collections.Generic.HashSet[string]'
 $apiTerminationUpstreams = New-Object 'System.Collections.Generic.HashSet[string]'
+$apiTerminationReadyReplicas = New-Object 'System.Collections.Generic.HashSet[string]'
 $reservationIDs = New-Object 'System.Collections.Generic.HashSet[string]'
 $entryIDs = New-Object 'System.Collections.Generic.HashSet[string]'
 $admissionTimes = New-Object 'System.Collections.Generic.List[DateTimeOffset]'
@@ -1124,6 +1146,10 @@ try {
     Invoke-DockerCompose -Arguments @('stop', 'api-1') `
         -CapturePath (Join-Path $EvidenceDirectory 'api-1-stop.log') | Out-Null
     Wait-APIReady -Attempts 30
+    foreach ($service in @('api-2', 'api-3')) {
+        Wait-APIServiceReady -Service $service
+        [void]$apiTerminationReadyReplicas.Add($service)
+    }
     $expectedEntryID = $customers[0].EntryID
     for ($attempt = 1; $attempt -le 30; $attempt++) {
         $join = Invoke-API -Method POST -Path '/api/v1/waiting-room/entries' `
@@ -1550,6 +1576,7 @@ try {
             admission_worker_replicas = 2
             api_upstreams_observed = $upstreams.Count
             surviving_upstreams_during_api_termination = $apiTerminationUpstreams.Count
+            surviving_api_replicas_ready_during_termination = $apiTerminationReadyReplicas.Count
             cross_replica_token_flows = $crossReplicaTokenFlows
         }
         steady_state_smoke = [ordered]@{

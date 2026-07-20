@@ -86,12 +86,14 @@ unrelated local services do not compete for a fixed host port.
 Nginx may report a comma-delimited `$upstream_addr` retry chain. The harness
 counts only the final successful address, requires exactly two surviving API
 addresses while one replica is stopped, and exactly three after recovery.
-Retry-chain strings are never counted as additional replicas.
+It also checks both surviving services' `/readyz` endpoints directly before
+the load-balancer probe. Retry-chain strings are never counted as additional
+replicas.
 
 The bounded evidence Nginx configuration deliberately avoids upstream
 connection reuse so each `X-Upstream-Addr` value represents a fresh
-`least_conn` decision. Production ingress connection-pooling policy remains a
-deployment concern.
+round-robin decision. Production ingress balancing and connection-pooling
+policy remain deployment concerns.
 
 Run from the repository root:
 
