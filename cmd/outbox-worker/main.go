@@ -17,6 +17,7 @@ import (
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/clock"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
 	platformmetrics "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/metrics"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/redisx"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/workerhttp"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -52,7 +53,11 @@ func main() {
 	if cfg.OutboxPublisherEnabled {
 		switch cfg.OutboxPublisher {
 		case "redis_stream":
-			redisClient = redis.NewClient(&redis.Options{Addr: cfg.RedisAddress, Password: cfg.RedisPassword})
+			redisClient = redis.NewClient(redisx.BoundedClientOptions(
+				cfg.RedisAddress,
+				cfg.RedisPassword,
+				cfg.RedisTimeout,
+			))
 			defer func() { _ = redisClient.Close() }()
 			redisReady := func(checkContext context.Context) error {
 				return redisClient.Ping(checkContext).Err()

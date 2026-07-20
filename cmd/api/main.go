@@ -11,6 +11,9 @@ import (
 	"syscall"
 	"time"
 
+	admissiondomain "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/admission/domain"
+	admissionpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/admission/postgres"
+	admissionredis "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/admission/redis"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/app"
 	bookingpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/postgres"
 	offeringpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/offering/postgres"
@@ -64,13 +67,29 @@ func run(logger *slog.Logger) error {
 	}
 	defer pool.Close()
 
-	redisClient := redis.NewClient(&redis.Options{Addr: cfg.RedisAddress, Password: cfg.RedisPassword})
+	redisClient := redis.NewClient(redisx.BoundedClientOptions(
+		cfg.RedisAddress,
+		cfg.RedisPassword,
+		cfg.RedisTimeout,
+	))
 	defer func() { _ = redisClient.Close() }()
 
 	registry := prometheus.NewRegistry()
 	metrics, err := platformmetrics.New(registry)
 	if err != nil {
 		return errors.New("metrics initialization failed")
+	}
+	keySelection, err := cfg.ParseAdmissionTokenKeys()
+	if err != nil {
+		return errors.New("admission token keyring invalid")
+	}
+	admissionKeys := make(map[string][]byte, len(keySelection.AcceptKeys))
+	for keyID, key := range keySelection.AcceptKeys {
+		admissionKeys[keyID] = append([]byte(nil), key[:]...)
+	}
+	admissionKeyring, err := admissiondomain.NewTokenKeyring(keySelection.IssueKeyID, admissionKeys)
+	if err != nil {
+		return errors.New("admission token keyring invalid")
 	}
 	passwordClock := clock.RealClock{}
 	auth, tokenParser, err := app.NewPostgresAuth(pool, cfg, passwordClock)
@@ -89,7 +108,23 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return errors.New("query store initialization failed")
 	}
-	bookingStore := bookingpostgres.New(pool)
+	bookingStore := bookingpostgres.NewWithReservationQuotaLimits(pool, bookingpostgres.ReservationQuotaLimits{
+		MaxActiveHoldsPerUser:            cfg.ReservationMaxActiveHoldsPerUser,
+		MaxActiveHoldsPerUserPerTrainRun: cfg.ReservationMaxActiveHoldsPerUserPerTrainRun,
+		MaxActivePassengersPerUser:       cfg.ReservationMaxActivePassengersPerUser,
+	})
+	policyStore, err := admissionpostgres.NewStore(pool)
+	if err != nil {
+		return errors.New("admission policy store initialization failed")
+	}
+	admissionControl, err := admissionredis.NewStore(redisClient, "railway-admission")
+	if err != nil {
+		return errors.New("admission control initialization failed")
+	}
+	executionSlots, err := app.NewExecutionSlots(cfg.ReservationMaxInflightPerInstance)
+	if err != nil {
+		return errors.New("reservation backpressure initialization failed")
+	}
 	reads := app.NewPostgresReads(pool)
 	rateLimitBackend, err := redisx.NewRateLimiter(redisClient, "railway-api")
 	if err != nil {
@@ -97,10 +132,16 @@ func run(logger *slog.Logger) error {
 	}
 
 	router := httpapi.New(httpapi.Dependencies{
-		Readiness:           app.NewReadinessChecker(pool, redisClient, cfg),
-		ReadinessTimeout:    readinessTimeout(cfg),
-		TokenParser:         tokenParser,
-		Reservations:        app.NewReservationService(bookingStore, queryStore, reads, passwordClock, cfg.HoldTTL, cfg.MaxPassengersPerReservation, metrics),
+		Readiness:        app.NewReadinessChecker(pool, redisClient, cfg),
+		ReadinessTimeout: readinessTimeout(cfg),
+		TokenParser:      tokenParser,
+		Reservations: app.NewAdmissionProtectedReservationService(
+			bookingStore, bookingStore, queryStore, reads, policyStore, admissionControl,
+			admissionKeyring, executionSlots, passwordClock, cfg.HoldTTL,
+			cfg.MaxPassengersPerReservation, metrics,
+		).WithDatabaseCommandTimeout(cfg.DatabaseTimeout),
+		WaitingRoom:         app.NewWaitingRoomService(policyStore, queryStore, admissionControl, admissionKeyring, metrics),
+		HotTrainPolicies:    app.NewHotTrainPolicyService(policyStore),
 		MaxRequestBodyBytes: maxRequestBodyBytes,
 		MaxPassengers:       cfg.MaxPassengersPerReservation,
 		HTTPMetrics:         metrics,
@@ -189,10 +230,14 @@ func publicReason(err error) string {
 		"configuration invalid",
 		"postgres configuration invalid",
 		"metrics initialization failed",
+		"admission token keyring invalid",
 		"authentication initialization failed",
 		"passenger service initialization failed",
 		"offering store initialization failed",
 		"query store initialization failed",
+		"admission policy store initialization failed",
+		"admission control initialization failed",
+		"reservation backpressure initialization failed",
 		"rate limiter initialization failed",
 		"trusted proxy configuration invalid",
 		"http listener failed",

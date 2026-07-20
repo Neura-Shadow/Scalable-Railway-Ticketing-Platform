@@ -3,6 +3,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"math"
@@ -28,9 +29,18 @@ const (
 type Process string
 
 const (
-	ProcessAPI          Process = "api"
-	ProcessHoldExpirer  Process = "hold-expirer"
-	ProcessOutboxWorker Process = "outbox-worker"
+	ProcessAPI             Process = "api"
+	ProcessHoldExpirer     Process = "hold-expirer"
+	ProcessOutboxWorker    Process = "outbox-worker"
+	ProcessAdmissionWorker Process = "admission-worker"
+)
+
+const (
+	maxReservationProtectionLimit = 10_000
+	// Keep this process-boundary validation aligned with
+	// admissionredis.MaxAdmissionBatch. Config deliberately does not import an
+	// infrastructure adapter solely to share a constant.
+	maxAdmissionWorkerBatchSize = 1_000
 )
 
 // Config contains the typed runtime settings used by the application and its
@@ -45,27 +55,40 @@ type Config struct {
 	JWTSecret     string
 	JWTIssuer     string
 	JWTAudience   string
+	// Admission token key material stays raw until the owning process builds
+	// its keyring. It is never defaulted, formatted into errors, or loaded by
+	// processes that do not issue or accept admission tokens.
+	AdmissionTokenKeyring      string
+	AdmissionTokenIssueKeyID   string
+	AdmissionTokenAcceptKeyIDs string
 
-	AccessTokenTTL                time.Duration
-	RefreshTokenTTL               time.Duration
-	BcryptCost                    int
-	HoldTTL                       time.Duration
-	MaxPassengersPerReservation   int
-	WorkerBatchSize               int
-	HoldExpirerEnabled            bool
-	HoldExpirerBatchSize          int
-	HoldExpirerInterval           time.Duration
-	OutboxPublisherEnabled        bool
-	OutboxPublisher               string
-	AllowLogPublisherInProduction bool
-	OutboxBatchSize               int
-	OutboxMaxAttempts             int
-	OutboxPollInterval            time.Duration
-	OutboxProcessingTimeout       time.Duration
-	OutboxRetryBase               time.Duration
-	OutboxRetryMax                time.Duration
-	WorkerHTTPAddress             string
-	WorkerPassTimeout             time.Duration
+	AccessTokenTTL                              time.Duration
+	RefreshTokenTTL                             time.Duration
+	BcryptCost                                  int
+	HoldTTL                                     time.Duration
+	MaxPassengersPerReservation                 int
+	WorkerBatchSize                             int
+	HoldExpirerEnabled                          bool
+	HoldExpirerBatchSize                        int
+	HoldExpirerInterval                         time.Duration
+	OutboxPublisherEnabled                      bool
+	OutboxPublisher                             string
+	AllowLogPublisherInProduction               bool
+	OutboxBatchSize                             int
+	OutboxMaxAttempts                           int
+	OutboxPollInterval                          time.Duration
+	OutboxProcessingTimeout                     time.Duration
+	OutboxRetryBase                             time.Duration
+	OutboxRetryMax                              time.Duration
+	WorkerHTTPAddress                           string
+	WorkerPassTimeout                           time.Duration
+	AdmissionWorkerEnabled                      bool
+	AdmissionWorkerBatchSize                    int
+	AdmissionWorkerPollInterval                 time.Duration
+	ReservationMaxActiveHoldsPerUser            int
+	ReservationMaxActiveHoldsPerUserPerTrainRun int
+	ReservationMaxActivePassengersPerUser       int
+	ReservationMaxInflightPerInstance           int
 
 	HTTPReadTimeout  time.Duration
 	HTTPWriteTimeout time.Duration
@@ -85,35 +108,41 @@ type LookupFunc func(key string) (string, bool)
 // invent credentials, secrets, or dependency addresses.
 func Defaults() Config {
 	return Config{
-		Environment:                 EnvironmentDevelopment,
-		HTTPAddress:                 ":8080",
-		JWTIssuer:                   "scalable-railway-ticketing-platform",
-		JWTAudience:                 "railway-api",
-		AccessTokenTTL:              15 * time.Minute,
-		RefreshTokenTTL:             7 * 24 * time.Hour,
-		BcryptCost:                  12,
-		HoldTTL:                     10 * time.Minute,
-		MaxPassengersPerReservation: 6,
-		WorkerBatchSize:             100,
-		HoldExpirerBatchSize:        50,
-		HoldExpirerInterval:         30 * time.Second,
-		OutboxPublisherEnabled:      true,
-		OutboxPublisher:             "log",
-		OutboxBatchSize:             100,
-		OutboxMaxAttempts:           5,
-		OutboxPollInterval:          2 * time.Second,
-		OutboxProcessingTimeout:     60 * time.Second,
-		OutboxRetryBase:             time.Second,
-		OutboxRetryMax:              time.Minute,
-		WorkerHTTPAddress:           ":9090",
-		WorkerPassTimeout:           60 * time.Second,
-		HTTPReadTimeout:             5 * time.Second,
-		HTTPWriteTimeout:            10 * time.Second,
-		ShutdownTimeout:             15 * time.Second,
-		DatabaseTimeout:             3 * time.Second,
-		RedisTimeout:                time.Second,
-		TrustedProxies:              []string{"127.0.0.1", "::1"},
-		CORSAllowedOrigins:          nil,
+		Environment:                      EnvironmentDevelopment,
+		HTTPAddress:                      ":8080",
+		JWTIssuer:                        "scalable-railway-ticketing-platform",
+		JWTAudience:                      "railway-api",
+		AccessTokenTTL:                   15 * time.Minute,
+		RefreshTokenTTL:                  7 * 24 * time.Hour,
+		BcryptCost:                       12,
+		HoldTTL:                          10 * time.Minute,
+		MaxPassengersPerReservation:      6,
+		ReservationMaxActiveHoldsPerUser: 10,
+		ReservationMaxActiveHoldsPerUserPerTrainRun: 3,
+		ReservationMaxActivePassengersPerUser:       24,
+		ReservationMaxInflightPerInstance:           32,
+		WorkerBatchSize:                             100,
+		HoldExpirerBatchSize:                        50,
+		HoldExpirerInterval:                         30 * time.Second,
+		OutboxPublisherEnabled:                      true,
+		OutboxPublisher:                             "log",
+		OutboxBatchSize:                             100,
+		OutboxMaxAttempts:                           5,
+		OutboxPollInterval:                          2 * time.Second,
+		OutboxProcessingTimeout:                     60 * time.Second,
+		OutboxRetryBase:                             time.Second,
+		OutboxRetryMax:                              time.Minute,
+		WorkerHTTPAddress:                           ":9090",
+		WorkerPassTimeout:                           60 * time.Second,
+		AdmissionWorkerBatchSize:                    100,
+		AdmissionWorkerPollInterval:                 250 * time.Millisecond,
+		HTTPReadTimeout:                             5 * time.Second,
+		HTTPWriteTimeout:                            10 * time.Second,
+		ShutdownTimeout:                             15 * time.Second,
+		DatabaseTimeout:                             3 * time.Second,
+		RedisTimeout:                                time.Second,
+		TrustedProxies:                              []string{"127.0.0.1", "::1"},
+		CORSAllowedOrigins:                          nil,
 	}
 }
 
@@ -131,8 +160,8 @@ func (c Config) ValidateFor(process Process) error {
 	}
 
 	var problems []error
-	if process != ProcessAPI && process != ProcessHoldExpirer && process != ProcessOutboxWorker {
-		problems = append(problems, errors.New("runtime process must be api, hold-expirer, or outbox-worker"))
+	if process != ProcessAPI && process != ProcessHoldExpirer && process != ProcessOutboxWorker && process != ProcessAdmissionWorker {
+		problems = append(problems, errors.New("runtime process must be api, hold-expirer, outbox-worker, or admission-worker"))
 	}
 	if c.Environment != EnvironmentDevelopment && c.Environment != EnvironmentTest && c.Environment != EnvironmentProduction {
 		problems = append(problems, errors.New("APP_ENV must be development, test, or production"))
@@ -162,12 +191,21 @@ func (c Config) ValidateFor(process Process) error {
 
 	switch process {
 	case ProcessAPI:
+		// Admission policies enforce a minimum five-second processing lease.
+		// Every reservation database command must end before Redis can make the
+		// same admission available for retry.
+		if c.DatabaseTimeout >= 5*time.Second {
+			problems = append(problems, errors.New("DATABASE_TIMEOUT must be less than the minimum admission processing lease of 5s"))
+		}
 		if strings.TrimSpace(c.JWTSecret) == "" {
 			problems = append(problems, errors.New("JWT_SECRET is required"))
 		} else if c.Environment == EnvironmentProduction && (len(c.JWTSecret) < 32 || isCommittedDevelopmentJWTSecret(c.JWTSecret)) {
 			problems = append(problems, errors.New("JWT_SECRET must be a non-development value containing at least 32 bytes in production"))
 		}
 		if err := validateRedisAddress(c.RedisAddress); err != nil {
+			problems = append(problems, err)
+		}
+		if err := validateAdmissionTokenKeyring(c); err != nil {
 			problems = append(problems, err)
 		}
 		validatePositive(
@@ -179,7 +217,14 @@ func (c Config) ValidateFor(process Process) error {
 			validationCheck{"HTTP_READ_TIMEOUT", c.HTTPReadTimeout > 0},
 			validationCheck{"HTTP_WRITE_TIMEOUT", c.HTTPWriteTimeout > 0},
 			validationCheck{"REDIS_TIMEOUT", c.RedisTimeout > 0},
+			validationCheck{"RESERVATION_MAX_ACTIVE_HOLDS_PER_USER", positiveBounded(c.ReservationMaxActiveHoldsPerUser, maxReservationProtectionLimit)},
+			validationCheck{"RESERVATION_MAX_ACTIVE_HOLDS_PER_USER_PER_TRAIN_RUN", positiveBounded(c.ReservationMaxActiveHoldsPerUserPerTrainRun, maxReservationProtectionLimit)},
+			validationCheck{"RESERVATION_MAX_ACTIVE_PASSENGERS_PER_USER", positiveBounded(c.ReservationMaxActivePassengersPerUser, maxReservationProtectionLimit)},
+			validationCheck{"RESERVATION_MAX_INFLIGHT_PER_INSTANCE", positiveBounded(c.ReservationMaxInflightPerInstance, maxReservationProtectionLimit)},
 		)
+		if c.ReservationMaxActiveHoldsPerUserPerTrainRun > c.ReservationMaxActiveHoldsPerUser {
+			problems = append(problems, errors.New("RESERVATION_MAX_ACTIVE_HOLDS_PER_USER_PER_TRAIN_RUN must not exceed RESERVATION_MAX_ACTIVE_HOLDS_PER_USER"))
+		}
 		for range invalidTrustedProxies(c.TrustedProxies) {
 			problems = append(problems, errors.New("TRUSTED_PROXIES entries must be IP addresses or CIDR ranges"))
 			break
@@ -228,8 +273,137 @@ func (c Config) ValidateFor(process Process) error {
 			validationCheck{"OUTBOX_RETRY_MAX_SECONDS", c.OutboxRetryMax >= c.OutboxRetryBase},
 			validationCheck{"WORKER_PASS_TIMEOUT", c.WorkerPassTimeout > 0},
 		)
+	case ProcessAdmissionWorker:
+		validateWorkerHTTP()
+		if err := validateRedisAddress(c.RedisAddress); err != nil {
+			problems = append(problems, err)
+		}
+		if err := validateAdmissionTokenKeyring(c); err != nil {
+			problems = append(problems, err)
+		}
+		validatePositive(
+			validationCheck{"REDIS_TIMEOUT", c.RedisTimeout > 0},
+			validationCheck{"ADMISSION_WORKER_BATCH_SIZE", positiveBounded(c.AdmissionWorkerBatchSize, maxAdmissionWorkerBatchSize)},
+			validationCheck{"ADMISSION_WORKER_INTERVAL_MILLISECONDS", c.AdmissionWorkerPollInterval > 0},
+			validationCheck{"WORKER_PASS_TIMEOUT", c.WorkerPassTimeout > 0},
+		)
 	}
 	return errors.Join(problems...)
+}
+
+func positiveBounded(value, maximum int) bool {
+	return value > 0 && value <= maximum
+}
+
+func validateAdmissionTokenKeyring(c Config) error {
+	var missing []error
+	if strings.TrimSpace(c.AdmissionTokenKeyring) == "" {
+		missing = append(missing, errors.New("ADMISSION_TOKEN_KEYRING is required"))
+	}
+	if strings.TrimSpace(c.AdmissionTokenIssueKeyID) == "" {
+		missing = append(missing, errors.New("ADMISSION_TOKEN_ISSUE_KEY_ID is required"))
+	}
+	if strings.TrimSpace(c.AdmissionTokenAcceptKeyIDs) == "" {
+		missing = append(missing, errors.New("ADMISSION_TOKEN_ACCEPT_KEY_IDS is required"))
+	}
+	if len(missing) > 0 {
+		return errors.Join(missing...)
+	}
+
+	keys := make(map[string]struct{})
+	entries := splitList(c.AdmissionTokenKeyring)
+	if len(entries) == 0 || len(entries) > 8 {
+		return errors.New("ADMISSION_TOKEN_KEYRING must contain between one and eight keys")
+	}
+	for _, entry := range entries {
+		parts := strings.SplitN(entry, "=", 2)
+		if len(parts) != 2 || !validAdmissionKeyID(parts[0]) {
+			return errors.New("ADMISSION_TOKEN_KEYRING must use key-id=base64url entries")
+		}
+		material, err := base64.RawURLEncoding.DecodeString(parts[1])
+		if err != nil || len(material) != 32 {
+			return errors.New("ADMISSION_TOKEN_KEYRING entries must decode to exactly 32 bytes")
+		}
+		if _, duplicate := keys[parts[0]]; duplicate {
+			return errors.New("ADMISSION_TOKEN_KEYRING key IDs must be unique")
+		}
+		keys[parts[0]] = struct{}{}
+	}
+
+	issueID := strings.TrimSpace(c.AdmissionTokenIssueKeyID)
+	if _, ok := keys[issueID]; !ok {
+		return errors.New("ADMISSION_TOKEN_ISSUE_KEY_ID must name a configured key")
+	}
+	acceptIDs := splitList(c.AdmissionTokenAcceptKeyIDs)
+	if len(acceptIDs) == 0 || len(acceptIDs) > len(keys) {
+		return errors.New("ADMISSION_TOKEN_ACCEPT_KEY_IDS must name configured keys")
+	}
+	accepted := make(map[string]struct{}, len(acceptIDs))
+	for _, keyID := range acceptIDs {
+		if !validAdmissionKeyID(keyID) {
+			return errors.New("ADMISSION_TOKEN_ACCEPT_KEY_IDS contains an invalid key ID")
+		}
+		if _, ok := keys[keyID]; !ok {
+			return errors.New("ADMISSION_TOKEN_ACCEPT_KEY_IDS must name configured keys")
+		}
+		if _, duplicate := accepted[keyID]; duplicate {
+			return errors.New("ADMISSION_TOKEN_ACCEPT_KEY_IDS must not contain duplicates")
+		}
+		accepted[keyID] = struct{}{}
+	}
+	if _, ok := accepted[issueID]; !ok {
+		return errors.New("ADMISSION_TOKEN_ISSUE_KEY_ID must also be accepted")
+	}
+	return nil
+}
+
+type AdmissionTokenKeySelection struct {
+	IssueKeyID string
+	// AcceptKeys intentionally excludes configured key material that is not in
+	// ADMISSION_TOKEN_ACCEPT_KEY_IDS. Callers must not infer acceptance from
+	// mere keyring presence.
+	AcceptKeys map[string][32]byte
+}
+
+// ParseAdmissionTokenKeys returns only explicitly accepted key material after
+// applying the same fail-closed validation used by API and worker readiness.
+func (c Config) ParseAdmissionTokenKeys() (AdmissionTokenKeySelection, error) {
+	if err := validateAdmissionTokenKeyring(c); err != nil {
+		return AdmissionTokenKeySelection{}, err
+	}
+	all := make(map[string][32]byte)
+	for _, entry := range splitList(c.AdmissionTokenKeyring) {
+		parts := strings.SplitN(entry, "=", 2)
+		material, err := base64.RawURLEncoding.DecodeString(parts[1])
+		if err != nil || len(material) != 32 {
+			return AdmissionTokenKeySelection{}, errors.New("ADMISSION_TOKEN_KEYRING entries must decode to exactly 32 bytes")
+		}
+		var key [32]byte
+		copy(key[:], material)
+		all[parts[0]] = key
+	}
+	selection := AdmissionTokenKeySelection{
+		IssueKeyID: strings.TrimSpace(c.AdmissionTokenIssueKeyID),
+		AcceptKeys: make(map[string][32]byte),
+	}
+	for _, keyID := range splitList(c.AdmissionTokenAcceptKeyIDs) {
+		selection.AcceptKeys[keyID] = all[keyID]
+	}
+	return selection, nil
+}
+
+func validAdmissionKeyID(value string) bool {
+	if len(value) < 1 || len(value) > 32 {
+		return false
+	}
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || char == '-' || char == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func invalidTrustedProxies(values []string) []string {
@@ -361,8 +535,10 @@ func LoadFromFor(lookup LookupFunc, process Process) (Config, error) {
 		err = loadHoldExpirerSettings(lookup, &cfg)
 	case ProcessOutboxWorker:
 		err = loadOutboxSettings(lookup, &cfg)
+	case ProcessAdmissionWorker:
+		err = loadAdmissionWorkerSettings(lookup, &cfg)
 	default:
-		err = errors.New("runtime process must be api, hold-expirer, or outbox-worker")
+		err = errors.New("runtime process must be api, hold-expirer, outbox-worker, or admission-worker")
 	}
 	if err != nil {
 		return Config{}, err
@@ -382,6 +558,7 @@ func loadAPISettings(lookup LookupFunc, cfg *Config) error {
 	setString(lookup, "JWT_SECRET", &cfg.JWTSecret)
 	setString(lookup, "JWT_ISSUER", &cfg.JWTIssuer)
 	setString(lookup, "JWT_AUDIENCE", &cfg.JWTAudience)
+	loadAdmissionTokenSettings(lookup, cfg)
 	for _, item := range []struct {
 		name   string
 		target *time.Duration
@@ -407,6 +584,10 @@ func loadAPISettings(lookup LookupFunc, cfg *Config) error {
 		{"MAX_PASSENGERS_PER_RESERVATION", &cfg.MaxPassengersPerReservation},
 		{"RESERVATION_MAX_PASSENGERS", &cfg.MaxPassengersPerReservation},
 		{"BCRYPT_COST", &cfg.BcryptCost},
+		{"RESERVATION_MAX_ACTIVE_HOLDS_PER_USER", &cfg.ReservationMaxActiveHoldsPerUser},
+		{"RESERVATION_MAX_ACTIVE_HOLDS_PER_USER_PER_TRAIN_RUN", &cfg.ReservationMaxActiveHoldsPerUserPerTrainRun},
+		{"RESERVATION_MAX_ACTIVE_PASSENGERS_PER_USER", &cfg.ReservationMaxActivePassengersPerUser},
+		{"RESERVATION_MAX_INFLIGHT_PER_INSTANCE", &cfg.ReservationMaxInflightPerInstance},
 	} {
 		if err := setInt(lookup, item.name, item.target); err != nil {
 			return err
@@ -419,6 +600,36 @@ func loadAPISettings(lookup LookupFunc, cfg *Config) error {
 		cfg.CORSAllowedOrigins = splitList(value)
 	}
 	return nil
+}
+
+func loadAdmissionWorkerSettings(lookup LookupFunc, cfg *Config) error {
+	setString(lookup, "WORKER_HTTP_ADDRESS", &cfg.WorkerHTTPAddress)
+	setString(lookup, "REDIS_ADDRESS", &cfg.RedisAddress)
+	setString(lookup, "REDIS_ADDR", &cfg.RedisAddress)
+	setString(lookup, "REDIS_PASSWORD", &cfg.RedisPassword)
+	loadAdmissionTokenSettings(lookup, cfg)
+	if err := setBool(lookup, "ADMISSION_WORKER_ENABLED", &cfg.AdmissionWorkerEnabled); err != nil {
+		return err
+	}
+	if err := setInt(lookup, "ADMISSION_WORKER_BATCH_SIZE", &cfg.AdmissionWorkerBatchSize); err != nil {
+		return err
+	}
+	if err := setDuration(lookup, "ADMISSION_WORKER_POLL_INTERVAL", &cfg.AdmissionWorkerPollInterval); err != nil {
+		return err
+	}
+	if err := setMilliseconds(lookup, "ADMISSION_WORKER_INTERVAL_MILLISECONDS", &cfg.AdmissionWorkerPollInterval); err != nil {
+		return err
+	}
+	if err := setDuration(lookup, "REDIS_TIMEOUT", &cfg.RedisTimeout); err != nil {
+		return err
+	}
+	return setDuration(lookup, "WORKER_PASS_TIMEOUT", &cfg.WorkerPassTimeout)
+}
+
+func loadAdmissionTokenSettings(lookup LookupFunc, cfg *Config) {
+	setString(lookup, "ADMISSION_TOKEN_KEYRING", &cfg.AdmissionTokenKeyring)
+	setString(lookup, "ADMISSION_TOKEN_ISSUE_KEY_ID", &cfg.AdmissionTokenIssueKeyID)
+	setString(lookup, "ADMISSION_TOKEN_ACCEPT_KEY_IDS", &cfg.AdmissionTokenAcceptKeyIDs)
 }
 
 func loadHoldExpirerSettings(lookup LookupFunc, cfg *Config) error {
@@ -511,6 +722,20 @@ func setSeconds(lookup LookupFunc, name string, target *time.Duration) error {
 		return fmt.Errorf("config: %s must be an integer number of seconds", name)
 	}
 	*target = time.Duration(seconds) * time.Second
+	return nil
+}
+
+func setMilliseconds(lookup LookupFunc, name string, target *time.Duration) error {
+	value, ok := lookup(name)
+	if !ok {
+		return nil
+	}
+	milliseconds, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil || milliseconds > math.MaxInt64/int64(time.Millisecond) ||
+		milliseconds < math.MinInt64/int64(time.Millisecond) {
+		return fmt.Errorf("config: %s must be an integer number of milliseconds", name)
+	}
+	*target = time.Duration(milliseconds) * time.Millisecond
 	return nil
 }
 
