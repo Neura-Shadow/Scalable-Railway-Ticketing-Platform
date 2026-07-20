@@ -1,6 +1,6 @@
 # Multi-Replica Admission Design
 
-`docker-compose.multi-replica.yml` is a local production-like evidence
+`docker-compose.multi-replica.yml` is a bounded functional evidence
 topology, not a production deployment manifest:
 
 ```text
@@ -59,8 +59,8 @@ The evidence plan must validate:
 2. duplicate identical joins through different APIs return one entry;
 3. queue and token state is shared;
 4. two workers do not double-issue and remain within rate/inflight bounds;
-5. terminating one API leaves other replicas usable and preserves the shared
-   queue entry;
+5. terminating one API leaves both survivors ready before and after the
+   load-balancer probe and preserves the shared queue entry;
 6. a deterministic request routed directly to `api-1`, while PostgreSQL proves
    it is blocked inside the hot reservation transaction, rolls back completely
    when that replica is terminated;
@@ -81,9 +81,10 @@ v2 behavior. The committed admission key is obviously synthetic local material.
 Never reuse it outside this isolated environment.
 
 The evidence-only load balancer and direct `api-1` endpoint bind to
-Compose-assigned ephemeral `127.0.0.1` ports. The harness resolves those
-published ports at runtime; it does not expose the other API replicas directly
-or reserve a fixed host port.
+Compose-assigned ephemeral `127.0.0.1` ports for Windows/Docker Desktop. On
+Linux hosts, the harness instead resolves their private addresses on the
+isolated Compose bridge and avoids the host-published NAT path. It does not
+expose the other API replicas directly or reserve a fixed host port.
 
 This topology does not prove multi-region behavior, regional Redis
 replication, global fairness, national-scale capacity, or production sizing.

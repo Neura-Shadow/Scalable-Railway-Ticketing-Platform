@@ -79,9 +79,12 @@ a clean non-hot reservation still creates exactly one PostgreSQL reservation.
 It then restores Redis, waits for API and both workers, runs hot and non-hot
 seat reconciliation plus quota/admission reconciliation, writes sanitized
 artifacts under the operating-system temporary directory, and removes the
-project and its volumes by default. The load balancer and the direct `api-1`
-booking probe use Compose-assigned ephemeral loopback ports, so parallel or
-unrelated local services do not compete for a fixed host port.
+project and its volumes by default. On Linux hosts, the load balancer and the
+direct `api-1` booking probe use their private addresses on the isolated
+Compose bridge. On Windows/Docker Desktop, the same probes use
+Compose-assigned ephemeral loopback ports. Neither path competes for a fixed
+host port, and the Linux CI path avoids relying on host-published NAT while a
+bounded load is running.
 
 Nginx may report a comma-delimited `$upstream_addr` retry chain. The harness
 counts only the final successful address, requires exactly three addresses in
@@ -90,8 +93,8 @@ in a separate post-restart probe within a 30-second bounded recovery window.
 Phase-local sets allow a restarted container to receive a new private address
 without being miscounted as a fourth replica.
 It also checks both surviving services' `/readyz` endpoints directly before
-the load-balancer probe. Retry-chain strings are never counted as additional
-replicas.
+and after the load-balancer probe. Retry-chain strings are never counted as
+additional replicas.
 
 The bounded evidence Nginx configuration deliberately avoids upstream
 connection reuse so each `X-Upstream-Addr` value represents a fresh
