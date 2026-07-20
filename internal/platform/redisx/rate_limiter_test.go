@@ -20,7 +20,13 @@ func TestRateLimiterLuaCounterIsAtomicAndBounded(t *testing.T) {
 }
 
 func TestRateLimiterOperationAllowlistIncludesEveryTransportPolicy(t *testing.T) {
-	for _, operation := range []string{"register", "login", "reservation_create", "passenger_create"} {
+	for _, operation := range []string{
+		"register",
+		"login",
+		"reservation_create",
+		"passenger_create",
+		"hot_train_policy_mutation",
+	} {
 		if normalized := normalizeOperation(operation); normalized != operation {
 			t.Fatalf("normalizeOperation(%q) = %q", operation, normalized)
 		}
