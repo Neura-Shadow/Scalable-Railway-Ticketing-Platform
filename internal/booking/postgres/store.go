@@ -15,25 +15,33 @@ import (
 )
 
 var (
-	ErrInvalidArgument       = errors.New("invalid booking store argument")
-	ErrInsufficientInventory = errors.New("insufficient seat inventory")
-	ErrNotFound              = errors.New("booking resource not found")
-	ErrNotBookable           = errors.New("train run is not bookable")
-	ErrReservationExpired    = errors.New("reservation expired")
-	ErrPassengerConflict     = errors.New("passenger already has an active reservation for this train run")
-	ErrInvalidState          = errors.New("invalid reservation state")
-	ErrPersistenceInvariant  = errors.New("booking persistence invariant violated")
+	ErrInvalidArgument          = errors.New("invalid booking store argument")
+	ErrInsufficientInventory    = errors.New("insufficient seat inventory")
+	ErrNotFound                 = errors.New("booking resource not found")
+	ErrNotBookable              = errors.New("train run is not bookable")
+	ErrReservationExpired       = errors.New("reservation expired")
+	ErrPassengerConflict        = errors.New("passenger already has an active reservation for this train run")
+	ErrReservationQuotaExceeded = errors.New("reservation_quota_exceeded")
+	ErrAdmissionRequired        = errors.New("hot-train admission required")
+	ErrAdmissionPolicyChanged   = errors.New("hot-train admission policy changed")
+	ErrInvalidState             = errors.New("invalid reservation state")
+	ErrPersistenceInvariant     = errors.New("booking persistence invariant violated")
 )
 
 // Store is the PostgreSQL authority for Booking commands. The exported
 // transaction seam exists for the Offering commissioning workflow and focused
 // concurrency tests; customer commands should use the Store command methods.
 type Store struct {
-	pool *pgxpool.Pool
+	pool                   *pgxpool.Pool
+	reservationQuotaLimits ReservationQuotaLimits
 }
 
 func New(pool *pgxpool.Pool) *Store {
-	return &Store{pool: pool}
+	return NewWithReservationQuotaLimits(pool, DefaultReservationQuotaLimits())
+}
+
+func NewWithReservationQuotaLimits(pool *pgxpool.Pool, limits ReservationQuotaLimits) *Store {
+	return &Store{pool: pool, reservationQuotaLimits: limits}
 }
 
 func isRetryableTransactionError(err error) bool {

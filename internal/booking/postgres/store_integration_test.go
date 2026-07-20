@@ -385,6 +385,13 @@ func TestInventoryRejectsSeatFromDifferentTrain(t *testing.T) {
 
 func TestConcurrentHoldsNeverExceedSeatCapacity(t *testing.T) {
 	store, fixture := newIntegrationFixture(t, 10)
+	// This test isolates the seat-capacity invariant. Quota concurrency has
+	// dedicated tests, so keep its independent bound above the attempt count.
+	store = NewWithReservationQuotaLimits(store.pool, ReservationQuotaLimits{
+		MaxActiveHoldsPerUser:            200,
+		MaxActiveHoldsPerUserPerTrainRun: 200,
+		MaxActivePassengersPerUser:       200,
+	})
 	ctx := context.Background()
 	if _, err := store.InitializeInventory(ctx, fixture.trainRunID); err != nil {
 		t.Fatalf("initialize inventory: %v", err)
@@ -445,7 +452,7 @@ func TestConcurrentSameIdempotencyKeyReturnsOneReservation(t *testing.T) {
 		IdempotencyKeyHash: hashWithByte(0xa1), RequestFingerprint: hashWithByte(0xa2),
 		IdempotencyExpiresAt: time.Now().UTC().Add(24 * time.Hour),
 	}
-	const attempts = 12
+	const attempts = 100
 	start := make(chan struct{})
 	results := make(chan CreateHoldResult, attempts)
 	errorsFound := make(chan error, attempts)

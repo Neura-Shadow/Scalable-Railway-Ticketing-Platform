@@ -39,6 +39,73 @@ type IdempotencyAcquisition struct {
 	ResourceID uuid.UUID
 }
 
+type CompletedCreateHoldLookupParams struct {
+	UserID             uuid.UUID
+	IdempotencyKeyHash []byte
+	RequestFingerprint []byte
+}
+
+// LookupCompletedCreateHold performs a bounded read-only replay probe. It does
+// not acquire or create an idempotency record, so missing, expired, and
+// in-progress commands cannot bypass admission or enter booking execution.
+func (s *Store) LookupCompletedCreateHold(
+	ctx context.Context,
+	params CompletedCreateHoldLookupParams,
+) (CreateHoldResult, bool, error) {
+	if s == nil || s.pool == nil || params.UserID == uuid.Nil ||
+		len(params.IdempotencyKeyHash) != 32 || len(params.RequestFingerprint) != 32 {
+		return CreateHoldResult{}, false, ErrInvalidArgument
+	}
+
+	var (
+		fingerprint   []byte
+		status        string
+		resourceID    *uuid.UUID
+		reservationID *uuid.UUID
+		totalAmount   *int64
+		currency      *string
+		seatCount     *int
+	)
+	err := s.pool.QueryRow(ctx, `
+SELECT ir.request_fingerprint, ir.status, ir.resource_id,
+       r.id, r.total_amount_minor, r.currency,
+       (SELECT count(*) FROM reservation_seats AS rs WHERE rs.reservation_id = r.id)
+FROM idempotency_records AS ir
+LEFT JOIN reservations AS r
+  ON r.id = ir.resource_id
+ AND r.user_id = ir.user_id
+WHERE ir.user_id = $1
+  AND ir.operation = 'reservation.create'
+  AND ir.key_hash = $2
+  AND ir.expires_at > clock_timestamp()`,
+		params.UserID, params.IdempotencyKeyHash,
+	).Scan(
+		&fingerprint, &status, &resourceID,
+		&reservationID, &totalAmount, &currency, &seatCount,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return CreateHoldResult{}, false, nil
+		}
+		return CreateHoldResult{}, false, fmt.Errorf("lookup completed create hold: %w", err)
+	}
+	if status != "completed" {
+		return CreateHoldResult{}, false, nil
+	}
+	if !bytes.Equal(fingerprint, params.RequestFingerprint) {
+		return CreateHoldResult{}, false, ErrIdempotencyConflict
+	}
+	if resourceID == nil || reservationID == nil || totalAmount == nil || currency == nil || seatCount == nil ||
+		*resourceID == uuid.Nil || *reservationID != *resourceID {
+		return CreateHoldResult{}, false, ErrPersistenceInvariant
+	}
+	result := CreateHoldResult{
+		ReservationID: *reservationID, TotalAmountMinor: *totalAmount,
+		Currency: *currency, SeatCount: *seatCount, Replayed: true,
+	}
+	return result, true, nil
+}
+
 func (tx *Tx) AcquireIdempotency(ctx context.Context, input IdempotencyInput) (IdempotencyAcquisition, error) {
 	if tx == nil || tx.tx == nil || input.UserID == uuid.Nil || !validOperation(input.Operation) ||
 		len(input.KeyHash) != 32 || len(input.RequestFingerprint) != 32 || input.ExpiresAt.IsZero() {

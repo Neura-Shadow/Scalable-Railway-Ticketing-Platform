@@ -25,6 +25,7 @@ type CreateHoldParams struct {
 	IdempotencyKeyHash   []byte
 	RequestFingerprint   []byte
 	IdempotencyExpiresAt time.Time
+	AdmissionPolicy      *AdmissionPolicyDecision
 }
 
 type CreateHoldResult struct {
@@ -123,6 +124,12 @@ func (s *Store) createHoldOnce(ctx context.Context, params CreateHoldParams) (Cr
 			return CreateHoldResult{}, err
 		}
 		return result, nil
+	}
+	if err := tx.recheckAdmissionPolicy(ctx, params.TrainRunID, seatClass, params.AdmissionPolicy); err != nil {
+		return CreateHoldResult{}, err
+	}
+	if err := tx.enforceReservationQuota(ctx, params.UserID, params.TrainRunID, len(passengerIDs), s.reservationQuotaLimits); err != nil {
+		return CreateHoldResult{}, err
 	}
 
 	var (
@@ -777,6 +784,10 @@ func validateCreateHoldParams(params CreateHoldParams) error {
 		if id == uuid.Nil {
 			return ErrInvalidArgument
 		}
+	}
+	if params.AdmissionPolicy != nil &&
+		(params.AdmissionPolicy.PolicyID == uuid.Nil || params.AdmissionPolicy.Version < 1) {
+		return ErrInvalidArgument
 	}
 	return nil
 }
