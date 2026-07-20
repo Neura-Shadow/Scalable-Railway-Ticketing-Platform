@@ -233,6 +233,19 @@ jobs:
             -SteadyStateDuration 30s `
             -EvidenceDirectory $evidence
           Get-Content -Raw (Join-Path $evidence 'evidence-summary.json')
+      - name: Print bounded multi-replica failure diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP 'milestone-2-evidence'
+          foreach ($name in @('compose-failure-ps.log', 'load-balancer-failure.log')) {
+            $path = Join-Path $evidence $name
+            if (Test-Path -LiteralPath $path) {
+              Write-Host "::group::$name"
+              Get-Content -LiteralPath $path
+              Write-Host '::endgroup::'
+            }
+          }
 
   container:
     name: Container build and image scan

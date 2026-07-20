@@ -1107,6 +1107,7 @@ try {
 
     Write-Host "Running the bounded $SteadyStateDuration multi-replica k6 smoke"
     Invoke-K6SteadyState
+    Wait-APIReady -Attempts 30
 
     Write-Host 'Resolving one shared queue entry per customer through the load balancer'
     foreach ($customer in $customers) {
@@ -1663,6 +1664,24 @@ try {
         Out-File -FilePath (Join-Path $EvidenceDirectory 'evidence-summary.json') -Encoding utf8
     $succeeded = $true
     Write-Host "Milestone 2 evidence passed; sanitized artifacts: $EvidenceDirectory"
+} catch {
+    $failure = $_
+    if ($started) {
+        try {
+            Invoke-DockerCompose -Arguments @('ps', '-a') `
+                -CapturePath (Join-Path $EvidenceDirectory 'compose-failure-ps.log') | Out-Null
+        } catch {
+            Write-Warning 'could not capture bounded Compose failure state'
+        }
+        try {
+            Invoke-DockerCompose -Arguments @(
+                'logs', '--no-color', '--tail', '200', 'load-balancer'
+            ) -CapturePath (Join-Path $EvidenceDirectory 'load-balancer-failure.log') | Out-Null
+        } catch {
+            Write-Warning 'could not capture bounded load-balancer failure logs'
+        }
+    }
+    throw $failure
 } finally {
     if ($null -ne $bookingHttpAttempt) {
         try {
