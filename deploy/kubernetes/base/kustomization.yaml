@@ -7,5 +7,6 @@ resources:
   - api-deployment.yaml
   - api-service.yaml
   - api-pdb.yaml
+  - admission-worker-deployment.yaml
   - hold-expirer-deployment.yaml
   - outbox-worker-deployment.yaml

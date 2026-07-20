@@ -52,8 +52,16 @@ services:
       JWT_SECRET: ${JWT_SECRET:-local-development-secret-change-me-123456789}
       JWT_ISSUER: scalable-railway-ticketing-platform
       JWT_AUDIENCE: railway-api
+      # Synthetic local-only key. Production must inject a distinct 32-byte keyring.
+      ADMISSION_TOKEN_KEYRING: ${ADMISSION_TOKEN_KEYRING:-local-current=a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s}
+      ADMISSION_TOKEN_ISSUE_KEY_ID: ${ADMISSION_TOKEN_ISSUE_KEY_ID:-local-current}
+      ADMISSION_TOKEN_ACCEPT_KEY_IDS: ${ADMISSION_TOKEN_ACCEPT_KEY_IDS:-local-current}
       RESERVATION_HOLD_TTL_SECONDS: 600
       RESERVATION_MAX_PASSENGERS: 6
+      RESERVATION_MAX_ACTIVE_HOLDS_PER_USER: 10
+      RESERVATION_MAX_ACTIVE_HOLDS_PER_USER_PER_TRAIN_RUN: 3
+      RESERVATION_MAX_ACTIVE_PASSENGERS_PER_USER: 24
+      RESERVATION_MAX_INFLIGHT_PER_INSTANCE: 32
       TRUSTED_PROXIES: 127.0.0.1
     depends_on:
       migrate:
@@ -65,6 +73,37 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    restart: unless-stopped
+
+  admission-worker:
+    profiles: ["workers"]
+    build:
+      context: .
+      target: admission-worker
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
+      REDIS_ADDR: redis:6379
+      ADMISSION_WORKER_ENABLED: "true"
+      ADMISSION_WORKER_BATCH_SIZE: 100
+      ADMISSION_WORKER_INTERVAL_MILLISECONDS: 250
+      # Must match the API for local token issuance and verification.
+      ADMISSION_TOKEN_KEYRING: ${ADMISSION_TOKEN_KEYRING:-local-current=a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s}
+      ADMISSION_TOKEN_ISSUE_KEY_ID: ${ADMISSION_TOKEN_ISSUE_KEY_ID:-local-current}
+      ADMISSION_TOKEN_ACCEPT_KEY_IDS: ${ADMISSION_TOKEN_ACCEPT_KEY_IDS:-local-current}
+      WORKER_HTTP_ADDRESS: :9090
+      WORKER_PASS_TIMEOUT: 60s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    read_only: true
     security_opt:
       - no-new-privileges:true
     cap_drop:

@@ -1,0 +1,245 @@
+name: scalable-railway-ticketing-platform-multi-replica
+
+x-api-common: &api-common
+  build:
+    context: .
+    target: api
+  environment: &api-environment
+    APP_ENV: development
+    HTTP_ADDR: :8080
+    DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
+    REDIS_ADDR: redis:6379
+    JWT_SECRET: ${JWT_SECRET:-local-development-secret-change-me-123456789}
+    JWT_ISSUER: scalable-railway-ticketing-platform
+    JWT_AUDIENCE: railway-api
+    ADMISSION_TOKEN_KEYRING: ${ADMISSION_TOKEN_KEYRING:-local-current=a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s}
+    ADMISSION_TOKEN_ISSUE_KEY_ID: ${ADMISSION_TOKEN_ISSUE_KEY_ID:-local-current}
+    ADMISSION_TOKEN_ACCEPT_KEY_IDS: ${ADMISSION_TOKEN_ACCEPT_KEY_IDS:-local-current}
+    RESERVATION_HOLD_TTL_SECONDS: 600
+    RESERVATION_MAX_PASSENGERS: 6
+    RESERVATION_MAX_ACTIVE_HOLDS_PER_USER: 10
+    RESERVATION_MAX_ACTIVE_HOLDS_PER_USER_PER_TRAIN_RUN: 3
+    RESERVATION_MAX_ACTIVE_PASSENGERS_PER_USER: 24
+    RESERVATION_MAX_INFLIGHT_PER_INSTANCE: 32
+    TRUSTED_PROXIES: 0.0.0.0/0
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  init: true
+  restart: unless-stopped
+
+x-admission-worker-common: &admission-worker-common
+  build:
+    context: .
+    target: admission-worker
+  environment: &admission-worker-environment
+    APP_ENV: development
+    DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
+    REDIS_ADDR: redis:6379
+    ADMISSION_WORKER_ENABLED: "true"
+    ADMISSION_WORKER_BATCH_SIZE: 100
+    ADMISSION_WORKER_INTERVAL_MILLISECONDS: 250
+    ADMISSION_TOKEN_KEYRING: ${ADMISSION_TOKEN_KEYRING:-local-current=a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s}
+    ADMISSION_TOKEN_ISSUE_KEY_ID: ${ADMISSION_TOKEN_ISSUE_KEY_ID:-local-current}
+    ADMISSION_TOKEN_ACCEPT_KEY_IDS: ${ADMISSION_TOKEN_ACCEPT_KEY_IDS:-local-current}
+    WORKER_HTTP_ADDRESS: :9090
+    WORKER_PASS_TIMEOUT: 60s
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  init: true
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: railway
+      POSTGRES_USER: railway
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-railway-local}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U railway -d railway"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres-multi-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - redis-multi-data:/data
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: .
+      target: migrate
+    environment:
+      DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
+    command: ["up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api-1:
+    <<: *api-common
+    ports:
+      - "127.0.0.1::8080"
+
+  api-2:
+    <<: *api-common
+
+  api-3:
+    <<: *api-common
+
+  admission-worker-1:
+    <<: *admission-worker-common
+
+  admission-worker-2:
+    <<: *admission-worker-common
+
+  hold-expirer:
+    build:
+      context: .
+      target: hold-expirer
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
+      HOLD_EXPIRER_ENABLED: "true"
+      HOLD_EXPIRER_BATCH_SIZE: 50
+      HOLD_EXPIRER_INTERVAL_SECONDS: 30
+      WORKER_HTTP_ADDRESS: :9090
+      WORKER_PASS_TIMEOUT: 60s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    restart: unless-stopped
+
+  outbox-worker:
+    build:
+      context: .
+      target: outbox-worker
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
+      OUTBOX_PUBLISHER_ENABLED: "true"
+      OUTBOX_PUBLISHER: log
+      OUTBOX_BATCH_SIZE: 100
+      OUTBOX_POLL_INTERVAL_SECONDS: 2
+      WORKER_HTTP_ADDRESS: :9090
+      WORKER_PASS_TIMEOUT: 60s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    restart: unless-stopped
+
+  load-balancer:
+    image: nginx:1.29-alpine
+    user: "101:101"
+    depends_on:
+      - api-1
+      - api-2
+      - api-3
+    ports:
+      - "127.0.0.1::8080"
+    volumes:
+      - ./deploy/nginx/multi-replica.conf:/etc/nginx/nginx.conf:ro
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:size=16m,mode=0755,uid=101,gid=101
+      - /var/run:size=1m,mode=0755,uid=101,gid=101
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+  reconcile:
+    build:
+      context: .
+      target: reconcile
+    profiles:
+      - tools
+    environment:
+      DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
+      REDIS_ADDR: redis:6379
+      RESERVATION_MAX_ACTIVE_HOLDS_PER_USER: 10
+      RESERVATION_MAX_ACTIVE_HOLDS_PER_USER_PER_TRAIN_RUN: 3
+      RESERVATION_MAX_ACTIVE_PASSENGERS_PER_USER: 24
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    restart: "no"
+
+  k6:
+    image: grafana/k6:0.54.0
+    profiles:
+      - tools
+    working_dir: /scripts
+    volumes:
+      - ./loadtest/k6:/scripts:ro
+    depends_on:
+      - load-balancer
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    restart: "no"
+
+volumes:
+  postgres-multi-data:
+  redis-multi-data:

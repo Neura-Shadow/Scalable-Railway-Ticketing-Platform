@@ -7,8 +7,16 @@ data:
   HTTP_ADDR: ":8080"
   JWT_ISSUER: scalable-railway-ticketing-platform
   JWT_AUDIENCE: railway-api
+  DATABASE_TIMEOUT: "3s"
+  REDIS_TIMEOUT: "1s"
   RESERVATION_HOLD_TTL_SECONDS: "600"
   RESERVATION_MAX_PASSENGERS: "6"
+  RESERVATION_MAX_ACTIVE_HOLDS_PER_USER: "10"
+  RESERVATION_MAX_ACTIVE_HOLDS_PER_USER_PER_TRAIN_RUN: "3"
+  RESERVATION_MAX_ACTIVE_PASSENGERS_PER_USER: "24"
+  RESERVATION_MAX_INFLIGHT_PER_INSTANCE: "32"
+  ADMISSION_TOKEN_ISSUE_KEY_ID: current
+  ADMISSION_TOKEN_ACCEPT_KEY_IDS: current
   # A production overlay must replace this with only the exact ingress/proxy
   # addresses or narrow CIDRs used by the target cluster.
   TRUSTED_PROXIES: "127.0.0.1,::1"
@@ -23,6 +31,24 @@ data:
   HOLD_EXPIRER_ENABLED: "true"
   HOLD_EXPIRER_BATCH_SIZE: "50"
   HOLD_EXPIRER_INTERVAL_SECONDS: "30"
+  WORKER_HTTP_ADDRESS: ":9090"
+  WORKER_PASS_TIMEOUT: "60s"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: railway-admission-worker-config
+data:
+  APP_ENV: production
+  # This baseline starts the process only for health and dependency checks.
+  # A reviewed single-region overlay must explicitly enable admission.
+  ADMISSION_WORKER_ENABLED: "false"
+  ADMISSION_WORKER_BATCH_SIZE: "100"
+  ADMISSION_WORKER_INTERVAL_MILLISECONDS: "250"
+  ADMISSION_TOKEN_ISSUE_KEY_ID: current
+  ADMISSION_TOKEN_ACCEPT_KEY_IDS: current
+  DATABASE_TIMEOUT: "3s"
+  REDIS_TIMEOUT: "1s"
   WORKER_HTTP_ADDRESS: ":9090"
   WORKER_PASS_TIMEOUT: "60s"
 ---
