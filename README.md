@@ -190,12 +190,10 @@ Invoke-RestMethod "http://127.0.0.1:$loadBalancerPort/livez"
 Invoke-RestMethod "http://127.0.0.1:$loadBalancerPort/readyz"
 ```
 
-On Linux, the multi-replica harness reaches its evidence-only endpoints through
-the isolated Compose bridge. On Windows/Docker Desktop, it resolves
-Compose-assigned ephemeral loopback ports. Both paths avoid fixed host-port
-collisions. The bounded automated procedure is documented in
-[Milestone 2 load testing](docs/milestone-2-load-testing.md). Compose
-credentials are explicit local-development defaults only. There is no
+The multi-replica load balancer uses a Compose-assigned ephemeral loopback port
+so parallel evidence projects cannot collide. The bounded automated procedure
+is documented in [Milestone 2 load testing](docs/milestone-2-load-testing.md).
+Compose credentials are explicit local-development defaults only. There is no
 committed production secret, default production database, or production-ready
 customer bootstrap token.
 

@@ -56,14 +56,6 @@ $seatClass = 'standard'
 $configuredAdmissionRate = 5
 $configuredInflightLimit = 5
 $baseURL = ''
-$useDockerBridgeTransport = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
-    [System.Runtime.InteropServices.OSPlatform]::Linux
-)
-$orchestrationTransport = if ($useDockerBridgeTransport) {
-    'docker_bridge'
-} else {
-    'published_loopback'
-}
 $composeArguments = @('compose', '-p', $ProjectName, '-f', $composeFile)
 $environmentNames = @(
     'BASE_URL',
@@ -221,11 +213,12 @@ function Invoke-API {
     }
 
     $parameters = @{
-        Uri             = "$($RequestBaseURL.TrimEnd('/'))$Path"
-        Method          = $Method
-        Headers         = $requestHeaders
-        UseBasicParsing = $true
-        TimeoutSec      = 15
+        Uri              = "$($RequestBaseURL.TrimEnd('/'))$Path"
+        Method           = $Method
+        Headers          = $requestHeaders
+        UseBasicParsing  = $true
+        TimeoutSec       = 15
+        DisableKeepAlive = $true
     }
     if (-not [string]::IsNullOrWhiteSpace($BodyJSON)) {
         $parameters.Body = $BodyJSON
@@ -260,66 +253,6 @@ function Get-PublishedServiceBaseURL {
         throw "could not parse the published HTTP endpoint for $Service"
     }
     return "http://127.0.0.1:$($match.Groups['port'].Value)"
-}
-
-function Get-DockerBridgeServiceBaseURL {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Service
-    )
-
-    $containerProbe = Invoke-NativeProbe -Command {
-        & docker @script:composeArguments ps --status running -q $Service
-    }
-    if ($containerProbe.ExitCode -ne 0) {
-        throw "could not resolve the running container for $Service"
-    }
-    $containerID = @(
-        $containerProbe.Output |
-            ForEach-Object { ([string]$_).Trim() } |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-    ) | Select-Object -First 1
-    if ([string]::IsNullOrWhiteSpace([string]$containerID)) {
-        throw "$Service does not have a running container"
-    }
-
-    $addressProbe = Invoke-NativeProbe -Command {
-        & docker inspect --format `
-            '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' `
-            $containerID
-    }
-    if ($addressProbe.ExitCode -ne 0) {
-        throw "could not inspect the Docker bridge address for $Service"
-    }
-    $bridgeAddresses = @(
-        foreach ($line in $addressProbe.Output) {
-            $candidate = ([string]$line).Trim()
-            $parsedAddress = $null
-            if (
-                -not [string]::IsNullOrWhiteSpace($candidate) -and
-                [System.Net.IPAddress]::TryParse($candidate, [ref]$parsedAddress) -and
-                $parsedAddress.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork
-            ) {
-                $candidate
-            }
-        }
-    )
-    if ($bridgeAddresses.Count -ne 1) {
-        throw "$Service must have exactly one IPv4 Docker bridge address"
-    }
-    return "http://$($bridgeAddresses[0]):8080"
-}
-
-function Get-ServiceBaseURL {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Service
-    )
-
-    if ($script:useDockerBridgeTransport) {
-        return Get-DockerBridgeServiceBaseURL -Service $Service
-    }
-    return Get-PublishedServiceBaseURL -Service $Service
 }
 
 function Invoke-PostgresScalar {
@@ -1102,7 +1035,7 @@ try {
     $started = $true
     Invoke-DockerCompose -Arguments @('up', '-d', '--build') `
         -CapturePath (Join-Path $EvidenceDirectory 'compose-up.log') | Out-Null
-    $baseURL = Get-ServiceBaseURL -Service 'load-balancer'
+    $baseURL = Get-PublishedServiceBaseURL -Service 'load-balancer'
     Wait-APIReady
     Wait-WorkerReady -Service 'admission-worker-1'
     Wait-WorkerReady -Service 'admission-worker-2'
@@ -1402,7 +1335,7 @@ try {
         seat_class               = $seatClass
         passenger_ids            = @($bookingTarget.Customer.PassengerID)
     } | ConvertTo-Json -Compress -Depth 8
-    $apiOneBaseURL = Get-ServiceBaseURL -Service 'api-1'
+    $apiOneBaseURL = Get-PublishedServiceBaseURL -Service 'api-1'
     $bookingBlockerApplicationName = "m2-booking-blocker-$runSuffix"
     Start-BookingBlocker -ApplicationName $bookingBlockerApplicationName
     $bookingHttpAttempt = Start-ReservationHttpAttempt `
@@ -1682,7 +1615,6 @@ try {
         topology = [ordered]@{
             api_replicas = 3
             admission_worker_replicas = 2
-            orchestration_transport = $orchestrationTransport
             api_upstreams_observed = $initialUpstreams.Count
             surviving_upstreams_during_api_termination = $apiTerminationUpstreams.Count
             surviving_api_replicas_ready_before_termination_probe = $apiTerminationReadyReplicas.Count
@@ -1693,9 +1625,11 @@ try {
         steady_state_smoke = [ordered]@{
             join_duration = $SteadyStateDuration
             join_virtual_users = $CustomerCount
+            join_iteration_pause_seconds = 1
             join_k6_summary = 'multi-replica-summary.json'
             status_duration = '15s'
             status_virtual_users = 10
+            status_iteration_pause_seconds = 1
             status_k6_summary = 'waiting-room-status-summary.json'
         }
         admission = [ordered]@{

@@ -1,6 +1,6 @@
 import http from 'k6/http';
 import exec from 'k6/execution';
-import { check } from 'k6';
+import { check, sleep } from 'k6';
 import { Counter, Trend } from 'k6/metrics';
 
 const apiReplicaHits = new Counter('api_replica_hits');
@@ -115,4 +115,6 @@ export default function (config) {
     'load balancer exposes bounded local evidence header': ({ first: a, second: b }) =>
       Boolean(a.headers['X-Upstream-Addr']) && Boolean(b.headers['X-Upstream-Addr']),
   });
+  // Duration mode is a functional smoke, so bound short upstream connections.
+  if ((__ENV.DURATION || '').trim()) sleep(1);
 }

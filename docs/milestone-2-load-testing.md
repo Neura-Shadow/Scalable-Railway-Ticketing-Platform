@@ -79,12 +79,9 @@ a clean non-hot reservation still creates exactly one PostgreSQL reservation.
 It then restores Redis, waits for API and both workers, runs hot and non-hot
 seat reconciliation plus quota/admission reconciliation, writes sanitized
 artifacts under the operating-system temporary directory, and removes the
-project and its volumes by default. On Linux hosts, the load balancer and the
-direct `api-1` booking probe use their private addresses on the isolated
-Compose bridge. On Windows/Docker Desktop, the same probes use
-Compose-assigned ephemeral loopback ports. Neither path competes for a fixed
-host port, and the Linux CI path avoids relying on host-published NAT while a
-bounded load is running.
+project and its volumes by default. The load balancer and the direct `api-1`
+booking probe use Compose-assigned ephemeral loopback ports, so parallel or
+unrelated local services do not compete for a fixed host port.
 
 Nginx may report a comma-delimited `$upstream_addr` retry chain. The harness
 counts only the final successful address, requires exactly three addresses in
@@ -115,14 +112,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-milestone-2-mult
 ```
 
 The default is a 30-VU, 30-second duplicate-join steady-state smoke followed by
-a 10-VU, 15-second status smoke. The harness first proves the policy generation
+a 10-VU, 15-second status smoke. Each VU pauses for one second after its
+bounded request group, preventing this functional check from becoming an
+unbounded short-connection flood. With the defaults, that is approximately at
+most 60 duplicate-join requests per second and 10 status requests per second
+after the initial request group. The harness first proves the policy generation
 initialized, then pauses both admission workers during these two read-only
 queue phases so repeated status/join requests cannot claim and discard a
-one-time admission credential. It is a **functional smoke**, not a capacity benchmark. Use
-`-SteadyStateDuration 2m` or a different bounded `-CustomerCount` only when the
-host and disposable dataset are recorded. The multi-replica k6 scenario keeps
-its iteration-based mode when `DURATION` is unset and switches to
-`constant-vus` only when `DURATION` is supplied.
+one-time admission credential. It is a **functional smoke**, not a capacity
+benchmark. Use `-SteadyStateDuration 2m` or a different bounded
+`-CustomerCount` only when the host and disposable dataset are recorded. The
+multi-replica k6 scenario keeps its iteration-based mode when `DURATION` is
+unset and switches to paced `constant-vus` only when `DURATION` is supplied.
 
 The harness asserts and records:
 

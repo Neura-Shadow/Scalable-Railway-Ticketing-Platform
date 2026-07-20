@@ -1,6 +1,6 @@
 import http from 'k6/http';
 import exec from 'k6/execution';
-import { check } from 'k6';
+import { check, sleep } from 'k6';
 import { Counter, Trend } from 'k6/metrics';
 
 const statusLatency = new Trend('waiting_room_status_duration', true);
@@ -58,4 +58,6 @@ export default function (config) {
     'successful response disables credential caching': (r) =>
       r.status !== 200 || (r.headers['Cache-Control'] || '').includes('no-store'),
   });
+  // Keep the latency sample bounded instead of turning it into a capacity run.
+  sleep(1);
 }
