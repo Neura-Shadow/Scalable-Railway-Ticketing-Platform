@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -74,11 +75,16 @@ func (s *Store) ProcessEvent(
 	if processedAt.IsZero() {
 		return ProcessEventResult{}, ErrInvalidStore
 	}
-	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return ProcessEventResult{}, fmt.Errorf("%w: begin generic event projection", ErrPersistence)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+	for _, trainRunID := range trainRunIDs {
+		if err := lockTrainRunProjection(ctx, tx, trainRunID); err != nil {
+			return ProcessEventResult{}, err
+		}
+	}
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO read_model_event_receipts (
 			consumer_name, event_id, event_type, aggregate_type, aggregate_id, processed_at
@@ -89,6 +95,9 @@ func (s *Store) ProcessEvent(
 		return ProcessEventResult{}, fmt.Errorf("%w: write generic event receipt", ErrPersistence)
 	}
 	if tag.RowsAffected() == 0 {
+		if err := verifyExistingReceipt(ctx, tx, event, eventID, aggregateID); err != nil {
+			return ProcessEventResult{}, err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return ProcessEventResult{}, fmt.Errorf("%w: commit duplicate generic event", ErrPersistence)
 		}
@@ -127,11 +136,14 @@ func (s *Store) RebuildTrainRun(ctx context.Context, rawTrainRunID string) (Rebu
 		return RebuildResult{}, ErrInvalidStore
 	}
 
-	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return RebuildResult{}, fmt.Errorf("%w: begin projection rebuild", ErrPersistence)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+	if err := lockTrainRunProjection(ctx, tx, trainRunID); err != nil {
+		return RebuildResult{}, err
+	}
 	result, err := rebuildTrainRunTx(ctx, tx, trainRunID, rebuiltAt)
 	if err != nil {
 		return RebuildResult{}, err
@@ -152,11 +164,14 @@ func (s *Store) ProcessTrainRunEvent(ctx context.Context, event ProjectionEvent)
 		return ProcessEventResult{}, ErrInvalidStore
 	}
 
-	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return ProcessEventResult{}, fmt.Errorf("%w: begin event projection", ErrPersistence)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+	if err := lockTrainRunProjection(ctx, tx, trainRunID); err != nil {
+		return ProcessEventResult{}, err
+	}
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO read_model_event_receipts (
 			consumer_name,
@@ -172,6 +187,9 @@ func (s *Store) ProcessTrainRunEvent(ctx context.Context, event ProjectionEvent)
 		return ProcessEventResult{}, fmt.Errorf("%w: write event receipt", ErrPersistence)
 	}
 	if tag.RowsAffected() == 0 {
+		if err := verifyExistingReceipt(ctx, tx, event, eventID, trainRunID); err != nil {
+			return ProcessEventResult{}, err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return ProcessEventResult{}, fmt.Errorf("%w: commit duplicate event", ErrPersistence)
 		}
@@ -245,7 +263,42 @@ func parseBoundedTrainRunIDs(rawIDs []string) ([]uuid.UUID, error) {
 		seen[trainRunID] = struct{}{}
 		result = append(result, trainRunID)
 	}
+	sort.Slice(result, func(left, right int) bool {
+		return strings.Compare(result[left].String(), result[right].String()) < 0
+	})
 	return result, nil
+}
+
+func lockTrainRunProjection(ctx context.Context, tx pgx.Tx, trainRunID uuid.UUID) error {
+	if _, err := tx.Exec(ctx, `
+		SELECT pg_advisory_xact_lock(hashtextextended($1::text, 7213007))
+	`, trainRunID); err != nil {
+		return fmt.Errorf("%w: lock train-run projection", ErrPersistence)
+	}
+	return nil
+}
+
+func verifyExistingReceipt(
+	ctx context.Context,
+	tx pgx.Tx,
+	event ProjectionEvent,
+	eventID uuid.UUID,
+	aggregateID uuid.UUID,
+) error {
+	var eventType string
+	var aggregateType string
+	var storedAggregateID uuid.UUID
+	if err := tx.QueryRow(ctx, `
+		SELECT event_type, aggregate_type, aggregate_id
+		FROM read_model_event_receipts
+		WHERE consumer_name = $1 AND event_id = $2
+	`, event.ConsumerName, eventID).Scan(&eventType, &aggregateType, &storedAggregateID); err != nil {
+		return fmt.Errorf("%w: read duplicate event receipt", ErrPersistence)
+	}
+	if eventType != event.EventType || aggregateType != event.AggregateType || storedAggregateID != aggregateID {
+		return ErrInvalidEvent
+	}
+	return nil
 }
 
 func rebuildTrainRunTx(
@@ -331,6 +384,9 @@ func (s *Store) DeleteTrainRunProjection(ctx context.Context, rawTrainRunID stri
 		return 0, fmt.Errorf("%w: begin projection delete", ErrPersistence)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+	if err := lockTrainRunProjection(ctx, tx, trainRunID); err != nil {
+		return 0, err
+	}
 	tag, err := tx.Exec(ctx, `
 		DELETE FROM train_run_journey_read_model
 		WHERE train_run_id = $1

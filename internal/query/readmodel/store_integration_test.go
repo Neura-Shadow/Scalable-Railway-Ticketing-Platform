@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -249,6 +251,96 @@ func TestProcessTrainRunEventReloadsCurrentStateForOutOfOrderEvent(t *testing.T)
 	}
 	if projectedFare != 1350 {
 		t.Fatalf("out-of-order event projected fare = %d, want current source fare 1350", projectedFare)
+	}
+}
+
+func TestConcurrentProjectionEventsCannotCommitAnOlderSnapshotLast(t *testing.T) {
+	conn := openMigrationSevenDatabase(t)
+	trainRunID := seedProjectionSource(t, conn)
+	newerConn := connectMigrationTestPeer(t, conn)
+	inspectorConn := connectMigrationTestPeer(t, conn)
+	olderEvent := projectionTrainRunEvent(trainRunID)
+	newerEvent := projectionTrainRunEvent(trainRunID)
+	receiptEntered := make(chan struct{})
+	releaseOlder := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseOlder) }) }
+	t.Cleanup(release)
+
+	olderStore, err := readmodel.NewStore(&receiptBarrierDB{
+		Conn:    conn,
+		eventID: olderEvent.EventID,
+		entered: receiptEntered,
+		release: releaseOlder,
+	}, clock.NewDeterministic(time.Now().UTC()))
+	if err != nil {
+		t.Fatalf("NewStore(older) error = %v", err)
+	}
+	newerStore, err := readmodel.NewStore(newerConn, clock.NewDeterministic(time.Now().UTC().Add(time.Second)))
+	if err != nil {
+		t.Fatalf("NewStore(newer) error = %v", err)
+	}
+
+	olderResult := make(chan error, 1)
+	go func() {
+		_, processErr := olderStore.ProcessEvent(context.Background(), olderEvent, []string{trainRunID.String()})
+		olderResult <- processErr
+	}()
+	select {
+	case <-receiptEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("older projection did not reach the controlled receipt barrier")
+	}
+
+	if _, err := inspectorConn.Exec(context.Background(), `
+		UPDATE fares
+		SET amount_minor = 1350,
+			updated_at = updated_at + interval '1 minute'
+		WHERE train_run_id = $1
+		  AND from_stop_index = 0
+		  AND to_stop_index = 2
+		  AND seat_class = 'standard'
+	`, trainRunID); err != nil {
+		t.Fatalf("update authoritative fare between events: %v", err)
+	}
+
+	newerResult := make(chan error, 1)
+	go func() {
+		_, processErr := newerStore.ProcessEvent(context.Background(), newerEvent, []string{trainRunID.String()})
+		newerResult <- processErr
+	}()
+	waitForProjectionAdvisoryWaiter(t, inspectorConn, conn.PgConn().PID(), newerConn.PgConn().PID())
+	release()
+	for label, result := range map[string]<-chan error{"older": olderResult, "newer": newerResult} {
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("%s projection event error = %v", label, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s projection event did not complete", label)
+		}
+	}
+
+	var projectedFare int64
+	var receipts int
+	if err := inspectorConn.QueryRow(context.Background(), `
+		SELECT
+			(SELECT fare_amount_minor
+			 FROM train_run_journey_read_model
+			 WHERE train_run_id = $1
+			   AND from_stop_index = 0
+			   AND to_stop_index = 2
+			   AND seat_class = 'standard'),
+			(SELECT count(*)
+			 FROM read_model_event_receipts
+			 WHERE consumer_name = $2
+			   AND event_id IN ($3, $4))
+	`, trainRunID, olderEvent.ConsumerName, olderEvent.EventID, newerEvent.EventID).Scan(&projectedFare, &receipts); err != nil {
+		t.Fatalf("inspect concurrent projection result: %v", err)
+	}
+	if projectedFare != 1350 || receipts != 2 {
+		t.Fatalf("concurrent projection state = fare %d receipts %d, want 1350 and 2", projectedFare, receipts)
 	}
 }
 
@@ -598,6 +690,100 @@ type versionRotatorFake struct{ keys []string }
 func (rotator *versionRotatorFake) Rotate(_ context.Context, key string) (string, error) {
 	rotator.keys = append(rotator.keys, key)
 	return "rotated", nil
+}
+
+type receiptBarrierDB struct {
+	*pgx.Conn
+	eventID string
+	entered chan<- struct{}
+	release <-chan struct{}
+}
+
+func (db *receiptBarrierDB) BeginTx(ctx context.Context, options pgx.TxOptions) (pgx.Tx, error) {
+	tx, err := db.Conn.BeginTx(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	return &receiptBarrierTx{
+		Tx:      tx,
+		eventID: db.eventID,
+		entered: db.entered,
+		release: db.release,
+	}, nil
+}
+
+type receiptBarrierTx struct {
+	pgx.Tx
+	eventID string
+	entered chan<- struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (tx *receiptBarrierTx) Exec(ctx context.Context, query string, args ...any) (pgconn.CommandTag, error) {
+	tag, err := tx.Tx.Exec(ctx, query, args...)
+	if err == nil && strings.Contains(query, "INSERT INTO read_model_event_receipts") &&
+		len(args) > 1 && args[1].(uuid.UUID).String() == tx.eventID {
+		tx.once.Do(func() {
+			close(tx.entered)
+			<-tx.release
+		})
+	}
+	return tag, err
+}
+
+func connectMigrationTestPeer(t *testing.T, conn *pgx.Conn) *pgx.Conn {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	peer, err := pgx.ConnectConfig(ctx, conn.Config().Copy())
+	if err != nil {
+		t.Fatalf("connect migration test peer: %v", err)
+	}
+	t.Cleanup(func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer closeCancel()
+		_ = peer.Close(closeCtx)
+	})
+	return peer
+}
+
+func waitForProjectionAdvisoryWaiter(t *testing.T, inspector *pgx.Conn, holderPID, waiterPID uint32) {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting bool
+		if err := inspector.QueryRow(context.Background(), `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_locks AS holder
+				JOIN pg_locks AS waiter
+				  ON waiter.locktype = holder.locktype
+				 AND waiter.database IS NOT DISTINCT FROM holder.database
+				 AND waiter.classid = holder.classid
+				 AND waiter.objid = holder.objid
+				 AND waiter.objsubid = holder.objsubid
+				WHERE holder.pid = $1
+				  AND waiter.pid = $2
+				  AND holder.locktype = 'advisory'
+				  AND holder.granted
+				  AND NOT waiter.granted
+			)
+		`, holderPID, waiterPID).Scan(&waiting); err != nil {
+			t.Fatalf("inspect projection advisory-lock waiter: %v", err)
+		}
+		if waiting {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("newer projection did not wait for the older per-run transaction lock")
+		case <-ticker.C:
+		}
+	}
 }
 
 func projectionTrainRunEvent(trainRunID uuid.UUID) readmodel.ProjectionEvent {
