@@ -433,6 +433,9 @@ func loadProjectionRows(
 				tr.updated_at,
 				t.updated_at,
 				r.updated_at,
+				route_origin.updated_at,
+				origin.updated_at,
+				destination.updated_at,
 				origin_station.updated_at,
 				destination_station.updated_at,
 				selected_fare.updated_at

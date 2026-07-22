@@ -74,8 +74,25 @@ func TestWorkerRunOnceDeadLettersPoisonAfterBoundedAttemptsBeforeAck(t *testing.
 	if result.DeadLettered != 1 || result.Acked != 1 || len(transport.deadLetters) != 1 {
 		t.Fatalf("RunOnce() = %+v dead_letters=%v", result, transport.deadLetters)
 	}
-	if !reflect.DeepEqual(transport.calls, []string{"ensure", "claim", "read", "deliveries:9-0", "dlq:9-0:invalid_event", "ack:9-0"}) {
-		t.Fatalf("transport calls = %v, want DLQ before ack", transport.calls)
+	if !reflect.DeepEqual(transport.calls, []string{"ensure", "claim", "read", "deliveries:9-0", "dlq_ack:9-0:invalid_event"}) {
+		t.Fatalf("transport calls = %v, want atomic DLQ and ack", transport.calls)
+	}
+}
+
+func TestWorkerRunOnceContinuesBoundedFanoutWithoutCountingFailureAttempts(t *testing.T) {
+	message := validStreamMessage("11-0", uuid.NewString())
+	transport := &streamTransportFake{pending: []StreamMessage{message}}
+	worker := mustNewWorker(t, transport, &eventHandlerFake{err: ErrProjectionPending}, 1)
+
+	result, err := worker.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if result.Continued != 1 || result.Acked != 1 || result.DeadLettered != 0 || result.Retried != 0 {
+		t.Fatalf("RunOnce() = %+v, want one planned continuation", result)
+	}
+	if !reflect.DeepEqual(transport.calls, []string{"ensure", "claim", "read", "continue_ack:11-0"}) {
+		t.Fatalf("transport calls = %v", transport.calls)
 	}
 }
 
@@ -144,9 +161,16 @@ func (fake *streamTransportFake) DeliveryCount(_ context.Context, messageID stri
 	return fake.deliveryCount, nil
 }
 
-func (fake *streamTransportFake) DeadLetter(_ context.Context, message StreamMessage, reason string) error {
-	fake.calls = append(fake.calls, "dlq:"+message.ID+":"+reason)
+func (fake *streamTransportFake) ContinueAndAck(_ context.Context, message StreamMessage) error {
+	fake.calls = append(fake.calls, "continue_ack:"+message.ID)
+	fake.acked = append(fake.acked, message.ID)
+	return nil
+}
+
+func (fake *streamTransportFake) DeadLetterAndAck(_ context.Context, message StreamMessage, reason string) error {
+	fake.calls = append(fake.calls, "dlq_ack:"+message.ID+":"+reason)
 	fake.deadLetters = append(fake.deadLetters, message.ID)
+	fake.acked = append(fake.acked, message.ID)
 	return nil
 }
 

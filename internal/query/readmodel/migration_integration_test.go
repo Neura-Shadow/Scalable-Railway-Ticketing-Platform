@@ -23,6 +23,12 @@ func TestMigrationSevenCreatesProjectionAndReceiptSchema(t *testing.T) {
 	ctx := context.Background()
 
 	wantConstraints := []string{
+		"read_model_event_progress_pkey",
+		"read_model_event_progress_aggregate_type_check",
+		"read_model_event_progress_consumer_name_check",
+		"read_model_event_progress_event_type_check",
+		"read_model_event_progress_phase_check",
+		"read_model_event_progress_processed_check",
 		"read_model_event_receipts_pkey",
 		"read_model_event_receipts_aggregate_type_check",
 		"read_model_event_receipts_consumer_name_check",
@@ -33,6 +39,7 @@ func TestMigrationSevenCreatesProjectionAndReceiptSchema(t *testing.T) {
 		"train_run_journey_read_model_fare_amount_minor_check",
 		"train_run_journey_read_model_journey_order_check",
 		"train_run_journey_read_model_station_codes_check",
+		"train_run_journey_read_model_station_ids_check",
 		"train_run_journey_read_model_status_check",
 		"train_run_journey_read_model_times_check",
 	}
@@ -43,7 +50,7 @@ func TestMigrationSevenCreatesProjectionAndReceiptSchema(t *testing.T) {
 		JOIN pg_catalog.pg_constraint AS pc
 		  ON pc.conname = tc.constraint_name
 		WHERE tc.table_schema = current_schema()
-		  AND tc.table_name IN ('train_run_journey_read_model', 'read_model_event_receipts')
+		  AND tc.table_name IN ('train_run_journey_read_model', 'read_model_event_receipts', 'read_model_event_progress')
 		  AND pc.contype IN ('p', 'c')
 		ORDER BY constraint_name
 	`)
@@ -52,6 +59,8 @@ func TestMigrationSevenCreatesProjectionAndReceiptSchema(t *testing.T) {
 	}
 
 	wantIndexes := []string{
+		"read_model_event_progress_pkey",
+		"read_model_event_progress_projection_idx",
 		"read_model_event_receipts_aggregate_idx",
 		"read_model_event_receipts_pkey",
 		"read_model_event_receipts_processed_at_idx",
@@ -64,25 +73,31 @@ func TestMigrationSevenCreatesProjectionAndReceiptSchema(t *testing.T) {
 		SELECT indexname
 		FROM pg_indexes
 		WHERE schemaname = current_schema()
-		  AND tablename IN ('train_run_journey_read_model', 'read_model_event_receipts')
+		  AND tablename IN ('train_run_journey_read_model', 'read_model_event_receipts', 'read_model_event_progress')
 		ORDER BY indexname
 	`)
 	if !equalStrings(gotIndexes, wantIndexes) {
 		t.Fatalf("migration 7 indexes = %v, want %v", gotIndexes, wantIndexes)
 	}
 
-	var projectionColumns, receiptColumns int
+	var projectionColumns, receiptColumns, progressColumns int
 	if err := conn.QueryRow(ctx, `
 		SELECT
 			count(*) FILTER (WHERE table_name = 'train_run_journey_read_model'),
-			count(*) FILTER (WHERE table_name = 'read_model_event_receipts')
+			count(*) FILTER (WHERE table_name = 'read_model_event_receipts'),
+			count(*) FILTER (WHERE table_name = 'read_model_event_progress')
 		FROM information_schema.columns
 		WHERE table_schema = current_schema()
-	`).Scan(&projectionColumns, &receiptColumns); err != nil {
+	`).Scan(&projectionColumns, &receiptColumns, &progressColumns); err != nil {
 		t.Fatalf("inspect migration 7 columns: %v", err)
 	}
-	if projectionColumns != 21 || receiptColumns != 6 {
-		t.Fatalf("migration 7 column counts = projection %d receipt %d, want 21 and 6", projectionColumns, receiptColumns)
+	if projectionColumns != 21 || receiptColumns != 6 || progressColumns != 11 {
+		t.Fatalf(
+			"migration 7 column counts = projection %d receipt %d progress %d, want 21, 6, and 11",
+			projectionColumns,
+			receiptColumns,
+			progressColumns,
+		)
 	}
 }
 

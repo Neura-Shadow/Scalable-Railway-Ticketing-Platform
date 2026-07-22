@@ -10,9 +10,52 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const MaxDeadLetterStreamLength = 10_000
+const (
+	MaxSourceStreamLength     = 10_000
+	MaxDeadLetterStreamLength = 10_000
+)
 
 var ErrInvalidStreamTransport = errors.New("read-model stream transport configuration invalid")
+
+var continueAndAckScript = redis.NewScript(`
+local pending = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[2], ARGV[2], 1)
+if #pending == 0 then
+  return ''
+end
+local continuation = redis.call(
+  'XADD', KEYS[1], 'MAXLEN', '~', ARGV[3], '*',
+  'event_id', ARGV[4],
+  'event_type', ARGV[5],
+  'aggregate_type', ARGV[6],
+  'aggregate_id', ARGV[7]
+)
+local acked = redis.call('XACK', KEYS[1], ARGV[1], ARGV[2])
+if acked ~= 1 then
+  return redis.error_reply('continuation acknowledgment conflict')
+end
+return continuation
+`)
+
+var deadLetterAndAckScript = redis.NewScript(`
+local pending = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[2], ARGV[2], 1)
+if #pending == 0 then
+  return ''
+end
+local dead_letter = redis.call(
+  'XADD', KEYS[2], 'MAXLEN', '~', ARGV[3], '*',
+  'source_stream_id', ARGV[2],
+  'reason', ARGV[4],
+  'event_id', ARGV[5],
+  'event_type', ARGV[6],
+  'aggregate_type', ARGV[7],
+  'aggregate_id', ARGV[8]
+)
+local acked = redis.call('XACK', KEYS[1], ARGV[1], ARGV[2])
+if acked ~= 1 then
+  return redis.error_reply('dead-letter acknowledgment conflict')
+end
+return dead_letter
+`)
 
 type RedisStreamTransport struct {
 	client redis.UniversalClient
@@ -97,7 +140,29 @@ func (transport *RedisStreamTransport) DeliveryCount(ctx context.Context, messag
 	return pending[0].RetryCount, nil
 }
 
-func (transport *RedisStreamTransport) DeadLetter(
+func (transport *RedisStreamTransport) ContinueAndAck(ctx context.Context, message StreamMessage) error {
+	continuationID, err := continueAndAckScript.Run(
+		ctx,
+		transport.client,
+		[]string{transport.stream},
+		transport.group,
+		message.ID,
+		MaxSourceStreamLength,
+		message.Values["event_id"],
+		message.Values["event_type"],
+		message.Values["aggregate_type"],
+		message.Values["aggregate_id"],
+	).Text()
+	if err != nil {
+		return fmt.Errorf("continue and acknowledge Redis stream event: %w", err)
+	}
+	if continuationID == "" {
+		return errors.New("Redis stream continuation conflict")
+	}
+	return nil
+}
+
+func (transport *RedisStreamTransport) DeadLetterAndAck(
 	ctx context.Context,
 	message StreamMessage,
 	reason string,
@@ -105,21 +170,24 @@ func (transport *RedisStreamTransport) DeadLetter(
 	if reason != "invalid_event" && reason != "handler_failure" {
 		return ErrInvalidEvent
 	}
-	values := map[string]any{
-		"source_stream_id": message.ID,
-		"reason":           reason,
-		"event_id":         message.Values["event_id"],
-		"event_type":       message.Values["event_type"],
-		"aggregate_type":   message.Values["aggregate_type"],
-		"aggregate_id":     message.Values["aggregate_id"],
+	deadLetterID, err := deadLetterAndAckScript.Run(
+		ctx,
+		transport.client,
+		[]string{transport.stream, transport.dlq},
+		transport.group,
+		message.ID,
+		MaxDeadLetterStreamLength,
+		reason,
+		message.Values["event_id"],
+		message.Values["event_type"],
+		message.Values["aggregate_type"],
+		message.Values["aggregate_id"],
+	).Text()
+	if err != nil {
+		return fmt.Errorf("dead-letter and acknowledge Redis stream event: %w", err)
 	}
-	if err := transport.client.XAdd(ctx, &redis.XAddArgs{
-		Stream: transport.dlq,
-		MaxLen: MaxDeadLetterStreamLength,
-		Approx: true,
-		Values: values,
-	}).Err(); err != nil {
-		return fmt.Errorf("append Redis dead-letter event: %w", err)
+	if deadLetterID == "" {
+		return errors.New("Redis stream dead-letter conflict")
 	}
 	return nil
 }

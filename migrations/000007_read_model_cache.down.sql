@@ -45,6 +45,7 @@ ALTER TABLE outbox_events
             'hot_train_policy.disabled'
         ));
 
+DROP TABLE read_model_event_progress;
 DROP TABLE read_model_event_receipts;
 DROP TABLE train_run_journey_read_model;
 

@@ -53,6 +53,11 @@ CREATE TABLE train_run_journey_read_model (
             AND to_station_code = btrim(to_station_code)
             AND from_station_code <> ''
             AND to_station_code <> ''
+        ),
+    CONSTRAINT train_run_journey_read_model_station_ids_check
+        CHECK (
+            from_station_id <> '00000000-0000-0000-0000-000000000000'::uuid
+            AND to_station_id <> '00000000-0000-0000-0000-000000000000'::uuid
         )
 );
 
@@ -116,6 +121,44 @@ CREATE INDEX read_model_event_receipts_aggregate_idx
 
 CREATE INDEX read_model_event_receipts_processed_at_idx
     ON read_model_event_receipts (processed_at, event_id);
+
+CREATE TABLE read_model_event_progress (
+    consumer_name text NOT NULL,
+    event_id uuid NOT NULL,
+    event_type text NOT NULL,
+    aggregate_type text NOT NULL,
+    aggregate_id uuid NOT NULL,
+    projection_affecting boolean NOT NULL,
+    phase text NOT NULL DEFAULT 'invalidating',
+    after_train_run_id uuid,
+    processed_train_runs integer NOT NULL DEFAULT 0,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (consumer_name, event_id),
+    CONSTRAINT read_model_event_progress_consumer_name_check
+        CHECK (
+            consumer_name = btrim(consumer_name)
+            AND length(consumer_name) BETWEEN 1 AND 128
+        ),
+    CONSTRAINT read_model_event_progress_event_type_check
+        CHECK (
+            event_type = btrim(event_type)
+            AND length(event_type) BETWEEN 1 AND 128
+        ),
+    CONSTRAINT read_model_event_progress_aggregate_type_check
+        CHECK (
+            aggregate_type = btrim(aggregate_type)
+            AND length(aggregate_type) BETWEEN 1 AND 64
+        ),
+    CONSTRAINT read_model_event_progress_phase_check
+        CHECK (phase IN ('invalidating', 'processing', 'finalizing')),
+    CONSTRAINT read_model_event_progress_processed_check
+        CHECK (processed_train_runs >= 0)
+);
+
+CREATE INDEX read_model_event_progress_projection_idx
+    ON read_model_event_progress (projection_affecting, phase, updated_at)
+    WHERE projection_affecting;
 
 ALTER TABLE outbox_events
     DROP CONSTRAINT outbox_events_aggregate_type_check,

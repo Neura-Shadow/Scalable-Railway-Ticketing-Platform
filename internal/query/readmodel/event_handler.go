@@ -12,7 +12,12 @@ import (
 )
 
 type EventImpactResolver interface {
-	AffectedTrainRunIDs(context.Context, ProjectionEvent) ([]string, error)
+	AffectedTrainRunIDs(context.Context, ProjectionEvent, string, int) (EventImpactPage, error)
+}
+
+type EventImpactPage struct {
+	TrainRunIDs []string
+	HasMore     bool
 }
 
 type VersionRotator interface {
@@ -56,31 +61,86 @@ func (coordinator *EventCoordinator) HandleEvent(ctx context.Context, event Proj
 		coordinator.recordEvent(event.EventType, "failure")
 		return ErrInvalidEvent
 	}
-	trainRunIDs := []string(nil)
-	if projectionAffectingEvent(event.EventType) || availabilityAffectingEvent(event.EventType) {
-		var err error
-		trainRunIDs, err = coordinator.impacts.AffectedTrainRunIDs(ctx, event)
+	projectionAffecting := projectionAffectingEvent(event.EventType)
+	progress, err := coordinator.store.BeginEventProgress(ctx, event, projectionAffecting)
+	if err != nil {
+		coordinator.recordEvent(event.EventType, "failure")
+		return err
+	}
+	if progress.Complete {
+		coordinator.recordEvent(event.EventType, "success")
+		coordinator.recordDuplicate(event.EventType)
+		return nil
+	}
+	if progress.Phase == eventPhaseInvalidating {
+		if err := coordinator.rotateGlobalCaches(ctx, event); err != nil {
+			coordinator.recordEvent(event.EventType, "failure")
+			return err
+		}
+		progress, err = coordinator.store.MarkEventInvalidated(ctx, event, projectionAffecting)
 		if err != nil {
+			coordinator.recordEvent(event.EventType, "failure")
 			return err
 		}
 	}
-	projectionIDs := trainRunIDs
-	if !projectionAffectingEvent(event.EventType) {
-		projectionIDs = nil
+	if progress.Phase == eventPhaseProcessing {
+		page := EventImpactPage{}
+		if projectionAffecting || availabilityAffectingEvent(event.EventType) {
+			page, err = coordinator.impacts.AffectedTrainRunIDs(
+				ctx,
+				event,
+				progress.AfterTrainRunID,
+				MaxRebuildAllBatchSize,
+			)
+			if err != nil {
+				coordinator.recordEvent(event.EventType, "failure")
+				return err
+			}
+		}
+		if availabilityAffectingEvent(event.EventType) {
+			if err := coordinator.rotateAvailabilityCaches(ctx, event, page.TrainRunIDs); err != nil {
+				coordinator.recordEvent(event.EventType, "failure")
+				return err
+			}
+		}
+		started := time.Now()
+		result, processErr := coordinator.store.ProcessEventPage(
+			ctx,
+			event,
+			projectionAffecting,
+			progress.AfterTrainRunID,
+			page.TrainRunIDs,
+			page.HasMore,
+		)
+		if processErr != nil {
+			coordinator.recordEvent(event.EventType, "failure")
+			coordinator.recordRebuild("failure", "database", 0, time.Since(started))
+			return processErr
+		}
+		if projectionAffecting && len(page.TrainRunIDs) > 0 {
+			coordinator.recordRebuild("success", "none", result.RowsWritten, time.Since(started))
+		}
+		if page.HasMore {
+			return ErrProjectionPending
+		}
+		progress.Phase = eventPhaseFinalizing
 	}
-	started := time.Now()
-	result, err := coordinator.store.ProcessEvent(ctx, event, projectionIDs)
+	if progress.Phase != eventPhaseFinalizing {
+		return ErrProjectionPending
+	}
+	duplicate, err := coordinator.store.CompleteEvent(ctx, event, projectionAffecting)
 	if err != nil {
 		coordinator.recordEvent(event.EventType, "failure")
-		coordinator.recordRebuild("failure", "database", 0, time.Since(started))
 		return err
 	}
 	coordinator.recordEvent(event.EventType, "success")
-	if result.Duplicate {
+	if duplicate {
 		coordinator.recordDuplicate(event.EventType)
-	} else if len(projectionIDs) > 0 {
-		coordinator.recordRebuild("success", "none", result.RowsWritten, time.Since(started))
 	}
+	return nil
+}
+
+func (coordinator *EventCoordinator) rotateGlobalCaches(ctx context.Context, event ProjectionEvent) error {
 	if stationAffectingEvent(event.EventType) {
 		if _, err := coordinator.versions.Rotate(ctx, querycache.StationVersionKey()); err != nil {
 			coordinator.recordInvalidation("stations", event.EventType, "failure", "redis")
@@ -95,18 +155,24 @@ func (coordinator *EventCoordinator) HandleEvent(ctx context.Context, event Proj
 		}
 		coordinator.recordInvalidation("train_search", event.EventType, "success", "none")
 	}
-	if availabilityAffectingEvent(event.EventType) {
-		for _, trainRunID := range trainRunIDs {
-			key, err := querycache.AvailabilityVersionKey(trainRunID)
-			if err != nil {
-				return err
-			}
-			if _, err := coordinator.versions.Rotate(ctx, key); err != nil {
-				coordinator.recordInvalidation("availability", event.EventType, "failure", "redis")
-				return fmt.Errorf("rotate availability cache namespace: %w", err)
-			}
-			coordinator.recordInvalidation("availability", event.EventType, "success", "none")
+	return nil
+}
+
+func (coordinator *EventCoordinator) rotateAvailabilityCaches(
+	ctx context.Context,
+	event ProjectionEvent,
+	trainRunIDs []string,
+) error {
+	for _, trainRunID := range trainRunIDs {
+		key, err := querycache.AvailabilityVersionKey(trainRunID)
+		if err != nil {
+			return err
 		}
+		if _, err := coordinator.versions.Rotate(ctx, key); err != nil {
+			coordinator.recordInvalidation("availability", event.EventType, "failure", "redis")
+			return fmt.Errorf("rotate availability cache namespace: %w", err)
+		}
+		coordinator.recordInvalidation("availability", event.EventType, "success", "none")
 	}
 	return nil
 }
@@ -153,59 +219,75 @@ func NewPostgresImpactResolver(db impactQueryer) (*PostgresImpactResolver, error
 func (resolver *PostgresImpactResolver) AffectedTrainRunIDs(
 	ctx context.Context,
 	event ProjectionEvent,
-) ([]string, error) {
+	after string,
+	limit int,
+) (EventImpactPage, error) {
 	aggregateID, err := uuid.Parse(event.AggregateID)
 	if err != nil || aggregateID == uuid.Nil {
-		return nil, ErrInvalidEvent
+		return EventImpactPage{}, ErrInvalidEvent
+	}
+	afterID, err := parseEventCursor(after)
+	if err != nil || limit < 1 || limit > MaxRebuildAllBatchSize {
+		return EventImpactPage{}, ErrInvalidEvent
 	}
 	if event.AggregateType == "train_run" {
-		return []string{aggregateID.String()}, nil
+		if afterID != uuid.Nil {
+			return EventImpactPage{}, nil
+		}
+		return EventImpactPage{TrainRunIDs: []string{aggregateID.String()}}, nil
 	}
-	query, ok := impactQuery(event.AggregateType)
+	baseQuery, ok := impactQuery(event.AggregateType)
 	if !ok {
-		return nil, nil
+		return EventImpactPage{}, nil
 	}
-	rows, err := resolver.db.Query(ctx, query, aggregateID, MaxRebuildAllBatchSize+1)
+	query := `WITH impacted AS (` + baseQuery + `)
+		SELECT train_run_id
+		FROM impacted
+		WHERE train_run_id > $2
+		ORDER BY train_run_id
+		LIMIT $3`
+	rows, err := resolver.db.Query(ctx, query, aggregateID, afterID, limit+1)
 	if err != nil {
-		return nil, fmt.Errorf("%w: query event impact", ErrPersistence)
+		return EventImpactPage{}, fmt.Errorf("%w: query event impact", ErrPersistence)
 	}
 	defer rows.Close()
 	ids := make([]string, 0)
 	for rows.Next() {
 		var trainRunID uuid.UUID
 		if err := rows.Scan(&trainRunID); err != nil {
-			return nil, fmt.Errorf("%w: scan event impact", ErrPersistence)
+			return EventImpactPage{}, fmt.Errorf("%w: scan event impact", ErrPersistence)
 		}
 		ids = append(ids, trainRunID.String())
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("%w: iterate event impact", ErrPersistence)
+		return EventImpactPage{}, fmt.Errorf("%w: iterate event impact", ErrPersistence)
 	}
-	if len(ids) > MaxRebuildAllBatchSize {
-		return nil, ErrProjectionLimit
+	page := EventImpactPage{HasMore: len(ids) > limit}
+	if page.HasMore {
+		ids = ids[:limit]
 	}
-	return ids, nil
+	page.TrainRunIDs = ids
+	return page, nil
 }
 
 func impactQuery(aggregateType string) (string, bool) {
-	const suffix = ` ORDER BY tr.id LIMIT $2`
 	switch aggregateType {
 	case "station":
-		return `SELECT DISTINCT tr.id FROM route_stops rs JOIN train_runs tr ON tr.route_id = rs.route_id WHERE rs.station_id = $1` + suffix, true
+		return `SELECT DISTINCT tr.id AS train_run_id FROM route_stops rs JOIN train_runs tr ON tr.route_id = rs.route_id WHERE rs.station_id = $1`, true
 	case "route":
-		return `SELECT tr.id FROM train_runs tr WHERE tr.route_id = $1` + suffix, true
+		return `SELECT tr.id AS train_run_id FROM train_runs tr WHERE tr.route_id = $1`, true
 	case "train":
-		return `SELECT tr.id FROM train_runs tr WHERE tr.train_id = $1` + suffix, true
+		return `SELECT tr.id AS train_run_id FROM train_runs tr WHERE tr.train_id = $1`, true
 	case "fare":
-		return `SELECT DISTINCT tr.id FROM fares f JOIN train_runs tr ON tr.id = f.train_run_id OR (f.train_run_id IS NULL AND tr.route_id = f.route_id) WHERE f.id = $1` + suffix, true
+		return `SELECT DISTINCT tr.id AS train_run_id FROM fares f JOIN train_runs tr ON tr.id = f.train_run_id OR (f.train_run_id IS NULL AND tr.route_id = f.route_id) WHERE f.id = $1`, true
 	case "coach":
-		return `SELECT tr.id FROM coaches c JOIN train_runs tr ON tr.train_id = c.train_id WHERE c.id = $1` + suffix, true
+		return `SELECT tr.id AS train_run_id FROM coaches c JOIN train_runs tr ON tr.train_id = c.train_id WHERE c.id = $1`, true
 	case "seat":
-		return `SELECT tr.id FROM seats s JOIN coaches c ON c.id = s.coach_id JOIN train_runs tr ON tr.train_id = c.train_id WHERE s.id = $1` + suffix, true
+		return `SELECT tr.id AS train_run_id FROM seats s JOIN coaches c ON c.id = s.coach_id JOIN train_runs tr ON tr.train_id = c.train_id WHERE s.id = $1`, true
 	case "reservation":
-		return `SELECT tr.id FROM reservations r JOIN train_runs tr ON tr.id = r.train_run_id WHERE r.id = $1` + suffix, true
+		return `SELECT tr.id AS train_run_id FROM reservations r JOIN train_runs tr ON tr.id = r.train_run_id WHERE r.id = $1`, true
 	case "ticket":
-		return `SELECT tr.id FROM tickets t JOIN reservation_seats rs ON rs.id = t.reservation_seat_id JOIN reservations r ON r.id = rs.reservation_id JOIN train_runs tr ON tr.id = r.train_run_id WHERE t.id = $1` + suffix, true
+		return `SELECT tr.id AS train_run_id FROM tickets t JOIN reservation_seats rs ON rs.id = t.reservation_seat_id JOIN reservations r ON r.id = rs.reservation_id JOIN train_runs tr ON tr.id = r.train_run_id WHERE t.id = $1`, true
 	default:
 		return "", false
 	}

@@ -10,7 +10,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-func TestRedisStreamTransportRecoversPendingAndDeadLettersBeforeAck(t *testing.T) {
+func TestRedisStreamTransportAtomicallyContinuesAndDeadLettersSafeFields(t *testing.T) {
 	address := os.Getenv("TEST_REDIS_ADDR")
 	if address == "" {
 		address = "127.0.0.1:56379"
@@ -62,13 +62,31 @@ func TestRedisStreamTransportRecoversPendingAndDeadLettersBeforeAck(t *testing.T
 	if err != nil || deliveries < 2 {
 		t.Fatalf("DeliveryCount() = %d, %v", deliveries, err)
 	}
-	if err := transport.DeadLetter(ctx, claimed[0], "handler_failure"); err != nil {
-		t.Fatalf("DeadLetter() error = %v", err)
+	if err := transport.ContinueAndAck(ctx, claimed[0]); err != nil {
+		t.Fatalf("ContinueAndAck() error = %v", err)
 	}
-	if err := transport.Ack(ctx, messageID); err != nil {
-		t.Fatalf("Ack() error = %v", err)
+	if err := transport.ContinueAndAck(ctx, claimed[0]); err == nil {
+		t.Fatal("ContinueAndAck(duplicate) error = nil, want old-pending conflict")
 	}
 	pending, err := client.XPending(ctx, stream, group).Result()
+	if err != nil || pending.Count != 0 {
+		t.Fatalf("pending after continuation+ack = %+v, %v", pending, err)
+	}
+	streamEntries, err := client.XRange(ctx, stream, "-", "+").Result()
+	if err != nil || len(streamEntries) != 2 {
+		t.Fatalf("stream entries after continuation = %+v, %v", streamEntries, err)
+	}
+	if _, leaked := streamEntries[1].Values["payload"]; leaked {
+		t.Fatal("continuation retained outbox payload")
+	}
+	continued, err := transport.ReadNew(ctx, "replica-c", 1)
+	if err != nil || len(continued) != 1 || continued[0].Values["event_id"] != eventID {
+		t.Fatalf("ReadNew(continuation) = %+v, %v", continued, err)
+	}
+	if err := transport.DeadLetterAndAck(ctx, continued[0], "handler_failure"); err != nil {
+		t.Fatalf("DeadLetterAndAck() error = %v", err)
+	}
+	pending, err = client.XPending(ctx, stream, group).Result()
 	if err != nil || pending.Count != 0 {
 		t.Fatalf("pending after DLQ+ack = %+v, %v", pending, err)
 	}

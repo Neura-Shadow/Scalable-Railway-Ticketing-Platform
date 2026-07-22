@@ -124,6 +124,29 @@ func TestMigrationSevenAcceptsExistingFirstClassProjection(t *testing.T) {
 	}
 }
 
+func TestMigrationSevenRejectsNilProjectionStationIDs(t *testing.T) {
+	conn := openMigrationSevenDatabase(t)
+	trainRunID := seedProjectionSource(t, conn)
+	store, err := readmodel.NewStore(conn, clock.NewDeterministic(time.Now().UTC()))
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	if _, err := store.RebuildTrainRun(context.Background(), trainRunID.String()); err != nil {
+		t.Fatalf("RebuildTrainRun() error = %v", err)
+	}
+	for _, column := range []string{"from_station_id", "to_station_id"} {
+		_, err := conn.Exec(context.Background(), `
+			UPDATE train_run_journey_read_model
+			SET `+column+` = '00000000-0000-0000-0000-000000000000'::uuid
+			WHERE train_run_id = $1
+		`, trainRunID)
+		var pgError *pgconn.PgError
+		if !errors.As(err, &pgError) || pgError.Code != "23514" {
+			t.Fatalf("nil %s error = %v, want check violation", column, err)
+		}
+	}
+}
+
 func TestDeleteTrainRunProjectionLeavesAuthoritativeSourceUntouched(t *testing.T) {
 	conn := openMigrationSevenDatabase(t)
 	trainRunID := seedProjectionSource(t, conn)
@@ -507,6 +530,62 @@ func TestReconcileTrainRunDetectsMissingAndMismatchedRowsWithoutRepair(t *testin
 	}
 }
 
+func TestRouteStopOffsetTimestampDrivesReconciliationAndRebuild(t *testing.T) {
+	conn := openMigrationSevenDatabase(t)
+	trainRunID := seedProjectionSource(t, conn)
+	store, err := readmodel.NewStore(conn, clock.NewDeterministic(time.Now().UTC()))
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	if _, err := store.RebuildTrainRun(context.Background(), trainRunID.String()); err != nil {
+		t.Fatalf("RebuildTrainRun(initial) error = %v", err)
+	}
+	var initialSourceUpdatedAt time.Time
+	if err := conn.QueryRow(context.Background(), `
+		SELECT max(source_updated_at)
+		FROM train_run_journey_read_model
+		WHERE train_run_id = $1
+	`, trainRunID).Scan(&initialSourceUpdatedAt); err != nil {
+		t.Fatalf("read initial source timestamp: %v", err)
+	}
+	if _, err := conn.Exec(context.Background(), `
+		UPDATE route_stops
+		SET departure_offset_minutes = departure_offset_minutes + 5
+		WHERE route_id = (SELECT route_id FROM train_runs WHERE id = $1)
+		  AND stop_index = 1
+	`, trainRunID); err != nil {
+		t.Fatalf("update route-stop offset: %v", err)
+	}
+	mismatch, err := store.ReconcileTrainRun(context.Background(), trainRunID.String())
+	if err != nil {
+		t.Fatalf("ReconcileTrainRun(route-stop change) error = %v", err)
+	}
+	if mismatch.Consistent || mismatch.StaleRows == 0 || mismatch.MismatchedRows == 0 {
+		t.Fatalf("route-stop reconciliation = %+v, want stale schedule rows", mismatch)
+	}
+	if _, err := store.RebuildTrainRun(context.Background(), trainRunID.String()); err != nil {
+		t.Fatalf("RebuildTrainRun(route-stop change) error = %v", err)
+	}
+	consistent, err := store.ReconcileTrainRun(context.Background(), trainRunID.String())
+	if err != nil {
+		t.Fatalf("ReconcileTrainRun(after rebuild) error = %v", err)
+	}
+	if !consistent.Consistent {
+		t.Fatalf("route-stop reconciliation after rebuild = %+v", consistent)
+	}
+	var rebuiltSourceUpdatedAt time.Time
+	if err := conn.QueryRow(context.Background(), `
+		SELECT max(source_updated_at)
+		FROM train_run_journey_read_model
+		WHERE train_run_id = $1
+	`, trainRunID).Scan(&rebuiltSourceUpdatedAt); err != nil {
+		t.Fatalf("read rebuilt source timestamp: %v", err)
+	}
+	if !rebuiltSourceUpdatedAt.After(initialSourceUpdatedAt) {
+		t.Fatalf("route-stop source timestamp = %s, want after %s", rebuiltSourceUpdatedAt, initialSourceUpdatedAt)
+	}
+}
+
 func TestRepeatedRebuildIsDeterministicAndRetainsCancelledStatus(t *testing.T) {
 	conn := openMigrationSevenDatabase(t)
 	trainRunID := seedProjectionSource(t, conn)
@@ -596,7 +675,7 @@ func TestProjectionSearchUsesDenormalizedRowsAndExcludesCancelledRuns(t *testing
 	}
 }
 
-func TestEventCoordinatorCommitsProjectionReceiptAndRetriesCacheRotationOnDuplicate(t *testing.T) {
+func TestEventCoordinatorCompletesInvalidationBeforeReceiptAndSkipsDuplicateWork(t *testing.T) {
 	conn := openMigrationSevenDatabase(t)
 	trainRunID := seedProjectionSource(t, conn)
 	store, err := readmodel.NewStore(conn, clock.NewDeterministic(time.Now().UTC()))
@@ -631,7 +710,7 @@ func TestEventCoordinatorCommitsProjectionReceiptAndRetriesCacheRotationOnDuplic
 	if err := coordinator.HandleEvent(context.Background(), event); err != nil {
 		t.Fatalf("HandleEvent(duplicate) error = %v", err)
 	}
-	if !reflect.DeepEqual(rotator.keys, append(wantRotations, wantRotations...)) {
+	if !reflect.DeepEqual(rotator.keys, wantRotations) {
 		t.Fatalf("duplicate event rotations = %v", rotator.keys)
 	}
 	var receiptRows int
@@ -682,6 +761,154 @@ func TestStationEventRebuildsAffectedRunsAndRotatesOnlyStationAndSearchCaches(t 
 	}
 	if projectedName != "Taipei Main" {
 		t.Fatalf("projected station name = %q", projectedName)
+	}
+}
+
+func TestImpactResolverPaginatesOneHundredAndOneRunsWithoutDroppingTheTail(t *testing.T) {
+	conn := openMigrationSevenDatabase(t)
+	sourceTrainRunID := seedProjectionSource(t, conn)
+	cloneProjectionTrainRuns(t, conn, sourceTrainRunID, 100)
+	var stationID uuid.UUID
+	if err := conn.QueryRow(context.Background(), `SELECT id FROM stations WHERE code = 'TPE'`).Scan(&stationID); err != nil {
+		t.Fatalf("read station ID: %v", err)
+	}
+	resolver, err := readmodel.NewPostgresImpactResolver(conn)
+	if err != nil {
+		t.Fatalf("NewPostgresImpactResolver() error = %v", err)
+	}
+	event := readmodel.ProjectionEvent{
+		ConsumerName: readmodel.DurableConsumerName, EventID: uuid.NewString(), EventType: "station.updated",
+		AggregateType: "station", AggregateID: stationID.String(),
+	}
+	first, err := resolver.AffectedTrainRunIDs(context.Background(), event, "", 100)
+	if err != nil {
+		t.Fatalf("AffectedTrainRunIDs(first) error = %v", err)
+	}
+	if len(first.TrainRunIDs) != 100 || !first.HasMore {
+		t.Fatalf("first impact page = %d has_more=%v, want 100 and true", len(first.TrainRunIDs), first.HasMore)
+	}
+	second, err := resolver.AffectedTrainRunIDs(
+		context.Background(),
+		event,
+		first.TrainRunIDs[len(first.TrainRunIDs)-1],
+		100,
+	)
+	if err != nil {
+		t.Fatalf("AffectedTrainRunIDs(second) error = %v", err)
+	}
+	if len(second.TrainRunIDs) != 1 || second.HasMore {
+		t.Fatalf("second impact page = %d has_more=%v, want 1 and false", len(second.TrainRunIDs), second.HasMore)
+	}
+}
+
+func TestStationEventResumesTwoHundredFiftyOneRunFanoutFromDurableCursor(t *testing.T) {
+	conn := openMigrationSevenDatabase(t)
+	sourceTrainRunID := seedProjectionSource(t, conn)
+	cloneProjectionTrainRuns(t, conn, sourceTrainRunID, 250)
+	var stationID uuid.UUID
+	if err := conn.QueryRow(context.Background(), `SELECT id FROM stations WHERE code = 'TPE'`).Scan(&stationID); err != nil {
+		t.Fatalf("read station ID: %v", err)
+	}
+	event := readmodel.ProjectionEvent{
+		ConsumerName: readmodel.DurableConsumerName, EventID: uuid.NewString(), EventType: "station.updated",
+		AggregateType: "station", AggregateID: stationID.String(),
+	}
+	firstClock := time.Date(2026, time.July, 22, 10, 0, 0, 0, time.UTC)
+	firstStore, _ := readmodel.NewStore(conn, clock.NewDeterministic(firstClock))
+	resolver, _ := readmodel.NewPostgresImpactResolver(conn)
+	firstRotator := &versionRotatorFake{}
+	firstCoordinator, _ := readmodel.NewEventCoordinator(firstStore, resolver, firstRotator)
+
+	if err := firstCoordinator.HandleEvent(context.Background(), event); !errors.Is(err, readmodel.ErrProjectionPending) {
+		t.Fatalf("HandleEvent(first page) error = %v, want ErrProjectionPending", err)
+	}
+	if !reflect.DeepEqual(firstRotator.keys, []string{querycache.StationVersionKey(), querycache.SearchVersionKey()}) {
+		t.Fatalf("first-page rotations = %v", firstRotator.keys)
+	}
+	var processed, progressRows, receiptRows, projectedRuns int
+	var firstPageTrainRunID uuid.UUID
+	if err := conn.QueryRow(context.Background(), `
+		SELECT
+			(SELECT processed_train_runs FROM read_model_event_progress
+			 WHERE consumer_name = $1 AND event_id = $2),
+			(SELECT count(*) FROM read_model_event_progress
+			 WHERE consumer_name = $1 AND event_id = $2),
+			(SELECT count(*) FROM read_model_event_receipts
+			 WHERE consumer_name = $1 AND event_id = $2),
+			(SELECT count(DISTINCT train_run_id) FROM train_run_journey_read_model),
+			(SELECT train_run_id FROM train_run_journey_read_model ORDER BY train_run_id LIMIT 1)
+	`, event.ConsumerName, event.EventID).Scan(
+		&processed,
+		&progressRows,
+		&receiptRows,
+		&projectedRuns,
+		&firstPageTrainRunID,
+	); err != nil {
+		t.Fatalf("inspect interrupted fanout: %v", err)
+	}
+	if processed != 100 || progressRows != 1 || receiptRows != 0 || projectedRuns != 100 {
+		t.Fatalf(
+			"interrupted fanout = processed %d progress %d receipts %d projected %d",
+			processed,
+			progressRows,
+			receiptRows,
+			projectedRuns,
+		)
+	}
+	searchRequest := querypostgres.SearchRequest{
+		OriginCode: "TPE", DestinationCode: "KHH", ServiceDate: time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC),
+		SeatClass: "standard", Page: 1, PageSize: 20, Sort: "departure_asc",
+	}
+	if _, err := firstStore.SearchTrainRuns(context.Background(), searchRequest); !errors.Is(err, readmodel.ErrProjectionUnavailable) {
+		t.Fatalf("SearchTrainRuns(during fanout) error = %v, want source-fallback signal", err)
+	}
+
+	resumedStore, _ := readmodel.NewStore(conn, clock.NewDeterministic(firstClock.Add(time.Hour)))
+	resumedRotator := &versionRotatorFake{}
+	resumedCoordinator, _ := readmodel.NewEventCoordinator(resumedStore, resolver, resumedRotator)
+	if err := resumedCoordinator.HandleEvent(context.Background(), event); !errors.Is(err, readmodel.ErrProjectionPending) {
+		t.Fatalf("HandleEvent(second page) error = %v, want ErrProjectionPending", err)
+	}
+	if err := resumedCoordinator.HandleEvent(context.Background(), event); err != nil {
+		t.Fatalf("HandleEvent(final page) error = %v", err)
+	}
+	if len(resumedRotator.keys) != 0 {
+		t.Fatalf("resumed global rotations = %v, want checkpointed no-op", resumedRotator.keys)
+	}
+	var finalProgress, finalReceipts, finalRuns, finalRows int
+	var firstPageRebuiltAt time.Time
+	if err := conn.QueryRow(context.Background(), `
+		SELECT
+			(SELECT count(*) FROM read_model_event_progress
+			 WHERE consumer_name = $1 AND event_id = $2),
+			(SELECT count(*) FROM read_model_event_receipts
+			 WHERE consumer_name = $1 AND event_id = $2),
+			(SELECT count(DISTINCT train_run_id) FROM train_run_journey_read_model),
+			(SELECT count(*) FROM train_run_journey_read_model),
+			(SELECT min(rebuilt_at) FROM train_run_journey_read_model WHERE train_run_id = $3)
+	`, event.ConsumerName, event.EventID, firstPageTrainRunID).Scan(
+		&finalProgress,
+		&finalReceipts,
+		&finalRuns,
+		&finalRows,
+		&firstPageRebuiltAt,
+	); err != nil {
+		t.Fatalf("inspect completed fanout: %v", err)
+	}
+	if finalProgress != 0 || finalReceipts != 1 || finalRuns != 251 || finalRows != 1506 {
+		t.Fatalf(
+			"completed fanout = progress %d receipts %d runs %d rows %d",
+			finalProgress,
+			finalReceipts,
+			finalRuns,
+			finalRows,
+		)
+	}
+	if !firstPageRebuiltAt.Equal(firstClock) {
+		t.Fatalf("first-page rebuilt_at after resume = %s, want %s", firstPageRebuiltAt, firstClock)
+	}
+	if _, err := resumedStore.SearchTrainRuns(context.Background(), searchRequest); err != nil {
+		t.Fatalf("SearchTrainRuns(after fanout) error = %v", err)
 	}
 }
 
@@ -823,6 +1050,44 @@ func cloneProjectionTrainRun(t *testing.T, conn *pgx.Conn, sourceTrainRunID uuid
 		t.Fatalf("clone projection train run: %v", err)
 	}
 	return secondTrainRunID
+}
+
+func cloneProjectionTrainRuns(t *testing.T, conn *pgx.Conn, sourceTrainRunID uuid.UUID, count int) []uuid.UUID {
+	t.Helper()
+	rows, err := conn.Query(context.Background(), `
+		INSERT INTO train_runs (
+			id,
+			train_id,
+			route_id,
+			service_date,
+			scheduled_departure_at,
+			status,
+			segment_count
+		)
+		SELECT
+			gen_random_uuid(),
+			train_id,
+			route_id,
+			service_date + generated.day_offset,
+			scheduled_departure_at + generated.day_offset * interval '1 day',
+			status,
+			segment_count
+		FROM train_runs
+		CROSS JOIN generate_series(1, $2) AS generated(day_offset)
+		WHERE id = $1
+		RETURNING id
+	`, sourceTrainRunID, count)
+	if err != nil {
+		t.Fatalf("clone %d projection train runs: %v", count, err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	if err != nil {
+		t.Fatalf("collect cloned projection train runs: %v", err)
+	}
+	if len(ids) != count {
+		t.Fatalf("cloned projection train runs = %d, want %d", len(ids), count)
+	}
+	return ids
 }
 
 func projectionChecksum(t *testing.T, conn *pgx.Conn, trainRunID uuid.UUID) string {

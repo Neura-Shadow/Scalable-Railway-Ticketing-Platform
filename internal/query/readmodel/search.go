@@ -23,6 +23,19 @@ func (s *Store) SearchTrainRuns(
 		return nil, fmt.Errorf("%w: begin projection search", ErrPersistence)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+	var projectionAvailable bool
+	if err := tx.QueryRow(ctx, `
+		SELECT NOT EXISTS (
+			SELECT 1
+			FROM read_model_event_progress
+			WHERE projection_affecting
+		)
+	`).Scan(&projectionAvailable); err != nil {
+		return nil, fmt.Errorf("%w: inspect projection progress", ErrPersistence)
+	}
+	if !projectionAvailable {
+		return nil, ErrProjectionUnavailable
+	}
 	rows, err := tx.Query(ctx, `
 		SELECT
 			train_run_id::text,

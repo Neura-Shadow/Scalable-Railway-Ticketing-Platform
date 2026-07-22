@@ -28,7 +28,8 @@ type StreamTransport interface {
 	ClaimPending(context.Context, string, time.Duration, int64) ([]StreamMessage, error)
 	ReadNew(context.Context, string, int64) ([]StreamMessage, error)
 	DeliveryCount(context.Context, string) (int64, error)
-	DeadLetter(context.Context, StreamMessage, string) error
+	ContinueAndAck(context.Context, StreamMessage) error
+	DeadLetterAndAck(context.Context, StreamMessage, string) error
 	Ack(context.Context, string) error
 }
 
@@ -49,6 +50,7 @@ type WorkerResult struct {
 	Processed    int
 	Retried      int
 	DeadLettered int
+	Continued    int
 	Acked        int
 }
 
@@ -114,6 +116,15 @@ func (worker *Worker) RunOnce(ctx context.Context) (WorkerResult, error) {
 			continue
 		}
 		if err := worker.handler.HandleEvent(ctx, event); err != nil {
+			if errors.Is(err, ErrProjectionPending) {
+				if continuationErr := worker.transport.ContinueAndAck(ctx, message); continuationErr != nil {
+					runErrors = append(runErrors, fmt.Errorf("continue read-model event: %w", continuationErr))
+					continue
+				}
+				result.Continued++
+				result.Acked++
+				continue
+			}
 			if failureErr := worker.handleFailure(ctx, message, "handler_failure", &result); failureErr != nil {
 				runErrors = append(runErrors, failureErr)
 			}
@@ -144,13 +155,10 @@ func (worker *Worker) handleFailure(
 		result.Retried++
 		return nil
 	}
-	if err := worker.transport.DeadLetter(ctx, message, reason); err != nil {
+	if err := worker.transport.DeadLetterAndAck(ctx, message, reason); err != nil {
 		return fmt.Errorf("dead-letter read-model event: %w", err)
 	}
 	result.DeadLettered++
-	if err := worker.transport.Ack(ctx, message.ID); err != nil {
-		return fmt.Errorf("ack dead-lettered read-model event: %w", err)
-	}
 	result.Acked++
 	return nil
 }
