@@ -25,6 +25,7 @@ func TestCacheStoreCoalescesColdStationMissAndSharesWarmValue(t *testing.T) {
 	const callers = 24
 	ready := make(chan struct{}, callers)
 	start := make(chan struct{})
+	stationPointers := make(chan *querypostgres.Station, callers)
 	var wait sync.WaitGroup
 	for caller := 0; caller < callers; caller++ {
 		wait.Add(1)
@@ -35,7 +36,9 @@ func TestCacheStoreCoalescesColdStationMissAndSharesWarmValue(t *testing.T) {
 			stations, err := store.ListStations(context.Background())
 			if err != nil || len(stations) != 1 {
 				t.Errorf("ListStations() = %v, %v", stations, err)
+				return
 			}
+			stationPointers <- &stations[0]
 		}()
 	}
 	for caller := 0; caller < callers; caller++ {
@@ -46,6 +49,14 @@ func TestCacheStoreCoalescesColdStationMissAndSharesWarmValue(t *testing.T) {
 		runtime.Gosched()
 	}
 	wait.Wait()
+	close(stationPointers)
+	seenPointers := make(map[*querypostgres.Station]struct{}, callers)
+	for pointer := range stationPointers {
+		if _, duplicate := seenPointers[pointer]; duplicate {
+			t.Fatal("cold station callers shared a mutable result slice")
+		}
+		seenPointers[pointer] = struct{}{}
+	}
 	if source.stationCalls.Load() != 1 {
 		t.Fatalf("cold station source calls = %d, want 1", source.stationCalls.Load())
 	}
@@ -137,6 +148,87 @@ func TestAvailabilityHintCanonicalizesUppercaseTrainRunIDForWarmHit(t *testing.T
 	}
 	if source.availabilityCalls.Load() != 1 {
 		t.Fatalf("uppercase UUID source calls = %d, want one warm cache fill", source.availabilityCalls.Load())
+	}
+}
+
+func TestAvailabilityHintRejectsValidJSONFromDifferentJourneyScope(t *testing.T) {
+	client := openCacheRedis(t)
+	trainRunID := uuid.NewString()
+	request := querypostgres.AvailabilityRequest{
+		TrainRunID: trainRunID, OriginCode: "TPE", DestinationCode: "KHH", SeatClass: "standard",
+	}
+	source := &cacheSourceFake{availability: availabilityFixture(trainRunID, 7)}
+	store := newCacheStore(t, source, source, client)
+	version, err := store.versions.GetOrCreate(context.Background(), "cache:availability:version:"+trainRunID)
+	if err != nil {
+		t.Fatalf("GetOrCreate() error = %v", err)
+	}
+	key, err := AvailabilityDataKey(version, trainRunID, "TPE", "KHH", "standard")
+	if err != nil {
+		t.Fatalf("AvailabilityDataKey() error = %v", err)
+	}
+	payload, valid := availabilityCachePayload(
+		availabilityFixture(trainRunID, 99), request,
+		time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC),
+	)
+	if !valid {
+		t.Fatal("availabilityCachePayload() rejected valid fixture")
+	}
+	payload.OriginCode = "TXG"
+	if err := store.writeJSON(context.Background(), key, payload, store.availabilityTTL); err != nil {
+		t.Fatalf("seed cross-scope cache payload: %v", err)
+	}
+	availability, err := store.Availability(context.Background(), request)
+	if err != nil || availability.AvailableSeats != 7 {
+		t.Fatalf("Availability(cross-scope cache) = %+v, %v", availability, err)
+	}
+	if source.availabilityCalls.Load() != 1 {
+		t.Fatalf("cross-scope cache source calls = %d, want 1", source.availabilityCalls.Load())
+	}
+}
+
+func TestAvailabilityBatchCoalescesConcurrentIdenticalMisses(t *testing.T) {
+	client := openCacheRedis(t)
+	requests := []querypostgres.AvailabilityRequest{
+		{TrainRunID: uuid.NewString(), OriginCode: "TPE", DestinationCode: "KHH", SeatClass: "standard"},
+		{TrainRunID: uuid.NewString(), OriginCode: "TPE", DestinationCode: "KHH", SeatClass: "standard"},
+	}
+	source := &cacheBatchSourceFake{entered: make(chan struct{}), release: make(chan struct{})}
+	store := newCacheStore(t, source, source, client)
+	const callers = 32
+	ready := make(chan struct{}, callers)
+	start := make(chan struct{})
+	errorsSeen := make(chan error, callers)
+	var wait sync.WaitGroup
+	for caller := 0; caller < callers; caller++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			ready <- struct{}{}
+			<-start
+			results, err := store.AvailabilityBatch(context.Background(), requests)
+			if err == nil && (len(results) != 2 || results[0].TrainRunID != requests[0].TrainRunID ||
+				results[1].TrainRunID != requests[1].TrainRunID) {
+				err = querypostgres.ErrPersistence
+			}
+			errorsSeen <- err
+		}()
+	}
+	for caller := 0; caller < callers; caller++ {
+		<-ready
+	}
+	close(start)
+	<-source.entered
+	close(source.release)
+	wait.Wait()
+	close(errorsSeen)
+	for err := range errorsSeen {
+		if err != nil {
+			t.Fatalf("AvailabilityBatch(concurrent) error = %v", err)
+		}
+	}
+	if source.batchCalls.Load() != 1 {
+		t.Fatalf("concurrent availability batch source calls = %d, want 1", source.batchCalls.Load())
 	}
 }
 
@@ -299,6 +391,45 @@ type cacheSourceFake struct {
 	availabilityCalls atomic.Int64
 }
 
+type cacheBatchSourceFake struct {
+	batchCalls atomic.Int64
+	entered    chan struct{}
+	release    chan struct{}
+	once       sync.Once
+}
+
+func (source *cacheBatchSourceFake) ListStations(context.Context) ([]querypostgres.Station, error) {
+	return nil, nil
+}
+
+func (source *cacheBatchSourceFake) SearchTrainRuns(
+	context.Context,
+	querypostgres.SearchRequest,
+) ([]querypostgres.SearchResult, error) {
+	return nil, nil
+}
+
+func (source *cacheBatchSourceFake) Availability(
+	_ context.Context,
+	request querypostgres.AvailabilityRequest,
+) (querypostgres.Availability, error) {
+	return availabilityFixture(request.TrainRunID, 7), nil
+}
+
+func (source *cacheBatchSourceFake) AvailabilityBatch(
+	_ context.Context,
+	requests []querypostgres.AvailabilityRequest,
+) ([]querypostgres.Availability, error) {
+	source.batchCalls.Add(1)
+	source.once.Do(func() { close(source.entered) })
+	<-source.release
+	results := make([]querypostgres.Availability, 0, len(requests))
+	for _, request := range requests {
+		results = append(results, availabilityFixture(request.TrainRunID, 7))
+	}
+	return results, nil
+}
+
 func (source *cacheSourceFake) ListStations(context.Context) ([]querypostgres.Station, error) {
 	source.stationCalls.Add(1)
 	source.mu.Lock()
@@ -346,7 +477,7 @@ func searchResultFixture(fare int64) querypostgres.SearchResult {
 
 func availabilityFixture(trainRunID string, seats int64) querypostgres.Availability {
 	return querypostgres.Availability{
-		TrainRunID: trainRunID, TrainCode: "TR200", FromStopIndex: 0, ToStopIndex: 2,
+		TrainRunID: trainRunID, TrainCode: "TR200", FromStopIndex: 0, ToStopIndex: 2, SegmentCount: 2,
 		DepartureAt: time.Date(2026, 7, 22, 1, 0, 0, 0, time.UTC),
 		ArrivalAt:   time.Date(2026, 7, 22, 3, 0, 0, 0, time.UTC),
 		SeatClass:   domain.SeatClassStandard, AvailableSeats: seats, FareAmountMinor: 1200, Currency: "TWD",

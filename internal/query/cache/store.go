@@ -2,6 +2,8 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"sort"
@@ -90,9 +92,12 @@ type cachedStation struct {
 }
 
 type cachedAvailability struct {
-	Value      querypostgres.Availability `json:"value"`
-	ObservedAt time.Time                  `json:"observed_at"`
-	Source     string                     `json:"source"`
+	Value           querypostgres.Availability `json:"value"`
+	OriginCode      string                     `json:"origin_code"`
+	DestinationCode string                     `json:"destination_code"`
+	SeatClass       string                     `json:"seat_class"`
+	ObservedAt      time.Time                  `json:"observed_at"`
+	Source          string                     `json:"source"`
 }
 
 type fillOutcome struct {
@@ -184,7 +189,7 @@ func (store *Store) ListStations(ctx context.Context) ([]querypostgres.Station, 
 	} else {
 		store.recordFill("stations", "success", "none", time.Since(started), shared)
 	}
-	return outcome.value.([]querypostgres.Station), nil
+	return append([]querypostgres.Station(nil), outcome.value.([]querypostgres.Station)...), nil
 }
 
 func (store *Store) SearchTrainRuns(
@@ -289,7 +294,10 @@ func (store *Store) Availability(
 		if availability.AvailableSeats < 0 {
 			return nil, querypostgres.ErrPersistence
 		}
-		payload := cachedAvailability{Value: availability, ObservedAt: store.clock.Now().UTC(), Source: "postgres"}
+		payload, valid := availabilityCachePayload(availability, request, store.clock.Now().UTC())
+		if !valid {
+			return nil, querypostgres.ErrPersistence
+		}
 		return fillOutcome{
 			value: availability, writeErr: store.writeJSON(fillContext, key, payload, store.availabilityTTL),
 		}, nil
@@ -332,6 +340,7 @@ func (store *Store) AvailabilityBatch(
 	keys := make([]string, len(requests))
 	misses := make([]querypostgres.AvailabilityRequest, 0)
 	missIndexes := make([]int, 0)
+	missKeys := make([]string, 0)
 	for index, request := range requests {
 		versionKey, err := AvailabilityVersionKey(request.TrainRunID)
 		if err != nil {
@@ -358,19 +367,61 @@ func (store *Store) AvailabilityBatch(
 		}
 		misses = append(misses, request)
 		missIndexes = append(missIndexes, index)
+		missKeys = append(missKeys, keys[index])
 	}
 	if len(misses) == 0 {
 		return results, nil
 	}
-	loaded := make([]querypostgres.Availability, 0, len(misses))
+	flightKey, err := availabilityBatchFlightKey(misses, missKeys)
+	if err != nil {
+		return nil, err
+	}
+	value, err, _ := store.coalescer.Do(ctx, flightKey, func(fillContext context.Context) (any, error) {
+		return store.fillAvailabilityMisses(fillContext, misses, missKeys)
+	})
+	if err != nil {
+		return nil, err
+	}
+	loaded := value.([]querypostgres.Availability)
+	for offset, availability := range loaded {
+		index := missIndexes[offset]
+		results[index] = availability
+	}
+	return results, nil
+}
+
+func (store *Store) fillAvailabilityMisses(
+	ctx context.Context,
+	requests []querypostgres.AvailabilityRequest,
+	keys []string,
+) ([]querypostgres.Availability, error) {
+	results := make([]querypostgres.Availability, len(requests))
+	sourceRequests := make([]querypostgres.AvailabilityRequest, 0, len(requests))
+	sourceIndexes := make([]int, 0, len(requests))
+	for index, request := range requests {
+		if keys[index] != "" {
+			if availability, status := store.readAvailability(ctx, keys[index], request); status == cacheReadHit {
+				results[index] = availability
+				continue
+			} else if status == cacheReadRedisFailure || status == cacheReadInvalid {
+				store.recordReadStatus("availability", status)
+			}
+		}
+		sourceRequests = append(sourceRequests, request)
+		sourceIndexes = append(sourceIndexes, index)
+	}
+	if len(sourceRequests) == 0 {
+		return results, nil
+	}
+	loaded := make([]querypostgres.Availability, 0, len(sourceRequests))
 	if batch, ok := store.source.(availabilityBatchSource); ok {
 		var err error
-		loaded, err = batch.AvailabilityBatch(ctx, misses)
+		loaded, err = batch.AvailabilityBatch(ctx, sourceRequests)
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		for _, request := range misses {
+		for _, request := range sourceRequests {
 			availability, err := store.source.Availability(ctx, request)
 			if err != nil {
 				return nil, err
@@ -378,26 +429,45 @@ func (store *Store) AvailabilityBatch(
 			loaded = append(loaded, availability)
 		}
 	}
-	if len(loaded) != len(misses) {
+	if len(loaded) != len(sourceRequests) {
 		return nil, querypostgres.ErrPersistence
 	}
 	for offset, availability := range loaded {
-		index := missIndexes[offset]
+		index := sourceIndexes[offset]
 		if availability.AvailableSeats < 0 {
 			return nil, querypostgres.ErrPersistence
 		}
 		results[index] = availability
-		if keys[index] != "" {
-			payload := cachedAvailability{Value: availability, ObservedAt: store.clock.Now().UTC(), Source: "postgres"}
-			started := time.Now()
-			if err := store.writeJSON(ctx, keys[index], payload, store.availabilityTTL); err != nil {
-				store.recordFill("availability", "failure", "redis", time.Since(started), false)
-			} else {
-				store.recordFill("availability", "success", "none", time.Since(started), false)
-			}
+		if keys[index] == "" {
+			continue
+		}
+		payload, valid := availabilityCachePayload(availability, requests[index], store.clock.Now().UTC())
+		if !valid {
+			return nil, querypostgres.ErrPersistence
+		}
+		started := time.Now()
+		if err := store.writeJSON(ctx, keys[index], payload, store.availabilityTTL); err != nil {
+			store.recordFill("availability", "failure", "redis", time.Since(started), false)
+		} else {
+			store.recordFill("availability", "success", "none", time.Since(started), false)
 		}
 	}
 	return results, nil
+}
+
+func availabilityBatchFlightKey(requests []querypostgres.AvailabilityRequest, keys []string) (string, error) {
+	if len(requests) == 0 || len(requests) != len(keys) {
+		return "", querypostgres.ErrInvalidQuery
+	}
+	hash := sha256.New()
+	for index, request := range requests {
+		trainRunID, origin, destination, seatClass, valid := normalizedAvailabilityScope(request)
+		if !valid {
+			return "", querypostgres.ErrInvalidJourney
+		}
+		_, _ = hash.Write([]byte(keys[index] + "\x00" + trainRunID + "\x00" + origin + "\x00" + destination + "\x00" + seatClass + "\n"))
+	}
+	return "availability-batch:" + hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func (store *Store) readStations(ctx context.Context, key string) ([]querypostgres.Station, cacheReadStatus) {
@@ -446,9 +516,13 @@ func (store *Store) readAvailability(
 	}
 	requestTrainRunID, requestErr := uuid.Parse(request.TrainRunID)
 	cachedTrainRunID, cachedErr := uuid.Parse(cached.Value.TrainRunID)
+	_, origin, destination, seatClass, scopeValid := normalizedAvailabilityScope(request)
 	if cached.Source != "postgres" || cached.ObservedAt.IsZero() ||
 		cached.Value.AvailableSeats < 0 || requestErr != nil || cachedErr != nil ||
-		requestTrainRunID == uuid.Nil || cachedTrainRunID != requestTrainRunID {
+		requestTrainRunID == uuid.Nil || cachedTrainRunID != requestTrainRunID || !scopeValid ||
+		cached.OriginCode != origin || cached.DestinationCode != destination || cached.SeatClass != seatClass ||
+		cached.Value.SeatClass.String() != seatClass || cached.Value.FromStopIndex < 0 ||
+		cached.Value.ToStopIndex <= cached.Value.FromStopIndex || cached.Value.SegmentCount < cached.Value.ToStopIndex {
 		return querypostgres.Availability{}, cacheReadInvalid
 	}
 	age := store.clock.Now().UTC().Sub(cached.ObservedAt.UTC())
@@ -456,6 +530,43 @@ func (store *Store) readAvailability(
 		return querypostgres.Availability{}, cacheReadMiss
 	}
 	return cached.Value, cacheReadHit
+}
+
+func availabilityCachePayload(
+	value querypostgres.Availability,
+	request querypostgres.AvailabilityRequest,
+	observedAt time.Time,
+) (cachedAvailability, bool) {
+	_, origin, destination, seatClass, valid := normalizedAvailabilityScope(request)
+	if !valid || observedAt.IsZero() {
+		return cachedAvailability{}, false
+	}
+	return cachedAvailability{
+		Value: value, OriginCode: origin, DestinationCode: destination, SeatClass: seatClass,
+		ObservedAt: observedAt, Source: "postgres",
+	}, true
+}
+
+func normalizedAvailabilityScope(
+	request querypostgres.AvailabilityRequest,
+) (string, string, string, string, bool) {
+	trainRunID, err := uuid.Parse(request.TrainRunID)
+	if err != nil || trainRunID == uuid.Nil {
+		return "", "", "", "", false
+	}
+	origin, err := domain.NewStationCode(request.OriginCode)
+	if err != nil {
+		return "", "", "", "", false
+	}
+	destination, err := domain.NewStationCode(request.DestinationCode)
+	if err != nil || origin == destination {
+		return "", "", "", "", false
+	}
+	seatClass, err := domain.ParseSeatClass(request.SeatClass)
+	if err != nil {
+		return "", "", "", "", false
+	}
+	return trainRunID.String(), origin.String(), destination.String(), seatClass.String(), true
 }
 
 func (store *Store) searchProjectionOrSource(
