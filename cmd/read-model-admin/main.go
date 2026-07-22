@@ -12,12 +12,19 @@ import (
 	"time"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/clock"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/redisx"
 	queryreadmodel "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/readmodel"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 )
 
-const defaultAdminTimeout = 2 * time.Minute
+const (
+	defaultAdminTimeout = 2 * time.Minute
+	readModelStream     = "railway:outbox:v1"
+	readModelGroup      = "railway-read-model"
+	readModelDLQ        = "railway:outbox:v1:read-model:dlq"
+)
 
 type envelope struct {
 	Command  string `json:"command"`
@@ -58,6 +65,19 @@ func run(parent context.Context, args []string, lookup func(string) (string, boo
 		result, err = reconcile(parent, databaseURL, args[1:])
 	case "inspect-lag":
 		result, err = inspectLag(parent, databaseURL, args[1:])
+	case "resume-event":
+		redisAddress, _ := lookup("REDIS_ADDRESS")
+		if strings.TrimSpace(redisAddress) == "" {
+			redisAddress, _ = lookup("REDIS_ADDR")
+		}
+		redisPassword, _ := lookup("REDIS_PASSWORD")
+		result, err = resumeEvent(
+			parent,
+			databaseURL,
+			strings.TrimSpace(redisAddress),
+			redisPassword,
+			args[1:],
+		)
 	default:
 		writeUsage(stderr)
 		return 2
@@ -75,6 +95,63 @@ func run(parent context.Context, args []string, lookup func(string) (string, boo
 		return 1
 	}
 	return 0
+}
+
+func resumeEvent(
+	parent context.Context,
+	databaseURL string,
+	redisAddress string,
+	redisPassword string,
+	args []string,
+) (envelope, error) {
+	flags := flag.NewFlagSet("resume-event", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	eventIDText := flags.String("event-id", "", "canonical event UUID from the read-model DLQ")
+	consumerName := flags.String("consumer-name", queryreadmodel.DurableConsumerName, "durable receipt consumer")
+	apply := flags.Bool("apply", false, "enqueue a safe-field continuation")
+	timeout := flags.Duration("timeout", defaultAdminTimeout, "maximum command duration")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || *timeout <= 0 {
+		return envelope{}, errors.New("usage: read-model-admin resume-event --event-id UUID [--consumer-name railway-read-model] [--apply] [--timeout 2m]")
+	}
+	eventID, err := uuid.Parse(strings.TrimSpace(*eventIDText))
+	if err != nil || eventID == uuid.Nil || eventID.String() != strings.TrimSpace(*eventIDText) {
+		return envelope{}, errors.New("event-id must be a canonical UUID")
+	}
+	result := envelope{
+		Command:  "resume-event",
+		Status:   "dry-run",
+		ReadOnly: !*apply,
+		Result:   map[string]any{"event_id": eventID.String()},
+	}
+	ctx, store, closeStore, err := openStore(parent, databaseURL, *timeout)
+	if err != nil {
+		return result, err
+	}
+	defer closeStore()
+	event, err := store.PendingEvent(ctx, strings.TrimSpace(*consumerName), eventID.String())
+	if err != nil {
+		return result, err
+	}
+	result.Result = map[string]any{
+		"event_id": event.EventID, "event_type": event.EventType, "aggregate_type": event.AggregateType,
+	}
+	if !*apply {
+		return result, nil
+	}
+	if redisAddress == "" {
+		return result, errors.New("REDIS_ADDRESS is required to resume an event")
+	}
+	client := redis.NewClient(redisx.BoundedClientOptions(redisAddress, redisPassword, 3*time.Second))
+	defer func() { _ = client.Close() }()
+	transport, err := queryreadmodel.NewRedisStreamTransport(client, readModelStream, readModelGroup, readModelDLQ)
+	if err != nil {
+		return result, err
+	}
+	if _, err := transport.EnqueueEvent(ctx, event); err != nil {
+		return result, err
+	}
+	result.Status = "resumed"
+	return result, nil
 }
 
 func rebuildTrainRun(parent context.Context, databaseURL string, args []string) (envelope, error) {
@@ -235,5 +312,5 @@ func publicAdminError(err error) string {
 }
 
 func writeUsage(output io.Writer) {
-	fmt.Fprintln(output, "usage: read-model-admin {rebuild-train-run|rebuild-all|reconcile|inspect-lag} [options]")
+	fmt.Fprintln(output, "usage: read-model-admin {rebuild-train-run|rebuild-all|reconcile|inspect-lag|resume-event} [options]")
 }

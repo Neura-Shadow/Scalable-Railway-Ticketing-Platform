@@ -35,5 +35,14 @@
   network policy, backup service, or audited approval workflow.
 - No zero-downtime migration or backfill claim is made. Operators must measure
   locks, disk growth, and backfill duration on a production-like restore.
+- The shared source stream is not blindly length-trimmed because Redis trimming
+  can remove entries still present in a consumer-group PEL. Backlog capacity,
+  alerting, and a group-floor-aware retention procedure remain deployment
+  responsibilities; an extended worker outage can therefore increase Redis
+  storage until recovery.
+- A repeatedly failing event is DLQ-bound after bounded attempts, but its
+  PostgreSQL progress intentionally keeps search on correct source fallback.
+  Recovery requires the documented `read-model-admin resume-event` redrive
+  after the dependency or data defect is repaired.
 - No national-scale, 12306-equivalent, global fairness, or production capacity
   claim is supported.

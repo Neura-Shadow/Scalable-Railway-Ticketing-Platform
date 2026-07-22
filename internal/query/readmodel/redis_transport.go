@@ -11,7 +11,6 @@ import (
 )
 
 const (
-	MaxSourceStreamLength     = 10_000
 	MaxDeadLetterStreamLength = 10_000
 )
 
@@ -23,11 +22,11 @@ if #pending == 0 then
   return ''
 end
 local continuation = redis.call(
-  'XADD', KEYS[1], 'MAXLEN', '~', ARGV[3], '*',
-  'event_id', ARGV[4],
-  'event_type', ARGV[5],
-  'aggregate_type', ARGV[6],
-  'aggregate_id', ARGV[7]
+  'XADD', KEYS[1], '*',
+  'event_id', ARGV[3],
+  'event_type', ARGV[4],
+  'aggregate_type', ARGV[5],
+  'aggregate_id', ARGV[6]
 )
 local acked = redis.call('XACK', KEYS[1], ARGV[1], ARGV[2])
 if acked ~= 1 then
@@ -123,6 +122,25 @@ func (transport *RedisStreamTransport) ReadNew(
 	return messages, nil
 }
 
+func (transport *RedisStreamTransport) EnqueueEvent(ctx context.Context, event ProjectionEvent) (string, error) {
+	if _, _, err := validateProjectionEvent(event); err != nil || !validEventPair(event.EventType, event.AggregateType) {
+		return "", ErrInvalidEvent
+	}
+	messageID, err := transport.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: transport.stream,
+		Values: map[string]any{
+			"event_id":       event.EventID,
+			"event_type":     event.EventType,
+			"aggregate_type": event.AggregateType,
+			"aggregate_id":   event.AggregateID,
+		},
+	}).Result()
+	if err != nil {
+		return "", fmt.Errorf("enqueue Redis stream event: %w", err)
+	}
+	return messageID, nil
+}
+
 func (transport *RedisStreamTransport) DeliveryCount(ctx context.Context, messageID string) (int64, error) {
 	pending, err := transport.client.XPendingExt(ctx, &redis.XPendingExtArgs{
 		Stream: transport.stream,
@@ -147,7 +165,6 @@ func (transport *RedisStreamTransport) ContinueAndAck(ctx context.Context, messa
 		[]string{transport.stream},
 		transport.group,
 		message.ID,
-		MaxSourceStreamLength,
 		message.Values["event_id"],
 		message.Values["event_type"],
 		message.Values["aggregate_type"],

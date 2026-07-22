@@ -19,6 +19,7 @@ const (
 var (
 	ErrProjectionPending     = errors.New("read-model projection event has more bounded work")
 	ErrProjectionUnavailable = errors.New("read-model projection temporarily unavailable")
+	ErrEventProgressNotFound = errors.New("read-model event progress not found")
 )
 
 type EventProgress struct {
@@ -26,6 +27,39 @@ type EventProgress struct {
 	Phase              string
 	AfterTrainRunID    string
 	ProcessedTrainRuns int
+}
+
+func (s *Store) PendingEvent(ctx context.Context, consumerName, rawEventID string) (ProjectionEvent, error) {
+	if !validRuntimeIdentifier(consumerName, 128) {
+		return ProjectionEvent{}, ErrInvalidEvent
+	}
+	eventID, err := uuid.Parse(rawEventID)
+	if err != nil || eventID == uuid.Nil || eventID.String() != rawEventID {
+		return ProjectionEvent{}, ErrInvalidEvent
+	}
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return ProjectionEvent{}, fmt.Errorf("%w: begin pending event lookup", ErrPersistence)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	event := ProjectionEvent{ConsumerName: consumerName, EventID: eventID.String()}
+	if err := tx.QueryRow(ctx, `
+		SELECT event_type, aggregate_type, aggregate_id::text
+		FROM read_model_event_progress
+		WHERE consumer_name = $1 AND event_id = $2
+	`, consumerName, eventID).Scan(&event.EventType, &event.AggregateType, &event.AggregateID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ProjectionEvent{}, ErrEventProgressNotFound
+		}
+		return ProjectionEvent{}, fmt.Errorf("%w: read pending event", ErrPersistence)
+	}
+	if !validEventPair(event.EventType, event.AggregateType) {
+		return ProjectionEvent{}, ErrInvalidEvent
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ProjectionEvent{}, fmt.Errorf("%w: commit pending event lookup", ErrPersistence)
+	}
+	return event, nil
 }
 
 func (s *Store) BeginEventProgress(
@@ -337,4 +371,9 @@ func parseEventCursor(raw string) (uuid.UUID, error) {
 		return uuid.Nil, ErrInvalidEvent
 	}
 	return value, nil
+}
+
+func validRuntimeIdentifier(value string, maximum int) bool {
+	return value == strings.TrimSpace(value) && len(value) >= 1 && len(value) <= maximum &&
+		!strings.ContainsAny(value, "\x00\r\n")
 }

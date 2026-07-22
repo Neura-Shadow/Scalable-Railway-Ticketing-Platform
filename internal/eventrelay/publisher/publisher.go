@@ -38,8 +38,6 @@ func NewRedisStream(client redis.UniversalClient, stream string) (*RedisStream, 
 func (p *RedisStream) Publish(ctx context.Context, event domain.Event) error {
 	return p.client.XAdd(ctx, &redis.XAddArgs{
 		Stream: p.stream,
-		MaxLen: 10_000,
-		Approx: true,
 		Values: map[string]any{
 			"event_id":       event.ID.String(),
 			"aggregate_type": event.AggregateType,

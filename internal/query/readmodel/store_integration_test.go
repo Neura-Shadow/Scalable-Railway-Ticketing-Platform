@@ -912,10 +912,16 @@ func TestStationEventResumesTwoHundredFiftyOneRunFanoutFromDurableCursor(t *test
 	}
 }
 
-type versionRotatorFake struct{ keys []string }
+type versionRotatorFake struct {
+	keys []string
+	err  error
+}
 
 func (rotator *versionRotatorFake) Rotate(_ context.Context, key string) (string, error) {
 	rotator.keys = append(rotator.keys, key)
+	if rotator.err != nil {
+		return "", rotator.err
+	}
 	return "rotated", nil
 }
 

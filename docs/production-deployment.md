@@ -61,7 +61,7 @@ An enabled production outbox worker must use `OUTBOX_PUBLISHER=redis_stream` by 
 7. Deploy API instances in the single target region, pinned by digest.
 8. Wait for `/livez` and `/readyz`; do not route traffic before readiness succeeds.
 9. Run a dry-run and bounded initial projection backfill; reconcile the read model before enabling its worker.
-10. Deploy one read-model worker disabled, prove PostgreSQL/Redis/migration/config readiness, then enable it and validate pending/DLQ/cache rotation before scaling.
+10. Deploy one read-model worker disabled, prove PostgreSQL/Redis/migration/config readiness, then enable it and validate pending/DLQ/cache rotation before scaling. Set a stable group and a unique consumer name per replica; require claim-min-idle to exceed the pass timeout.
 11. Deploy admission workers disabled, prove their PostgreSQL/Redis/migration/config readiness, then enable one and verify policy generations before scaling.
 12. Deploy one hold-expirer and one outbox-worker initially. Scale only after concurrency and database impact are measured.
 13. Run sanitized read, hot/non-hot booking, cache-loss, and source-fallback smokes plus seat, quota, admission, read-model, and cache-version reconciliation.
@@ -122,6 +122,11 @@ events because the older constraints cannot represent them.
 - The API `/readyz` uses short checks for PostgreSQL, Redis, migrations, and required configuration without exposing credentials.
 - Each worker exposes a private `WORKER_HTTP_ADDRESS` (default `:9090`) with process-only `/livez`, dependency/config `/readyz`, and its own `/metrics`. Admission-worker readiness checks PostgreSQL, Redis, migrations, and its process-owned keyring/config; queue backlog does not fail readiness. Hold-expirer `/readyz` checks PostgreSQL; a Redis Streams outbox-worker checks both PostgreSQL and Redis; a log outbox-worker checks PostgreSQL only. Each pass is bounded by `WORKER_PASS_TIMEOUT`.
 - Outbox backlog, pending consumer work, or a dead-letter item is alertable but is not by itself a readiness failure.
+- The source stream is intentionally not blind-`MAXLEN` trimmed. Alert on
+  stream length, PEL size, pending age, and Redis memory. Do not trim below any
+  consumer group's delivered/pending floor. For a repaired DLQ event with
+  durable read-model progress, preview and apply `read-model-admin resume-event`
+  rather than deleting the progress gate.
 - `/metrics` must remain internal or protected by the platform network boundary.
 - Use graceful termination with a pre-stop/drain window long enough for the configured HTTP shutdown timeout.
 

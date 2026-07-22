@@ -11,18 +11,22 @@ For every `RunOnce` pass the worker:
 
 1. claims idle pending entries before reading new entries;
 2. validates the allowlisted event/aggregate pair and UUIDs;
-3. resolves at most 100 affected train runs from current PostgreSQL state;
-4. opens the projection transaction;
-5. inserts the durable consumer receipt;
-6. treats a receipt conflict as duplicate success;
-7. otherwise rebuilds each affected complete train-run set from current state;
-8. commits receipt and projection together;
-9. rotates the bounded station, search, or per-run availability generations;
-10. acknowledges the stream entry only after required work succeeds.
+3. creates or resumes a durable PostgreSQL progress row;
+4. rotates global cache generations before projection work and checkpoints that
+   phase only after Redis succeeds;
+5. resolves at most 100 affected train runs after the durable UUID cursor;
+6. locks run projection writers in deterministic UUID order and reloads current
+   source state under `READ COMMITTED`;
+7. commits each complete train-run page and its cursor in one transaction;
+8. atomically appends a safe-field continuation and acknowledges the old entry
+   when another page remains;
+9. inserts the final receipt and removes progress only after every required
+   projection and invalidation phase succeeds;
+10. acknowledges the completed stream entry.
 
 Pending entries use Redis delivery counts for a maximum-attempt decision. A
 poison or repeatedly failing event is appended to the bounded DLQ before its
-source entry is acknowledged. DLQ records contain only safe envelope metadata
+source entry is acknowledged in the same Redis script. DLQ records contain only safe envelope metadata
 and a bounded reason. Raw payloads, cache values, credentials, and customer
 identifiers are not copied.
 
@@ -38,10 +42,9 @@ only to identify an impact scope, then query current authoritative source rows.
 Consequently duplicate and out-of-order deliveries converge on the latest
 committed source state.
 
-Invalidation is intentionally retried for duplicate events as well. A crash
-after the PostgreSQL transaction but before Redis rotation/ACK therefore does
-not strand the old generation: receipt conflict suppresses another projection
-write, but the deterministic rotation mapping runs again.
+The final receipt now means every invalidation checkpoint completed. A crash
+after Redis rotation but before the PostgreSQL checkpoint safely repeats the
+rotation; a completed duplicate performs no projection or invalidation work.
 
 ## Impact map
 
@@ -55,8 +58,11 @@ write, but the deterministic rotation mapping runs again.
 | train_run | the named train run |
 | reservation or ticket | availability for the named train run |
 
-An event whose impact exceeds the 100-run bound fails visibly instead of doing
-unbounded work in one pass. Operators then use the resumable rebuild command.
+An event whose impact exceeds 100 runs is processed as keyset pages of at most
+100. The progress row survives process termination, and projection search
+explicitly falls back to the authoritative source while any projection page is
+in progress. A 251-run event therefore advances as 100/100/51 without one
+unbounded PostgreSQL transaction.
 
 ## Lifecycle and failure behavior
 
@@ -71,3 +77,23 @@ not alter source tables or booking correctness. PostgreSQL failure likewise
 prevents projection progress. Backlog, pending age, retries, DLQ, rebuild
 duration, and projection lag are operational signals; none grants authority to
 serve cached availability as a booking decision.
+
+The source stream does not use blind `MAXLEN` trimming: Redis can trim entries
+that are still referenced by a consumer-group PEL. Operators must capacity-plan
+and alert on stream/backlog growth, then apply only a reviewed retention policy
+that proves every consumer group has advanced beyond the removal floor.
+
+If a dependency failure reaches the bounded retry limit, the safe envelope is
+placed in the DLQ while durable progress keeps projection reads on source
+fallback. After fixing the dependency, an operator previews and then redrives
+that exact event:
+
+```text
+read-model-admin resume-event --event-id <uuid>
+read-model-admin resume-event --event-id <uuid> --apply
+```
+
+The apply form requires secret-managed `DATABASE_URL`, `REDIS_ADDR` (or
+`REDIS_ADDRESS`), and optional `REDIS_PASSWORD`. It reconstructs only the four
+safe stream fields from PostgreSQL progress; it does not copy payloads or clear
+the safety gate. The normal worker removes progress only after convergence.

@@ -16,12 +16,20 @@ read-model-admin rebuild-all --batch-size 100
 read-model-admin rebuild-all --batch-size 100 --apply
 read-model-admin reconcile --limit 100
 read-model-admin inspect-lag
+read-model-admin resume-event --event-id <uuid>
+read-model-admin resume-event --event-id <uuid> --apply
 ```
 
 Rebuild commands default to dry-run. `rebuild-all` selects stable
 `(service_date,id)` batches of at most 100 and reports its cursor so an operator
 can resume. Context cancellation rolls back the active train-run transaction;
 already committed earlier batches remain complete.
+
+`resume-event` is the controlled recovery path for an event that reached the
+DLQ after creating durable fan-out progress. Dry-run verifies that progress
+still exists. Apply re-enqueues only the bounded event envelope after the failed
+dependency is repaired. It never deletes progress or bypasses projection
+fallback; successful worker completion does that atomically with the receipt.
 
 ## Initial backfill
 
