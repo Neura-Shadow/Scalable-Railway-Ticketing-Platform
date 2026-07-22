@@ -687,6 +687,126 @@ func TestProjectionSearchUsesDenormalizedRowsAndExcludesCancelledRuns(t *testing
 	}
 }
 
+func TestProjectionSearchKeepsGateAndRowsInOneRepeatableSnapshot(t *testing.T) {
+	conn := openMigrationSevenDatabase(t)
+	firstTrainRunID := seedProjectionSource(t, conn)
+	cloneProjectionTrainRun(t, conn, firstTrainRunID)
+	bootstrap, err := readmodel.NewStore(conn, clock.NewDeterministic(time.Now().UTC()))
+	if err != nil {
+		t.Fatalf("NewStore(bootstrap) error = %v", err)
+	}
+	first, err := bootstrap.RebuildAll(context.Background(), readmodel.RebuildAllOptions{Limit: 1})
+	if err != nil || !first.HasMore {
+		t.Fatalf("RebuildAll(first) = %+v, %v", first, err)
+	}
+	if _, err := bootstrap.RebuildAll(context.Background(), readmodel.RebuildAllOptions{
+		After: first.NextCursor, Limit: 1,
+	}); err != nil {
+		t.Fatalf("RebuildAll(final) error = %v", err)
+	}
+
+	barrier := &searchSnapshotBarrier{
+		conn: conn, observed: make(chan struct{}), release: make(chan struct{}),
+		opts: make(chan pgx.TxOptions, 1),
+	}
+	store, err := readmodel.NewStore(barrier, clock.NewDeterministic(time.Now().UTC()))
+	if err != nil {
+		t.Fatalf("NewStore(barrier) error = %v", err)
+	}
+	request := querypostgres.SearchRequest{
+		OriginCode: "TPE", DestinationCode: "KHH", ServiceDate: time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC),
+		SeatClass: "standard", Page: 1, PageSize: 20, Sort: "departure_asc",
+	}
+	type searchOutcome struct {
+		results []querypostgres.SearchResult
+		err     error
+	}
+	outcome := make(chan searchOutcome, 1)
+	go func() {
+		results, searchErr := store.SearchTrainRuns(context.Background(), request)
+		outcome <- searchOutcome{results: results, err: searchErr}
+	}()
+	<-barrier.observed
+	if options := <-barrier.opts; options.IsoLevel != pgx.RepeatableRead {
+		t.Fatalf("projection search isolation = %q, want repeatable read", options.IsoLevel)
+	}
+
+	writerConfig := conn.Config().Copy()
+	writer, err := pgx.ConnectConfig(context.Background(), writerConfig)
+	if err != nil {
+		t.Fatalf("connect snapshot writer: %v", err)
+	}
+	t.Cleanup(func() { _ = writer.Close(context.Background()) })
+	writerTx, err := writer.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin snapshot writer: %v", err)
+	}
+	defer func() { _ = writerTx.Rollback(context.Background()) }()
+	if _, err := writerTx.Exec(context.Background(), `
+		UPDATE read_model_projection_state
+		SET ready = false, updated_at = clock_timestamp()
+		WHERE projection_name = 'journey_search'
+	`); err != nil {
+		t.Fatalf("mark concurrent rebuild unavailable: %v", err)
+	}
+	if _, err := writerTx.Exec(context.Background(), `
+		DELETE FROM train_run_journey_read_model WHERE train_run_id = $1
+	`, firstTrainRunID); err != nil {
+		t.Fatalf("commit concurrent partial rebuild state: %v", err)
+	}
+	if err := writerTx.Commit(context.Background()); err != nil {
+		t.Fatalf("commit concurrent partial rebuild state: %v", err)
+	}
+	close(barrier.release)
+	result := <-outcome
+	if result.err != nil || len(result.results) != 1 || result.results[0].TrainRunID != firstTrainRunID.String() {
+		t.Fatalf("SearchTrainRuns(snapshot) = %+v, %v, want old complete matching result", result.results, result.err)
+	}
+}
+
+type searchSnapshotBarrier struct {
+	conn     *pgx.Conn
+	observed chan struct{}
+	release  chan struct{}
+	opts     chan pgx.TxOptions
+}
+
+func (barrier *searchSnapshotBarrier) BeginTx(ctx context.Context, options pgx.TxOptions) (pgx.Tx, error) {
+	barrier.opts <- options
+	tx, err := barrier.conn.BeginTx(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	return &searchSnapshotTx{Tx: tx, observed: barrier.observed, release: barrier.release}, nil
+}
+
+type searchSnapshotTx struct {
+	pgx.Tx
+	observed chan struct{}
+	release  chan struct{}
+}
+
+func (tx *searchSnapshotTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	row := tx.Tx.QueryRow(ctx, sql, args...)
+	if !strings.Contains(sql, "read_model_projection_state") {
+		return row
+	}
+	return &searchSnapshotRow{Row: row, observed: tx.observed, release: tx.release}
+}
+
+type searchSnapshotRow struct {
+	pgx.Row
+	observed chan struct{}
+	release  chan struct{}
+}
+
+func (row *searchSnapshotRow) Scan(dest ...any) error {
+	err := row.Row.Scan(dest...)
+	close(row.observed)
+	<-row.release
+	return err
+}
+
 func TestEventCoordinatorCompletesInvalidationBeforeReceiptAndSkipsDuplicateWork(t *testing.T) {
 	conn := openMigrationSevenDatabase(t)
 	trainRunID := seedProjectionSource(t, conn)

@@ -18,7 +18,7 @@ func (s *Store) SearchTrainRuns(
 	if err != nil {
 		return nil, err
 	}
-	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted, AccessMode: pgx.ReadOnly})
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return nil, fmt.Errorf("%w: begin projection search", ErrPersistence)
 	}
