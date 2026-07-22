@@ -91,12 +91,19 @@ type Config struct {
 	ReadModelWorkerMaxAttempts                  int
 	ReadModelWorkerPollInterval                 time.Duration
 	ReadModelWorkerPendingIdle                  time.Duration
+	ReadModelConsumerGroup                      string
+	ReadModelConsumerName                       string
+	StationCacheEnabled                         bool
 	StationCacheTTL                             time.Duration
 	StationCacheJitter                          time.Duration
+	TrainSearchCacheEnabled                     bool
+	TrainSearchFallbackEnabled                  bool
 	SearchCacheTTL                              time.Duration
 	SearchCacheJitter                           time.Duration
+	AvailabilityCacheEnabled                    bool
 	AvailabilityCacheTTL                        time.Duration
 	AvailabilityCacheJitter                     time.Duration
+	AvailabilityCacheMaxStale                   time.Duration
 	ReservationMaxActiveHoldsPerUser            int
 	ReservationMaxActiveHoldsPerUserPerTrainRun int
 	ReservationMaxActivePassengersPerUser       int
@@ -151,13 +158,19 @@ func Defaults() Config {
 		ReadModelWorkerBatchSize:                    100,
 		ReadModelWorkerMaxAttempts:                  5,
 		ReadModelWorkerPollInterval:                 time.Second,
-		ReadModelWorkerPendingIdle:                  30 * time.Second,
+		ReadModelWorkerPendingIdle:                  90 * time.Second,
+		ReadModelConsumerGroup:                      "railway-read-model",
+		StationCacheEnabled:                         true,
 		StationCacheTTL:                             5 * time.Minute,
 		StationCacheJitter:                          30 * time.Second,
+		TrainSearchCacheEnabled:                     true,
+		TrainSearchFallbackEnabled:                  true,
 		SearchCacheTTL:                              60 * time.Second,
 		SearchCacheJitter:                           10 * time.Second,
+		AvailabilityCacheEnabled:                    true,
 		AvailabilityCacheTTL:                        10 * time.Second,
 		AvailabilityCacheJitter:                     2 * time.Second,
+		AvailabilityCacheMaxStale:                   10 * time.Second,
 		HTTPReadTimeout:                             5 * time.Second,
 		HTTPWriteTimeout:                            10 * time.Second,
 		ShutdownTimeout:                             15 * time.Second,
@@ -246,6 +259,7 @@ func (c Config) ValidateFor(process Process) error {
 			validationCheck{"CACHE_STATION_TTL", c.StationCacheTTL > 0 && c.StationCacheTTL <= 24*time.Hour},
 			validationCheck{"CACHE_SEARCH_TTL", c.SearchCacheTTL > 0 && c.SearchCacheTTL <= 24*time.Hour},
 			validationCheck{"CACHE_AVAILABILITY_TTL", c.AvailabilityCacheTTL > 0 && c.AvailabilityCacheTTL <= 24*time.Hour},
+			validationCheck{"AVAILABILITY_CACHE_MAX_STALE_SECONDS", c.AvailabilityCacheMaxStale > 0 && c.AvailabilityCacheMaxStale <= 24*time.Hour},
 		)
 		if c.StationCacheJitter < 0 || c.StationCacheJitter > c.StationCacheTTL ||
 			c.SearchCacheJitter < 0 || c.SearchCacheJitter > c.SearchCacheTTL ||
@@ -330,12 +344,26 @@ func (c Config) ValidateFor(process Process) error {
 			validationCheck{"READ_MODEL_WORKER_PENDING_IDLE", c.ReadModelWorkerPendingIdle > 0},
 			validationCheck{"WORKER_PASS_TIMEOUT", c.WorkerPassTimeout > 0},
 		)
+		if c.ReadModelWorkerPendingIdle <= c.WorkerPassTimeout {
+			problems = append(problems, errors.New("READ_MODEL_CLAIM_MIN_IDLE_SECONDS must be greater than WORKER_PASS_TIMEOUT"))
+		}
+		if !validRuntimeName(c.ReadModelConsumerGroup, 256) {
+			problems = append(problems, errors.New("READ_MODEL_CONSUMER_GROUP must contain between 1 and 256 trimmed characters"))
+		}
+		if c.ReadModelConsumerName != "" && !validRuntimeName(c.ReadModelConsumerName, 128) {
+			problems = append(problems, errors.New("READ_MODEL_CONSUMER_NAME must be empty or contain between 1 and 128 trimmed characters"))
+		}
 	}
 	return errors.Join(problems...)
 }
 
 func positiveBounded(value, maximum int) bool {
 	return value > 0 && value <= maximum
+}
+
+func validRuntimeName(value string, maximum int) bool {
+	return value == strings.TrimSpace(value) && len(value) >= 1 && len(value) <= maximum &&
+		!strings.ContainsAny(value, "\x00\r\n")
 }
 
 func validateAdmissionTokenKeyring(c Config) error {
@@ -606,6 +634,19 @@ func loadAPISettings(lookup LookupFunc, cfg *Config) error {
 	loadAdmissionTokenSettings(lookup, cfg)
 	for _, item := range []struct {
 		name   string
+		target *bool
+	}{
+		{"STATION_CACHE_ENABLED", &cfg.StationCacheEnabled},
+		{"TRAIN_SEARCH_CACHE_ENABLED", &cfg.TrainSearchCacheEnabled},
+		{"TRAIN_SEARCH_FALLBACK_ENABLED", &cfg.TrainSearchFallbackEnabled},
+		{"AVAILABILITY_CACHE_ENABLED", &cfg.AvailabilityCacheEnabled},
+	} {
+		if err := setBool(lookup, item.name, item.target); err != nil {
+			return err
+		}
+	}
+	for _, item := range []struct {
+		name   string
 		target *time.Duration
 	}{
 		{"JWT_ACCESS_TTL", &cfg.AccessTokenTTL},
@@ -627,6 +668,22 @@ func loadAPISettings(lookup LookupFunc, cfg *Config) error {
 	}
 	if err := setSeconds(lookup, "RESERVATION_HOLD_TTL_SECONDS", &cfg.HoldTTL); err != nil {
 		return err
+	}
+	for _, item := range []struct {
+		name   string
+		target *time.Duration
+	}{
+		{"STATION_CACHE_TTL_SECONDS", &cfg.StationCacheTTL},
+		{"STATION_CACHE_JITTER_SECONDS", &cfg.StationCacheJitter},
+		{"TRAIN_SEARCH_CACHE_TTL_SECONDS", &cfg.SearchCacheTTL},
+		{"TRAIN_SEARCH_CACHE_JITTER_SECONDS", &cfg.SearchCacheJitter},
+		{"AVAILABILITY_CACHE_TTL_SECONDS", &cfg.AvailabilityCacheTTL},
+		{"AVAILABILITY_CACHE_JITTER_SECONDS", &cfg.AvailabilityCacheJitter},
+		{"AVAILABILITY_CACHE_MAX_STALE_SECONDS", &cfg.AvailabilityCacheMaxStale},
+	} {
+		if err := setSeconds(lookup, item.name, item.target); err != nil {
+			return err
+		}
 	}
 	for _, item := range []struct {
 		name   string
@@ -682,6 +739,8 @@ func loadReadModelWorkerSettings(lookup LookupFunc, cfg *Config) error {
 	setString(lookup, "REDIS_ADDRESS", &cfg.RedisAddress)
 	setString(lookup, "REDIS_ADDR", &cfg.RedisAddress)
 	setString(lookup, "REDIS_PASSWORD", &cfg.RedisPassword)
+	setString(lookup, "READ_MODEL_CONSUMER_GROUP", &cfg.ReadModelConsumerGroup)
+	setString(lookup, "READ_MODEL_CONSUMER_NAME", &cfg.ReadModelConsumerName)
 	if err := setBool(lookup, "READ_MODEL_WORKER_ENABLED", &cfg.ReadModelWorkerEnabled); err != nil {
 		return err
 	}
@@ -689,6 +748,15 @@ func loadReadModelWorkerSettings(lookup LookupFunc, cfg *Config) error {
 		return err
 	}
 	if err := setInt(lookup, "READ_MODEL_WORKER_MAX_ATTEMPTS", &cfg.ReadModelWorkerMaxAttempts); err != nil {
+		return err
+	}
+	if err := setInt(lookup, "READ_MODEL_MAX_ATTEMPTS", &cfg.ReadModelWorkerMaxAttempts); err != nil {
+		return err
+	}
+	if err := setMilliseconds(lookup, "READ_MODEL_WORKER_INTERVAL_MILLISECONDS", &cfg.ReadModelWorkerPollInterval); err != nil {
+		return err
+	}
+	if err := setSeconds(lookup, "READ_MODEL_CLAIM_MIN_IDLE_SECONDS", &cfg.ReadModelWorkerPendingIdle); err != nil {
 		return err
 	}
 	for _, item := range []struct {

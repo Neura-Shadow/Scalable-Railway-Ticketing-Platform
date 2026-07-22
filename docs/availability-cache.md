@@ -1,5 +1,11 @@
 # Availability Hint Cache
 
+Runtime controls are `AVAILABILITY_CACHE_ENABLED`,
+`AVAILABILITY_CACHE_TTL_SECONDS`, `AVAILABILITY_CACHE_JITTER_SECONDS`, and
+`AVAILABILITY_CACHE_MAX_STALE_SECONDS`. The observed-at age is checked even
+while the Redis key still exists; a value beyond max-stale is refreshed from
+PostgreSQL and is never served as fresh.
+
 Availability is a short-lived observation of PostgreSQL seat inventory. It is
 not an inventory ledger, lock, hold, allocation decision, or proof that a seat
 can be sold.

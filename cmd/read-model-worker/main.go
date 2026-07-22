@@ -26,7 +26,6 @@ import (
 
 const (
 	readModelStream = "railway:outbox:v1"
-	readModelGroup  = "railway-read-model"
 	readModelDLQ    = "railway:outbox:v1:read-model:dlq"
 	schemaVersion   = 7
 )
@@ -81,13 +80,17 @@ func run(logger *slog.Logger) error {
 	}
 	coordinator.WithMetrics(readMetrics)
 	transport, err := queryreadmodel.NewRedisStreamTransport(
-		redisClient, readModelStream, readModelGroup, readModelDLQ,
+		redisClient, readModelStream, cfg.ReadModelConsumerGroup, readModelDLQ,
 	)
 	if err != nil {
 		return errors.New("read-model stream transport initialization failed")
 	}
+	consumerName := cfg.ReadModelConsumerName
+	if consumerName == "" {
+		consumerName = "read-model-" + uuid.NewString()
+	}
 	worker, err := queryreadmodel.NewWorker(transport, coordinator, queryreadmodel.WorkerConfig{
-		ConsumerName: "read-model-" + uuid.NewString(),
+		ConsumerName: consumerName,
 		BatchSize:    int64(cfg.ReadModelWorkerBatchSize), MaxAttempts: int64(cfg.ReadModelWorkerMaxAttempts),
 		PendingIdle: cfg.ReadModelWorkerPendingIdle,
 	})
@@ -114,15 +117,18 @@ func run(logger *slog.Logger) error {
 		passContext, cancel := context.WithTimeout(ctx, cfg.WorkerPassTimeout)
 		defer cancel()
 		result, passErr := worker.RunOnce(passContext)
+		if lagErr := observeProjectionLag(passContext, pool, readMetrics); lagErr != nil {
+			logger.Warn("read-model lag observation failed", "reason", "database")
+		}
 		if passErr != nil {
 			logger.Warn("read-model pass completed with handled failures",
 				"claimed", result.Claimed, "read", result.Read, "processed", result.Processed,
-				"retried", result.Retried, "dead_lettered", result.DeadLettered)
+				"retried", result.Retried, "continued", result.Continued, "dead_lettered", result.DeadLettered)
 			return
 		}
 		logger.Info("read-model pass complete",
 			"claimed", result.Claimed, "read", result.Read, "processed", result.Processed,
-			"retried", result.Retried, "dead_lettered", result.DeadLettered)
+			"retried", result.Retried, "continued", result.Continued, "dead_lettered", result.DeadLettered)
 	}
 	runPass()
 	ticker := clock.RealClock{}.NewTicker(cfg.ReadModelWorkerPollInterval)
@@ -140,6 +146,29 @@ func run(logger *slog.Logger) error {
 			runPass()
 		}
 	}
+}
+
+func observeProjectionLag(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	readMetrics *platformmetrics.ReadModelMetrics,
+) error {
+	if ctx == nil || pool == nil || readMetrics == nil {
+		return errors.New("projection lag observer unavailable")
+	}
+	var lagSeconds float64
+	if err := pool.QueryRow(ctx, `
+		SELECT COALESCE(
+			max(EXTRACT(EPOCH FROM (clock_timestamp() - updated_at))),
+			0
+		)
+		FROM read_model_event_progress
+		WHERE projection_affecting
+	`).Scan(&lagSeconds); err != nil {
+		return err
+	}
+	readMetrics.SetProjectionLag(time.Duration(lagSeconds * float64(time.Second)))
+	return nil
 }
 
 func readModelReadiness(

@@ -37,16 +37,29 @@ type Metrics interface {
 }
 
 type Store struct {
-	source          SourceStore
-	projection      ProjectionSearch
-	client          redis.UniversalClient
-	versions        *VersionManager
-	clock           timeSource
-	stationTTL      *TTLPolicy
-	searchTTL       *TTLPolicy
-	availabilityTTL *TTLPolicy
-	coalescer       Coalescer
-	metrics         Metrics
+	source                SourceStore
+	projection            ProjectionSearch
+	client                redis.UniversalClient
+	versions              *VersionManager
+	clock                 timeSource
+	stationTTL            *TTLPolicy
+	searchTTL             *TTLPolicy
+	availabilityTTL       *TTLPolicy
+	coalescer             Coalescer
+	metrics               Metrics
+	stationEnabled        bool
+	searchEnabled         bool
+	searchFallbackEnabled bool
+	availabilityEnabled   bool
+	availabilityMaxStale  time.Duration
+}
+
+type Policy struct {
+	StationEnabled        bool
+	SearchEnabled         bool
+	SearchFallbackEnabled bool
+	AvailabilityEnabled   bool
+	AvailabilityMaxStale  time.Duration
 }
 
 func (store *Store) WithMetrics(metrics Metrics) *Store {
@@ -54,6 +67,18 @@ func (store *Store) WithMetrics(metrics Metrics) *Store {
 		store.metrics = metrics
 	}
 	return store
+}
+
+func (store *Store) WithPolicy(policy Policy) (*Store, error) {
+	if store == nil || policy.AvailabilityMaxStale <= 0 || policy.AvailabilityMaxStale > MaxCacheTTL {
+		return nil, errors.New("read cache policy invalid")
+	}
+	store.stationEnabled = policy.StationEnabled
+	store.searchEnabled = policy.SearchEnabled
+	store.searchFallbackEnabled = policy.SearchFallbackEnabled
+	store.availabilityEnabled = policy.AvailabilityEnabled
+	store.availabilityMaxStale = policy.AvailabilityMaxStale
+	return store, nil
 }
 
 type cachedStation struct {
@@ -74,6 +99,15 @@ type fillOutcome struct {
 	writeErr error
 }
 
+type cacheReadStatus string
+
+const (
+	cacheReadHit          cacheReadStatus = "hit"
+	cacheReadMiss         cacheReadStatus = "miss"
+	cacheReadRedisFailure cacheReadStatus = "redis_failure"
+	cacheReadInvalid      cacheReadStatus = "invalid"
+)
+
 func NewStore(
 	source SourceStore,
 	projection ProjectionSearch,
@@ -91,10 +125,15 @@ func NewStore(
 	return &Store{
 		source: source, projection: projection, client: client, versions: versions, clock: clock,
 		stationTTL: stationTTL, searchTTL: searchTTL, availabilityTTL: availabilityTTL,
+		stationEnabled: true, searchEnabled: true, searchFallbackEnabled: true,
+		availabilityEnabled: true, availabilityMaxStale: availabilityTTL.base,
 	}, nil
 }
 
 func (store *Store) ListStations(ctx context.Context) ([]querypostgres.Station, error) {
+	if !store.stationEnabled {
+		return store.source.ListStations(ctx)
+	}
 	version, err := store.versions.GetOrCreate(ctx, StationVersionKey())
 	if err != nil {
 		store.recordRequest("stations", "version_get", "failure", "redis")
@@ -105,15 +144,18 @@ func (store *Store) ListStations(ctx context.Context) ([]querypostgres.Station, 
 	if err != nil {
 		return nil, err
 	}
-	if stations, hit := store.readStations(ctx, key); hit {
-		store.recordRequest("stations", "read", "hit", "none")
+	if stations, status := store.readStations(ctx, key); status == cacheReadHit {
+		store.recordReadStatus("stations", status)
 		return stations, nil
+	} else {
+		store.recordReadStatus("stations", status)
 	}
-	store.recordRequest("stations", "read", "miss", "none")
 	started := time.Now()
 	value, err, shared := store.coalescer.Do(ctx, key, func(fillContext context.Context) (any, error) {
-		if stations, hit := store.readStations(fillContext, key); hit {
+		if stations, status := store.readStations(fillContext, key); status == cacheReadHit {
 			return fillOutcome{value: stations}, nil
+		} else if status == cacheReadRedisFailure || status == cacheReadInvalid {
+			store.recordReadStatus("stations", status)
 		}
 		stations, sourceErr := store.source.ListStations(fillContext)
 		if sourceErr != nil {
@@ -151,6 +193,9 @@ func (store *Store) SearchTrainRuns(
 	if err != nil {
 		return nil, err
 	}
+	if !store.searchEnabled {
+		return store.searchProjectionOrSource(ctx, request)
+	}
 	version, err := store.versions.GetOrCreate(ctx, SearchVersionKey())
 	if err != nil {
 		store.recordRequest("train_search", "version_get", "failure", "redis")
@@ -161,24 +206,22 @@ func (store *Store) SearchTrainRuns(
 	if err != nil {
 		return nil, err
 	}
-	if results, hit := store.readSearch(ctx, key); hit {
-		store.recordRequest("train_search", "read", "hit", "none")
+	if results, status := store.readSearch(ctx, key); status == cacheReadHit {
+		store.recordReadStatus("train_search", status)
 		return results, nil
+	} else {
+		store.recordReadStatus("train_search", status)
 	}
-	store.recordRequest("train_search", "read", "miss", "none")
 	started := time.Now()
 	value, err, shared := store.coalescer.Do(ctx, key, func(fillContext context.Context) (any, error) {
-		if results, hit := store.readSearch(fillContext, key); hit {
+		if results, status := store.readSearch(fillContext, key); status == cacheReadHit {
 			return fillOutcome{value: results}, nil
+		} else if status == cacheReadRedisFailure || status == cacheReadInvalid {
+			store.recordReadStatus("train_search", status)
 		}
-		results, projectionErr := store.projection.SearchTrainRuns(fillContext, request)
-		if projectionErr != nil || len(results) == 0 {
-			store.recordFallback("projection")
-			var sourceErr error
-			results, sourceErr = store.source.SearchTrainRuns(fillContext, request)
-			if sourceErr != nil {
-				return nil, sourceErr
-			}
+		results, projectionErr := store.searchProjectionOrSource(fillContext, request)
+		if projectionErr != nil {
+			return nil, projectionErr
 		}
 		return fillOutcome{
 			value: results, writeErr: store.writeJSON(fillContext, key, results, store.searchTTL),
@@ -201,6 +244,9 @@ func (store *Store) Availability(
 	ctx context.Context,
 	request querypostgres.AvailabilityRequest,
 ) (querypostgres.Availability, error) {
+	if !store.availabilityEnabled {
+		return store.source.Availability(ctx, request)
+	}
 	versionKey, err := AvailabilityVersionKey(request.TrainRunID)
 	if err != nil {
 		return querypostgres.Availability{}, querypostgres.ErrInvalidQuery
@@ -221,15 +267,18 @@ func (store *Store) Availability(
 	if err != nil {
 		return querypostgres.Availability{}, querypostgres.ErrInvalidJourney
 	}
-	if availability, hit := store.readAvailability(ctx, key, request); hit {
-		store.recordRequest("availability", "read", "hit", "none")
+	if availability, status := store.readAvailability(ctx, key, request); status == cacheReadHit {
+		store.recordReadStatus("availability", status)
 		return availability, nil
+	} else {
+		store.recordReadStatus("availability", status)
 	}
-	store.recordRequest("availability", "read", "miss", "none")
 	started := time.Now()
 	value, err, shared := store.coalescer.Do(ctx, key, func(fillContext context.Context) (any, error) {
-		if availability, hit := store.readAvailability(fillContext, key, request); hit {
+		if availability, status := store.readAvailability(fillContext, key, request); status == cacheReadHit {
 			return fillOutcome{value: availability}, nil
+		} else if status == cacheReadRedisFailure || status == cacheReadInvalid {
+			store.recordReadStatus("availability", status)
 		}
 		availability, sourceErr := store.source.Availability(fillContext, request)
 		if sourceErr != nil {
@@ -263,6 +312,20 @@ func (store *Store) AvailabilityBatch(
 	if len(requests) == 0 || len(requests) > querypostgres.MaxPageSize {
 		return nil, querypostgres.ErrInvalidQuery
 	}
+	if !store.availabilityEnabled {
+		if batch, ok := store.source.(availabilityBatchSource); ok {
+			return batch.AvailabilityBatch(ctx, requests)
+		}
+		results := make([]querypostgres.Availability, 0, len(requests))
+		for _, request := range requests {
+			availability, err := store.source.Availability(ctx, request)
+			if err != nil {
+				return nil, err
+			}
+			results = append(results, availability)
+		}
+		return results, nil
+	}
 	results := make([]querypostgres.Availability, len(requests))
 	keys := make([]string, len(requests))
 	misses := make([]querypostgres.AvailabilityRequest, 0)
@@ -280,12 +343,13 @@ func (store *Store) AvailabilityBatch(
 			if err != nil {
 				return nil, querypostgres.ErrInvalidJourney
 			}
-			if availability, hit := store.readAvailability(ctx, keys[index], request); hit {
-				store.recordRequest("availability", "read", "hit", "none")
+			if availability, status := store.readAvailability(ctx, keys[index], request); status == cacheReadHit {
+				store.recordReadStatus("availability", status)
 				results[index] = availability
 				continue
+			} else {
+				store.recordReadStatus("availability", status)
 			}
-			store.recordRequest("availability", "read", "miss", "none")
 		} else {
 			store.recordRequest("availability", "version_get", "failure", "redis")
 			store.recordFallback("redis")
@@ -334,48 +398,88 @@ func (store *Store) AvailabilityBatch(
 	return results, nil
 }
 
-func (store *Store) readStations(ctx context.Context, key string) ([]querypostgres.Station, bool) {
+func (store *Store) readStations(ctx context.Context, key string) ([]querypostgres.Station, cacheReadStatus) {
 	var cached []cachedStation
-	if !store.readJSON(ctx, key, &cached) {
-		return nil, false
+	status := store.readJSON(ctx, key, &cached)
+	if status != cacheReadHit {
+		return nil, status
+	}
+	if cached == nil {
+		return nil, cacheReadInvalid
 	}
 	stations := make([]querypostgres.Station, 0, len(cached))
 	for _, item := range cached {
 		code, err := domain.NewStationCode(item.Code)
 		if err != nil || item.ID == "" || item.Name == "" || item.Timezone == "" {
-			return nil, false
+			return nil, cacheReadInvalid
 		}
 		stations = append(stations, querypostgres.Station{
 			ID: item.ID, Code: code, Name: item.Name, Timezone: item.Timezone,
 		})
 	}
-	return stations, true
+	return stations, cacheReadHit
 }
 
-func (store *Store) readSearch(ctx context.Context, key string) ([]querypostgres.SearchResult, bool) {
+func (store *Store) readSearch(ctx context.Context, key string) ([]querypostgres.SearchResult, cacheReadStatus) {
 	var results []querypostgres.SearchResult
-	if !store.readJSON(ctx, key, &results) || results == nil {
-		return nil, false
+	status := store.readJSON(ctx, key, &results)
+	if status != cacheReadHit {
+		return nil, status
 	}
-	return results, true
+	if results == nil {
+		return nil, cacheReadInvalid
+	}
+	return results, cacheReadHit
 }
 
 func (store *Store) readAvailability(
 	ctx context.Context,
 	key string,
 	request querypostgres.AvailabilityRequest,
-) (querypostgres.Availability, bool) {
+) (querypostgres.Availability, cacheReadStatus) {
 	var cached cachedAvailability
-	if !store.readJSON(ctx, key, &cached) || cached.Source != "postgres" || cached.ObservedAt.IsZero() ||
-		cached.Value.AvailableSeats < 0 || cached.Value.TrainRunID != request.TrainRunID {
-		return querypostgres.Availability{}, false
+	status := store.readJSON(ctx, key, &cached)
+	if status != cacheReadHit {
+		return querypostgres.Availability{}, status
 	}
-	return cached.Value, true
+	if cached.Source != "postgres" || cached.ObservedAt.IsZero() ||
+		cached.Value.AvailableSeats < 0 || cached.Value.TrainRunID != request.TrainRunID {
+		return querypostgres.Availability{}, cacheReadInvalid
+	}
+	age := store.clock.Now().UTC().Sub(cached.ObservedAt.UTC())
+	if age < 0 || age > store.availabilityMaxStale {
+		return querypostgres.Availability{}, cacheReadMiss
+	}
+	return cached.Value, cacheReadHit
 }
 
-func (store *Store) readJSON(ctx context.Context, key string, target any) bool {
+func (store *Store) searchProjectionOrSource(
+	ctx context.Context,
+	request querypostgres.SearchRequest,
+) ([]querypostgres.SearchResult, error) {
+	results, projectionErr := store.projection.SearchTrainRuns(ctx, request)
+	if projectionErr == nil && (len(results) > 0 || !store.searchFallbackEnabled) {
+		return results, nil
+	}
+	if !store.searchFallbackEnabled {
+		return nil, projectionErr
+	}
+	store.recordFallback("projection")
+	return store.source.SearchTrainRuns(ctx, request)
+}
+
+func (store *Store) readJSON(ctx context.Context, key string, target any) cacheReadStatus {
 	encoded, err := store.client.Get(ctx, key).Bytes()
-	return err == nil && json.Unmarshal(encoded, target) == nil
+	if errors.Is(err, redis.Nil) {
+		return cacheReadMiss
+	}
+	if err != nil {
+		return cacheReadRedisFailure
+	}
+	if json.Unmarshal(encoded, target) != nil {
+		return cacheReadInvalid
+	}
+	return cacheReadHit
 }
 
 func (store *Store) writeJSON(ctx context.Context, key string, value any, policy *TTLPolicy) error {
@@ -393,6 +497,21 @@ func (store *Store) writeJSON(ctx context.Context, key string, value any, policy
 func (store *Store) recordRequest(cacheType, operation, result, reason string) {
 	if store.metrics != nil {
 		store.metrics.RecordCacheRequest(cacheType, operation, result, reason)
+	}
+}
+
+func (store *Store) recordReadStatus(cacheType string, status cacheReadStatus) {
+	switch status {
+	case cacheReadHit:
+		store.recordRequest(cacheType, "read", "hit", "none")
+	case cacheReadMiss:
+		store.recordRequest(cacheType, "read", "miss", "none")
+	case cacheReadInvalid:
+		store.recordRequest(cacheType, "read", "failure", "invalid")
+		store.recordFallback("redis")
+	default:
+		store.recordRequest(cacheType, "read", "failure", "redis")
+		store.recordFallback("redis")
 	}
 }
 

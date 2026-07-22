@@ -161,6 +161,58 @@ func TestRedisContinuationDoesNotTrimMoreThanTenThousandPendingEntries(t *testin
 	}
 }
 
+func TestRedisClaimPendingAdvancesAcrossThePELInsteadOfReclaimingTheFront(t *testing.T) {
+	address := os.Getenv("TEST_REDIS_ADDR")
+	if address == "" {
+		address = "127.0.0.1:56379"
+	}
+	client := redis.NewClient(&redis.Options{Addr: address, DB: 13})
+	ctx := context.Background()
+	if err := client.Ping(ctx).Err(); err != nil {
+		client.Close()
+		t.Skipf("Redis integration dependency unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	if err := client.FlushDB(ctx).Err(); err != nil {
+		t.Fatalf("flush Redis test database: %v", err)
+	}
+	transport, err := readmodel.NewRedisStreamTransport(
+		client,
+		"railway:test:claim-cursor",
+		readmodel.DurableConsumerName,
+		"railway:test:claim-cursor:dlq",
+	)
+	if err != nil {
+		t.Fatalf("NewRedisStreamTransport() error = %v", err)
+	}
+	if err := transport.EnsureGroup(ctx); err != nil {
+		t.Fatalf("EnsureGroup() error = %v", err)
+	}
+	for index := 0; index < 3; index++ {
+		if _, err := transport.EnqueueEvent(ctx, readmodel.ProjectionEvent{
+			ConsumerName: readmodel.DurableConsumerName, EventID: uuid.NewString(), EventType: "trainrun.updated",
+			AggregateType: "train_run", AggregateID: uuid.NewString(),
+		}); err != nil {
+			t.Fatalf("EnqueueEvent(%d) error = %v", index, err)
+		}
+	}
+	initial, err := transport.ReadNew(ctx, "original-owner", 3)
+	if err != nil || len(initial) != 3 {
+		t.Fatalf("ReadNew() = %+v, %v", initial, err)
+	}
+	first, err := transport.ClaimPending(ctx, "recovery-owner", 0, 1)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("ClaimPending(first) = %+v, %v", first, err)
+	}
+	second, err := transport.ClaimPending(ctx, "recovery-owner", 0, 1)
+	if err != nil || len(second) != 1 {
+		t.Fatalf("ClaimPending(second) = %+v, %v", second, err)
+	}
+	if first[0].ID == second[0].ID || first[0].ID != initial[0].ID || second[0].ID != initial[1].ID {
+		t.Fatalf("claim cursor IDs = first %s second %s, initial %v", first[0].ID, second[0].ID, initial)
+	}
+}
+
 func TestDeadLetteredProgressConvergesAfterOperatorRedrive(t *testing.T) {
 	conn := openMigrationSevenDatabase(t)
 	trainRunID := seedProjectionSource(t, conn)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -57,10 +58,13 @@ return dead_letter
 `)
 
 type RedisStreamTransport struct {
-	client redis.UniversalClient
-	stream string
-	group  string
-	dlq    string
+	client        redis.UniversalClient
+	stream        string
+	group         string
+	dlq           string
+	claimMu       sync.Mutex
+	claimConsumer string
+	claimCursor   string
 }
 
 func NewRedisStreamTransport(
@@ -90,12 +94,25 @@ func (transport *RedisStreamTransport) ClaimPending(
 	minIdle time.Duration,
 	count int64,
 ) ([]StreamMessage, error) {
-	messages, _, err := transport.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+	transport.claimMu.Lock()
+	defer transport.claimMu.Unlock()
+	if transport.claimConsumer != consumer {
+		transport.claimConsumer = consumer
+		transport.claimCursor = "0-0"
+	}
+	if transport.claimCursor == "" {
+		transport.claimCursor = "0-0"
+	}
+	messages, nextCursor, err := transport.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
 		Stream: transport.stream, Group: transport.group, Consumer: consumer,
-		MinIdle: minIdle, Start: "0-0", Count: count,
+		MinIdle: minIdle, Start: transport.claimCursor, Count: count,
 	}).Result()
 	if err != nil && !errors.Is(err, redis.Nil) {
 		return nil, fmt.Errorf("claim Redis stream pending entries: %w", err)
+	}
+	transport.claimCursor = nextCursor
+	if transport.claimCursor == "" {
+		transport.claimCursor = "0-0"
 	}
 	return safeStreamMessages(messages), nil
 }

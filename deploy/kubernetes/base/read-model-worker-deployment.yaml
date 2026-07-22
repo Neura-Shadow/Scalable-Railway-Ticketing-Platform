@@ -43,6 +43,10 @@ spec:
             - configMapRef:
                 name: railway-read-model-worker-config
           env:
+            - name: READ_MODEL_CONSUMER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

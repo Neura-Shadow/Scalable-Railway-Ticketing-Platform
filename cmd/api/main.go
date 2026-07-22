@@ -148,6 +148,16 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return errors.New("read cache store initialization failed")
 	}
+	cachedQueryStore, err = cachedQueryStore.WithPolicy(querycache.Policy{
+		StationEnabled:        cfg.StationCacheEnabled,
+		SearchEnabled:         cfg.TrainSearchCacheEnabled,
+		SearchFallbackEnabled: cfg.TrainSearchFallbackEnabled,
+		AvailabilityEnabled:   cfg.AvailabilityCacheEnabled,
+		AvailabilityMaxStale:  cfg.AvailabilityCacheMaxStale,
+	})
+	if err != nil {
+		return errors.New("read cache policy invalid")
+	}
 	cachedQueryStore.WithMetrics(readMetrics)
 	bookingStore := bookingpostgres.NewWithReservationQuotaLimits(pool, bookingpostgres.ReservationQuotaLimits{
 		MaxActiveHoldsPerUser:            cfg.ReservationMaxActiveHoldsPerUser,

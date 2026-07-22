@@ -83,6 +83,15 @@ that are still referenced by a consumer-group PEL. Operators must capacity-plan
 and alert on stream/backlog growth, then apply only a reviewed retention policy
 that proves every consumer group has advanced beyond the removal floor.
 
+Runtime controls are process-owned and bounded:
+
+- `READ_MODEL_WORKER_ENABLED`, `READ_MODEL_WORKER_BATCH_SIZE`, and
+  `READ_MODEL_WORKER_INTERVAL_MILLISECONDS`;
+- `READ_MODEL_CONSUMER_GROUP` plus a unique `READ_MODEL_CONSUMER_NAME` per
+  replica (an empty local value generates a unique process name);
+- `READ_MODEL_MAX_ATTEMPTS` and `READ_MODEL_CLAIM_MIN_IDLE_SECONDS`, where
+  claim-min-idle must be greater than `WORKER_PASS_TIMEOUT`.
+
 If a dependency failure reaches the bounded retry limit, the safe envelope is
 placed in the DLQ while durable progress keeps projection reads on source
 fallback. After fixing the dependency, an operator previews and then redrives

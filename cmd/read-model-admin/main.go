@@ -36,7 +36,7 @@ type envelope struct {
 type lagResult struct {
 	TrainRunsWithoutProjection int64         `json:"train_runs_without_projection"`
 	MaximumSourceAhead         time.Duration `json:"maximum_source_ahead"`
-	OldestReceiptAge           time.Duration `json:"oldest_receipt_age"`
+	OldestProgressAge          time.Duration `json:"oldest_progress_age"`
 }
 
 func main() {
@@ -252,7 +252,7 @@ func inspectLag(parent context.Context, databaseURL string, args []string) (enve
 	}
 	defer pool.Close()
 	var missing int64
-	var sourceAheadSeconds, receiptAgeSeconds float64
+	var sourceAheadSeconds, progressAgeSeconds float64
 	err = pool.QueryRow(ctx, `
 		SELECT
 			(SELECT count(*) FROM train_runs tr WHERE NOT EXISTS (
@@ -263,16 +263,16 @@ func inspectLag(parent context.Context, databaseURL string, args []string) (enve
 			 JOIN (SELECT train_run_id, max(source_updated_at) AS projected_at
 			       FROM train_run_journey_read_model GROUP BY train_run_id) rm ON rm.train_run_id = tr.id
 			 WHERE tr.updated_at > rm.projected_at), 0),
-			COALESCE((SELECT EXTRACT(EPOCH FROM (clock_timestamp() - min(processed_at)))
-			 FROM read_model_event_receipts), 0)
-	`).Scan(&missing, &sourceAheadSeconds, &receiptAgeSeconds)
+			COALESCE((SELECT EXTRACT(EPOCH FROM (clock_timestamp() - min(updated_at)))
+			 FROM read_model_event_progress WHERE projection_affecting), 0)
+	`).Scan(&missing, &sourceAheadSeconds, &progressAgeSeconds)
 	if err != nil {
 		return envelope{}, errors.New("read-model lag inspection failed")
 	}
 	result := lagResult{
 		TrainRunsWithoutProjection: missing,
 		MaximumSourceAhead:         time.Duration(sourceAheadSeconds * float64(time.Second)),
-		OldestReceiptAge:           time.Duration(receiptAgeSeconds * float64(time.Second)),
+		OldestProgressAge:          time.Duration(progressAgeSeconds * float64(time.Second)),
 	}
 	return envelope{Command: "inspect-lag", Status: "completed", ReadOnly: true, Result: result}, nil
 }

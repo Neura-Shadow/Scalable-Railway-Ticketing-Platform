@@ -1,5 +1,11 @@
 # Train-search Cache
 
+Runtime controls are `TRAIN_SEARCH_CACHE_ENABLED`,
+`TRAIN_SEARCH_CACHE_TTL_SECONDS`, `TRAIN_SEARCH_CACHE_JITTER_SECONDS`, and
+`TRAIN_SEARCH_FALLBACK_ENABLED`. The safe default keeps fallback enabled so a
+projection error or incomplete result uses the normalized authoritative source
+query rather than fabricating a response.
+
 Train-search caching sits in front of the disposable journey projection and
 the normalized source fallback. It does not alter booking or availability
 authority.

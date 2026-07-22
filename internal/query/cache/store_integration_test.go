@@ -119,6 +119,80 @@ func TestAvailabilityHintIsSharedAcrossReplicasAndRotationReobservesPostgres(t *
 	}
 }
 
+func TestCachePolicyDisablesRedisPathsWithoutChangingSourceAuthority(t *testing.T) {
+	client := openCacheRedis(t)
+	trainRunID := uuid.NewString()
+	source := &cacheSourceFake{
+		stations:     stationFixture(t),
+		search:       []querypostgres.SearchResult{searchResultFixture(1300)},
+		availability: availabilityFixture(trainRunID, 4),
+	}
+	projection := &cacheSourceFake{search: []querypostgres.SearchResult{searchResultFixture(1200)}}
+	store := newCacheStore(t, source, projection, client)
+	store, err := store.WithPolicy(Policy{
+		StationEnabled: false, SearchEnabled: false, SearchFallbackEnabled: false,
+		AvailabilityEnabled: false, AvailabilityMaxStale: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("WithPolicy() error = %v", err)
+	}
+	if _, err := store.ListStations(context.Background()); err != nil {
+		t.Fatalf("ListStations(disabled) error = %v", err)
+	}
+	search, err := store.SearchTrainRuns(context.Background(), searchFixture())
+	if err != nil || len(search) != 1 || search[0].FareAmountMinor != 1200 {
+		t.Fatalf("SearchTrainRuns(disabled cache) = %+v, %v", search, err)
+	}
+	availability, err := store.Availability(context.Background(), querypostgres.AvailabilityRequest{
+		TrainRunID: trainRunID, OriginCode: "TPE", DestinationCode: "KHH", SeatClass: "standard",
+	})
+	if err != nil || availability.AvailableSeats != 4 {
+		t.Fatalf("Availability(disabled) = %+v, %v", availability, err)
+	}
+	if source.stationCalls.Load() != 1 || source.availabilityCalls.Load() != 1 || source.searchCalls.Load() != 0 ||
+		projection.searchCalls.Load() != 1 {
+		t.Fatalf(
+			"disabled policy source/projection calls = station %d availability %d source-search %d projection-search %d",
+			source.stationCalls.Load(), source.availabilityCalls.Load(), source.searchCalls.Load(), projection.searchCalls.Load(),
+		)
+	}
+	if size, err := client.DBSize(context.Background()).Result(); err != nil || size != 0 {
+		t.Fatalf("disabled policy Redis size = %d, %v, want 0", size, err)
+	}
+}
+
+func TestAvailabilityMaxStaleRefreshesBeforeRedisTTLExpires(t *testing.T) {
+	client := openCacheRedis(t)
+	trainRunID := uuid.NewString()
+	request := querypostgres.AvailabilityRequest{
+		TrainRunID: trainRunID, OriginCode: "TPE", DestinationCode: "KHH", SeatClass: "standard",
+	}
+	source := &cacheSourceFake{availability: availabilityFixture(trainRunID, 7)}
+	testClock := clock.NewDeterministic(time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC))
+	store := newCacheStoreWithClock(t, source, source, client, testClock)
+	store, err := store.WithPolicy(Policy{
+		StationEnabled: true, SearchEnabled: true, SearchFallbackEnabled: true,
+		AvailabilityEnabled: true, AvailabilityMaxStale: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("WithPolicy() error = %v", err)
+	}
+	if _, err := store.Availability(context.Background(), request); err != nil {
+		t.Fatalf("Availability(first) error = %v", err)
+	}
+	source.mu.Lock()
+	source.availability = availabilityFixture(trainRunID, 2)
+	source.mu.Unlock()
+	testClock.Advance(6 * time.Second)
+	refreshed, err := store.Availability(context.Background(), request)
+	if err != nil || refreshed.AvailableSeats != 2 {
+		t.Fatalf("Availability(max stale) = %+v, %v", refreshed, err)
+	}
+	if source.availabilityCalls.Load() != 2 {
+		t.Fatalf("max-stale source calls = %d, want 2", source.availabilityCalls.Load())
+	}
+}
+
 func openCacheRedis(t *testing.T) *redis.Client {
 	t.Helper()
 	address := os.Getenv("TEST_REDIS_ADDR")
@@ -139,6 +213,22 @@ func openCacheRedis(t *testing.T) *redis.Client {
 }
 
 func newCacheStore(t *testing.T, source SourceStore, projection ProjectionSearch, client *redis.Client) *Store {
+	return newCacheStoreWithClock(
+		t,
+		source,
+		projection,
+		client,
+		clock.NewDeterministic(time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)),
+	)
+}
+
+func newCacheStoreWithClock(
+	t *testing.T,
+	source SourceStore,
+	projection ProjectionSearch,
+	client *redis.Client,
+	testClock *clock.DeterministicClock,
+) *Store {
 	t.Helper()
 	versions, err := NewSecureVersionManager(client)
 	if err != nil {
@@ -149,7 +239,7 @@ func newCacheStore(t *testing.T, source SourceStore, projection ProjectionSearch
 	availabilityTTL, _ := NewTTLPolicy(10*time.Second, time.Second, rand.Reader)
 	store, err := NewStore(
 		source, projection, client, versions,
-		clock.NewDeterministic(time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)),
+		testClock,
 		stationTTL, searchTTL, availabilityTTL,
 	)
 	if err != nil {

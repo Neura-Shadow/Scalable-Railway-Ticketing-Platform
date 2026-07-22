@@ -1,5 +1,10 @@
 # Station Cache
 
+Runtime controls are `STATION_CACHE_ENABLED`,
+`STATION_CACHE_TTL_SECONDS`, and `STATION_CACHE_JITTER_SECONDS`. Disabling the
+cache sends station browsing directly to PostgreSQL and does not change booking
+behavior.
+
 The station cache stores only public active-station fields in deterministic
 code order. PostgreSQL stations remain authoritative.
 
