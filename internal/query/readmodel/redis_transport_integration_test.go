@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"testing"
-	"time"
 
 	readmodel "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/readmodel"
 	"github.com/google/uuid"
@@ -55,7 +54,7 @@ func TestRedisStreamTransportRecoversPendingAndDeadLettersBeforeAck(t *testing.T
 	if _, leaked := messages[0].Values["payload"]; leaked {
 		t.Fatal("consumer message retained outbox payload")
 	}
-	claimed, err := transport.ClaimPending(ctx, "replica-b", time.Nanosecond, 1)
+	claimed, err := transport.ClaimPending(ctx, "replica-b", 0, 1)
 	if err != nil || len(claimed) != 1 || claimed[0].ID != messageID {
 		t.Fatalf("ClaimPending() = %+v, %v", claimed, err)
 	}
