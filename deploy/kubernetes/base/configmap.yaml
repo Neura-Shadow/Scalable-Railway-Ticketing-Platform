@@ -21,6 +21,12 @@ data:
   # addresses or narrow CIDRs used by the target cluster.
   TRUSTED_PROXIES: "127.0.0.1,::1"
   CORS_ALLOWED_ORIGINS: ""
+  CACHE_STATION_TTL: "5m"
+  CACHE_STATION_JITTER: "30s"
+  CACHE_SEARCH_TTL: "1m"
+  CACHE_SEARCH_JITTER: "10s"
+  CACHE_AVAILABILITY_TTL: "10s"
+  CACHE_AVAILABILITY_JITTER: "2s"
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -47,6 +53,24 @@ data:
   ADMISSION_WORKER_INTERVAL_MILLISECONDS: "250"
   ADMISSION_TOKEN_ISSUE_KEY_ID: current
   ADMISSION_TOKEN_ACCEPT_KEY_IDS: current
+  DATABASE_TIMEOUT: "3s"
+  REDIS_TIMEOUT: "1s"
+  WORKER_HTTP_ADDRESS: ":9090"
+  WORKER_PASS_TIMEOUT: "60s"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: railway-read-model-worker-config
+data:
+  APP_ENV: production
+  # A reviewed single-region overlay enables the worker after Migration 7 and
+  # an observed bounded initial backfill.
+  READ_MODEL_WORKER_ENABLED: "false"
+  READ_MODEL_WORKER_BATCH_SIZE: "100"
+  READ_MODEL_WORKER_MAX_ATTEMPTS: "5"
+  READ_MODEL_WORKER_POLL_INTERVAL: "1s"
+  READ_MODEL_WORKER_PENDING_IDLE: "30s"
   DATABASE_TIMEOUT: "3s"
   REDIS_TIMEOUT: "1s"
   WORKER_HTTP_ADDRESS: ":9090"

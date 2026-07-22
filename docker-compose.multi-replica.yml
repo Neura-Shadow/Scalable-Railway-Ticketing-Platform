@@ -265,6 +265,25 @@ services:
     init: true
     restart: "no"
 
+  read-model-admin:
+    build:
+      context: .
+      target: read-model-admin
+    profiles:
+      - tools
+    environment:
+      DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    restart: "no"
+
   k6:
     image: grafana/k6:0.54.0
     profiles:

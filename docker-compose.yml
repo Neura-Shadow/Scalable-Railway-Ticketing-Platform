@@ -198,6 +198,24 @@ services:
     init: true
     restart: unless-stopped
 
+  read-model-admin:
+    profiles: ["tools"]
+    build:
+      context: .
+      target: read-model-admin
+    environment:
+      DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    restart: "no"
+
 volumes:
   postgres-data:
   redis-data:

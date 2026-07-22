@@ -1,19 +1,19 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: railway-hold-expirer
+  name: railway-read-model-worker
   labels:
-    app.kubernetes.io/name: railway-hold-expirer
+    app.kubernetes.io/name: railway-read-model-worker
     app.kubernetes.io/component: worker
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: railway-hold-expirer
+      app.kubernetes.io/name: railway-read-model-worker
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: railway-hold-expirer
+        app.kubernetes.io/name: railway-read-model-worker
         app.kubernetes.io/component: worker
       annotations:
         prometheus.io/scrape: "true"
@@ -30,23 +30,34 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - name: hold-expirer
+        - name: read-model-worker
           image: scalable-railway-ticketing-platform:milestone-3
           imagePullPolicy: IfNotPresent
-          command: ["/usr/local/bin/hold-expirer"]
+          command: ["/usr/local/bin/read-model-worker"]
           ports:
+            # No Service selects this port. Health and metrics remain private.
             - name: worker-http
               containerPort: 9090
               protocol: TCP
           envFrom:
             - configMapRef:
-                name: railway-hold-expirer-config
+                name: railway-read-model-worker-config
           env:
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: railway-runtime-secrets
                   key: database-url
+            - name: REDIS_ADDR
+              valueFrom:
+                secretKeyRef:
+                  name: railway-runtime-secrets
+                  key: redis-address
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: railway-runtime-secrets
+                  key: redis-password
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
