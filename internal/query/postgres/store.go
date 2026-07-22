@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/offering/domain"
+	querydomain "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -93,6 +94,8 @@ type SearchResult struct {
 	Currency                        string
 }
 
+const anchoredDepartureOrderSQL = "tr.scheduled_departure_at + make_interval(mins => origin.departure_offset_minutes - route_origin.departure_offset_minutes)"
+
 func (s *Store) SearchTrainRuns(ctx context.Context, request SearchRequest) ([]SearchResult, error) {
 	normalized, err := NormalizeSearch(request)
 	if err != nil {
@@ -104,9 +107,8 @@ func (s *Store) SearchTrainRuns(ctx context.Context, request SearchRequest) ([]S
 		       tr.route_id::text, r.code, r.name, tr.service_date,
 		       tr.scheduled_departure_at, tr.status, tr.segment_count,
 		       origin.stop_index, destination.stop_index,
+		       route_origin.departure_offset_minutes,
 		       origin.departure_offset_minutes, destination.arrival_offset_minutes,
-		       tr.scheduled_departure_at + make_interval(mins => origin.departure_offset_minutes - route_origin.departure_offset_minutes) AS departure_at,
-		       tr.scheduled_departure_at + make_interval(mins => destination.arrival_offset_minutes - route_origin.departure_offset_minutes) AS arrival_at,
 		       selected_fare.amount_minor, selected_fare.currency
 		FROM train_runs AS tr
 		JOIN trains AS t ON t.id = tr.train_id AND t.active
@@ -142,13 +144,15 @@ func (s *Store) SearchTrainRuns(ctx context.Context, request SearchRequest) ([]S
 	for rows.Next() {
 		var result SearchResult
 		var status string
+		var firstDepartureOffsetMinutes int
 		if err := rows.Scan(
 			&result.TrainRunID, &result.TrainID, &result.TrainCode, &result.TrainName,
 			&result.RouteID, &result.RouteCode, &result.RouteName, &result.ServiceDate,
 			&result.ScheduledDepartureAt, &status, &result.SegmentCount,
 			&result.FromStopIndex, &result.ToStopIndex,
+			&firstDepartureOffsetMinutes,
 			&result.OriginDepartureOffsetMinutes, &result.DestinationArrivalOffsetMinutes,
-			&result.DepartureAt, &result.ArrivalAt, &result.FareAmountMinor, &result.Currency,
+			&result.FareAmountMinor, &result.Currency,
 		); err != nil {
 			return nil, safeQueryError(err)
 		}
@@ -160,8 +164,15 @@ func (s *Store) SearchTrainRuns(ctx context.Context, request SearchRequest) ([]S
 		result.SeatClass = normalized.SeatClass
 		result.ServiceDate = dateUTC(result.ServiceDate)
 		result.ScheduledDepartureAt = result.ScheduledDepartureAt.UTC()
-		result.DepartureAt = result.DepartureAt.UTC()
-		result.ArrivalAt = result.ArrivalAt.UTC()
+		result.DepartureAt, result.ArrivalAt, err = querydomain.AnchorJourneyTimes(
+			result.ScheduledDepartureAt,
+			firstDepartureOffsetMinutes,
+			result.OriginDepartureOffsetMinutes,
+			result.DestinationArrivalOffsetMinutes,
+		)
+		if err != nil {
+			return nil, ErrPersistence
+		}
 		results = append(results, result)
 	}
 	if err := rows.Err(); err != nil {
@@ -173,13 +184,13 @@ func (s *Store) SearchTrainRuns(ctx context.Context, request SearchRequest) ([]S
 func searchOrderBy(sortOrder SortOrder) string {
 	switch sortOrder {
 	case SortDepartureDesc:
-		return "departure_at DESC, tr.id DESC"
+		return anchoredDepartureOrderSQL + " DESC, tr.id DESC"
 	case SortFareAsc:
-		return "selected_fare.amount_minor ASC, departure_at ASC, tr.id ASC"
+		return "selected_fare.amount_minor ASC, " + anchoredDepartureOrderSQL + " ASC, tr.id ASC"
 	case SortFareDesc:
-		return "selected_fare.amount_minor DESC, departure_at ASC, tr.id ASC"
+		return "selected_fare.amount_minor DESC, " + anchoredDepartureOrderSQL + " ASC, tr.id ASC"
 	default:
-		return "departure_at ASC, tr.id ASC"
+		return anchoredDepartureOrderSQL + " ASC, tr.id ASC"
 	}
 }
 
@@ -225,16 +236,16 @@ func (s *Store) Availability(ctx context.Context, request AvailabilityRequest) (
 	}
 
 	var result Availability
+	var firstDepartureOffsetMinutes int
 	err = s.db.QueryRow(ctx, `
 		WITH journey AS (
 			SELECT tr.id, tr.route_id, tr.segment_count, t.code AS train_code,
 			       tr.scheduled_departure_at,
 			       origin.stop_index AS from_stop_index,
 			       destination.stop_index AS to_stop_index,
+			       route_origin.departure_offset_minutes AS first_departure_offset_minutes,
 			       origin.departure_offset_minutes,
 			       destination.arrival_offset_minutes,
-			       tr.scheduled_departure_at + make_interval(mins => origin.departure_offset_minutes - route_origin.departure_offset_minutes) AS departure_at,
-			       tr.scheduled_departure_at + make_interval(mins => destination.arrival_offset_minutes - route_origin.departure_offset_minutes) AS arrival_at,
 			       repeat('0', origin.stop_index)::bit varying
 			       || repeat('1', destination.stop_index - origin.stop_index)::bit varying
 			       || repeat('0', tr.segment_count - destination.stop_index)::bit varying AS requested_mask
@@ -266,8 +277,9 @@ func (s *Store) Availability(ctx context.Context, request AvailabilityRequest) (
 		)
 		SELECT priced.id::text, priced.train_code, priced.scheduled_departure_at,
 		       priced.from_stop_index, priced.to_stop_index, priced.segment_count,
+		       priced.first_departure_offset_minutes,
 		       priced.departure_offset_minutes, priced.arrival_offset_minutes,
-		       priced.departure_at, priced.arrival_at, priced.amount_minor, priced.currency,
+		       priced.amount_minor, priced.currency,
 		       count(si.seat_id) FILTER (
 				WHERE CASE
 					WHEN si.seat_id IS NULL THEN false
@@ -281,13 +293,14 @@ func (s *Store) Availability(ctx context.Context, request AvailabilityRequest) (
 		 AND si.seat_class = $4
 		GROUP BY priced.id, priced.train_code, priced.scheduled_departure_at,
 		         priced.from_stop_index, priced.to_stop_index, priced.segment_count,
+		         priced.first_departure_offset_minutes,
 		         priced.departure_offset_minutes, priced.arrival_offset_minutes,
-		         priced.departure_at, priced.arrival_at, priced.amount_minor, priced.currency
+		         priced.amount_minor, priced.currency
 	`, request.TrainRunID, origin.String(), destination.String(), seatClass.String()).Scan(
 		&result.TrainRunID, &result.TrainCode, &result.ScheduledDepartureAt,
 		&result.FromStopIndex, &result.ToStopIndex, &result.SegmentCount,
+		&firstDepartureOffsetMinutes,
 		&result.OriginDepartureOffsetMinutes, &result.DestinationArrivalOffsetMinutes,
-		&result.DepartureAt, &result.ArrivalAt,
 		&result.FareAmountMinor, &result.Currency, &result.AvailableSeats,
 	)
 	if err != nil {
@@ -295,8 +308,15 @@ func (s *Store) Availability(ctx context.Context, request AvailabilityRequest) (
 	}
 	result.SeatClass = seatClass
 	result.ScheduledDepartureAt = result.ScheduledDepartureAt.UTC()
-	result.DepartureAt = result.DepartureAt.UTC()
-	result.ArrivalAt = result.ArrivalAt.UTC()
+	result.DepartureAt, result.ArrivalAt, err = querydomain.AnchorJourneyTimes(
+		result.ScheduledDepartureAt,
+		firstDepartureOffsetMinutes,
+		result.OriginDepartureOffsetMinutes,
+		result.DestinationArrivalOffsetMinutes,
+	)
+	if err != nil {
+		return Availability{}, ErrPersistence
+	}
 	return result, nil
 }
 

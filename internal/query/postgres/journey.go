@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/offering/domain"
+	querydomain "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query"
 )
 
 // Journey is the authoritative persisted stop-index resolution for one train
@@ -44,6 +45,7 @@ func (s *Store) ResolveJourney(ctx context.Context, trainRunID, rawOrigin, rawDe
 
 	var journey Journey
 	var status string
+	var firstDepartureOffsetMinutes int
 	// scheduled_departure_at is already the UTC departure instant at stop 0.
 	// Later stop times therefore use offsets relative to that first departure.
 	err = s.db.QueryRow(ctx, `
@@ -51,9 +53,8 @@ func (s *Store) ResolveJourney(ctx context.Context, trainRunID, rawOrigin, rawDe
 		       tr.route_id::text, r.code, tr.service_date,
 		       tr.scheduled_departure_at, tr.status, tr.segment_count,
 		       origin.stop_index, destination.stop_index,
-		       origin.departure_offset_minutes, destination.arrival_offset_minutes,
-		       tr.scheduled_departure_at + make_interval(mins => origin.departure_offset_minutes - route_origin.departure_offset_minutes),
-		       tr.scheduled_departure_at + make_interval(mins => destination.arrival_offset_minutes - route_origin.departure_offset_minutes)
+		       route_origin.departure_offset_minutes,
+		       origin.departure_offset_minutes, destination.arrival_offset_minutes
 		FROM train_runs AS tr
 		JOIN trains AS t ON t.id = tr.train_id AND t.active
 		JOIN routes AS r ON r.id = tr.route_id AND r.active
@@ -69,8 +70,8 @@ func (s *Store) ResolveJourney(ctx context.Context, trainRunID, rawOrigin, rawDe
 		&journey.RouteID, &journey.RouteCode, &journey.ServiceDate,
 		&journey.ScheduledDepartureAt, &status, &journey.SegmentCount,
 		&journey.FromStopIndex, &journey.ToStopIndex,
+		&firstDepartureOffsetMinutes,
 		&journey.OriginDepartureOffsetMinutes, &journey.DestinationArrivalOffsetMinutes,
-		&journey.DepartureAt, &journey.ArrivalAt,
 	)
 	if err != nil {
 		return Journey{}, safeQueryError(err)
@@ -82,7 +83,14 @@ func (s *Store) ResolveJourney(ctx context.Context, trainRunID, rawOrigin, rawDe
 	journey.Status = parsedStatus
 	journey.ServiceDate = dateUTC(journey.ServiceDate)
 	journey.ScheduledDepartureAt = journey.ScheduledDepartureAt.UTC()
-	journey.DepartureAt = journey.DepartureAt.UTC()
-	journey.ArrivalAt = journey.ArrivalAt.UTC()
+	journey.DepartureAt, journey.ArrivalAt, err = querydomain.AnchorJourneyTimes(
+		journey.ScheduledDepartureAt,
+		firstDepartureOffsetMinutes,
+		journey.OriginDepartureOffsetMinutes,
+		journey.DestinationArrivalOffsetMinutes,
+	)
+	if err != nil {
+		return Journey{}, ErrPersistence
+	}
 	return journey, nil
 }
