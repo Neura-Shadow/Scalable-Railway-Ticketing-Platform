@@ -15,6 +15,9 @@ import (
 	admissionpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/admission/postgres"
 	admissionredis "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/admission/redis"
 	bookingpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/postgres"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/clock"
+	querycache "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/cache"
+	queryreadmodel "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/readmodel"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -84,7 +87,7 @@ func run(
 	}
 
 	databaseURL := strings.TrimSpace(environmentValue(lookup, "DATABASE_URL"))
-	if databaseURL == "" {
+	if databaseURL == "" && args[0] != "cache-versions" {
 		fmt.Fprintln(stderr, "configuration invalid: DATABASE_URL is required")
 		return 2
 	}
@@ -100,6 +103,10 @@ func run(
 		envelope, err = runReservationQuotas(parent, databaseURL, lookup, args[1:])
 	case "admission-state":
 		envelope, err = runAdmissionState(parent, databaseURL, lookup, args[1:])
+	case "read-model":
+		envelope, err = runReadModel(parent, databaseURL, args[1:])
+	case "cache-versions":
+		envelope, err = runCacheVersions(parent, lookup, args[1:])
 	default:
 		writeUsage(stderr)
 		return 2
@@ -124,6 +131,97 @@ func run(
 		return 1
 	}
 	return 0
+}
+
+func runReadModel(parent context.Context, databaseURL string, args []string) (resultEnvelope, error) {
+	flags := flag.NewFlagSet("read-model", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	trainRunText := flags.String("train-run-id", "", "canonical train-run UUID")
+	timeout := flags.Duration("timeout", defaultTimeout, "maximum reconciliation duration")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || *timeout <= 0 {
+		return resultEnvelope{}, errors.New("usage: reconcile read-model --train-run-id UUID [--timeout 30s]")
+	}
+	trainRunID, err := uuid.Parse(strings.TrimSpace(*trainRunText))
+	if err != nil || trainRunID == uuid.Nil {
+		return resultEnvelope{}, errors.New("train-run-id must be a canonical UUID")
+	}
+	ctx, cancel := context.WithTimeout(parent, *timeout)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		return resultEnvelope{}, errors.New("postgres configuration invalid")
+	}
+	defer pool.Close()
+	store, err := queryreadmodel.NewStore(pool, clock.RealClock{})
+	if err != nil {
+		return resultEnvelope{}, errors.New("read-model store initialization failed")
+	}
+	result, reconcileErr := store.ReconcileTrainRun(ctx, trainRunID.String())
+	envelope := resultEnvelope{Command: "read-model", Status: "healthy", ReadOnly: true, Result: result}
+	if reconcileErr != nil {
+		return envelope, reconcileErr
+	}
+	if !result.Consistent {
+		return envelope, fmt.Errorf("%w: read-model mismatches detected", errReconciliationViolations)
+	}
+	return envelope, nil
+}
+
+type cacheVersionResult struct {
+	Checked int `json:"checked"`
+	Missing int `json:"missing"`
+	Invalid int `json:"invalid"`
+}
+
+func runCacheVersions(
+	parent context.Context,
+	lookup environmentLookup,
+	args []string,
+) (resultEnvelope, error) {
+	flags := flag.NewFlagSet("cache-versions", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	trainRunText := flags.String("train-run-id", "", "optional canonical train-run UUID")
+	timeout := flags.Duration("timeout", defaultTimeout, "maximum reconciliation duration")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || *timeout <= 0 {
+		return resultEnvelope{}, errors.New("usage: reconcile cache-versions [--train-run-id UUID] [--timeout 30s]")
+	}
+	redisAddress := strings.TrimSpace(firstEnvironmentValue(lookup, "REDIS_ADDRESS", "REDIS_ADDR"))
+	if redisAddress == "" {
+		return resultEnvelope{}, errors.New("configuration invalid: REDIS_ADDRESS is required")
+	}
+	keys := []string{querycache.StationVersionKey(), querycache.SearchVersionKey()}
+	if strings.TrimSpace(*trainRunText) != "" {
+		trainRunID, err := uuid.Parse(strings.TrimSpace(*trainRunText))
+		if err != nil || trainRunID == uuid.Nil {
+			return resultEnvelope{}, errors.New("train-run-id must be a canonical UUID")
+		}
+		key, _ := querycache.AvailabilityVersionKey(trainRunID.String())
+		keys = append(keys, key)
+	}
+	ctx, cancel := context.WithTimeout(parent, *timeout)
+	defer cancel()
+	client := redis.NewClient(&redis.Options{Addr: redisAddress, Password: environmentValue(lookup, "REDIS_PASSWORD")})
+	defer func() { _ = client.Close() }()
+	result := cacheVersionResult{Checked: len(keys)}
+	for _, key := range keys {
+		value, err := client.Get(ctx, key).Result()
+		if errors.Is(err, redis.Nil) {
+			result.Missing++
+			continue
+		}
+		if err != nil {
+			envelope := resultEnvelope{Command: "cache-versions", Status: "failed", ReadOnly: true, Result: result}
+			return envelope, errors.New("cache version lookup failed")
+		}
+		if !querycache.ValidVersionToken(value) {
+			result.Invalid++
+		}
+	}
+	envelope := resultEnvelope{Command: "cache-versions", Status: "healthy", ReadOnly: true, Result: result}
+	if result.Missing+result.Invalid > 0 {
+		return envelope, fmt.Errorf("%w: cache version mismatches detected", errReconciliationViolations)
+	}
+	return envelope, nil
 }
 
 func runSeatInventory(parent context.Context, databaseURL string, args []string) (resultEnvelope, error) {
@@ -456,5 +554,5 @@ func publicError(err error) string {
 }
 
 func writeUsage(output io.Writer) {
-	fmt.Fprintln(output, "usage: reconcile {seat-inventory|reservation-quotas|admission-state} [options]")
+	fmt.Fprintln(output, "usage: reconcile {seat-inventory|reservation-quotas|admission-state|read-model|cache-versions} [options]")
 }
