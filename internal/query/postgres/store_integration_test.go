@@ -267,7 +267,7 @@ func openQueryTestDatabase(t *testing.T) *pgx.Conn {
 		t.Fatal("resolve integration test path")
 	}
 	root := filepath.Join(filepath.Dir(currentFile), "..", "..", "..")
-	for _, name := range []string{"000001_accounts.up.sql", "000002_railway_offering.up.sql", "000003_booking.up.sql", "000004_idempotency_outbox.up.sql", "000005_inventory_and_route_integrity.up.sql"} {
+	for _, name := range []string{"000001_accounts.up.sql", "000002_railway_offering.up.sql", "000003_booking.up.sql", "000004_idempotency_outbox.up.sql", "000005_inventory_and_route_integrity.up.sql", "000006_hot_train_admission.up.sql", "000007_read_model_cache.up.sql"} {
 		migration, err := os.ReadFile(filepath.Join(root, "migrations", name))
 		if err != nil {
 			t.Fatal(err)

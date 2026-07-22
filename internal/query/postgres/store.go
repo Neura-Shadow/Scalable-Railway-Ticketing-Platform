@@ -8,6 +8,7 @@ import (
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/offering/domain"
 	querydomain "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -318,6 +319,135 @@ func (s *Store) Availability(ctx context.Context, request AvailabilityRequest) (
 		return Availability{}, ErrPersistence
 	}
 	return result, nil
+}
+
+func (s *Store) AvailabilityBatch(ctx context.Context, requests []AvailabilityRequest) ([]Availability, error) {
+	if len(requests) == 0 || len(requests) > MaxPageSize {
+		return nil, ErrInvalidQuery
+	}
+	origin, err := domain.NewStationCode(requests[0].OriginCode)
+	if err != nil {
+		return nil, ErrInvalidJourney
+	}
+	destination, err := domain.NewStationCode(requests[0].DestinationCode)
+	if err != nil || origin == destination {
+		return nil, ErrInvalidJourney
+	}
+	seatClass, err := domain.ParseSeatClass(requests[0].SeatClass)
+	if err != nil {
+		return nil, err
+	}
+	trainRunIDs := make([]uuid.UUID, 0, len(requests))
+	for _, request := range requests {
+		if request.OriginCode != requests[0].OriginCode || request.DestinationCode != requests[0].DestinationCode ||
+			request.SeatClass != requests[0].SeatClass {
+			return nil, ErrInvalidQuery
+		}
+		trainRunID, err := uuid.Parse(request.TrainRunID)
+		if err != nil || trainRunID == uuid.Nil {
+			return nil, ErrInvalidQuery
+		}
+		trainRunIDs = append(trainRunIDs, trainRunID)
+	}
+	rows, err := s.db.Query(ctx, `
+		WITH journeys AS (
+			SELECT tr.id, tr.route_id, tr.segment_count, t.code AS train_code,
+			       tr.scheduled_departure_at,
+			       origin.stop_index AS from_stop_index,
+			       destination.stop_index AS to_stop_index,
+			       route_origin.departure_offset_minutes AS first_departure_offset_minutes,
+			       origin.departure_offset_minutes,
+			       destination.arrival_offset_minutes,
+			       repeat('0', origin.stop_index)::bit varying
+			       || repeat('1', destination.stop_index - origin.stop_index)::bit varying
+			       || repeat('0', tr.segment_count - destination.stop_index)::bit varying AS requested_mask
+			FROM train_runs AS tr
+			JOIN trains AS t ON t.id = tr.train_id AND t.active
+			JOIN routes AS r ON r.id = tr.route_id AND r.active
+			JOIN route_stops AS route_origin ON route_origin.route_id = tr.route_id AND route_origin.stop_index = 0
+			JOIN route_stops AS origin ON origin.route_id = tr.route_id
+			JOIN stations AS origin_station ON origin_station.id = origin.station_id AND origin_station.code = $2 AND origin_station.active
+			JOIN route_stops AS destination ON destination.route_id = tr.route_id
+			JOIN stations AS destination_station ON destination_station.id = destination.station_id AND destination_station.code = $3 AND destination_station.active
+			WHERE tr.id = ANY($1::uuid[])
+			  AND tr.status = 'scheduled'
+			  AND origin.stop_index < destination.stop_index
+		), priced AS (
+			SELECT journeys.*, selected_fare.amount_minor, selected_fare.currency
+			FROM journeys
+			JOIN LATERAL (
+				SELECT f.amount_minor, f.currency
+				FROM fares AS f
+				WHERE f.active AND f.seat_class = $4
+				  AND f.from_stop_index = journeys.from_stop_index
+				  AND f.to_stop_index = journeys.to_stop_index
+				  AND (f.train_run_id = journeys.id OR (f.train_run_id IS NULL AND f.route_id = journeys.route_id))
+				ORDER BY (f.train_run_id IS NOT NULL) DESC
+				LIMIT 1
+			) AS selected_fare ON true
+		)
+		SELECT priced.id::text, priced.train_code, priced.scheduled_departure_at,
+		       priced.from_stop_index, priced.to_stop_index, priced.segment_count,
+		       priced.first_departure_offset_minutes,
+		       priced.departure_offset_minutes, priced.arrival_offset_minutes,
+		       priced.amount_minor, priced.currency,
+		       count(si.seat_id) FILTER (
+				WHERE CASE
+					WHEN si.seat_id IS NULL THEN false
+					WHEN bit_length(si.occupied_segments) <> priced.segment_count THEN false
+					ELSE (si.occupied_segments & priced.requested_mask) = repeat('0', priced.segment_count)::bit varying
+				END
+		       )::bigint AS available_seats
+		FROM priced
+		LEFT JOIN seat_inventory AS si ON si.train_run_id = priced.id AND si.seat_class = $4
+		GROUP BY priced.id, priced.train_code, priced.scheduled_departure_at,
+		         priced.from_stop_index, priced.to_stop_index, priced.segment_count,
+		         priced.first_departure_offset_minutes,
+		         priced.departure_offset_minutes, priced.arrival_offset_minutes,
+		         priced.amount_minor, priced.currency
+	`, trainRunIDs, origin.String(), destination.String(), seatClass.String())
+	if err != nil {
+		return nil, safeQueryError(err)
+	}
+	defer rows.Close()
+	byID := make(map[string]Availability, len(requests))
+	for rows.Next() {
+		var result Availability
+		var firstDepartureOffsetMinutes int
+		if err := rows.Scan(
+			&result.TrainRunID, &result.TrainCode, &result.ScheduledDepartureAt,
+			&result.FromStopIndex, &result.ToStopIndex, &result.SegmentCount,
+			&firstDepartureOffsetMinutes,
+			&result.OriginDepartureOffsetMinutes, &result.DestinationArrivalOffsetMinutes,
+			&result.FareAmountMinor, &result.Currency, &result.AvailableSeats,
+		); err != nil {
+			return nil, safeQueryError(err)
+		}
+		result.SeatClass = seatClass
+		result.ScheduledDepartureAt = result.ScheduledDepartureAt.UTC()
+		result.DepartureAt, result.ArrivalAt, err = querydomain.AnchorJourneyTimes(
+			result.ScheduledDepartureAt,
+			firstDepartureOffsetMinutes,
+			result.OriginDepartureOffsetMinutes,
+			result.DestinationArrivalOffsetMinutes,
+		)
+		if err != nil {
+			return nil, ErrPersistence
+		}
+		byID[result.TrainRunID] = result
+	}
+	if err := rows.Err(); err != nil {
+		return nil, safeQueryError(err)
+	}
+	results := make([]Availability, 0, len(requests))
+	for _, request := range requests {
+		result, exists := byID[request.TrainRunID]
+		if !exists {
+			return nil, ErrNotFound
+		}
+		results = append(results, result)
+	}
+	return results, nil
 }
 
 func dateUTC(value time.Time) time.Time {

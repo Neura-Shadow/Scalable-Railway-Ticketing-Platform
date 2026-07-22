@@ -33,6 +33,7 @@ const (
 	ProcessHoldExpirer     Process = "hold-expirer"
 	ProcessOutboxWorker    Process = "outbox-worker"
 	ProcessAdmissionWorker Process = "admission-worker"
+	ProcessReadModelWorker Process = "read-model-worker"
 )
 
 const (
@@ -85,6 +86,17 @@ type Config struct {
 	AdmissionWorkerEnabled                      bool
 	AdmissionWorkerBatchSize                    int
 	AdmissionWorkerPollInterval                 time.Duration
+	ReadModelWorkerEnabled                      bool
+	ReadModelWorkerBatchSize                    int
+	ReadModelWorkerMaxAttempts                  int
+	ReadModelWorkerPollInterval                 time.Duration
+	ReadModelWorkerPendingIdle                  time.Duration
+	StationCacheTTL                             time.Duration
+	StationCacheJitter                          time.Duration
+	SearchCacheTTL                              time.Duration
+	SearchCacheJitter                           time.Duration
+	AvailabilityCacheTTL                        time.Duration
+	AvailabilityCacheJitter                     time.Duration
 	ReservationMaxActiveHoldsPerUser            int
 	ReservationMaxActiveHoldsPerUserPerTrainRun int
 	ReservationMaxActivePassengersPerUser       int
@@ -136,6 +148,16 @@ func Defaults() Config {
 		WorkerPassTimeout:                           60 * time.Second,
 		AdmissionWorkerBatchSize:                    100,
 		AdmissionWorkerPollInterval:                 250 * time.Millisecond,
+		ReadModelWorkerBatchSize:                    100,
+		ReadModelWorkerMaxAttempts:                  5,
+		ReadModelWorkerPollInterval:                 time.Second,
+		ReadModelWorkerPendingIdle:                  30 * time.Second,
+		StationCacheTTL:                             5 * time.Minute,
+		StationCacheJitter:                          30 * time.Second,
+		SearchCacheTTL:                              60 * time.Second,
+		SearchCacheJitter:                           10 * time.Second,
+		AvailabilityCacheTTL:                        10 * time.Second,
+		AvailabilityCacheJitter:                     2 * time.Second,
 		HTTPReadTimeout:                             5 * time.Second,
 		HTTPWriteTimeout:                            10 * time.Second,
 		ShutdownTimeout:                             15 * time.Second,
@@ -160,8 +182,8 @@ func (c Config) ValidateFor(process Process) error {
 	}
 
 	var problems []error
-	if process != ProcessAPI && process != ProcessHoldExpirer && process != ProcessOutboxWorker && process != ProcessAdmissionWorker {
-		problems = append(problems, errors.New("runtime process must be api, hold-expirer, outbox-worker, or admission-worker"))
+	if process != ProcessAPI && process != ProcessHoldExpirer && process != ProcessOutboxWorker && process != ProcessAdmissionWorker && process != ProcessReadModelWorker {
+		problems = append(problems, errors.New("runtime process must be api, hold-expirer, outbox-worker, admission-worker, or read-model-worker"))
 	}
 	if c.Environment != EnvironmentDevelopment && c.Environment != EnvironmentTest && c.Environment != EnvironmentProduction {
 		problems = append(problems, errors.New("APP_ENV must be development, test, or production"))
@@ -221,7 +243,15 @@ func (c Config) ValidateFor(process Process) error {
 			validationCheck{"RESERVATION_MAX_ACTIVE_HOLDS_PER_USER_PER_TRAIN_RUN", positiveBounded(c.ReservationMaxActiveHoldsPerUserPerTrainRun, maxReservationProtectionLimit)},
 			validationCheck{"RESERVATION_MAX_ACTIVE_PASSENGERS_PER_USER", positiveBounded(c.ReservationMaxActivePassengersPerUser, maxReservationProtectionLimit)},
 			validationCheck{"RESERVATION_MAX_INFLIGHT_PER_INSTANCE", positiveBounded(c.ReservationMaxInflightPerInstance, maxReservationProtectionLimit)},
+			validationCheck{"CACHE_STATION_TTL", c.StationCacheTTL > 0 && c.StationCacheTTL <= 24*time.Hour},
+			validationCheck{"CACHE_SEARCH_TTL", c.SearchCacheTTL > 0 && c.SearchCacheTTL <= 24*time.Hour},
+			validationCheck{"CACHE_AVAILABILITY_TTL", c.AvailabilityCacheTTL > 0 && c.AvailabilityCacheTTL <= 24*time.Hour},
 		)
+		if c.StationCacheJitter < 0 || c.StationCacheJitter > c.StationCacheTTL ||
+			c.SearchCacheJitter < 0 || c.SearchCacheJitter > c.SearchCacheTTL ||
+			c.AvailabilityCacheJitter < 0 || c.AvailabilityCacheJitter > c.AvailabilityCacheTTL {
+			problems = append(problems, errors.New("cache jitter must be non-negative and no greater than its TTL"))
+		}
 		if c.ReservationMaxActiveHoldsPerUserPerTrainRun > c.ReservationMaxActiveHoldsPerUser {
 			problems = append(problems, errors.New("RESERVATION_MAX_ACTIVE_HOLDS_PER_USER_PER_TRAIN_RUN must not exceed RESERVATION_MAX_ACTIVE_HOLDS_PER_USER"))
 		}
@@ -285,6 +315,19 @@ func (c Config) ValidateFor(process Process) error {
 			validationCheck{"REDIS_TIMEOUT", c.RedisTimeout > 0},
 			validationCheck{"ADMISSION_WORKER_BATCH_SIZE", positiveBounded(c.AdmissionWorkerBatchSize, maxAdmissionWorkerBatchSize)},
 			validationCheck{"ADMISSION_WORKER_INTERVAL_MILLISECONDS", c.AdmissionWorkerPollInterval > 0},
+			validationCheck{"WORKER_PASS_TIMEOUT", c.WorkerPassTimeout > 0},
+		)
+	case ProcessReadModelWorker:
+		validateWorkerHTTP()
+		if err := validateRedisAddress(c.RedisAddress); err != nil {
+			problems = append(problems, err)
+		}
+		validatePositive(
+			validationCheck{"REDIS_TIMEOUT", c.RedisTimeout > 0},
+			validationCheck{"READ_MODEL_WORKER_BATCH_SIZE", positiveBounded(c.ReadModelWorkerBatchSize, 100)},
+			validationCheck{"READ_MODEL_WORKER_MAX_ATTEMPTS", positiveBounded(c.ReadModelWorkerMaxAttempts, 10)},
+			validationCheck{"READ_MODEL_WORKER_POLL_INTERVAL", c.ReadModelWorkerPollInterval > 0},
+			validationCheck{"READ_MODEL_WORKER_PENDING_IDLE", c.ReadModelWorkerPendingIdle > 0},
 			validationCheck{"WORKER_PASS_TIMEOUT", c.WorkerPassTimeout > 0},
 		)
 	}
@@ -537,8 +580,10 @@ func LoadFromFor(lookup LookupFunc, process Process) (Config, error) {
 		err = loadOutboxSettings(lookup, &cfg)
 	case ProcessAdmissionWorker:
 		err = loadAdmissionWorkerSettings(lookup, &cfg)
+	case ProcessReadModelWorker:
+		err = loadReadModelWorkerSettings(lookup, &cfg)
 	default:
-		err = errors.New("runtime process must be api, hold-expirer, outbox-worker, or admission-worker")
+		err = errors.New("runtime process must be api, hold-expirer, outbox-worker, admission-worker, or read-model-worker")
 	}
 	if err != nil {
 		return Config{}, err
@@ -569,6 +614,12 @@ func loadAPISettings(lookup LookupFunc, cfg *Config) error {
 		{"HTTP_READ_TIMEOUT", &cfg.HTTPReadTimeout},
 		{"HTTP_WRITE_TIMEOUT", &cfg.HTTPWriteTimeout},
 		{"REDIS_TIMEOUT", &cfg.RedisTimeout},
+		{"CACHE_STATION_TTL", &cfg.StationCacheTTL},
+		{"CACHE_STATION_JITTER", &cfg.StationCacheJitter},
+		{"CACHE_SEARCH_TTL", &cfg.SearchCacheTTL},
+		{"CACHE_SEARCH_JITTER", &cfg.SearchCacheJitter},
+		{"CACHE_AVAILABILITY_TTL", &cfg.AvailabilityCacheTTL},
+		{"CACHE_AVAILABILITY_JITTER", &cfg.AvailabilityCacheJitter},
 	} {
 		if err := setDuration(lookup, item.name, item.target); err != nil {
 			return err
@@ -624,6 +675,36 @@ func loadAdmissionWorkerSettings(lookup LookupFunc, cfg *Config) error {
 		return err
 	}
 	return setDuration(lookup, "WORKER_PASS_TIMEOUT", &cfg.WorkerPassTimeout)
+}
+
+func loadReadModelWorkerSettings(lookup LookupFunc, cfg *Config) error {
+	setString(lookup, "WORKER_HTTP_ADDRESS", &cfg.WorkerHTTPAddress)
+	setString(lookup, "REDIS_ADDRESS", &cfg.RedisAddress)
+	setString(lookup, "REDIS_ADDR", &cfg.RedisAddress)
+	setString(lookup, "REDIS_PASSWORD", &cfg.RedisPassword)
+	if err := setBool(lookup, "READ_MODEL_WORKER_ENABLED", &cfg.ReadModelWorkerEnabled); err != nil {
+		return err
+	}
+	if err := setInt(lookup, "READ_MODEL_WORKER_BATCH_SIZE", &cfg.ReadModelWorkerBatchSize); err != nil {
+		return err
+	}
+	if err := setInt(lookup, "READ_MODEL_WORKER_MAX_ATTEMPTS", &cfg.ReadModelWorkerMaxAttempts); err != nil {
+		return err
+	}
+	for _, item := range []struct {
+		name   string
+		target *time.Duration
+	}{
+		{"READ_MODEL_WORKER_POLL_INTERVAL", &cfg.ReadModelWorkerPollInterval},
+		{"READ_MODEL_WORKER_PENDING_IDLE", &cfg.ReadModelWorkerPendingIdle},
+		{"REDIS_TIMEOUT", &cfg.RedisTimeout},
+		{"WORKER_PASS_TIMEOUT", &cfg.WorkerPassTimeout},
+	} {
+		if err := setDuration(lookup, item.name, item.target); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func loadAdmissionTokenSettings(lookup LookupFunc, cfg *Config) {

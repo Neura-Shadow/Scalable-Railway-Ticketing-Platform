@@ -207,3 +207,68 @@ func TestAdmissionWorkerLastSuccessAdvancesOnlyOnSuccessfulPass(t *testing.T) {
 	}
 	t.Fatal("admission_worker_last_success_timestamp_seconds was not gathered")
 }
+
+func TestReadModelMetricsExposeExactFamiliesWithOnlyBoundedLabels(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	recorder, err := metrics.NewReadModelMetrics(registry)
+	if err != nil {
+		t.Fatalf("NewReadModelMetrics() error = %v", err)
+	}
+	malicious := "user-id:event-id:cache-key:query-hash"
+	recorder.RecordEvent(malicious, malicious)
+	recorder.RecordDuplicateEvent(malicious)
+	recorder.RecordRebuild("failure", malicious, 3, time.Second)
+	recorder.RecordFallback(malicious)
+	recorder.RecordReconciliationMismatch(malicious)
+	recorder.SetProjectionLag(time.Second)
+	recorder.RecordCacheRequest(malicious, malicious, "failure", malicious)
+	recorder.RecordCacheRequest("stations", "read", "hit", "none")
+	recorder.RecordCacheRequest("train_search", "read", "miss", "none")
+	recorder.RecordCacheFill(malicious, "failure", malicious, time.Second, true)
+	recorder.RecordCacheFill("stations", "success", "none", time.Second, false)
+	recorder.RecordCacheInvalidation(malicious, malicious, "failure", malicious)
+	recorder.RecordCacheInvalidation("stations", "station.updated", "success", "none")
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("Gather() error = %v", err)
+	}
+	wantNames := map[string]struct{}{}
+	for _, name := range []string{
+		"read_model_event_total", "read_model_duplicate_event_total", "read_model_rebuild_total",
+		"read_model_rebuild_failure_total", "read_model_rebuild_duration_seconds",
+		"read_model_rows_written_total", "read_model_fallback_total",
+		"read_model_reconciliation_mismatch_total", "read_model_projection_lag_seconds",
+		"cache_request_total", "cache_hit_total", "cache_miss_total", "cache_failure_total",
+		"cache_invalidation_total", "cache_invalidation_failure_total", "cache_fill_total",
+		"cache_fill_failure_total", "cache_singleflight_shared_total", "cache_fill_duration_seconds",
+	} {
+		wantNames[name] = struct{}{}
+	}
+	seen := make(map[string]struct{})
+	for _, family := range families {
+		if _, wanted := wantNames[family.GetName()]; !wanted {
+			continue
+		}
+		seen[family.GetName()] = struct{}{}
+		for _, metric := range family.Metric {
+			for _, label := range metric.Label {
+				if strings.Contains(label.GetValue(), malicious) {
+					t.Fatalf("metric %s leaked caller value in label %s", family.GetName(), label.GetName())
+				}
+			}
+		}
+	}
+	if len(seen) != len(wantNames) {
+		t.Fatalf("read-model metric families seen = %d, want %d; missing=%v", len(seen), len(wantNames), missingMetricNames(wantNames, seen))
+	}
+}
+
+func missingMetricNames(want, seen map[string]struct{}) []string {
+	missing := make([]string, 0)
+	for name := range want {
+		if _, ok := seen[name]; !ok {
+			missing = append(missing, name)
+		}
+	}
+	return missing
+}

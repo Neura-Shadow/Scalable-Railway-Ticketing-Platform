@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"log/slog"
 	"net"
@@ -21,7 +22,9 @@ import (
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
 	platformmetrics "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/metrics"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/redisx"
+	querycache "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/cache"
 	querypostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/postgres"
+	queryreadmodel "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/readmodel"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/transport/httpapi"
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -79,6 +82,10 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return errors.New("metrics initialization failed")
 	}
+	readMetrics, err := platformmetrics.NewReadModelMetrics(registry)
+	if err != nil {
+		return errors.New("read-model metrics initialization failed")
+	}
 	keySelection, err := cfg.ParseAdmissionTokenKeys()
 	if err != nil {
 		return errors.New("admission token keyring invalid")
@@ -108,6 +115,40 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return errors.New("query store initialization failed")
 	}
+	projectionStore, err := queryreadmodel.NewStore(pool, clock.RealClock{})
+	if err != nil {
+		return errors.New("read-model store initialization failed")
+	}
+	versionManager, err := querycache.NewSecureVersionManager(redisClient)
+	if err != nil {
+		return errors.New("cache version manager initialization failed")
+	}
+	stationTTL, err := querycache.NewTTLPolicy(cfg.StationCacheTTL, cfg.StationCacheJitter, rand.Reader)
+	if err != nil {
+		return errors.New("station cache TTL configuration invalid")
+	}
+	searchTTL, err := querycache.NewTTLPolicy(cfg.SearchCacheTTL, cfg.SearchCacheJitter, rand.Reader)
+	if err != nil {
+		return errors.New("search cache TTL configuration invalid")
+	}
+	availabilityTTL, err := querycache.NewTTLPolicy(cfg.AvailabilityCacheTTL, cfg.AvailabilityCacheJitter, rand.Reader)
+	if err != nil {
+		return errors.New("availability cache TTL configuration invalid")
+	}
+	cachedQueryStore, err := querycache.NewStore(
+		queryStore,
+		projectionStore,
+		redisClient,
+		versionManager,
+		clock.RealClock{},
+		stationTTL,
+		searchTTL,
+		availabilityTTL,
+	)
+	if err != nil {
+		return errors.New("read cache store initialization failed")
+	}
+	cachedQueryStore.WithMetrics(readMetrics)
 	bookingStore := bookingpostgres.NewWithReservationQuotaLimits(pool, bookingpostgres.ReservationQuotaLimits{
 		MaxActiveHoldsPerUser:            cfg.ReservationMaxActiveHoldsPerUser,
 		MaxActiveHoldsPerUserPerTrainRun: cfg.ReservationMaxActiveHoldsPerUserPerTrainRun,
@@ -146,7 +187,7 @@ func run(logger *slog.Logger) error {
 		MaxPassengers:       cfg.MaxPassengersPerReservation,
 		HTTPMetrics:         metrics,
 		MetricsHandler:      promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
-		Offering:            app.NewOfferingQueries(queryStore),
+		Offering:            app.NewOfferingQueries(cachedQueryStore),
 		Auth:                auth,
 		RateLimiter:         app.NewRateLimiter(rateLimitBackend),
 		Passengers:          passengers,
