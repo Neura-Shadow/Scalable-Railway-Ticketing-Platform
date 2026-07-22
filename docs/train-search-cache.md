@@ -23,6 +23,10 @@ sort field, and sort direction. Case/whitespace equivalents converge. Unsafe
 sort values are rejected before SQL or key construction. Raw query strings and
 station values never appear in Redis keys or metric labels.
 
+Only `departure_at` and `fare_minor` sorts, ascending or descending, are
+publicly accepted. Unsupported sorts are rejected before projection lookup or
+cache-key creation.
+
 The default TTL is sixty seconds plus up to ten seconds of bounded jitter. A
 station, route, train, fare, train-run, or cancellation change rotates the
 global generation. Rotation is O(1); old pages expire without `KEYS` or a

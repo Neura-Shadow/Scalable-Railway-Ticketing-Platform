@@ -41,6 +41,9 @@ func (s *Store) RebuildAll(ctx context.Context, options RebuildAllOptions) (Rebu
 	if err != nil {
 		return RebuildAllResult{}, err
 	}
+	if err := s.beginRebuildAll(ctx, options.After); err != nil {
+		return RebuildAllResult{}, err
+	}
 	candidates, err := s.listRebuildCandidates(ctx, afterDate, afterID, options.Limit+1)
 	if err != nil {
 		return RebuildAllResult{}, err
@@ -62,7 +65,81 @@ func (s *Store) RebuildAll(ctx context.Context, options RebuildAllOptions) (Rebu
 		result.RowsWritten += rebuild.RowsWritten
 		result.NextCursor = formatRebuildCursor(candidate.serviceDate, candidate.trainRunID)
 	}
+	if result.NextCursor == "" {
+		result.NextCursor = options.After
+	}
+	if err := s.checkpointRebuildAll(ctx, options.After, result.NextCursor, !result.HasMore); err != nil {
+		return result, err
+	}
 	return result, nil
+}
+
+func (s *Store) beginRebuildAll(ctx context.Context, after string) error {
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return fmt.Errorf("%w: begin rebuild state", ErrPersistence)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(ctx, `
+		SELECT pg_advisory_xact_lock(hashtextextended('journey_search', 7213007))
+	`); err != nil {
+		return fmt.Errorf("%w: lock rebuild state", ErrPersistence)
+	}
+	if after == "" {
+		if _, err := tx.Exec(ctx, `
+			UPDATE read_model_projection_state
+			SET ready = false, rebuild_after = '', updated_at = clock_timestamp()
+			WHERE projection_name = 'journey_search'
+		`); err != nil {
+			return fmt.Errorf("%w: reset rebuild state", ErrPersistence)
+		}
+	} else {
+		var expected string
+		if err := tx.QueryRow(ctx, `
+			SELECT rebuild_after
+			FROM read_model_projection_state
+			WHERE projection_name = 'journey_search'
+			FOR UPDATE
+		`).Scan(&expected); err != nil {
+			return fmt.Errorf("%w: read rebuild state", ErrPersistence)
+		}
+		if expected != after {
+			return ErrInvalidRebuildOptions
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("%w: commit rebuild state", ErrPersistence)
+	}
+	return nil
+}
+
+func (s *Store) checkpointRebuildAll(ctx context.Context, expected, next string, ready bool) error {
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return fmt.Errorf("%w: begin rebuild checkpoint", ErrPersistence)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(ctx, `
+		SELECT pg_advisory_xact_lock(hashtextextended('journey_search', 7213007))
+	`); err != nil {
+		return fmt.Errorf("%w: lock rebuild checkpoint", ErrPersistence)
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE read_model_projection_state
+		SET ready = $1, rebuild_after = $2, updated_at = clock_timestamp()
+		WHERE projection_name = 'journey_search'
+		  AND rebuild_after = $3
+	`, ready, next, expected)
+	if err != nil {
+		return fmt.Errorf("%w: write rebuild checkpoint", ErrPersistence)
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrInvalidRebuildOptions
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("%w: commit rebuild checkpoint", ErrPersistence)
+	}
+	return nil
 }
 
 func (s *Store) PreviewRebuildAll(ctx context.Context, options RebuildAllOptions) (RebuildAllResult, error) {

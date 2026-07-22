@@ -232,10 +232,6 @@ func querySort(value string) (string, bool) {
 		return "fare_asc", true
 	case "-fare_minor":
 		return "fare_desc", true
-	case "arrival_at":
-		return "departure_asc", true
-	case "-arrival_at":
-		return "departure_desc", true
 	default:
 		return "", false
 	}

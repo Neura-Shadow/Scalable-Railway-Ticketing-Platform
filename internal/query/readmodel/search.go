@@ -25,11 +25,11 @@ func (s *Store) SearchTrainRuns(
 	defer func() { _ = tx.Rollback(context.Background()) }()
 	var projectionAvailable bool
 	if err := tx.QueryRow(ctx, `
-		SELECT NOT EXISTS (
-			SELECT 1
-			FROM read_model_event_progress
-			WHERE projection_affecting
+		SELECT state.ready AND NOT EXISTS (
+			SELECT 1 FROM read_model_event_progress WHERE projection_affecting
 		)
+		FROM read_model_projection_state AS state
+		WHERE state.projection_name = 'journey_search'
 	`).Scan(&projectionAvailable); err != nil {
 		return nil, fmt.Errorf("%w: inspect projection progress", ErrPersistence)
 	}

@@ -60,7 +60,11 @@ read-model-admin inspect-lag
 ```
 
 Record batch duration, rows, locks, WAL/disk growth, failures, and resumable
-cursor. Do not claim zero downtime: each run is replaced transactionally, but
+cursor. Pass the exact returned cursor to the next apply invocation. The first
+page marks `journey_search` unavailable in `read_model_projection_state`; only
+the final cursor checkpoint marks it ready, and a stale/skipped cursor is
+rejected. Public search therefore uses the authoritative source throughout an
+incomplete backfill. Do not claim zero downtime: each run is replaced transactionally, but
 the total backfill consumes real database resources. Enable one worker only
 after reconciliation is clean, then validate pending recovery, DLQ, metrics,
 and cache rotation before scaling to two.

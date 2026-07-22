@@ -160,6 +160,20 @@ CREATE INDEX read_model_event_progress_projection_idx
     ON read_model_event_progress (projection_affecting, phase, updated_at)
     WHERE projection_affecting;
 
+CREATE TABLE read_model_projection_state (
+    projection_name text PRIMARY KEY,
+    ready boolean NOT NULL DEFAULT false,
+    rebuild_after text NOT NULL DEFAULT '',
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT read_model_projection_state_name_check
+        CHECK (projection_name = 'journey_search'),
+    CONSTRAINT read_model_projection_state_cursor_check
+        CHECK (length(rebuild_after) <= 128)
+);
+
+INSERT INTO read_model_projection_state (projection_name)
+VALUES ('journey_search');
+
 ALTER TABLE outbox_events
     DROP CONSTRAINT outbox_events_aggregate_type_check,
     ADD CONSTRAINT outbox_events_aggregate_type_check

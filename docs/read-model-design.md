@@ -54,7 +54,9 @@ for bounded retry; short TTLs remain the final staleness bound.
 7. Best-effort fill Redis and return the complete PostgreSQL result.
 
 A Redis error never permits a booking bypass. A projection error never returns
-a known partial row set. Elevated lag is an alert condition, not by itself an
+a known partial row set. A durable singleton readiness row keeps projection
+search disabled from the first full-backfill page through its final cursor
+checkpoint; stale or skipped resume cursors fail closed. Elevated lag is an alert condition, not by itself an
 API readiness failure.
 
 ## Atomic replacement

@@ -33,6 +33,9 @@ func TestMigrationSevenCreatesProjectionAndReceiptSchema(t *testing.T) {
 		"read_model_event_receipts_aggregate_type_check",
 		"read_model_event_receipts_consumer_name_check",
 		"read_model_event_receipts_event_type_check",
+		"read_model_projection_state_pkey",
+		"read_model_projection_state_name_check",
+		"read_model_projection_state_cursor_check",
 		"train_run_journey_read_model_pkey",
 		"train_run_journey_read_model_seat_class_check",
 		"train_run_journey_read_model_currency_check",
@@ -47,10 +50,16 @@ func TestMigrationSevenCreatesProjectionAndReceiptSchema(t *testing.T) {
 	gotConstraints := collectStrings(t, conn, `
 		SELECT constraint_name
 		FROM information_schema.table_constraints AS tc
+		JOIN pg_catalog.pg_namespace AS pn
+		  ON pn.nspname = tc.table_schema
+		JOIN pg_catalog.pg_class AS pcl
+		  ON pcl.relname = tc.table_name
+		 AND pcl.relnamespace = pn.oid
 		JOIN pg_catalog.pg_constraint AS pc
 		  ON pc.conname = tc.constraint_name
+		 AND pc.conrelid = pcl.oid
 		WHERE tc.table_schema = current_schema()
-		  AND tc.table_name IN ('train_run_journey_read_model', 'read_model_event_receipts', 'read_model_event_progress')
+		  AND tc.table_name IN ('train_run_journey_read_model', 'read_model_event_receipts', 'read_model_event_progress', 'read_model_projection_state')
 		  AND pc.contype IN ('p', 'c')
 		ORDER BY constraint_name
 	`)
@@ -64,6 +73,7 @@ func TestMigrationSevenCreatesProjectionAndReceiptSchema(t *testing.T) {
 		"read_model_event_receipts_aggregate_idx",
 		"read_model_event_receipts_pkey",
 		"read_model_event_receipts_processed_at_idx",
+		"read_model_projection_state_pkey",
 		"train_run_journey_read_model_fare_search_idx",
 		"train_run_journey_read_model_pkey",
 		"train_run_journey_read_model_search_idx",
@@ -73,31 +83,45 @@ func TestMigrationSevenCreatesProjectionAndReceiptSchema(t *testing.T) {
 		SELECT indexname
 		FROM pg_indexes
 		WHERE schemaname = current_schema()
-		  AND tablename IN ('train_run_journey_read_model', 'read_model_event_receipts', 'read_model_event_progress')
+		  AND tablename IN ('train_run_journey_read_model', 'read_model_event_receipts', 'read_model_event_progress', 'read_model_projection_state')
 		ORDER BY indexname
 	`)
 	if !equalStrings(gotIndexes, wantIndexes) {
 		t.Fatalf("migration 7 indexes = %v, want %v", gotIndexes, wantIndexes)
 	}
 
-	var projectionColumns, receiptColumns, progressColumns int
+	var projectionColumns, receiptColumns, progressColumns, stateColumns int
 	if err := conn.QueryRow(ctx, `
 		SELECT
 			count(*) FILTER (WHERE table_name = 'train_run_journey_read_model'),
 			count(*) FILTER (WHERE table_name = 'read_model_event_receipts'),
-			count(*) FILTER (WHERE table_name = 'read_model_event_progress')
+			count(*) FILTER (WHERE table_name = 'read_model_event_progress'),
+			count(*) FILTER (WHERE table_name = 'read_model_projection_state')
 		FROM information_schema.columns
 		WHERE table_schema = current_schema()
-	`).Scan(&projectionColumns, &receiptColumns, &progressColumns); err != nil {
+	`).Scan(&projectionColumns, &receiptColumns, &progressColumns, &stateColumns); err != nil {
 		t.Fatalf("inspect migration 7 columns: %v", err)
 	}
-	if projectionColumns != 21 || receiptColumns != 6 || progressColumns != 11 {
+	if projectionColumns != 21 || receiptColumns != 6 || progressColumns != 11 || stateColumns != 4 {
 		t.Fatalf(
-			"migration 7 column counts = projection %d receipt %d progress %d, want 21, 6, and 11",
+			"migration 7 column counts = projection %d receipt %d progress %d state %d, want 21, 6, 11, and 4",
 			projectionColumns,
 			receiptColumns,
 			progressColumns,
+			stateColumns,
 		)
+	}
+	var ready bool
+	var rebuildAfter string
+	if err := conn.QueryRow(ctx, `
+		SELECT ready, rebuild_after
+		FROM read_model_projection_state
+		WHERE projection_name = 'journey_search'
+	`).Scan(&ready, &rebuildAfter); err != nil {
+		t.Fatalf("inspect initial projection state: %v", err)
+	}
+	if ready || rebuildAfter != "" {
+		t.Fatalf("initial projection state = ready %t cursor %q, want unavailable empty cursor", ready, rebuildAfter)
 	}
 }
 

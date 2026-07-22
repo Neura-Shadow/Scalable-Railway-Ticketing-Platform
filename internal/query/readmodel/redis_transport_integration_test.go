@@ -216,6 +216,7 @@ func TestRedisClaimPendingAdvancesAcrossThePELInsteadOfReclaimingTheFront(t *tes
 func TestDeadLetteredProgressConvergesAfterOperatorRedrive(t *testing.T) {
 	conn := openMigrationSevenDatabase(t)
 	trainRunID := seedProjectionSource(t, conn)
+	markProjectionReady(t, conn)
 	store, err := readmodel.NewStore(conn, clock.NewDeterministic(time.Now().UTC()))
 	if err != nil {
 		t.Fatalf("NewStore() error = %v", err)

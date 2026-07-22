@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -116,6 +117,26 @@ func TestAvailabilityHintIsSharedAcrossReplicasAndRotationReobservesPostgres(t *
 	}
 	if source.availabilityCalls.Load() != 2 {
 		t.Fatalf("availability source calls = %d, want 2", source.availabilityCalls.Load())
+	}
+}
+
+func TestAvailabilityHintCanonicalizesUppercaseTrainRunIDForWarmHit(t *testing.T) {
+	client := openCacheRedis(t)
+	canonicalTrainRunID := uuid.NewString()
+	request := querypostgres.AvailabilityRequest{
+		TrainRunID: strings.ToUpper(canonicalTrainRunID),
+		OriginCode: "TPE", DestinationCode: "KHH", SeatClass: "standard",
+	}
+	source := &cacheSourceFake{availability: availabilityFixture(canonicalTrainRunID, 7)}
+	store := newCacheStore(t, source, source, client)
+	for attempt := 0; attempt < 2; attempt++ {
+		availability, err := store.Availability(context.Background(), request)
+		if err != nil || availability.AvailableSeats != 7 {
+			t.Fatalf("Availability(attempt %d) = %+v, %v", attempt+1, availability, err)
+		}
+	}
+	if source.availabilityCalls.Load() != 1 {
+		t.Fatalf("uppercase UUID source calls = %d, want one warm cache fill", source.availabilityCalls.Load())
 	}
 }
 

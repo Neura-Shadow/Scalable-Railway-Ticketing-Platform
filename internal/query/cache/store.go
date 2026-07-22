@@ -9,6 +9,7 @@ import (
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/offering/domain"
 	querypostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/postgres"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -442,8 +443,11 @@ func (store *Store) readAvailability(
 	if status != cacheReadHit {
 		return querypostgres.Availability{}, status
 	}
+	requestTrainRunID, requestErr := uuid.Parse(request.TrainRunID)
+	cachedTrainRunID, cachedErr := uuid.Parse(cached.Value.TrainRunID)
 	if cached.Source != "postgres" || cached.ObservedAt.IsZero() ||
-		cached.Value.AvailableSeats < 0 || cached.Value.TrainRunID != request.TrainRunID {
+		cached.Value.AvailableSeats < 0 || requestErr != nil || cachedErr != nil ||
+		requestTrainRunID == uuid.Nil || cachedTrainRunID != requestTrainRunID {
 		return querypostgres.Availability{}, cacheReadInvalid
 	}
 	age := store.clock.Now().UTC().Sub(cached.ObservedAt.UTC())

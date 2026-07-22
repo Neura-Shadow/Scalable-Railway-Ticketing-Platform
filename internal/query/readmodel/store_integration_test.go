@@ -452,6 +452,12 @@ func TestRebuildAllIsBoundedAndResumesAfterOpaqueCursor(t *testing.T) {
 	if first.TrainRunsRebuilt != 1 || first.RowsWritten != 6 || !first.HasMore || first.NextCursor == "" {
 		t.Fatalf("RebuildAll(first) = %+v, want bounded first page", first)
 	}
+	if _, err := store.SearchTrainRuns(context.Background(), querypostgres.SearchRequest{
+		OriginCode: "TPE", DestinationCode: "KHH", ServiceDate: time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC),
+		SeatClass: "standard", Page: 1, PageSize: 20, Sort: "departure_asc",
+	}); !errors.Is(err, readmodel.ErrProjectionUnavailable) {
+		t.Fatalf("SearchTrainRuns(partial rebuild) error = %v, want projection unavailable", err)
+	}
 	second, err := store.RebuildAll(context.Background(), readmodel.RebuildAllOptions{
 		After: first.NextCursor,
 		Limit: 1,
@@ -473,6 +479,12 @@ func TestRebuildAllIsBoundedAndResumesAfterOpaqueCursor(t *testing.T) {
 	if firstRows != 6 || secondRows != 6 {
 		t.Fatalf("resumable rebuild rows = %d/%d, want 6/6", firstRows, secondRows)
 	}
+	var ready bool
+	if err := conn.QueryRow(context.Background(), `
+		SELECT ready FROM read_model_projection_state WHERE projection_name = 'journey_search'
+	`).Scan(&ready); err != nil || !ready {
+		t.Fatalf("completed rebuild ready = %t, %v", ready, err)
+	}
 }
 
 func TestReconcileTrainRunDetectsMissingAndMismatchedRowsWithoutRepair(t *testing.T) {
@@ -482,8 +494,8 @@ func TestReconcileTrainRunDetectsMissingAndMismatchedRowsWithoutRepair(t *testin
 	if err != nil {
 		t.Fatalf("NewStore() error = %v", err)
 	}
-	if _, err := store.RebuildTrainRun(context.Background(), trainRunID.String()); err != nil {
-		t.Fatalf("RebuildTrainRun() error = %v", err)
+	if _, err := store.RebuildAll(context.Background(), readmodel.RebuildAllOptions{Limit: 100}); err != nil {
+		t.Fatalf("RebuildAll() error = %v", err)
 	}
 	consistent, err := store.ReconcileTrainRun(context.Background(), trainRunID.String())
 	if err != nil {
@@ -649,8 +661,8 @@ func TestProjectionSearchUsesDenormalizedRowsAndExcludesCancelledRuns(t *testing
 	if err != nil {
 		t.Fatalf("NewStore() error = %v", err)
 	}
-	if _, err := store.RebuildTrainRun(context.Background(), trainRunID.String()); err != nil {
-		t.Fatalf("RebuildTrainRun() error = %v", err)
+	if _, err := store.RebuildAll(context.Background(), readmodel.RebuildAllOptions{Limit: 100}); err != nil {
+		t.Fatalf("RebuildAll() error = %v", err)
 	}
 	request := querypostgres.SearchRequest{
 		OriginCode: "TPE", DestinationCode: "KHH", ServiceDate: time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC),
@@ -805,6 +817,7 @@ func TestStationEventResumesTwoHundredFiftyOneRunFanoutFromDurableCursor(t *test
 	conn := openMigrationSevenDatabase(t)
 	sourceTrainRunID := seedProjectionSource(t, conn)
 	cloneProjectionTrainRuns(t, conn, sourceTrainRunID, 250)
+	markProjectionReady(t, conn)
 	var stationID uuid.UUID
 	if err := conn.QueryRow(context.Background(), `SELECT id FROM stations WHERE code = 'TPE'`).Scan(&stationID); err != nil {
 		t.Fatalf("read station ID: %v", err)
@@ -1262,4 +1275,15 @@ func seedProjectionSource(t *testing.T, conn *pgx.Conn) uuid.UUID {
 		t.Fatalf("commit projection source seed: %v", err)
 	}
 	return trainRunID
+}
+
+func markProjectionReady(t *testing.T, conn *pgx.Conn) {
+	t.Helper()
+	if _, err := conn.Exec(context.Background(), `
+		UPDATE read_model_projection_state
+		SET ready = true, updated_at = clock_timestamp()
+		WHERE projection_name = 'journey_search'
+	`); err != nil {
+		t.Fatalf("mark projection ready: %v", err)
+	}
 }

@@ -25,6 +25,13 @@ Rebuild commands default to dry-run. `rebuild-all` selects stable
 can resume. Context cancellation rolls back the active train-run transaction;
 already committed earlier batches remain complete.
 
+An apply run also checkpoints `read_model_projection_state`. Starting from an
+empty cursor marks journey search unavailable; each next page must present the
+exact durable cursor returned by the previous page. Projection search remains
+fail-closed to the authoritative source until the final page commits and marks
+the state ready. A skipped or stale cursor is rejected, so an interrupted
+backfill cannot silently expose a non-empty partial projection.
+
 `resume-event` is the controlled recovery path for an event that reached the
 DLQ after creating durable fan-out progress. Dry-run verifies that progress
 still exists. Apply re-enqueues only the bounded event envelope after the failed
@@ -37,7 +44,8 @@ fallback; successful worker completion does that atomically with the receipt.
 2. Record source run counts, free disk, PostgreSQL connection/lock telemetry,
    and the release commit.
 3. Run a dry-run with the intended batch size.
-4. Apply bounded batches during a measured window. Do not claim zero downtime;
+4. Apply bounded batches during a measured window, passing each returned cursor
+   as the next `--after` value. Do not claim zero downtime;
    each train-run rebuild reads source rows and writes one transaction.
 5. Run detect-only read-model reconciliation and inspect lag.
 6. Enable one worker, confirm stream pending/DLQ behavior and cache rotations,
