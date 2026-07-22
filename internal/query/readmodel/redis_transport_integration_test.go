@@ -2,6 +2,7 @@ package readmodel_test
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -11,7 +12,11 @@ import (
 )
 
 func TestRedisStreamTransportRecoversPendingAndDeadLettersBeforeAck(t *testing.T) {
-	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:56379"})
+	address := os.Getenv("TEST_REDIS_ADDR")
+	if address == "" {
+		address = "127.0.0.1:56379"
+	}
+	client := redis.NewClient(&redis.Options{Addr: address, DB: 13})
 	ctx := context.Background()
 	if err := client.Ping(ctx).Err(); err != nil {
 		client.Close()

@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"crypto/rand"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -120,8 +121,11 @@ func TestAvailabilityHintIsSharedAcrossReplicasAndRotationReobservesPostgres(t *
 
 func openCacheRedis(t *testing.T) *redis.Client {
 	t.Helper()
-	address := "127.0.0.1:56379"
-	client := redis.NewClient(&redis.Options{Addr: address})
+	address := os.Getenv("TEST_REDIS_ADDR")
+	if address == "" {
+		address = "127.0.0.1:56379"
+	}
+	client := redis.NewClient(&redis.Options{Addr: address, DB: 12})
 	if err := client.Ping(context.Background()).Err(); err != nil {
 		client.Close()
 		t.Skipf("Redis integration dependency unavailable: %v", err)

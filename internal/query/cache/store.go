@@ -69,6 +69,11 @@ type cachedAvailability struct {
 	Source     string                     `json:"source"`
 }
 
+type fillOutcome struct {
+	value    any
+	writeErr error
+}
+
 func NewStore(
 	source SourceStore,
 	projection ProjectionSearch,
@@ -90,7 +95,6 @@ func NewStore(
 }
 
 func (store *Store) ListStations(ctx context.Context) ([]querypostgres.Station, error) {
-	store.recordRequest("stations", "read", "request", "none")
 	version, err := store.versions.GetOrCreate(ctx, StationVersionKey())
 	if err != nil {
 		store.recordRequest("stations", "version_get", "failure", "redis")
@@ -109,7 +113,7 @@ func (store *Store) ListStations(ctx context.Context) ([]querypostgres.Station, 
 	started := time.Now()
 	value, err, shared := store.coalescer.Do(ctx, key, func(fillContext context.Context) (any, error) {
 		if stations, hit := store.readStations(fillContext, key); hit {
-			return stations, nil
+			return fillOutcome{value: stations}, nil
 		}
 		stations, sourceErr := store.source.ListStations(fillContext)
 		if sourceErr != nil {
@@ -122,15 +126,21 @@ func (store *Store) ListStations(ctx context.Context) ([]querypostgres.Station, 
 				ID: station.ID, Code: station.Code.String(), Name: station.Name, Timezone: station.Timezone,
 			})
 		}
-		store.writeJSON(fillContext, key, payload, store.stationTTL)
-		return stations, nil
+		return fillOutcome{
+			value: stations, writeErr: store.writeJSON(fillContext, key, payload, store.stationTTL),
+		}, nil
 	})
 	if err != nil {
 		store.recordFill("stations", "failure", "database", time.Since(started), shared)
 		return nil, err
 	}
-	store.recordFill("stations", "success", "none", time.Since(started), shared)
-	return value.([]querypostgres.Station), nil
+	outcome := value.(fillOutcome)
+	if outcome.writeErr != nil {
+		store.recordFill("stations", "failure", "redis", time.Since(started), shared)
+	} else {
+		store.recordFill("stations", "success", "none", time.Since(started), shared)
+	}
+	return outcome.value.([]querypostgres.Station), nil
 }
 
 func (store *Store) SearchTrainRuns(
@@ -159,7 +169,7 @@ func (store *Store) SearchTrainRuns(
 	started := time.Now()
 	value, err, shared := store.coalescer.Do(ctx, key, func(fillContext context.Context) (any, error) {
 		if results, hit := store.readSearch(fillContext, key); hit {
-			return results, nil
+			return fillOutcome{value: results}, nil
 		}
 		results, projectionErr := store.projection.SearchTrainRuns(fillContext, request)
 		if projectionErr != nil || len(results) == 0 {
@@ -170,15 +180,21 @@ func (store *Store) SearchTrainRuns(
 				return nil, sourceErr
 			}
 		}
-		store.writeJSON(fillContext, key, results, store.searchTTL)
-		return results, nil
+		return fillOutcome{
+			value: results, writeErr: store.writeJSON(fillContext, key, results, store.searchTTL),
+		}, nil
 	})
 	if err != nil {
 		store.recordFill("train_search", "failure", "database", time.Since(started), shared)
 		return nil, err
 	}
-	store.recordFill("train_search", "success", "none", time.Since(started), shared)
-	return value.([]querypostgres.SearchResult), nil
+	outcome := value.(fillOutcome)
+	if outcome.writeErr != nil {
+		store.recordFill("train_search", "failure", "redis", time.Since(started), shared)
+	} else {
+		store.recordFill("train_search", "success", "none", time.Since(started), shared)
+	}
+	return outcome.value.([]querypostgres.SearchResult), nil
 }
 
 func (store *Store) Availability(
@@ -213,7 +229,7 @@ func (store *Store) Availability(
 	started := time.Now()
 	value, err, shared := store.coalescer.Do(ctx, key, func(fillContext context.Context) (any, error) {
 		if availability, hit := store.readAvailability(fillContext, key, request); hit {
-			return availability, nil
+			return fillOutcome{value: availability}, nil
 		}
 		availability, sourceErr := store.source.Availability(fillContext, request)
 		if sourceErr != nil {
@@ -223,15 +239,21 @@ func (store *Store) Availability(
 			return nil, querypostgres.ErrPersistence
 		}
 		payload := cachedAvailability{Value: availability, ObservedAt: store.clock.Now().UTC(), Source: "postgres"}
-		store.writeJSON(fillContext, key, payload, store.availabilityTTL)
-		return availability, nil
+		return fillOutcome{
+			value: availability, writeErr: store.writeJSON(fillContext, key, payload, store.availabilityTTL),
+		}, nil
 	})
 	if err != nil {
 		store.recordFill("availability", "failure", "database", time.Since(started), shared)
 		return querypostgres.Availability{}, err
 	}
-	store.recordFill("availability", "success", "none", time.Since(started), shared)
-	return value.(querypostgres.Availability), nil
+	outcome := value.(fillOutcome)
+	if outcome.writeErr != nil {
+		store.recordFill("availability", "failure", "redis", time.Since(started), shared)
+	} else {
+		store.recordFill("availability", "success", "none", time.Since(started), shared)
+	}
+	return outcome.value.(querypostgres.Availability), nil
 }
 
 func (store *Store) AvailabilityBatch(
@@ -259,9 +281,14 @@ func (store *Store) AvailabilityBatch(
 				return nil, querypostgres.ErrInvalidJourney
 			}
 			if availability, hit := store.readAvailability(ctx, keys[index], request); hit {
+				store.recordRequest("availability", "read", "hit", "none")
 				results[index] = availability
 				continue
 			}
+			store.recordRequest("availability", "read", "miss", "none")
+		} else {
+			store.recordRequest("availability", "version_get", "failure", "redis")
+			store.recordFallback("redis")
 		}
 		misses = append(misses, request)
 		missIndexes = append(missIndexes, index)
@@ -296,7 +323,12 @@ func (store *Store) AvailabilityBatch(
 		results[index] = availability
 		if keys[index] != "" {
 			payload := cachedAvailability{Value: availability, ObservedAt: store.clock.Now().UTC(), Source: "postgres"}
-			store.writeJSON(ctx, keys[index], payload, store.availabilityTTL)
+			started := time.Now()
+			if err := store.writeJSON(ctx, keys[index], payload, store.availabilityTTL); err != nil {
+				store.recordFill("availability", "failure", "redis", time.Since(started), false)
+			} else {
+				store.recordFill("availability", "success", "none", time.Since(started), false)
+			}
 		}
 	}
 	return results, nil
@@ -346,16 +378,16 @@ func (store *Store) readJSON(ctx context.Context, key string, target any) bool {
 	return err == nil && json.Unmarshal(encoded, target) == nil
 }
 
-func (store *Store) writeJSON(ctx context.Context, key string, value any, policy *TTLPolicy) {
+func (store *Store) writeJSON(ctx context.Context, key string, value any, policy *TTLPolicy) error {
 	encoded, err := json.Marshal(value)
 	if err != nil {
-		return
+		return err
 	}
 	ttl, err := policy.Next()
 	if err != nil {
-		return
+		return err
 	}
-	_ = store.client.Set(ctx, key, encoded, ttl).Err()
+	return store.client.Set(ctx, key, encoded, ttl).Err()
 }
 
 func (store *Store) recordRequest(cacheType, operation, result, reason string) {

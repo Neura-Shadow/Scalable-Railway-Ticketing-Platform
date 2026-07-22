@@ -3,24 +3,13 @@ package cache
 import (
 	"context"
 	"crypto/rand"
-	"os"
 	"sync"
 	"testing"
-
-	"github.com/redis/go-redis/v9"
 )
 
 func TestVersionManagerAtomicCreationRotationAndVersionLossRecovery(t *testing.T) {
-	address := os.Getenv("TEST_REDIS_ADDR")
-	if address == "" {
-		t.Skip("TEST_REDIS_ADDR is not configured")
-	}
-	client := redis.NewClient(&redis.Options{Addr: address})
-	t.Cleanup(func() { _ = client.Close() })
+	client := openCacheRedis(t)
 	ctx := context.Background()
-	if err := client.FlushDB(ctx).Err(); err != nil {
-		t.Fatalf("flush Redis test database: %v", err)
-	}
 	manager, err := NewVersionManager(client, rand.Reader)
 	if err != nil {
 		t.Fatalf("NewVersionManager() error = %v", err)
