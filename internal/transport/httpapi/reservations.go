@@ -43,13 +43,19 @@ func createReservationHandler(dependencies Dependencies) gin.HandlerFunc {
 		}
 		normalizeCreateReservationRequest(&request)
 		idempotencyKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
+		admissionToken := strings.TrimSpace(c.GetHeader("X-Admission-Token"))
 		if !validCreateReservationRequest(request, idempotencyKey, dependencies.MaxPassengers) {
 			writeError(c, ErrInvalidInput)
+			return
+		}
+		if admissionToken != "" && !validAdmissionTokenHeader(admissionToken) {
+			writeError(c, ErrAdmissionInvalid)
 			return
 		}
 		result, err := dependencies.Reservations.CreateHold(c.Request.Context(), CreateReservationCommand{
 			OwnerID:                identity.Subject,
 			IdempotencyKey:         idempotencyKey,
+			AdmissionToken:         admissionToken,
 			TrainRunID:             request.TrainRunID,
 			OriginStationCode:      request.OriginStationCode,
 			DestinationStationCode: request.DestinationStationCode,

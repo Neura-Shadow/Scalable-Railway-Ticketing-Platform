@@ -101,6 +101,9 @@ func TestReservationCreateResolvesJourneyAndHashesIdempotencyMaterial(t *testing
 	if string(input.IdempotencyKeyHash) == "raw-key" {
 		t.Fatal("raw idempotency key crossed persistence seam")
 	}
+	if input.AdmissionPolicy != nil {
+		t.Fatalf("non-hot reservation carried admission policy = %+v", input.AdmissionPolicy)
+	}
 }
 
 func TestReservationCreateReplayReturnsCurrentAuthoritativeState(t *testing.T) {
@@ -165,7 +168,17 @@ func TestReservationMutationsHashOperationSpecificFingerprintsAndReturnAuthorita
 }
 
 func TestReservationMapsTypedStoreFailuresToSafeSentinels(t *testing.T) {
-	tests := []struct{ err, want error }{{bookingpostgres.ErrInsufficientInventory, httpapi.ErrConflict}, {bookingpostgres.ErrIdempotencyConflict, httpapi.ErrConflict}, {bookingpostgres.ErrPassengerConflict, httpapi.ErrConflict}, {bookingpostgres.ErrInvalidState, httpapi.ErrConflict}, {bookingpostgres.ErrNotFound, httpapi.ErrNotFound}, {bookingpostgres.ErrInvalidArgument, httpapi.ErrInvalidInput}, {errors.New("database secret"), httpapi.ErrUnavailable}}
+	tests := []struct{ err, want error }{
+		{bookingpostgres.ErrInsufficientInventory, httpapi.ErrConflict},
+		{bookingpostgres.ErrIdempotencyConflict, httpapi.ErrConflict},
+		{bookingpostgres.ErrPassengerConflict, httpapi.ErrConflict},
+		{bookingpostgres.ErrInvalidState, httpapi.ErrConflict},
+		{bookingpostgres.ErrAdmissionRequired, httpapi.ErrAdmissionRequired},
+		{bookingpostgres.ErrAdmissionPolicyChanged, httpapi.ErrAdmissionExpired},
+		{bookingpostgres.ErrNotFound, httpapi.ErrNotFound},
+		{bookingpostgres.ErrInvalidArgument, httpapi.ErrInvalidInput},
+		{errors.New("database secret"), httpapi.ErrUnavailable},
+	}
 	for _, test := range tests {
 		service := NewReservationService(&reservationCommandsFake{err: test.err}, &journeyResolverFake{journey: querypostgres.Journey{FromStopIndex: 0, ToStopIndex: 1}}, &reservationReaderFake{}, fixedClock{time.Now()}, time.Minute, 6)
 		_, err := service.CreateHold(context.Background(), httpapi.CreateReservationCommand{OwnerID: uuid.NewString(), IdempotencyKey: "key", TrainRunID: uuid.NewString(), OriginStationCode: "TPE", DestinationStationCode: "KHH", SeatClass: "standard", PassengerIDs: []string{uuid.NewString()}})

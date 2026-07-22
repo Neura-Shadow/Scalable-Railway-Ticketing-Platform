@@ -82,6 +82,7 @@ func TestRateLimiterMapsScopesToBoundedLuaPolicies(t *testing.T) {
 		{httpapi.RateLimitLogin, "login", 10, 15 * time.Minute},
 		{httpapi.RateLimitReservationCreate, "reservation_create", 10, time.Minute},
 		{httpapi.RateLimitPassengerCreate, "passenger_create", 12, time.Hour},
+		{httpapi.RateLimitPolicyMutation, "hot_train_policy_mutation", 20, time.Hour},
 	}
 	for _, test := range tests {
 		t.Run(string(test.scope), func(t *testing.T) {

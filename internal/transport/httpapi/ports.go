@@ -29,6 +29,7 @@ type HTTPMetrics interface {
 type CreateReservationCommand struct {
 	OwnerID                string
 	IdempotencyKey         string
+	AdmissionToken         string
 	TrainRunID             string
 	OriginStationCode      string
 	DestinationStationCode string
@@ -58,6 +59,94 @@ type ReservationService interface {
 	GetReservation(ctx context.Context, ownerID, reservationID string) (ReservationView, error)
 	ConfirmReservation(ctx context.Context, command ReservationMutationCommand) (ReservationView, error)
 	CancelReservation(ctx context.Context, command ReservationMutationCommand) (ReservationView, error)
+}
+
+type JoinWaitingRoomCommand struct {
+	OwnerID                string
+	TrainRunID             string
+	OriginStationCode      string
+	DestinationStationCode string
+	SeatClass              string
+	PassengerCount         int
+}
+
+type WaitingRoomEntryView struct {
+	EntryID             string     `json:"entry_id"`
+	Status              string     `json:"status"`
+	JoinedAt            time.Time  `json:"joined_at"`
+	ExpiresAt           time.Time  `json:"expires_at"`
+	AdmittedAt          *time.Time `json:"admitted_at,omitempty"`
+	ApproximatePosition int64      `json:"approximate_position"`
+	RetryAfterSeconds   int        `json:"retry_after_seconds"`
+	// AdmissionToken is a one-time credential and must never be serialized.
+	// The HTTP adapter may return it only in X-Admission-Token.
+	AdmissionToken string `json:"-"`
+}
+
+type WaitingRoomService interface {
+	JoinWaitingRoom(ctx context.Context, command JoinWaitingRoomCommand) (WaitingRoomEntryView, error)
+	GetWaitingRoomEntry(ctx context.Context, ownerID, entryID string) (WaitingRoomEntryView, error)
+	CancelWaitingRoomEntry(ctx context.Context, ownerID, entryID string) (WaitingRoomEntryView, error)
+}
+
+type HotTrainPolicyLimits struct {
+	MaxQueueSize             int `json:"max_queue_size"`
+	AdmissionRatePerSecond   int `json:"admission_rate_per_second"`
+	MaxInflightAdmissions    int `json:"max_inflight_admissions"`
+	AdmissionTokenTTLSeconds int `json:"admission_token_ttl_seconds"`
+	ProcessingLeaseSeconds   int `json:"processing_lease_seconds"`
+	QueueEntryTTLSeconds     int `json:"queue_entry_ttl_seconds"`
+}
+
+type CreateHotTrainPolicyCommand struct {
+	ActorID       string
+	CorrelationID string
+	TrainRunID    string
+	SeatClass     string
+	HotTrainPolicyLimits
+}
+
+type UpdateHotTrainPolicyCommand struct {
+	ActorID         string
+	CorrelationID   string
+	PolicyID        string
+	ExpectedVersion int64
+	Enabled         *bool
+	HotTrainPolicyLimits
+}
+
+type DisableHotTrainPolicyCommand struct {
+	ActorID         string
+	CorrelationID   string
+	PolicyID        string
+	ExpectedVersion int64
+}
+
+type HotTrainPolicyView struct {
+	ID                      string `json:"id"`
+	TrainRunID              string `json:"train_run_id"`
+	SeatClass               string `json:"seat_class"`
+	Enabled                 bool   `json:"enabled"`
+	Version                 int64  `json:"version"`
+	RedisInitializedVersion *int64 `json:"redis_initialized_version,omitempty"`
+	HotTrainPolicyLimits
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type HotTrainPolicyPage struct {
+	Items []HotTrainPolicyView `json:"items"`
+	Page  int                  `json:"page"`
+	Limit int                  `json:"limit"`
+	Total int64                `json:"total"`
+}
+
+type HotTrainPolicyService interface {
+	ListHotTrainPolicies(ctx context.Context, page PageRequest) (HotTrainPolicyPage, error)
+	GetHotTrainPolicy(ctx context.Context, actorID, policyID string) (HotTrainPolicyView, error)
+	CreateHotTrainPolicy(ctx context.Context, command CreateHotTrainPolicyCommand) (HotTrainPolicyView, error)
+	UpdateHotTrainPolicy(ctx context.Context, command UpdateHotTrainPolicyCommand) (HotTrainPolicyView, error)
+	DisableHotTrainPolicy(ctx context.Context, command DisableHotTrainPolicyCommand) (HotTrainPolicyView, error)
 }
 
 type PageRequest struct {
@@ -166,6 +255,7 @@ const (
 	RateLimitLogin             RateLimitScope = "auth_login"
 	RateLimitReservationCreate RateLimitScope = "reservation_create"
 	RateLimitPassengerCreate   RateLimitScope = "passenger_create"
+	RateLimitPolicyMutation    RateLimitScope = "hot_train_policy_mutation"
 )
 
 type RateLimitRequest struct {
@@ -337,8 +427,9 @@ type OperatorCommands interface {
 // ReadinessCheck reports only bounded component health, never an underlying
 // error or connection string.
 type ReadinessCheck struct {
-	Name  string
-	Ready bool
+	Name     string
+	Ready    bool
+	Optional bool
 }
 
 // ReadinessChecker checks external dependencies using the supplied bounded

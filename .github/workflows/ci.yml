@@ -15,7 +15,8 @@ concurrency:
 
 env:
   GO_VERSION: "1.25.12"
-  IMAGE_NAME: scalable-railway-ticketing-platform:milestone-1
+  IMAGE_NAME: scalable-railway-ticketing-platform:milestone-2
+  EVIDENCE_PROXY_IMAGE: scalable-railway-ticketing-proxy:milestone-2
 
 jobs:
   quality:
@@ -118,7 +119,9 @@ jobs:
           --health-retries 20
     env:
       DATABASE_URL: postgres://railway:ci-local-password@localhost:5432/railway?sslmode=disable
+      MIGRATION_REHEARSAL_DATABASE_URL: postgres://railway:ci-local-password@localhost:5432/railway_migration_rehearsal?sslmode=disable
       REDIS_ADDR: localhost:6379
+      TEST_REDIS_ADDR: localhost:6379
       APP_ENV: test
     steps:
       - name: Check out source
@@ -130,6 +133,73 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: go.sum
+      - name: Seed a populated version-5 migration fixture
+        shell: bash
+        run: |
+          psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --command 'CREATE DATABASE railway_migration_rehearsal'
+          mkdir -p "$RUNNER_TEMP/migrations-v5"
+          cp migrations/00000[1-5]_*.sql "$RUNNER_TEMP/migrations-v5/"
+          go run ./cmd/migrate \
+            -path "$RUNNER_TEMP/migrations-v5" \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            up
+          go run ./cmd/migrate \
+            -path "$RUNNER_TEMP/migrations-v5" \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            version
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/populated_v5_fixture.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_populated_v5_data.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_hot_train_v5_schema.sql
+      - name: Rehearse the populated version-5 to version-6 upgrade
+        shell: bash
+        run: |
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            up
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            version
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_populated_v5_data.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_hot_train_v6_schema.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/seed_hot_train_v6_fixture.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_hot_train_v6_data.sql
+      - name: Rehearse one-step down and up with populated data
+        shell: bash
+        run: |
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            down
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            version
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_populated_v5_data.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_hot_train_v5_schema.sql
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            up
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            version
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_populated_v5_data.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_hot_train_v6_schema.sql
       - name: Apply migrations to an empty database
         run: go run ./cmd/migrate -path migrations up
       - name: Verify migration-up is safe to repeat
@@ -138,8 +208,70 @@ jobs:
         run: go run ./cmd/migrate -path migrations version
       - name: Run integration and constraint tests
         run: go test ./... -count=1 -timeout 300s
+      - name: Run focused admission, token, quota, and concurrency tests
+        run: go test ./internal/admission/... ./internal/booking/postgres ./internal/app -count=3 -timeout 300s
       - name: Run race-enabled persistence and concurrency tests
-        run: go test -race ./internal/accounts/postgres ./internal/booking/postgres ./internal/offering/postgres ./internal/eventrelay/postgres -count=1 -timeout 300s
+        run: go test -race ./internal/accounts/postgres ./internal/admission/... ./internal/booking/postgres ./internal/offering/postgres ./internal/eventrelay/postgres -count=1 -timeout 300s
+
+  multi-replica-evidence:
+    name: Multi-replica admission evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Validate the multi-replica topology
+        run: docker compose -f docker-compose.multi-replica.yml config --quiet
+      - name: Run bounded multi-replica, Redis-outage, and failure-recovery evidence
+        shell: pwsh
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP 'milestone-2-evidence'
+          ./scripts/run-milestone-2-multi-replica-evidence.ps1 `
+            -CustomerCount 30 `
+            -SteadyStateDuration 30s `
+            -EvidenceDirectory $evidence
+          Get-Content -Raw (Join-Path $evidence 'evidence-summary.json')
+      - name: Print bounded multi-replica failure diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP 'milestone-2-evidence'
+          foreach ($name in @('compose-failure-ps.log', 'load-balancer-failure.log')) {
+            $path = Join-Path $evidence $name
+            if (Test-Path -LiteralPath $path) {
+              Write-Host "::group::$name"
+              Get-Content -LiteralPath $path
+              Write-Host '::endgroup::'
+            }
+          }
+          Write-Host '::group::bounded k6 and runner-network diagnostics'
+          foreach ($name in @('multi-replica-summary.json', 'waiting-room-status-summary.json')) {
+            $path = Join-Path $evidence $name
+            if (Test-Path -LiteralPath $path) {
+              $summary = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
+              [ordered]@{
+                summary = $name
+                http_reqs_count = $summary.metrics.http_reqs.count
+                http_reqs_rate = $summary.metrics.http_reqs.rate
+                iterations_count = $summary.metrics.iterations.count
+                iterations_rate = $summary.metrics.iterations.rate
+              } | ConvertTo-Json -Compress
+            }
+          }
+          $conntrack = [ordered]@{}
+          foreach ($name in @('nf_conntrack_count', 'nf_conntrack_max')) {
+            $path = "/proc/sys/net/netfilter/$name"
+            if (Test-Path -LiteralPath $path) {
+              $conntrack[$name] = (Get-Content -Raw -LiteralPath $path).Trim()
+            }
+          }
+          $conntrack | ConvertTo-Json -Compress
+          if (Get-Command ss -ErrorAction SilentlyContinue) {
+            ss -s
+          }
+          Write-Host '::endgroup::'
 
   container:
     name: Container build and image scan
@@ -151,7 +283,10 @@ jobs:
         with:
           persist-credentials: false
       - name: Build image
-        run: docker build --pull --tag "$IMAGE_NAME" .
+        run: |
+          docker build --pull --tag "$IMAGE_NAME" .
+          docker build --pull --file deploy/nginx/Dockerfile \
+            --tag "$EVIDENCE_PROXY_IMAGE" .
       - name: Verify runtime identity and timezone database
         run: |
           docker run --rm --entrypoint /bin/sh "$IMAGE_NAME" -c \
@@ -159,7 +294,16 @@ jobs:
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: scalable-railway-ticketing-platform:milestone-1
+          image-ref: scalable-railway-ticketing-platform:milestone-2
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          trivyignores: .trivyignore.yaml
+      - name: Trivy evidence proxy image scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: scalable-railway-ticketing-proxy:milestone-2
           format: table
           severity: CRITICAL,HIGH
           ignore-unfixed: true

@@ -30,27 +30,33 @@ var allowedPaths = map[string]string{
 	"/api/v1/routes":                      "/api/v1/routes",
 	"/api/v1/train-runs/search":           "/api/v1/train-runs/search",
 	"/api/v1/train-runs/:id/availability": "/api/v1/train-runs/:train_run_id/availability",
-	"/api/v1/train-runs/:train_run_id/availability": "/api/v1/train-runs/:train_run_id/availability",
-	"/api/v1/reservations":                          "/api/v1/reservations",
-	"/api/v1/reservations/:id":                      "/api/v1/reservations/:reservation_id",
-	"/api/v1/reservations/:reservation_id":          "/api/v1/reservations/:reservation_id",
-	"/api/v1/reservations/:id/confirm":              "/api/v1/reservations/:reservation_id/confirm",
-	"/api/v1/reservations/:reservation_id/confirm":  "/api/v1/reservations/:reservation_id/confirm",
-	"/api/v1/reservations/:id/cancel":               "/api/v1/reservations/:reservation_id/cancel",
-	"/api/v1/reservations/:reservation_id/cancel":   "/api/v1/reservations/:reservation_id/cancel",
-	"/api/v1/passengers":                            "/api/v1/passengers",
-	"/api/v1/passengers/:id":                        "/api/v1/passengers/:passenger_id",
-	"/api/v1/ticket-orders":                         "/api/v1/ticket-orders",
-	"/api/v1/ticket-orders/:id":                     "/api/v1/ticket-orders/:ticket_order_id",
-	"/api/v1/admin/stations":                        "/api/v1/admin/stations",
-	"/api/v1/admin/routes":                          "/api/v1/admin/routes",
-	"/api/v1/admin/trains":                          "/api/v1/admin/trains",
-	"/api/v1/admin/coaches":                         "/api/v1/admin/coaches",
-	"/api/v1/admin/seats":                           "/api/v1/admin/seats",
-	"/api/v1/admin/fares":                           "/api/v1/admin/fares",
-	"/api/v1/operator/train-runs":                   "/api/v1/operator/train-runs",
-	"/api/v1/operator/train-runs/:id/inventory":     "/api/v1/operator/train-runs/:train_run_id/inventory",
-	"/api/v1/operator/train-runs/:id/status":        "/api/v1/operator/train-runs/:train_run_id/status",
+	"/api/v1/train-runs/:train_run_id/availability":  "/api/v1/train-runs/:train_run_id/availability",
+	"/api/v1/reservations":                           "/api/v1/reservations",
+	"/api/v1/reservations/:id":                       "/api/v1/reservations/:reservation_id",
+	"/api/v1/reservations/:reservation_id":           "/api/v1/reservations/:reservation_id",
+	"/api/v1/reservations/:id/confirm":               "/api/v1/reservations/:reservation_id/confirm",
+	"/api/v1/reservations/:reservation_id/confirm":   "/api/v1/reservations/:reservation_id/confirm",
+	"/api/v1/reservations/:id/cancel":                "/api/v1/reservations/:reservation_id/cancel",
+	"/api/v1/reservations/:reservation_id/cancel":    "/api/v1/reservations/:reservation_id/cancel",
+	"/api/v1/passengers":                             "/api/v1/passengers",
+	"/api/v1/passengers/:id":                         "/api/v1/passengers/:passenger_id",
+	"/api/v1/ticket-orders":                          "/api/v1/ticket-orders",
+	"/api/v1/ticket-orders/:id":                      "/api/v1/ticket-orders/:ticket_order_id",
+	"/api/v1/admin/stations":                         "/api/v1/admin/stations",
+	"/api/v1/admin/routes":                           "/api/v1/admin/routes",
+	"/api/v1/admin/trains":                           "/api/v1/admin/trains",
+	"/api/v1/admin/coaches":                          "/api/v1/admin/coaches",
+	"/api/v1/admin/seats":                            "/api/v1/admin/seats",
+	"/api/v1/admin/fares":                            "/api/v1/admin/fares",
+	"/api/v1/operator/train-runs":                    "/api/v1/operator/train-runs",
+	"/api/v1/operator/train-runs/:id/inventory":      "/api/v1/operator/train-runs/:train_run_id/inventory",
+	"/api/v1/operator/train-runs/:id/status":         "/api/v1/operator/train-runs/:train_run_id/status",
+	"/api/v1/operator/hot-train-policies":            "/api/v1/operator/hot-train-policies",
+	"/api/v1/operator/hot-train-policies/:id":        "/api/v1/operator/hot-train-policies/:policy_id",
+	"/api/v1/operator/hot-train-policies/:policy_id": "/api/v1/operator/hot-train-policies/:policy_id",
+	"/api/v1/waiting-room/entries":                   "/api/v1/waiting-room/entries",
+	"/api/v1/waiting-room/entries/:id":               "/api/v1/waiting-room/entries/:entry_id",
+	"/api/v1/waiting-room/entries/:entry_id":         "/api/v1/waiting-room/entries/:entry_id",
 }
 
 var allowedEventTypes = set(
@@ -61,6 +67,9 @@ var allowedEventTypes = set(
 	"ticket.created",
 	"trainrun.cancelled",
 	"outbox.dead_lettered",
+	"hot_train_policy.created",
+	"hot_train_policy.updated",
+	"hot_train_policy.disabled",
 )
 
 var allowedReasons = set(
@@ -79,6 +88,30 @@ var allowedReasons = set(
 	"duplicate",
 	"rate_limited",
 	"stale_lock",
+	"queue_full",
+	"quota",
+	"backpressure",
+	"redis",
+	"processing",
+	"policy_version",
+	"continuity_lost",
+	"owner_mismatch",
+	"mac_invalid",
+	"binding_conflict",
+	"no_inventory",
+	"admission_required",
+	"token_invalid",
+	"token_expired",
+	"capacity",
+	"continuity",
+	"maintenance",
+	"queue_read",
+	"redis_time",
+	"token_generation",
+	"issue",
+	"locator",
+	"state_counts",
+	"ttl",
 )
 
 var (
@@ -97,6 +130,7 @@ type Metrics struct {
 	reservationEvents   *prometheus.CounterVec
 	seatInventoryEvents *prometheus.CounterVec
 	outboxEvents        *prometheus.CounterVec
+	admission           *admissionMetrics
 }
 
 // New registers the platform's bounded metric families.
@@ -105,6 +139,7 @@ func New(registerer prometheus.Registerer) (*Metrics, error) {
 		return nil, errors.New("metrics: nil Prometheus registerer")
 	}
 
+	admission := newAdmissionMetrics()
 	m := &Metrics{
 		httpRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "http_requests_total",
@@ -127,6 +162,7 @@ func New(registerer prometheus.Registerer) (*Metrics, error) {
 			Name: "outbox_operations_total",
 			Help: "Outbox operations by bounded operation, event type, result, and reason.",
 		}, []string{"operation", "event_type", "result", "reason"}),
+		admission: admission,
 	}
 
 	for _, collector := range []prometheus.Collector{
@@ -135,6 +171,31 @@ func New(registerer prometheus.Registerer) (*Metrics, error) {
 		m.reservationEvents,
 		m.seatInventoryEvents,
 		m.outboxEvents,
+		m.admission.waitingRoomJoin,
+		m.admission.waitingRoomJoinFailure,
+		m.admission.waitingRoomDuplicateJoin,
+		m.admission.waitingRoomQueueFull,
+		m.admission.waitingRoomCancel,
+		m.admission.waitingRoomExpired,
+		m.admission.admissionAttempt,
+		m.admission.admissionIssued,
+		m.admission.admissionFailure,
+		m.admission.waitDuration,
+		m.admission.tokenAcquire,
+		m.admission.tokenConsume,
+		m.admission.tokenRelease,
+		m.admission.tokenExpired,
+		m.admission.tokenConflict,
+		m.admission.quotaRejected,
+		m.admission.backpressureRejected,
+		m.admission.hotReservation,
+		m.admission.hotReservationConflict,
+		m.admission.hotReservationDuration,
+		m.admission.admissionWorkerPass,
+		m.admission.admissionWorkerDuration,
+		m.admission.admissionWorkerLastSuccess,
+		m.admission.waitingRoomQueueDepth,
+		m.admission.waitingRoomInflight,
 	} {
 		if err := registerer.Register(collector); err != nil {
 			return nil, fmt.Errorf("metrics: register collector: %w", err)

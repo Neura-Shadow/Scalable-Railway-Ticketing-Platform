@@ -37,13 +37,36 @@ func TestRateLimiterIntegrationUsesAtomicWindowAndHashedSubject(t *testing.T) {
 	if result, err := limiter.Allow(context.Background(), "passenger_create", "customer-id", RateLimit{Limit: 12, Window: time.Hour}); err != nil || !result.Allowed {
 		t.Fatalf("passenger_create policy integration = %#v, %v", result, err)
 	}
-
-	keys, _, err := client.Scan(context.Background(), 0, "ratelimit:"+namespace+":v1:*", 10).Result()
-	if err != nil {
-		t.Fatal(err)
+	if result, err := limiter.Allow(context.Background(), "hot_train_policy_mutation", "operator-id", RateLimit{Limit: 20, Window: time.Hour}); err != nil || !result.Allowed {
+		t.Fatalf("hot_train_policy_mutation policy integration = %#v, %v", result, err)
 	}
-	if len(keys) != 2 || strings.Contains(strings.Join(keys, "|"), rawSubject) || strings.Contains(strings.Join(keys, "|"), "customer-id") {
-		t.Fatalf("rate limit keys = %q; expected two hashed keys with no raw subject", keys)
+
+	var (
+		keys   []string
+		cursor uint64
+	)
+	for {
+		page, next, err := client.Scan(
+			context.Background(),
+			cursor,
+			"ratelimit:"+namespace+":v1:*",
+			10,
+		).Result()
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys = append(keys, page...)
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	joinedKeys := strings.Join(keys, "|")
+	if len(keys) != 3 ||
+		strings.Contains(joinedKeys, rawSubject) ||
+		strings.Contains(joinedKeys, "customer-id") ||
+		strings.Contains(joinedKeys, "operator-id") {
+		t.Fatalf("rate limit keys = %q; expected three hashed keys with no raw subject", keys)
 	}
 	_ = client.Del(context.Background(), keys...).Err()
 }

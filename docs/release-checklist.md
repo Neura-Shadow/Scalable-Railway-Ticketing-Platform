@@ -13,8 +13,10 @@ key paths into it.
   databases, logs, coverage, benchmark output, or runtime volumes.
 - [ ] Required unit, integration, concurrency, race, static, vulnerability,
   secret, migration, container, and deployment checks pass.
-- [ ] Deferred waiting-room, payment, multi-region, and cache work is not
-  represented as part of this release.
+- [ ] Payment, multi-region active-active writes, and deferred read-cache work
+  are not represented as part of this release; the Milestone 2 waiting room,
+  admission worker, durable quotas, and reconciliation commands are included
+  only with the evidence gates below.
 
 ## Configuration and recovery
 
@@ -50,6 +52,31 @@ key paths into it.
 - [ ] The rollback checks, one-step schema-down boundary, and dirty migration
   recovery decision tree are understood by the on-call operators.
 
+## Migration 6 and hot-admission gate
+
+- [ ] The operator followed
+  [migration-6-production-rollout.md](migrations/migration-6-production-rollout.md)
+  and recorded its preflight, lock/statement timeout, backup, capacity, and
+  abort decisions.
+- [ ] The starting database is `version=5 dirty=false`, the populated
+  Milestone 1.1 rehearsal passes, and incompatible or duplicate policy rows are
+  absent.
+- [ ] `up` completed once, a second `up` returned no change, and `version`
+  returned `version=6 dirty=false`.
+- [ ] Version-6 schema and populated-data assertions verify the policy
+  uniqueness/bounds, quota indexes, outbox event types, and preservation of
+  existing reservation, inventory, idempotency, ticket, and outbox data.
+- [ ] The API and admission-worker image is compatible with both the planned
+  rollout order and the enabled/disabled policy state. No enabled hot policy is
+  exposed before its Redis generation and continuity marker are initialized.
+- [ ] A one-step version-6 down rehearsal, if performed in disposable
+  infrastructure, proves the documented version-5 shape and destructive
+  cleanup behavior before reapplying version 6.
+- [ ] Version-6 down is treated as destructive: it removes durable hot-policy
+  rows and policy audit/outbox events that version 5 cannot represent. It is
+  never an automatic production rollback action; preserve evidence and require
+  an explicit incident decision before considering it.
+
 ## Application rollout
 
 - [ ] One canary reports liveness and version-aware readiness before traffic.
@@ -58,16 +85,33 @@ key paths into it.
   real customer data.
 - [ ] Mixed-version write compatibility is observed before rolling the remaining
   process groups.
+- [ ] Admission workers are first deployed with
+  `ADMISSION_WORKER_ENABLED=false`; PostgreSQL, Redis, migration, keyring, and
+  worker readiness pass before one reviewed regional worker is enabled.
+- [ ] The API accept-key set contains every worker issue key before that worker
+  can issue tokens. Old accept keys remain through the maximum token and
+  processing-lease window plus the approved safety margin.
+- [ ] Bounded multi-replica evidence proves shared duplicate joins, global
+  admission-rate/inflight limits, API and worker termination recovery, and one
+  durable result per admitted identity.
+- [ ] A real Redis-outage smoke proves enabled-hot join/admission fails closed
+  with bounded retry guidance, a non-hot reservation still executes its
+  PostgreSQL-authoritative path, Redis restoration returns API/worker readiness,
+  and the expected hot generation retains continuity.
 - [ ] Traffic is restored gradually while database locks, errors, latency,
   connections, WAL/storage, replica lag, worker health, outbox backlog, and
   reconciliation are monitored.
+- [ ] Detect-only `seat-inventory` reconciliation passes for every synthetic
+  hot and non-hot canary train run; `reservation-quotas` and `admission-state`
+  also pass after dependency restoration. No repair command is run implicitly.
 
 ## Closeout
 
 - [ ] All processes are on the intended immutable image, readiness is stable,
   and migration state remains clean through the observation window.
 - [ ] No Critical or High review/security finding remains open.
-- [ ] Rollback remains available; migration 5's compatibility trigger is not
-  removed in this release.
+- [ ] Application rollback remains available; migration 5's compatibility
+  trigger is not removed, and Migration 6 down remains a separately approved
+  destructive incident action rather than the default rollback.
 - [ ] The release record contains decisions and bounded evidence, not secrets or
   unsupported availability/throughput claims.

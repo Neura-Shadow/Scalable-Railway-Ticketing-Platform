@@ -99,6 +99,33 @@ func TestReadyzRequiresEveryProductionComponent(t *testing.T) {
 	}
 }
 
+func TestReadyzKeepsNonHotAPIReadyWhenRedisIsDegraded(t *testing.T) {
+	t.Parallel()
+
+	router := httpapi.New(httpapi.Dependencies{Readiness: readinessStub{checks: []httpapi.ReadinessCheck{
+		{Name: "postgres", Ready: true},
+		{Name: "redis", Ready: false, Optional: true},
+		{Name: "migrations", Ready: true},
+		{Name: "configuration", Ready: true},
+	}}})
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("Redis-degraded readiness status = %d, want 200", response.Code)
+	}
+	var body struct {
+		Status     string            `json:"status"`
+		Components map[string]string `json:"components"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.Status != "ready" || body.Components["redis"] != "degraded" {
+		t.Fatalf("Redis-degraded readiness body = %+v", body)
+	}
+}
+
 func TestUnknownRouteUsesStandardErrorEnvelopeWithoutEchoingPath(t *testing.T) {
 	t.Parallel()
 

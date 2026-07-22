@@ -9,6 +9,14 @@ import (
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
 )
 
+const testAdmissionKeyring = "current=a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s"
+
+func setValidAdmissionTokenConfig(cfg *config.Config) {
+	cfg.AdmissionTokenKeyring = testAdmissionKeyring
+	cfg.AdmissionTokenIssueKeyID = "current"
+	cfg.AdmissionTokenAcceptKeyIDs = "current"
+}
+
 func TestDefaultsProvideSafeOperationalValues(t *testing.T) {
 	t.Parallel()
 
@@ -32,11 +40,215 @@ func TestDefaultsProvideSafeOperationalValues(t *testing.T) {
 	if cfg.MaxPassengersPerReservation != 6 {
 		t.Fatalf("MaxPassengersPerReservation = %d, want 6", cfg.MaxPassengersPerReservation)
 	}
+	if cfg.ReservationMaxActiveHoldsPerUser != 10 ||
+		cfg.ReservationMaxActiveHoldsPerUserPerTrainRun != 3 ||
+		cfg.ReservationMaxActivePassengersPerUser != 24 ||
+		cfg.ReservationMaxInflightPerInstance != 32 {
+		t.Fatalf("reservation protection defaults = %+v", cfg)
+	}
 	if cfg.WorkerBatchSize != 100 {
 		t.Fatalf("WorkerBatchSize = %d, want 100", cfg.WorkerBatchSize)
 	}
 	if cfg.DatabaseURL != "" || cfg.RedisAddress != "" || cfg.JWTSecret != "" {
 		t.Fatal("connection settings and secrets must not have built-in defaults")
+	}
+}
+
+func TestLoadFromForAPILoadsReservationProtectionAndSharedTokenKeyring(t *testing.T) {
+	t.Parallel()
+
+	env := map[string]string{
+		"DATABASE_URL":                          "postgres://api@db.example/railway",
+		"REDIS_ADDRESS":                         "redis.example:6379",
+		"JWT_SECRET":                            "test-secret",
+		"RESERVATION_MAX_ACTIVE_HOLDS_PER_USER": "7",
+		"RESERVATION_MAX_ACTIVE_HOLDS_PER_USER_PER_TRAIN_RUN": "2",
+		"RESERVATION_MAX_ACTIVE_PASSENGERS_PER_USER":          "15",
+		"RESERVATION_MAX_INFLIGHT_PER_INSTANCE":               "11",
+		"ADMISSION_WORKER_BATCH_SIZE":                         "not-an-integer",
+		"ADMISSION_TOKEN_KEYRING":                             testAdmissionKeyring,
+		"ADMISSION_TOKEN_ISSUE_KEY_ID":                        "current",
+		"ADMISSION_TOKEN_ACCEPT_KEY_IDS":                      "current",
+	}
+	cfg, err := config.LoadFromFor(func(key string) (string, bool) {
+		value, ok := env[key]
+		return value, ok
+	}, config.ProcessAPI)
+	if err != nil {
+		t.Fatalf("LoadFromFor(api) error = %v", err)
+	}
+	if cfg.ReservationMaxActiveHoldsPerUser != 7 ||
+		cfg.ReservationMaxActiveHoldsPerUserPerTrainRun != 2 ||
+		cfg.ReservationMaxActivePassengersPerUser != 15 ||
+		cfg.ReservationMaxInflightPerInstance != 11 {
+		t.Fatalf("reservation protection settings = %+v", cfg)
+	}
+	if cfg.AdmissionTokenKeyring != testAdmissionKeyring ||
+		cfg.AdmissionTokenIssueKeyID != "current" ||
+		cfg.AdmissionTokenAcceptKeyIDs != "current" {
+		t.Fatal("API did not load the shared admission-token keyring")
+	}
+}
+
+func TestAdmissionWorkerLoadsOnlyItsOwnedDependencyAndKeySettings(t *testing.T) {
+	t.Parallel()
+
+	env := map[string]string{
+		"APP_ENV":                                "production",
+		"DATABASE_URL":                           "postgres://worker@db.example/railway",
+		"REDIS_ADDRESS":                          "redis.example:6379",
+		"ADMISSION_WORKER_ENABLED":               "true",
+		"ADMISSION_WORKER_BATCH_SIZE":            "25",
+		"ADMISSION_WORKER_INTERVAL_MILLISECONDS": "250",
+		"ADMISSION_TOKEN_KEYRING":                testAdmissionKeyring,
+		"ADMISSION_TOKEN_ISSUE_KEY_ID":           "current",
+		"ADMISSION_TOKEN_ACCEPT_KEY_IDS":         "current",
+		"JWT_ACCESS_TTL":                         "not-a-duration",
+		"JWT_SECRET":                             "must-not-load",
+	}
+	cfg, err := config.LoadFromFor(func(key string) (string, bool) {
+		value, ok := env[key]
+		return value, ok
+	}, config.ProcessAdmissionWorker)
+	if err != nil {
+		t.Fatalf("LoadFromFor(admission-worker) error = %v", err)
+	}
+	if !cfg.AdmissionWorkerEnabled || cfg.AdmissionWorkerBatchSize != 25 ||
+		cfg.AdmissionWorkerPollInterval != 250*time.Millisecond {
+		t.Fatalf("admission-worker settings = %+v", cfg)
+	}
+	if cfg.AdmissionTokenKeyring != env["ADMISSION_TOKEN_KEYRING"] ||
+		cfg.AdmissionTokenIssueKeyID != "current" ||
+		cfg.AdmissionTokenAcceptKeyIDs != "current" {
+		t.Fatal("admission-worker keyring settings not loaded")
+	}
+	if cfg.JWTSecret != "" {
+		t.Fatal("admission worker loaded API JWT secret")
+	}
+}
+
+func TestParseAdmissionTokenKeysExcludesConfiguredButUnacceptedKeys(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Defaults()
+	cfg.AdmissionTokenKeyring = testAdmissionKeyring + ",previous=cHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHA"
+	cfg.AdmissionTokenIssueKeyID = "current"
+	cfg.AdmissionTokenAcceptKeyIDs = "current"
+	selection, err := cfg.ParseAdmissionTokenKeys()
+	if err != nil {
+		t.Fatalf("ParseAdmissionTokenKeys() error = %v", err)
+	}
+	if selection.IssueKeyID != "current" || len(selection.AcceptKeys) != 1 {
+		t.Fatalf("selection = %+v", selection)
+	}
+	if _, ok := selection.AcceptKeys["current"]; !ok {
+		t.Fatal("current issue/accept key missing")
+	}
+	if _, ok := selection.AcceptKeys["previous"]; ok {
+		t.Fatal("unaccepted configured key was exposed as accepted")
+	}
+}
+
+func TestAdmissionTokenKeyringSupportsAPIFirstRotation(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Defaults()
+	cfg.AdmissionTokenKeyring = testAdmissionKeyring + ",next=bm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm4"
+	cfg.AdmissionTokenIssueKeyID = "current"
+	cfg.AdmissionTokenAcceptKeyIDs = "current,next"
+	if _, err := cfg.ParseAdmissionTokenKeys(); err != nil {
+		t.Fatalf("API accept-first keyring error = %v", err)
+	}
+
+	cfg.AdmissionTokenIssueKeyID = "next"
+	selection, err := cfg.ParseAdmissionTokenKeys()
+	if err != nil {
+		t.Fatalf("worker issue-key switch error = %v", err)
+	}
+	if selection.IssueKeyID != "next" || len(selection.AcceptKeys) != 2 {
+		t.Fatalf("rotated selection = %+v", selection)
+	}
+}
+
+func TestAdmissionTokenKeyringRejectsUnacceptedIssueKeyWithoutExposingMaterial(t *testing.T) {
+	t.Parallel()
+
+	sentinel := "bm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm4"
+	cfg := config.Defaults()
+	cfg.AdmissionTokenKeyring = testAdmissionKeyring + ",next=" + sentinel
+	cfg.AdmissionTokenIssueKeyID = "next"
+	cfg.AdmissionTokenAcceptKeyIDs = "current"
+	_, err := cfg.ParseAdmissionTokenKeys()
+	if err == nil || !strings.Contains(err.Error(), "ADMISSION_TOKEN_ISSUE_KEY_ID") {
+		t.Fatalf("ParseAdmissionTokenKeys() error = %v", err)
+	}
+	if strings.Contains(err.Error(), sentinel) {
+		t.Fatal("keyring validation error exposed key material")
+	}
+}
+
+func TestReservationProtectionLimitsMustBePositiveAndBounded(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		field  string
+		mutate func(*config.Config)
+	}{
+		{"holds per user", "RESERVATION_MAX_ACTIVE_HOLDS_PER_USER", func(c *config.Config) { c.ReservationMaxActiveHoldsPerUser = 0 }},
+		{"holds per run", "RESERVATION_MAX_ACTIVE_HOLDS_PER_USER_PER_TRAIN_RUN", func(c *config.Config) { c.ReservationMaxActiveHoldsPerUserPerTrainRun = 0 }},
+		{"passengers per user", "RESERVATION_MAX_ACTIVE_PASSENGERS_PER_USER", func(c *config.Config) { c.ReservationMaxActivePassengersPerUser = 0 }},
+		{"inflight per instance", "RESERVATION_MAX_INFLIGHT_PER_INSTANCE", func(c *config.Config) { c.ReservationMaxInflightPerInstance = 0 }},
+		{"holds upper bound", "RESERVATION_MAX_ACTIVE_HOLDS_PER_USER", func(c *config.Config) { c.ReservationMaxActiveHoldsPerUser = 100001 }},
+		{"inflight upper bound", "RESERVATION_MAX_INFLIGHT_PER_INSTANCE", func(c *config.Config) { c.ReservationMaxInflightPerInstance = 100001 }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.Defaults()
+			cfg.DatabaseURL = "postgres://api@db.example/railway"
+			cfg.RedisAddress = "redis.example:6379"
+			cfg.JWTSecret = "test-secret"
+			setValidAdmissionTokenConfig(&cfg)
+			tt.mutate(&cfg)
+			err := cfg.ValidateFor(config.ProcessAPI)
+			if err == nil || !strings.Contains(err.Error(), tt.field) {
+				t.Fatalf("ValidateFor(api) error = %v, want %s", err, tt.field)
+			}
+		})
+	}
+}
+
+func TestAdmissionWorkerRequiresOwnedDependenciesAndKeyring(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Defaults()
+	cfg.Environment = config.EnvironmentProduction
+	err := cfg.ValidateFor(config.ProcessAdmissionWorker)
+	if err == nil {
+		t.Fatal("ValidateFor(admission-worker) error = nil")
+	}
+	for _, field := range []string{"DATABASE_URL", "REDIS_ADDRESS", "ADMISSION_TOKEN_KEYRING", "ADMISSION_TOKEN_ISSUE_KEY_ID", "ADMISSION_TOKEN_ACCEPT_KEY_IDS"} {
+		if !strings.Contains(err.Error(), field) {
+			t.Errorf("ValidateFor(admission-worker) error %q does not name %s", err, field)
+		}
+	}
+}
+
+func TestAdmissionWorkerBatchMatchesRedisScriptMaximum(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	cfg.DatabaseURL = "postgres://worker@db.example/railway"
+	cfg.RedisAddress = "redis.example:6379"
+	setValidAdmissionTokenConfig(&cfg)
+
+	cfg.AdmissionWorkerBatchSize = 1_000
+	if err := cfg.ValidateFor(config.ProcessAdmissionWorker); err != nil {
+		t.Fatalf("ValidateFor(admission-worker, batch=1000) error = %v", err)
+	}
+	cfg.AdmissionWorkerBatchSize = 1_001
+	err := cfg.ValidateFor(config.ProcessAdmissionWorker)
+	if err == nil || !strings.Contains(err.Error(), "ADMISSION_WORKER_BATCH_SIZE") {
+		t.Fatalf("ValidateFor(admission-worker, batch=1001) error = %v", err)
 	}
 }
 
@@ -83,7 +295,7 @@ func TestAPIRequiresOwnedDependenciesInEveryEnvironment(t *testing.T) {
 	if err == nil {
 		t.Fatal("ValidateFor(api) error = nil, want dependency requirements")
 	}
-	for _, field := range []string{"JWT_SECRET", "REDIS_ADDRESS"} {
+	for _, field := range []string{"JWT_SECRET", "REDIS_ADDRESS", "ADMISSION_TOKEN_KEYRING", "ADMISSION_TOKEN_ISSUE_KEY_ID", "ADMISSION_TOKEN_ACCEPT_KEY_IDS"} {
 		if !strings.Contains(err.Error(), field) {
 			t.Errorf("ValidateFor(api) error %q does not name %s", err, field)
 		}
@@ -265,7 +477,7 @@ func TestRedisOutboxValidationNeverEchoesRedisCredentials(t *testing.T) {
 func TestEveryProcessRequiresDatabaseConfiguration(t *testing.T) {
 	t.Parallel()
 
-	for _, process := range []config.Process{config.ProcessAPI, config.ProcessHoldExpirer, config.ProcessOutboxWorker} {
+	for _, process := range []config.Process{config.ProcessAPI, config.ProcessHoldExpirer, config.ProcessOutboxWorker, config.ProcessAdmissionWorker} {
 		cfg := config.Defaults()
 		if process == config.ProcessOutboxWorker {
 			cfg.OutboxPublisher = "log"
@@ -374,6 +586,7 @@ func TestProductionAllowsNonDevelopmentDatabaseCredentialInQuery(t *testing.T) {
 	cfg.DatabaseURL = "postgres://db.example/railway?password=strong-secret"
 	cfg.RedisAddress = "redis.example:6379"
 	cfg.JWTSecret = strings.Repeat("s", 32)
+	setValidAdmissionTokenConfig(&cfg)
 
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v", err)
@@ -432,6 +645,19 @@ func TestValidateRejectsNonPositiveOperationalLimits(t *testing.T) {
 	}
 }
 
+func TestValidateAPIRejectsDatabaseTimeoutThatCanOutliveAdmissionLease(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Defaults()
+	cfg.DatabaseTimeout = 5 * time.Second
+
+	err := cfg.ValidateFor(config.ProcessAPI)
+	if err == nil || !strings.Contains(err.Error(), "DATABASE_TIMEOUT") ||
+		!strings.Contains(err.Error(), "less than") {
+		t.Fatalf("ValidateFor(ProcessAPI) error = %v, want bounded DATABASE_TIMEOUT error", err)
+	}
+}
+
 func TestValidateRejectsInvalidProxyAndCORSLists(t *testing.T) {
 	t.Parallel()
 
@@ -473,6 +699,9 @@ func TestLoadFromEnvironmentOverridesDefaults(t *testing.T) {
 		"DATABASE_URL":                   "postgres://db.example/railway",
 		"REDIS_ADDRESS":                  "redis.example:6379",
 		"JWT_SECRET":                     "test-secret",
+		"ADMISSION_TOKEN_KEYRING":        testAdmissionKeyring,
+		"ADMISSION_TOKEN_ISSUE_KEY_ID":   "current",
+		"ADMISSION_TOKEN_ACCEPT_KEY_IDS": "current",
 		"JWT_ACCESS_TTL":                 "30m",
 		"RESERVATION_HOLD_TTL":           "7m",
 		"MAX_PASSENGERS_PER_RESERVATION": "4",
@@ -526,6 +755,9 @@ func TestLoadFromSupportsCommittedEnvironmentContract(t *testing.T) {
 		"REDIS_ADDR":                        "redis:6379",
 		"REDIS_PASSWORD":                    "sentinel-redis-secret",
 		"JWT_SECRET":                        "sentinel-test-secret",
+		"ADMISSION_TOKEN_KEYRING":           testAdmissionKeyring,
+		"ADMISSION_TOKEN_ISSUE_KEY_ID":      "current",
+		"ADMISSION_TOKEN_ACCEPT_KEY_IDS":    "current",
 		"JWT_ISSUER":                        "railway-issuer",
 		"JWT_AUDIENCE":                      "railway-users",
 		"JWT_ACCESS_TTL":                    "20m",

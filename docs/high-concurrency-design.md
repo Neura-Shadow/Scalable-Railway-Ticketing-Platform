@@ -4,6 +4,11 @@
 
 The platform must prevent overlapping active reservations for the same seat and train run while allowing that seat to be reused on non-overlapping route segments. A multi-passenger request receives all seats or none.
 
+For an enabled hot policy, the platform must also prevent an uncontrolled
+request burst from entering the booking transaction. Admission permits one
+attempt and does not guarantee inventory. Redis orders and bounds attempts;
+PostgreSQL remains the only seat and durable-quota authority.
+
 ## Serialization points
 
 - Train-run row: compatible shared locks allow holds to proceed concurrently while still serializing them against operator status updates.
@@ -12,6 +17,10 @@ The platform must prevent overlapping active reservations for the same seat and 
 - Reservation row: serializes confirm, cancel, and expire.
 - Idempotency unique key/row: serializes retries of one customer command.
 - Outbox row: serializes claim/finalize ownership.
+- Redis policy generation: version and continuity latch fail closed on missing or stale hot-run control state.
+- Redis waiting-room Lua scripts: atomically serialize duplicate join, monotonic sequence, queue capacity, global issue rate, inflight count, and token leases across replicas.
+- Booking per-user advisory transaction lock: serializes authoritative held-reservation quota counts.
+- API execution slot: provides a non-blocking local instance bound and never becomes a queue.
 
 ## Allocation algorithm
 
@@ -20,6 +29,14 @@ Create-hold uses one Read Committed transaction. It locks the idempotency record
 The returned row count must exactly equal passenger count. Any shortfall returns a bounded availability conflict by rolling back the transaction. Passenger-to-seat assignment follows returned deterministic seat order and canonical passenger order.
 
 `SKIP LOCKED` avoids waiting behind seats another request is deciding. It can conservatively reject a request when enough seats are temporarily locked; it cannot partially commit. This tradeoff is measured under the hot-train k6 scenario.
+
+The core VARBIT allocation SQL is unchanged by admission. For hot requests, a
+completed durable idempotency replay is checked first; otherwise the current
+policy and admission token are validated, the token is acquired, and a local
+execution slot is obtained before entering the existing transaction. Inside
+that transaction, durable idempotency acquisition precedes the per-user quota
+lock/count and existing booking locks. PostgreSQL commit precedes token
+finalization.
 
 ## Lock ordering
 
@@ -44,6 +61,13 @@ Required cases:
 7. Same idempotency key: one resource.
 8. Cancel versus confirm: valid terminal outcome with no leak/double release.
 9. Train-run cancellation versus hold: no hold after non-bookable status is authoritative.
+10. One user and one admission fingerprint under 100 concurrent joins: one active entry and one sequence.
+11. Mismatched concurrent joins: one active entry and bounded conflicts.
+12. Three admission workers: no double issue and no global rate/inflight breach.
+13. One token under 100 same-key submissions: one durable reservation and stable replay.
+14. Wrong owner or request: token rejected before inventory mutation.
+15. One user under 100 quota attempts: configured held bounds are never exceeded.
+16. API/worker termination and Redis-finalize failure: transaction is atomic, lease recovery is bounded, and durable replay prevents duplication.
 
 Critical cases run repeatedly and under the Go race detector. Reconciliation follows every database concurrency suite.
 
@@ -58,4 +82,8 @@ Critical cases run repeatedly and under the Go race detector. Reconciliation fol
 
 ## Honest performance scope
 
-Milestone 1 measures local/single-region behavior only. It does not claim national-scale throughput, unlimited horizontal write scaling, or multi-region active-active writes.
+Milestone 2 measures local/single-region behavior only. FIFO fairness is scoped
+to one policy generation in one Redis deployment. The system does not claim
+global fairness, guaranteed post-admission inventory, national-scale
+throughput, unlimited horizontal write scaling, or multi-region active-active
+writes. No accepted sustained Milestone 2 benchmark is currently recorded.

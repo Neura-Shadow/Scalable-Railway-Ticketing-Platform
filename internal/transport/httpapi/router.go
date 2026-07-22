@@ -18,6 +18,8 @@ type Dependencies struct {
 	ReadinessTimeout    time.Duration
 	TokenParser         BearerTokenParser
 	Reservations        ReservationService
+	WaitingRoom         WaitingRoomService
+	HotTrainPolicies    HotTrainPolicyService
 	MaxRequestBodyBytes int64
 	MaxPassengers       int
 	HTTPMetrics         HTTPMetrics
@@ -52,6 +54,8 @@ func New(dependencies Dependencies) *gin.Engine {
 	registerManagementRoutes(api, dependencies)
 	registerOfferingRoutes(api, dependencies)
 	registerReservationRoutes(api, dependencies)
+	registerWaitingRoomRoutes(api, dependencies)
+	registerHotTrainPolicyRoutes(api, dependencies)
 	return router
 }
 
@@ -108,7 +112,11 @@ func readyHandler(dependencies Dependencies) gin.HandlerFunc {
 				status := "up"
 				if !check.Ready {
 					status = "down"
-					ready = false
+					if check.Optional {
+						status = "degraded"
+					} else {
+						ready = false
+					}
 				}
 				if seen[name] && components[name] == "down" {
 					continue
@@ -117,8 +125,8 @@ func readyHandler(dependencies Dependencies) gin.HandlerFunc {
 				seen[name] = true
 			}
 		}
-		for _, status := range components {
-			if status != "up" {
+		for name, status := range components {
+			if status != "up" && !(name == "redis" && status == "degraded") {
 				ready = false
 				break
 			}

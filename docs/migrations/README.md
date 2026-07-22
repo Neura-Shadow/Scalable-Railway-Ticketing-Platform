@@ -39,3 +39,15 @@ Never edit a migration that has been applied to any shared environment. If a
 large-table rehearsal shows that migration 5 cannot fit the approved window,
 hold the release and create a separately reviewed migration path as described in
 the runbook. Do not execute ad hoc write SQL from these documentation files.
+
+## Migration 6 operator material
+
+| File | Intended schema state | Purpose |
+|---|---|---|
+| [migration-6-production-rollout.md](migration-6-production-rollout.md) | Clean version 5 before rollout; clean version 6 after rollout | Hot-policy table/index/outbox checks, disabled-worker rollout, application rollback, and destructive-down warning |
+
+Migration 6 is additive to inventory: it does not rewrite seat masks or the
+VARBIT allocator. Rehearse its table/index/constraint changes against a recent
+restore, apply `up` twice, and verify clean version 6 before enabling an
+admission worker or policy. Its `down` deletes durable hot-policy outbox events
+and the policy table; it is never an automatic production rollback.
