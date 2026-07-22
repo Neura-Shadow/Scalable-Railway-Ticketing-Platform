@@ -22,6 +22,12 @@ x-api-common: &api-common
     RESERVATION_MAX_ACTIVE_PASSENGERS_PER_USER: 24
     RESERVATION_MAX_INFLIGHT_PER_INSTANCE: 32
     TRUSTED_PROXIES: 0.0.0.0/0
+    CACHE_STATION_TTL: 5m
+    CACHE_STATION_JITTER: 30s
+    CACHE_SEARCH_TTL: 1m
+    CACHE_SEARCH_JITTER: 10s
+    CACHE_AVAILABILITY_TTL: 10s
+    CACHE_AVAILABILITY_JITTER: 2s
   depends_on:
     migrate:
       condition: service_completed_successfully
@@ -51,6 +57,34 @@ x-admission-worker-common: &admission-worker-common
     ADMISSION_TOKEN_KEYRING: ${ADMISSION_TOKEN_KEYRING:-local-current=a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s}
     ADMISSION_TOKEN_ISSUE_KEY_ID: ${ADMISSION_TOKEN_ISSUE_KEY_ID:-local-current}
     ADMISSION_TOKEN_ACCEPT_KEY_IDS: ${ADMISSION_TOKEN_ACCEPT_KEY_IDS:-local-current}
+    WORKER_HTTP_ADDRESS: :9090
+    WORKER_PASS_TIMEOUT: 60s
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  init: true
+  restart: unless-stopped
+
+x-read-model-worker-common: &read-model-worker-common
+  build:
+    context: .
+    target: read-model-worker
+  environment:
+    APP_ENV: development
+    DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
+    REDIS_ADDR: redis:6379
+    READ_MODEL_WORKER_ENABLED: "true"
+    READ_MODEL_WORKER_BATCH_SIZE: 100
+    READ_MODEL_WORKER_MAX_ATTEMPTS: 5
+    READ_MODEL_WORKER_POLL_INTERVAL: 1s
+    READ_MODEL_WORKER_PENDING_IDLE: 30s
     WORKER_HTTP_ADDRESS: :9090
     WORKER_PASS_TIMEOUT: 60s
   depends_on:
@@ -128,6 +162,12 @@ services:
   admission-worker-2:
     <<: *admission-worker-common
 
+  read-model-worker-1:
+    <<: *read-model-worker-common
+
+  read-model-worker-2:
+    <<: *read-model-worker-common
+
   hold-expirer:
     build:
       context: .
@@ -159,7 +199,8 @@ services:
       APP_ENV: development
       DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
       OUTBOX_PUBLISHER_ENABLED: "true"
-      OUTBOX_PUBLISHER: log
+      OUTBOX_PUBLISHER: redis_stream
+      REDIS_ADDR: redis:6379
       OUTBOX_BATCH_SIZE: 100
       OUTBOX_POLL_INTERVAL_SECONDS: 2
       WORKER_HTTP_ADDRESS: :9090
@@ -167,6 +208,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     read_only: true
     security_opt:
       - no-new-privileges:true
@@ -179,7 +222,7 @@ services:
     build:
       context: .
       dockerfile: deploy/nginx/Dockerfile
-    image: scalable-railway-ticketing-proxy:milestone-2
+    image: scalable-railway-ticketing-proxy:milestone-3
     user: "101:101"
     depends_on:
       - api-1
