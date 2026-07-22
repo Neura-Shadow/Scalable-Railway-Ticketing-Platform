@@ -51,9 +51,63 @@ type ProjectionEvent struct {
 }
 
 type ProcessEventResult struct {
-	Duplicate   bool
-	RowsWritten int64
-	Deleted     bool
+	Duplicate        bool
+	TrainRunsRebuilt int
+	RowsWritten      int64
+	Deleted          bool
+}
+
+func (s *Store) ProcessEvent(
+	ctx context.Context,
+	event ProjectionEvent,
+	rawTrainRunIDs []string,
+) (ProcessEventResult, error) {
+	eventID, aggregateID, err := validateProjectionEvent(event)
+	if err != nil {
+		return ProcessEventResult{}, err
+	}
+	trainRunIDs, err := parseBoundedTrainRunIDs(rawTrainRunIDs)
+	if err != nil {
+		return ProcessEventResult{}, err
+	}
+	processedAt := s.clock.Now().UTC()
+	if processedAt.IsZero() {
+		return ProcessEventResult{}, ErrInvalidStore
+	}
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		return ProcessEventResult{}, fmt.Errorf("%w: begin generic event projection", ErrPersistence)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO read_model_event_receipts (
+			consumer_name, event_id, event_type, aggregate_type, aggregate_id, processed_at
+		) VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (consumer_name, event_id) DO NOTHING
+	`, event.ConsumerName, eventID, event.EventType, event.AggregateType, aggregateID, processedAt)
+	if err != nil {
+		return ProcessEventResult{}, fmt.Errorf("%w: write generic event receipt", ErrPersistence)
+	}
+	if tag.RowsAffected() == 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return ProcessEventResult{}, fmt.Errorf("%w: commit duplicate generic event", ErrPersistence)
+		}
+		return ProcessEventResult{Duplicate: true}, nil
+	}
+	result := ProcessEventResult{}
+	for _, trainRunID := range trainRunIDs {
+		rebuild, err := rebuildTrainRunTx(ctx, tx, trainRunID, processedAt)
+		if err != nil {
+			return ProcessEventResult{}, err
+		}
+		result.TrainRunsRebuilt++
+		result.RowsWritten += rebuild.RowsWritten
+		result.Deleted = result.Deleted || rebuild.Deleted
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ProcessEventResult{}, fmt.Errorf("%w: commit generic event projection", ErrPersistence)
+	}
+	return result, nil
 }
 
 func NewStore(db transactionStarter, clock timeSource) (*Store, error) {
@@ -154,6 +208,44 @@ func validateTrainRunEvent(event ProjectionEvent) (uuid.UUID, uuid.UUID, error) 
 		return uuid.Nil, uuid.Nil, ErrInvalidEvent
 	}
 	return eventID, trainRunID, nil
+}
+
+func validateProjectionEvent(event ProjectionEvent) (uuid.UUID, uuid.UUID, error) {
+	if event.ConsumerName != strings.TrimSpace(event.ConsumerName) ||
+		len(event.ConsumerName) == 0 || len(event.ConsumerName) > 128 ||
+		event.EventType != strings.TrimSpace(event.EventType) || len(event.EventType) == 0 || len(event.EventType) > 128 ||
+		event.AggregateType != strings.TrimSpace(event.AggregateType) || len(event.AggregateType) == 0 || len(event.AggregateType) > 64 {
+		return uuid.Nil, uuid.Nil, ErrInvalidEvent
+	}
+	eventID, err := uuid.Parse(event.EventID)
+	if err != nil || eventID == uuid.Nil {
+		return uuid.Nil, uuid.Nil, ErrInvalidEvent
+	}
+	aggregateID, err := uuid.Parse(event.AggregateID)
+	if err != nil || aggregateID == uuid.Nil {
+		return uuid.Nil, uuid.Nil, ErrInvalidEvent
+	}
+	return eventID, aggregateID, nil
+}
+
+func parseBoundedTrainRunIDs(rawIDs []string) ([]uuid.UUID, error) {
+	if len(rawIDs) > MaxRebuildAllBatchSize {
+		return nil, ErrProjectionLimit
+	}
+	result := make([]uuid.UUID, 0, len(rawIDs))
+	seen := make(map[uuid.UUID]struct{}, len(rawIDs))
+	for _, rawID := range rawIDs {
+		trainRunID, err := uuid.Parse(rawID)
+		if err != nil || trainRunID == uuid.Nil {
+			return nil, ErrInvalidTrainRunID
+		}
+		if _, duplicate := seen[trainRunID]; duplicate {
+			continue
+		}
+		seen[trainRunID] = struct{}{}
+		result = append(result, trainRunID)
+	}
+	return result, nil
 }
 
 func rebuildTrainRunTx(

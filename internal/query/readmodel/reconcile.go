@@ -270,7 +270,7 @@ func (snapshot projectionSnapshot) valid() bool {
 		snapshot.fromStationID != uuid.Nil && snapshot.toStationID != uuid.Nil &&
 		snapshot.fromStopIndex >= 0 && snapshot.toStopIndex > snapshot.fromStopIndex &&
 		snapshot.arrivalAt.After(snapshot.departureAt) && snapshot.fareAmountMinor >= 0 &&
-		(snapshot.seatClass == "standard" || snapshot.seatClass == "business") &&
-		(snapshot.status == "scheduled" || snapshot.status == "cancelled" || snapshot.status == "departed" || snapshot.status == "completed") &&
+		(snapshot.seatClass == "standard" || snapshot.seatClass == "business" || snapshot.seatClass == "first") &&
+		(snapshot.status == "scheduled" || snapshot.status == "boarding" || snapshot.status == "cancelled" || snapshot.status == "departed" || snapshot.status == "completed") &&
 		len(snapshot.currency) == 3
 }

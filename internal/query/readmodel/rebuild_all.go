@@ -21,10 +21,11 @@ type RebuildAllOptions struct {
 }
 
 type RebuildAllResult struct {
-	TrainRunsRebuilt int
-	RowsWritten      int64
-	NextCursor       string
-	HasMore          bool
+	TrainRunsSelected int
+	TrainRunsRebuilt  int
+	RowsWritten       int64
+	NextCursor        string
+	HasMore           bool
 }
 
 type rebuildCandidate struct {
@@ -49,6 +50,7 @@ func (s *Store) RebuildAll(ctx context.Context, options RebuildAllOptions) (Rebu
 		candidates = candidates[:options.Limit]
 	}
 	for _, candidate := range candidates {
+		result.TrainRunsSelected++
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
@@ -59,6 +61,30 @@ func (s *Store) RebuildAll(ctx context.Context, options RebuildAllOptions) (Rebu
 		result.TrainRunsRebuilt++
 		result.RowsWritten += rebuild.RowsWritten
 		result.NextCursor = formatRebuildCursor(candidate.serviceDate, candidate.trainRunID)
+	}
+	return result, nil
+}
+
+func (s *Store) PreviewRebuildAll(ctx context.Context, options RebuildAllOptions) (RebuildAllResult, error) {
+	if options.Limit < 1 || options.Limit > MaxRebuildAllBatchSize {
+		return RebuildAllResult{}, ErrInvalidRebuildOptions
+	}
+	afterDate, afterID, err := parseRebuildCursor(options.After)
+	if err != nil {
+		return RebuildAllResult{}, err
+	}
+	candidates, err := s.listRebuildCandidates(ctx, afterDate, afterID, options.Limit+1)
+	if err != nil {
+		return RebuildAllResult{}, err
+	}
+	result := RebuildAllResult{HasMore: len(candidates) > options.Limit}
+	if result.HasMore {
+		candidates = candidates[:options.Limit]
+	}
+	result.TrainRunsSelected = len(candidates)
+	if len(candidates) > 0 {
+		last := candidates[len(candidates)-1]
+		result.NextCursor = formatRebuildCursor(last.serviceDate, last.trainRunID)
 	}
 	return result, nil
 }
