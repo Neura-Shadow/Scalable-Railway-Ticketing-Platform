@@ -214,6 +214,26 @@ func TestAvailabilityMaxStaleRefreshesBeforeRedisTTLExpires(t *testing.T) {
 	}
 }
 
+func TestCacheStoreSkipsOversizedPayloadWithoutFailingSourceRead(t *testing.T) {
+	client := openCacheRedis(t)
+	stationCode, err := domain.NewStationCode("TPE")
+	if err != nil {
+		t.Fatalf("NewStationCode() error = %v", err)
+	}
+	source := &cacheSourceFake{stations: []querypostgres.Station{{
+		ID: uuid.NewString(), Code: stationCode,
+		Name: strings.Repeat("x", MaxCachePayloadBytes), Timezone: "Asia/Taipei",
+	}}}
+	store := newCacheStore(t, source, source, client)
+	stations, err := store.ListStations(context.Background())
+	if err != nil || len(stations) != 1 {
+		t.Fatalf("ListStations(oversized) = %d, %v", len(stations), err)
+	}
+	if size, err := client.DBSize(context.Background()).Result(); err != nil || size != 1 {
+		t.Fatalf("oversized cache DB size = %d, %v, want version key only", size, err)
+	}
+}
+
 func openCacheRedis(t *testing.T) *redis.Client {
 	t.Helper()
 	address := os.Getenv("TEST_REDIS_ADDR")

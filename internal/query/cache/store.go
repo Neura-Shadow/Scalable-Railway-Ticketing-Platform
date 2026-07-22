@@ -103,6 +103,7 @@ type fillOutcome struct {
 type cacheReadStatus string
 
 const (
+	MaxCachePayloadBytes                  = 1 << 20
 	cacheReadHit          cacheReadStatus = "hit"
 	cacheReadMiss         cacheReadStatus = "miss"
 	cacheReadRedisFailure cacheReadStatus = "redis_failure"
@@ -490,6 +491,9 @@ func (store *Store) writeJSON(ctx context.Context, key string, value any, policy
 	encoded, err := json.Marshal(value)
 	if err != nil {
 		return err
+	}
+	if len(encoded) > MaxCachePayloadBytes {
+		return errors.New("read cache payload exceeds bounded size")
 	}
 	ttl, err := policy.Next()
 	if err != nil {

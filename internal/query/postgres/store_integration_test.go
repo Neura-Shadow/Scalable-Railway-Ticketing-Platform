@@ -140,6 +140,41 @@ func TestStoreJourneyTimesSupportZeroFirstDepartureOffset(t *testing.T) {
 	}
 }
 
+func TestAvailabilityExcludesInactiveSeatsAndBatchCanonicalizesUUID(t *testing.T) {
+	conn := openQueryTestDatabase(t)
+	fixture := seedOffering(t, conn)
+	store, err := querypostgres.NewStore(conn)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	ctx := context.Background()
+	if _, err := conn.Exec(ctx, `
+		UPDATE seats
+		SET active = false
+		WHERE id = (
+			SELECT si.seat_id
+			FROM seat_inventory AS si
+			WHERE si.train_run_id = $1
+			ORDER BY si.seat_id
+			LIMIT 1
+		)
+	`, fixture.trainRunID); err != nil {
+		t.Fatalf("deactivate inventory seat: %v", err)
+	}
+	request := querypostgres.AvailabilityRequest{
+		TrainRunID: strings.ToUpper(fixture.trainRunID),
+		OriginCode: "TPE", DestinationCode: "KHH", SeatClass: "standard",
+	}
+	direct, err := store.Availability(ctx, request)
+	if err != nil || direct.AvailableSeats != 1 {
+		t.Fatalf("Availability(inactive seat) = %+v, %v, want one active seat", direct, err)
+	}
+	batch, err := store.AvailabilityBatch(ctx, []querypostgres.AvailabilityRequest{request})
+	if err != nil || len(batch) != 1 || batch[0].AvailableSeats != 1 {
+		t.Fatalf("AvailabilityBatch(uppercase UUID) = %+v, %v", batch, err)
+	}
+}
+
 type offeringFixture struct {
 	trainRunID  string
 	serviceDate time.Time

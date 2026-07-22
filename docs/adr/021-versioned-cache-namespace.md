@@ -26,8 +26,8 @@ cache:availability:version:{trainRunID}
 cache:availability:{versionToken}:{trainRunID}:{from}:{to}:{class}
 ```
 
-Tokens are generated from a cryptographically secure random source, encoded in
-a bounded URL-safe lowercase form, and validated before use. `GetOrCreate`
+Tokens are generated from a cryptographically secure random source, encoded as
+a fixed 24-character unpadded Base64URL value, and validated before use. `GetOrCreate`
 atomically keeps an existing valid token or installs one fresh candidate.
 `Rotate` atomically replaces the version with a newly generated token. `Build`
 accepts only validated, server-normalized components and creates an exact

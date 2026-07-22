@@ -5,6 +5,9 @@ Runtime controls are `STATION_CACHE_ENABLED`,
 cache sends station browsing directly to PostgreSQL and does not change booking
 behavior.
 
+Serialized cache values are capped at 1 MiB. An oversized station catalog is
+still returned from PostgreSQL, but that response is not written to Redis.
+
 The station cache stores only public active-station fields in deterministic
 code order. PostgreSQL stations remain authoritative.
 

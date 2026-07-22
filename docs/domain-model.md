@@ -1,6 +1,6 @@
 # Domain Model
 
-Milestone 2 is a production-minded, single-region railway booking backend with bounded hot-train admission. PostgreSQL is authoritative for train-run status, hot-train policy, seat occupancy, reservation lifecycle, durable quotas, tickets, durable idempotency, and outbox events. Redis owns only ephemeral waiting-room and admission-control state.
+Milestone 3 is a production-minded, single-region railway booking backend with bounded hot-train admission plus disposable PostgreSQL journey projections and optional Redis read caches. PostgreSQL is authoritative for train-run status, hot-train policy, seat occupancy, reservation lifecycle, durable quotas, tickets, durable idempotency, and outbox events. Redis owns only ephemeral waiting-room/admission state and non-authoritative read hints.
 
 ## Bounded contexts
 
@@ -10,7 +10,7 @@ Milestone 2 is a production-minded, single-region railway booking backend with b
 | Railway Offering | Topology, rolling stock, fares, dated services, bookable status, commissioning | Station, Route, RouteStop, Train, Coach, Seat, SeatClass, TrainRun, Fare | PostgreSQL adapter |
 | Admission | Hot-train classification, bounded waiting-room admission, token lifecycle, admission reconciliation | HotTrainPolicy, WaitingRoomEntry, AdmissionToken, AdmissionDecision, QueuePosition | Railway Offering journey-resolution port; PostgreSQL policy adapter; Redis queue/token adapter |
 | Booking | Atomic occupancy/allocation, lifecycle commands, tickets, idempotency, reconciliation | SegmentMask, SeatInventory, Reservation, ReservationSeat, TicketOrder, Ticket, IdempotencyRecord | Accounts ownership port; Railway Offering sales-input port; event append port |
-| Query (supporting) | Browse/search/availability hints; Redis read caches deferred | Read models only | Current read-only PostgreSQL adapter; future non-authoritative Redis decorators |
+| Query (supporting) | Browse/search/availability hints; projection rebuild and non-authoritative Redis caches | Disposable journey projection and cache namespaces | Authoritative PostgreSQL source adapter; Redis cache decorator |
 | Event Relay (supporting) | Claim, publish, retry, recover, finalize | OutboxEvent delivery state | PostgreSQL and publisher adapters |
 | Platform (supporting) | Technology adapters and process lifecycle | Config, database/Redis pools, middleware, response, metrics, clock | No railway business rules |
 

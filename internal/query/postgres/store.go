@@ -283,7 +283,7 @@ func (s *Store) Availability(ctx context.Context, request AvailabilityRequest) (
 		       priced.amount_minor, priced.currency,
 		       count(si.seat_id) FILTER (
 				WHERE CASE
-					WHEN si.seat_id IS NULL THEN false
+					WHEN si.seat_id IS NULL OR s.id IS NULL THEN false
 					WHEN bit_length(si.occupied_segments) <> priced.segment_count THEN false
 					ELSE (si.occupied_segments & priced.requested_mask) = repeat('0', priced.segment_count)::bit varying
 				END
@@ -292,6 +292,9 @@ func (s *Store) Availability(ctx context.Context, request AvailabilityRequest) (
 		LEFT JOIN seat_inventory AS si
 		  ON si.train_run_id = priced.id
 		 AND si.seat_class = $4
+		LEFT JOIN seats AS s
+		  ON s.id = si.seat_id
+		 AND s.active
 		GROUP BY priced.id, priced.train_code, priced.scheduled_departure_at,
 		         priced.from_stop_index, priced.to_stop_index, priced.segment_count,
 		         priced.first_departure_offset_minutes,
@@ -393,13 +396,14 @@ func (s *Store) AvailabilityBatch(ctx context.Context, requests []AvailabilityRe
 		       priced.amount_minor, priced.currency,
 		       count(si.seat_id) FILTER (
 				WHERE CASE
-					WHEN si.seat_id IS NULL THEN false
+					WHEN si.seat_id IS NULL OR s.id IS NULL THEN false
 					WHEN bit_length(si.occupied_segments) <> priced.segment_count THEN false
 					ELSE (si.occupied_segments & priced.requested_mask) = repeat('0', priced.segment_count)::bit varying
 				END
 		       )::bigint AS available_seats
 		FROM priced
 		LEFT JOIN seat_inventory AS si ON si.train_run_id = priced.id AND si.seat_class = $4
+		LEFT JOIN seats AS s ON s.id = si.seat_id AND s.active
 		GROUP BY priced.id, priced.train_code, priced.scheduled_departure_at,
 		         priced.from_stop_index, priced.to_stop_index, priced.segment_count,
 		         priced.first_departure_offset_minutes,
@@ -440,8 +444,8 @@ func (s *Store) AvailabilityBatch(ctx context.Context, requests []AvailabilityRe
 		return nil, safeQueryError(err)
 	}
 	results := make([]Availability, 0, len(requests))
-	for _, request := range requests {
-		result, exists := byID[request.TrainRunID]
+	for index := range requests {
+		result, exists := byID[trainRunIDs[index].String()]
 		if !exists {
 			return nil, ErrNotFound
 		}
