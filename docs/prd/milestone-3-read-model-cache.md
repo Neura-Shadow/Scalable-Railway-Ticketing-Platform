@@ -1,6 +1,6 @@
 # Milestone 3: Read Model and Availability Cache
 
-Status: Accepted for implementation
+Status: Implemented; final CI and independent review pending
 
 Target: Milestone 3
 
