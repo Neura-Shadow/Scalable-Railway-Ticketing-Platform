@@ -25,6 +25,10 @@ waiting room and PostgreSQL-authoritative booking. Its boundaries are:
   PostgreSQL can safely reject after admission.
 - The local multi-replica Compose topology is evidence scaffolding, not
   production capacity, high availability, or disaster-recovery architecture.
+- The digest-pinned evidence proxy runs `apk upgrade` so current fixed
+  Critical/High package findings remain covered by the image scan. Package
+  repository state can therefore change the resulting image, so the evidence
+  proxy build is not claimed to be bit-for-bit reproducible.
 - No accepted sustained Milestone 2 benchmark is recorded. There is no
   national-scale or 12306-equivalent throughput claim.
 - The system remains single-region with one authoritative PostgreSQL primary.

@@ -19,9 +19,9 @@ Create the referenced `railway-runtime-secrets` object out of band. Never commit
 
 Required keys, scoped to the process that consumes them:
 
-- `database-url`: TLS-enabled PostgreSQL URL required by the API and both workers; a production overlay should replace the baseline shared reference with process-specific least-privilege roles where their grants differ;
-- `redis-address`: regional Redis `host:port` endpoint used by the API and a Redis Streams outbox worker;
-- `redis-password`: Redis credential, if authentication is enabled, used only with those Redis clients; and
+- `database-url`: TLS-enabled PostgreSQL URL required by the API, admission-worker, hold-expirer, and outbox-worker; a production overlay should replace the baseline shared reference with process-specific least-privilege roles where their grants differ;
+- `redis-address`: regional Redis `host:port` endpoint used by the API, admission-worker, and a Redis Streams outbox-worker;
+- `redis-password`: Redis credential, if authentication is enabled, used only by those Redis clients; and
 - `jwt-secret`: at least 32 random bytes, managed and rotated through the deployment secret system and mounted only into the API; and
 - `admission-token-keyring`: one to eight `key-id=base64url` entries whose decoded material is exactly 32 bytes, mounted only into APIs and admission workers with separately configured issue and accept key IDs.
 
