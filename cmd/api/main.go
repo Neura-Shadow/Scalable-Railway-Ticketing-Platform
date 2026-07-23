@@ -25,6 +25,8 @@ import (
 	querycache "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/cache"
 	querypostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/postgres"
 	queryreadmodel "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/readmodel"
+	shardingpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/postgres"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/routecache"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/transport/httpapi"
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -124,9 +126,34 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return errors.New("offering store initialization failed")
 	}
+	var shardRouter *shardingpostgres.Router
+	if cfg.BookingShardMode == config.BookingShardModeSchemaPOC {
+		cache, cacheErr := routecache.New(routecache.Config{
+			Enabled: cfg.BookingRouteCacheEnabled, TTL: cfg.BookingRouteCacheTTL,
+			MaxEntries: cfg.BookingRouteCacheMaxEntries,
+		})
+		if cacheErr != nil {
+			return errors.New("booking route cache initialization failed")
+		}
+		shardRouter, err = shardingpostgres.NewRouter(
+			pool,
+			cache,
+			shardingpostgres.WithMetrics(metrics),
+			shardingpostgres.WithQueryTimeout(cfg.BookingShardQueryTimeout),
+		)
+		if err != nil {
+			return errors.New("booking shard router initialization failed")
+		}
+	}
 	queryStore, err := querypostgres.NewStore(pool)
 	if err != nil {
 		return errors.New("query store initialization failed")
+	}
+	if shardRouter != nil {
+		queryStore, err = querypostgres.NewShardedStore(pool, shardRouter)
+		if err != nil {
+			return errors.New("sharded query store initialization failed")
+		}
 	}
 	projectionStore, err := queryreadmodel.NewStore(pool, clock.RealClock{})
 	if err != nil {
@@ -181,6 +208,20 @@ func run(logger *slog.Logger) error {
 		MaxActiveHoldsPerUserPerTrainRun: cfg.ReservationMaxActiveHoldsPerUserPerTrainRun,
 		MaxActivePassengersPerUser:       cfg.ReservationMaxActivePassengersPerUser,
 	})
+	if shardRouter != nil {
+		bookingStore, err = bookingpostgres.NewShardedWithReservationQuotaLimits(
+			pool,
+			shardRouter,
+			bookingpostgres.ReservationQuotaLimits{
+				MaxActiveHoldsPerUser:            cfg.ReservationMaxActiveHoldsPerUser,
+				MaxActiveHoldsPerUserPerTrainRun: cfg.ReservationMaxActiveHoldsPerUserPerTrainRun,
+				MaxActivePassengersPerUser:       cfg.ReservationMaxActivePassengersPerUser,
+			},
+		)
+		if err != nil {
+			return errors.New("sharded booking store initialization failed")
+		}
+	}
 	policyStore, err := admissionpostgres.NewStore(pool)
 	if err != nil {
 		return errors.New("admission policy store initialization failed")
@@ -194,6 +235,12 @@ func run(logger *slog.Logger) error {
 		return errors.New("reservation backpressure initialization failed")
 	}
 	reads := app.NewPostgresReads(pool)
+	if shardRouter != nil {
+		reads, err = app.NewShardedPostgresReads(pool, shardRouter)
+		if err != nil {
+			return errors.New("sharded booking reads initialization failed")
+		}
+	}
 	rateLimitBackend, err := redisx.NewRateLimiter(redisClient, "railway-api")
 	if err != nil {
 		return errors.New("rate limiter initialization failed")
