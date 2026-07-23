@@ -251,6 +251,79 @@ func TestEnvironmentIntFailsClosedForMalformedOrUnboundedValues(t *testing.T) {
 	}
 }
 
+func TestShardScopesRejectInvalidBoundsBeforeDatabaseAccess(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func() (resultEnvelope, error)
+	}{
+		{
+			name: "assignments row limit",
+			run: func() (resultEnvelope, error) {
+				return runShardAssignments(context.Background(), "postgres://do-not-connect", []string{"--max-rows", "0"})
+			},
+		},
+		{
+			name: "locators page size",
+			run: func() (resultEnvelope, error) {
+				return runShardLocators(context.Background(), "postgres://do-not-connect", []string{"--page-size", "1001"})
+			},
+		},
+		{
+			name: "migration page limit",
+			run: func() (resultEnvelope, error) {
+				return runShardMigration(context.Background(), "postgres://do-not-connect", []string{
+					"--migration-id", uuid.NewString(), "--max-pages", "10001",
+				})
+			},
+		},
+		{
+			name: "repair mode is not exposed",
+			run: func() (resultEnvelope, error) {
+				return runShardAssignments(context.Background(), "postgres://do-not-connect", []string{"--repair"})
+			},
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			envelope, err := testCase.run()
+			if err == nil || envelope.Command != "" {
+				t.Fatalf("envelope=%+v error=%v, want pre-connection rejection", envelope, err)
+			}
+		})
+	}
+}
+
+func TestShardScopesRequireCanonicalUUIDs(t *testing.T) {
+	if _, err := runShardLocators(
+		context.Background(),
+		"postgres://do-not-connect",
+		[]string{"--train-run-id", "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"},
+	); err == nil || !strings.Contains(err.Error(), "canonical UUID") {
+		t.Fatalf("uppercase locator UUID error = %v", err)
+	}
+	if _, err := runShardMigration(
+		context.Background(),
+		"postgres://do-not-connect",
+		[]string{"--migration-id", ""},
+	); err == nil || !strings.Contains(err.Error(), "canonical UUID") {
+		t.Fatalf("empty migration UUID error = %v", err)
+	}
+}
+
+func TestUsagePreservesExistingAndAddsExactShardScopes(t *testing.T) {
+	var output bytes.Buffer
+	writeUsage(&output)
+	usage := output.String()
+	for _, scope := range []string{
+		"seat-inventory", "reservation-quotas", "admission-state", "read-model", "cache-versions",
+		"shard-assignments", "shard-locators", "shard-migration",
+	} {
+		if !strings.Contains(usage, scope) {
+			t.Fatalf("usage %q is missing scope %q", usage, scope)
+		}
+	}
+}
+
 func validPolicy(t *testing.T, enabled bool, initialized *int64) admissiondomain.HotTrainPolicy {
 	t.Helper()
 	limits, err := admissiondomain.NewPolicyLimits(admissiondomain.PolicyLimitsInput{
