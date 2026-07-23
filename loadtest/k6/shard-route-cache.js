@@ -36,4 +36,3 @@ export default function () {
   });
   sleep(0.2);
 }
-

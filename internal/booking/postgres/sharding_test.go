@@ -17,6 +17,7 @@ type fakeShardRouter struct {
 	resolveTrainRun    func(context.Context, uuid.UUID) (sharding.ShardRoute, error)
 	refreshTrainRun    func(context.Context, uuid.UUID) (sharding.ShardRoute, error)
 	resolveReservation func(context.Context, uuid.UUID) (sharding.ShardRoute, error)
+	resolveForOwner    func(context.Context, uuid.UUID, uuid.UUID) (sharding.ShardRoute, error)
 	beginWrite         func(context.Context, sharding.ShardRoute) (bookingRoutedTx, error)
 	beginRead          func(context.Context, sharding.ShardRoute) (bookingRoutedTx, error)
 	listShards         func(context.Context) ([]sharding.ShardID, error)
@@ -30,6 +31,12 @@ func (router *fakeShardRouter) RefreshTrainRun(ctx context.Context, id uuid.UUID
 }
 func (router *fakeShardRouter) ResolveReservation(ctx context.Context, id uuid.UUID) (sharding.ShardRoute, error) {
 	return router.resolveReservation(ctx, id)
+}
+func (router *fakeShardRouter) ResolveReservationForOwner(
+	ctx context.Context,
+	id, ownerUserID uuid.UUID,
+) (sharding.ShardRoute, error) {
+	return router.resolveForOwner(ctx, id, ownerUserID)
 }
 func (router *fakeShardRouter) BeginTrainRunWrite(ctx context.Context, route sharding.ShardRoute) (bookingRoutedTx, error) {
 	return router.beginWrite(ctx, route)
@@ -55,21 +62,45 @@ type embeddedPGXTx struct{ pgx.Tx }
 
 type generationWritePGXTx struct {
 	pgx.Tx
-	migrationID uuid.UUID
-	state       string
-	execCalls   int
+	migrationID      uuid.UUID
+	state            string
+	trainID          uuid.UUID
+	segmentCount     int
+	execCalls        int
+	inventoryInserts int
 }
 
-func (tx *generationWritePGXTx) QueryRow(context.Context, string, ...any) pgx.Row {
+func (tx *generationWritePGXTx) QueryRow(_ context.Context, sql string, _ ...any) pgx.Row {
+	if strings.Contains(sql, "FROM train_runs") {
+		return inventoryTrainRow{trainID: tx.trainID, segmentCount: tx.segmentCount}
+	}
 	return generationWriteRow{migrationID: tx.migrationID, state: tx.state}
 }
 
 func (tx *generationWritePGXTx) Exec(_ context.Context, sql string, arguments ...any) (pgconn.CommandTag, error) {
+	if strings.Contains(sql, "INSERT INTO seat_inventory") {
+		tx.inventoryInserts++
+		return pgconn.NewCommandTag("INSERT 0 1"), nil
+	}
 	if !strings.Contains(sql, "public.train_run_generation_writes") || len(arguments) != 4 {
 		return pgconn.CommandTag{}, errors.New("unexpected generation-write statement")
 	}
 	tx.execCalls++
 	return pgconn.NewCommandTag("INSERT 0 1"), nil
+}
+
+type inventoryTrainRow struct {
+	trainID      uuid.UUID
+	segmentCount int
+}
+
+func (row inventoryTrainRow) Scan(destinations ...any) error {
+	if len(destinations) != 2 {
+		return errors.New("unexpected inventory train scan")
+	}
+	*(destinations[0].(*uuid.UUID)) = row.trainID
+	*(destinations[1].(*int)) = row.segmentCount
+	return nil
 }
 
 type generationWriteRow struct {
@@ -128,18 +159,50 @@ func TestBeginTrainRunWriteUsesOpaqueResolvedRoute(t *testing.T) {
 	}
 }
 
+func TestInitializeInventoryUsesRoutedAuthorityAndRecordsRollbackEvidence(t *testing.T) {
+	t.Parallel()
+
+	run, trainID, migrationID := uuid.New(), uuid.New(), uuid.New()
+	route := mustBookingRoute(t, run, sharding.ShardLegacy, 8)
+	underlying := &generationWritePGXTx{
+		migrationID:  migrationID,
+		state:        "rollback_window",
+		trainID:      trainID,
+		segmentCount: 2,
+	}
+	store := &Store{shards: &fakeShardRouter{
+		resolveTrainRun: func(_ context.Context, got uuid.UUID) (sharding.ShardRoute, error) {
+			if got != run {
+				t.Fatalf("resolved train run = %s, want %s", got, run)
+			}
+			return route, nil
+		},
+		beginWrite: func(_ context.Context, got sharding.ShardRoute) (bookingRoutedTx, error) {
+			return &fakeBookingRoutedTx{Tx: underlying, route: got}, nil
+		},
+	}}
+
+	inserted, err := store.InitializeInventory(context.Background(), run)
+	if err != nil {
+		t.Fatalf("InitializeInventory() error = %v", err)
+	}
+	if inserted != 1 || underlying.inventoryInserts != 1 || underlying.execCalls != 1 {
+		t.Fatalf("inventory result = inserted %d inventory statements %d evidence statements %d", inserted, underlying.inventoryInserts, underlying.execCalls)
+	}
+}
+
 func TestBeginReservationReadRefreshesOneStaleLocatorGeneration(t *testing.T) {
 	t.Parallel()
 
-	reservationID, run := uuid.New(), uuid.New()
+	reservationID, ownerUserID, run := uuid.New(), uuid.New(), uuid.New()
 	stale := mustBookingRoute(t, run, sharding.ShardZero, 3)
 	fresh := mustBookingRoute(t, run, sharding.ShardOne, 4)
 	underlying := &embeddedPGXTx{}
 	beginCalls, refreshCalls := 0, 0
 	store := &Store{shards: &fakeShardRouter{
-		resolveReservation: func(_ context.Context, got uuid.UUID) (sharding.ShardRoute, error) {
-			if got != reservationID {
-				t.Fatalf("reservation = %s, want %s", got, reservationID)
+		resolveForOwner: func(_ context.Context, got, gotOwner uuid.UUID) (sharding.ShardRoute, error) {
+			if got != reservationID || gotOwner != ownerUserID {
+				t.Fatalf("reservation owner lookup = (%s, %s), want (%s, %s)", got, gotOwner, reservationID, ownerUserID)
 			}
 			return stale, nil
 		},
@@ -165,7 +228,7 @@ func TestBeginReservationReadRefreshesOneStaleLocatorGeneration(t *testing.T) {
 		},
 	}}
 
-	tx, err := store.beginReservationRead(context.Background(), reservationID)
+	tx, err := store.beginReservationRead(context.Background(), reservationID, ownerUserID)
 	if err != nil {
 		t.Fatalf("beginReservationRead() error = %v", err)
 	}
@@ -179,7 +242,7 @@ func TestBeginReservationWriteDoesNotProbeAfterMissingLocator(t *testing.T) {
 
 	beginCalls := 0
 	store := &Store{shards: &fakeShardRouter{
-		resolveReservation: func(context.Context, uuid.UUID) (sharding.ShardRoute, error) {
+		resolveForOwner: func(context.Context, uuid.UUID, uuid.UUID) (sharding.ShardRoute, error) {
 			return sharding.ShardRoute{}, sharding.ErrLocatorNotFound
 		},
 		beginWrite: func(context.Context, sharding.ShardRoute) (bookingRoutedTx, error) {
@@ -188,11 +251,33 @@ func TestBeginReservationWriteDoesNotProbeAfterMissingLocator(t *testing.T) {
 		},
 	}}
 
-	if _, err := store.beginReservationWrite(context.Background(), uuid.New()); !errors.Is(err, sharding.ErrLocatorNotFound) {
+	if _, err := store.beginReservationWrite(context.Background(), uuid.New(), uuid.New()); !errors.Is(err, sharding.ErrLocatorNotFound) {
 		t.Fatalf("beginReservationWrite() error = %v", err)
 	}
 	if beginCalls != 0 {
 		t.Fatalf("begin calls = %d, want zero", beginCalls)
+	}
+}
+
+func TestDueReservationQueriesSelectOnlyAuthoritativeWritableLocatorRows(t *testing.T) {
+	for _, shardID := range []sharding.ShardID{sharding.ShardLegacy, sharding.ShardZero, sharding.ShardOne} {
+		query, ok := dueReservationQuery(shardID)
+		if !ok {
+			t.Fatalf("dueReservationQuery(%s) rejected fixed shard", shardID)
+		}
+		for _, fragment := range []string{
+			"public.reservation_shard_locators",
+			"public.train_run_shard_assignments",
+			"assignment.assignment_generation = locator.assignment_generation",
+			"assignment.assignment_state IN ('stable', 'rollback_window')",
+			"catalog.write_enabled",
+			"catalog.minimum_fencing_protocol_version <= $2",
+			"locator.shard_id = '" + shardID.String() + "'",
+		} {
+			if !strings.Contains(query, fragment) {
+				t.Fatalf("dueReservationQuery(%s) missing %q", shardID, fragment)
+			}
+		}
 	}
 }
 

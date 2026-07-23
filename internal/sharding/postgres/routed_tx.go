@@ -61,7 +61,7 @@ func (router *Router) BeginTrainRunWrite(ctx context.Context, expected sharding.
 	started := time.Now()
 	metricShardID := boundedShardID(expected.ShardID())
 	defer func() { router.observeRoute(ctx, "write", metricShardID, started, resultErr) }()
-	if router == nil || router.db == nil || !validRoute(expected) {
+	if router == nil || router.db == nil || !validRoute(expected) || !router.shardAllowed(expected.ShardID()) {
 		return nil, sharding.ErrShardUnavailable
 	}
 	ctx, cancel := router.boundedQueryContext(ctx)
@@ -184,7 +184,7 @@ func (router *Router) BeginTrainRunRead(ctx context.Context, expected sharding.S
 	started := time.Now()
 	metricShardID := boundedShardID(expected.ShardID())
 	defer func() { router.observeRoute(ctx, "read", metricShardID, started, resultErr) }()
-	if router == nil || router.db == nil || !validRoute(expected) {
+	if router == nil || router.db == nil || !validRoute(expected) || !router.shardAllowed(expected.ShardID()) {
 		return nil, sharding.ErrShardUnavailable
 	}
 	ctx, cancel := router.boundedQueryContext(ctx)

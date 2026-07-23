@@ -22,6 +22,35 @@ type Metrics interface {
 
 type Option func(*Router)
 
+// WithAllowedShards installs the process-local subset this binary is willing
+// to serve. PostgreSQL remains the ownership authority; this option can only
+// make a catalog route ineligible and never remap it to another shard.
+func WithAllowedShards(shards ...sharding.ShardID) Option {
+	configured := append([]sharding.ShardID(nil), shards...)
+	return func(router *Router) {
+		if router == nil || len(configured) == 0 || len(configured) > 3 {
+			if router != nil {
+				router.invalidOptions = true
+			}
+			return
+		}
+		allowed := make(map[sharding.ShardID]struct{}, len(configured))
+		for _, candidate := range configured {
+			parsed, err := sharding.ParseShardID(candidate.String())
+			if err != nil || parsed != candidate {
+				router.invalidOptions = true
+				return
+			}
+			if _, duplicate := allowed[candidate]; duplicate {
+				router.invalidOptions = true
+				return
+			}
+			allowed[candidate] = struct{}{}
+		}
+		router.allowedShards = allowed
+	}
+}
+
 // WithMetrics installs an optional bounded metrics recorder.
 func WithMetrics(metrics Metrics) Option {
 	return func(router *Router) {

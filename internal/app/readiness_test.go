@@ -4,10 +4,29 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/transport/httpapi"
 )
+
+func TestShardReadinessQueryMatchesFixedCatalogSchema(t *testing.T) {
+	if strings.Contains(shardReadinessQuery, "schema_name") {
+		t.Fatal("shard readiness must not query a catalog column that migration 8 does not define")
+	}
+	for _, fragment := range []string{
+		"shard_id = 'legacy' AND storage_kind = 'legacy'",
+		"shard_id = 'shard-0' AND storage_kind = 'schema'",
+		"shard_id = 'shard-1' AND storage_kind = 'schema'",
+		"to_regnamespace('booking_shard_0')",
+		"to_regnamespace('booking_shard_1')",
+		"shard_id = ANY($2::text[])",
+	} {
+		if !strings.Contains(shardReadinessQuery, fragment) {
+			t.Fatalf("shard readiness query missing fixed-topology check %q", fragment)
+		}
+	}
+}
 
 func TestReadinessReportsEveryBoundedComponentWithoutLeakingProbeErrors(t *testing.T) {
 	checker := newReadinessChecker(

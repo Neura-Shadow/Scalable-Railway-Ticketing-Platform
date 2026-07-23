@@ -68,6 +68,109 @@ func TestNewRouterTreatsTypedNilOptionalCacheAsDisabled(t *testing.T) {
 	}
 }
 
+func TestNewRouterRejectsInvalidConfiguredShardSubset(t *testing.T) {
+	for name, option := range map[string]Option{
+		"empty":     WithAllowedShards(),
+		"duplicate": WithAllowedShards(sharding.ShardLegacy, sharding.ShardLegacy),
+		"unknown":   WithAllowedShards(sharding.ShardID("shard-9")),
+	} {
+		t.Run(name, func(t *testing.T) {
+			router, err := NewRouter(&fakeDB{}, nil, option)
+			if router != nil || !errors.Is(err, sharding.ErrShardUnavailable) {
+				t.Fatalf("NewRouter() = (%v, %v), want nil, %v", router, err, sharding.ErrShardUnavailable)
+			}
+		})
+	}
+}
+
+func TestConfiguredShardSubsetRejectsExcludedCatalogLocatorCacheAndTransactions(t *testing.T) {
+	trainRunID := uuid.New()
+	excluded := mustRoute(t, trainRunID, sharding.ShardOne, 9)
+	cache := &fakeRouteCache{route: excluded, found: true}
+	db := &fakeDB{queryRow: func(_ context.Context, sql string, _ ...any) pgx.Row {
+		if strings.Contains(sql, "_shard_locators") {
+			return fakeRow{values: []any{trainRunID, "shard-1", int64(9)}}
+		}
+		return fakeRow{values: []any{"shard-1", int64(9), true, "active", sharding.SupportedFencingProtocolVersion}}
+	}}
+	router, err := NewRouter(
+		db,
+		cache,
+		WithAllowedShards(sharding.ShardLegacy, sharding.ShardZero),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := router.ResolveTrainRun(context.Background(), trainRunID); !errors.Is(err, sharding.ErrShardUnavailable) {
+		t.Fatalf("ResolveTrainRun() error = %v, want %v", err, sharding.ErrShardUnavailable)
+	}
+	if cache.invalidated != trainRunID {
+		t.Fatalf("excluded cached route was not invalidated: %s", cache.invalidated)
+	}
+	if _, err := router.ResolveReservation(context.Background(), uuid.New()); !errors.Is(err, sharding.ErrShardUnavailable) {
+		t.Fatalf("ResolveReservation() error = %v, want %v", err, sharding.ErrShardUnavailable)
+	}
+	if _, err := router.BeginTrainRunRead(context.Background(), excluded); !errors.Is(err, sharding.ErrShardUnavailable) {
+		t.Fatalf("BeginTrainRunRead() error = %v, want %v", err, sharding.ErrShardUnavailable)
+	}
+	if _, err := router.BeginTrainRunWrite(context.Background(), excluded); !errors.Is(err, sharding.ErrShardUnavailable) {
+		t.Fatalf("BeginTrainRunWrite() error = %v, want %v", err, sharding.ErrShardUnavailable)
+	}
+}
+
+func TestListEnabledShardsIntersectsConfiguredSubset(t *testing.T) {
+	db := &fakeDB{query: func(context.Context, string, ...any) (pgx.Rows, error) {
+		return &fakeRows{values: [][]any{
+			{"legacy", sharding.SupportedFencingProtocolVersion},
+			{"shard-0", sharding.SupportedFencingProtocolVersion},
+			{"shard-1", sharding.SupportedFencingProtocolVersion},
+		}, index: -1}, nil
+	}}
+	router, err := NewRouter(
+		db,
+		nil,
+		WithAllowedShards(sharding.ShardLegacy, sharding.ShardOne),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := router.ListEnabledShards(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []sharding.ShardID{sharding.ShardLegacy, sharding.ShardOne}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ListEnabledShards() = %#v, want %#v", got, want)
+	}
+}
+
+func TestListEnabledShardsIgnoresExcludedShardProtocolDuringRollingUpgrade(t *testing.T) {
+	db := &fakeDB{query: func(context.Context, string, ...any) (pgx.Rows, error) {
+		return &fakeRows{values: [][]any{
+			{"legacy", sharding.SupportedFencingProtocolVersion},
+			{"shard-0", sharding.SupportedFencingProtocolVersion},
+			{"shard-1", sharding.SupportedFencingProtocolVersion + 1},
+		}, index: -1}, nil
+	}}
+	router, err := NewRouter(
+		db,
+		nil,
+		WithAllowedShards(sharding.ShardLegacy, sharding.ShardZero),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := router.ListEnabledShards(context.Background())
+	if err != nil {
+		t.Fatalf("ListEnabledShards() error = %v", err)
+	}
+	want := []sharding.ShardID{sharding.ShardLegacy, sharding.ShardZero}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ListEnabledShards() = %#v, want %#v", got, want)
+	}
+}
+
 func TestResolveReservationUsesOneGlobalLocator(t *testing.T) {
 	reservationID := uuid.New()
 	trainRunID := uuid.New()
@@ -93,6 +196,30 @@ func TestResolveReservationUsesOneGlobalLocator(t *testing.T) {
 	}
 	if got.TrainRunID() != trainRunID || got.ShardID() != sharding.ShardOne || got.Generation().Int64() != 9 {
 		t.Fatalf("ResolveReservation() = (%s, %s, %d)", got.TrainRunID(), got.ShardID(), got.Generation().Int64())
+	}
+}
+
+func TestResolveReservationForOwnerBindsEarlyAuthorizationPredicate(t *testing.T) {
+	reservationID, ownerUserID, trainRunID := uuid.New(), uuid.New(), uuid.New()
+	db := &fakeDB{queryRow: func(_ context.Context, sql string, args ...any) pgx.Row {
+		if !strings.Contains(sql, "owner_user_id = $2") {
+			t.Fatalf("owner-scoped locator query = %q", sql)
+		}
+		if len(args) != 2 || args[0] != reservationID || args[1] != ownerUserID {
+			t.Fatalf("owner-scoped locator args = %#v", args)
+		}
+		return fakeRow{values: []any{trainRunID, "legacy", int64(3)}}
+	}}
+	router, err := NewRouter(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := router.ResolveReservationForOwner(context.Background(), reservationID, ownerUserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TrainRunID() != trainRunID || got.ShardID() != sharding.ShardLegacy || got.Generation().Int64() != 3 {
+		t.Fatalf("ResolveReservationForOwner() = %+v", got)
 	}
 }
 

@@ -19,20 +19,26 @@ type readRoutedTx interface {
 }
 
 type readShardRouter interface {
-	ResolveReservation(context.Context, uuid.UUID) (sharding.ShardRoute, error)
-	ResolveTicketOrder(context.Context, uuid.UUID) (sharding.ShardRoute, error)
+	ResolveReservationForOwner(context.Context, uuid.UUID, uuid.UUID) (sharding.ShardRoute, error)
+	ResolveTicketOrderForOwner(context.Context, uuid.UUID, uuid.UUID) (sharding.ShardRoute, error)
 	RefreshTrainRun(context.Context, uuid.UUID) (sharding.ShardRoute, error)
 	BeginTrainRunRead(context.Context, sharding.ShardRoute) (readRoutedTx, error)
 }
 
 type readRouterAdapter struct{ router *shardingpostgres.Router }
 
-func (adapter readRouterAdapter) ResolveReservation(ctx context.Context, id uuid.UUID) (sharding.ShardRoute, error) {
-	return adapter.router.ResolveReservation(ctx, id)
+func (adapter readRouterAdapter) ResolveReservationForOwner(
+	ctx context.Context,
+	id, ownerUserID uuid.UUID,
+) (sharding.ShardRoute, error) {
+	return adapter.router.ResolveReservationForOwner(ctx, id, ownerUserID)
 }
 
-func (adapter readRouterAdapter) ResolveTicketOrder(ctx context.Context, id uuid.UUID) (sharding.ShardRoute, error) {
-	return adapter.router.ResolveTicketOrder(ctx, id)
+func (adapter readRouterAdapter) ResolveTicketOrderForOwner(
+	ctx context.Context,
+	id, ownerUserID uuid.UUID,
+) (sharding.ShardRoute, error) {
+	return adapter.router.ResolveTicketOrderForOwner(ctx, id, ownerUserID)
 }
 
 func (adapter readRouterAdapter) RefreshTrainRun(ctx context.Context, id uuid.UUID) (sharding.ShardRoute, error) {
@@ -50,22 +56,28 @@ func NewShardedPostgresReads(pool *pgxpool.Pool, router *shardingpostgres.Router
 	return &PostgresReads{pool: pool, shards: readRouterAdapter{router: router}}, nil
 }
 
-func (reads *PostgresReads) beginReservationRead(ctx context.Context, reservationID uuid.UUID) (readRoutedTx, error) {
-	if reads == nil || reads.shards == nil || reservationID == uuid.Nil {
+func (reads *PostgresReads) beginReservationRead(
+	ctx context.Context,
+	reservationID, ownerUserID uuid.UUID,
+) (readRoutedTx, error) {
+	if reads == nil || reads.shards == nil || reservationID == uuid.Nil || ownerUserID == uuid.Nil {
 		return nil, sharding.ErrShardUnavailable
 	}
-	route, err := reads.shards.ResolveReservation(ctx, reservationID)
+	route, err := reads.shards.ResolveReservationForOwner(ctx, reservationID, ownerUserID)
 	if err != nil {
 		return nil, err
 	}
 	return reads.beginResolvedRead(ctx, route)
 }
 
-func (reads *PostgresReads) beginTicketOrderRead(ctx context.Context, orderID uuid.UUID) (readRoutedTx, error) {
-	if reads == nil || reads.shards == nil || orderID == uuid.Nil {
+func (reads *PostgresReads) beginTicketOrderRead(
+	ctx context.Context,
+	orderID, ownerUserID uuid.UUID,
+) (readRoutedTx, error) {
+	if reads == nil || reads.shards == nil || orderID == uuid.Nil || ownerUserID == uuid.Nil {
 		return nil, sharding.ErrShardUnavailable
 	}
-	route, err := reads.shards.ResolveTicketOrder(ctx, orderID)
+	route, err := reads.shards.ResolveTicketOrderForOwner(ctx, orderID, ownerUserID)
 	if err != nil {
 		return nil, err
 	}

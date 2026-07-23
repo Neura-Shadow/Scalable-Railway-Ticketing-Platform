@@ -17,6 +17,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+. (Join-Path $PSScriptRoot 'milestone-4-evidence-guardrails.ps1')
+
 $root = Split-Path -Parent $PSScriptRoot
 $composeFile = Join-Path $root 'docker-compose.multi-replica.yml'
 $fixtureFile = Join-Path $root 'loadtest/fixtures/milestone-2-multi-replica.sql'
@@ -30,21 +32,9 @@ if ($ProjectName -notmatch '^[a-z0-9][a-z0-9_-]{2,62}$') {
 if ([string]::IsNullOrWhiteSpace($EvidenceDirectory)) {
     $EvidenceDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "railway-m4-evidence-$suffix"
 }
-$EvidenceDirectory = [System.IO.Path]::GetFullPath($EvidenceDirectory)
-$repositoryPath = [System.IO.Path]::GetFullPath($root).TrimEnd('\', '/')
-$isWindowsHost = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
-    [System.Runtime.InteropServices.OSPlatform]::Windows
-)
-$comparison = if ($isWindowsHost) {
-    [StringComparison]::OrdinalIgnoreCase
-} else {
-    [StringComparison]::Ordinal
-}
-if ($EvidenceDirectory.Equals($repositoryPath, $comparison) -or
-    $EvidenceDirectory.StartsWith($repositoryPath + [System.IO.Path]::DirectorySeparatorChar, $comparison)) {
-    throw 'EvidenceDirectory must be outside the repository'
-}
-New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+$repositoryPath = [System.IO.Path]::GetFullPath($root)
+$EvidenceDirectory = New-Milestone4EvidenceDirectory `
+    -EvidenceDirectory $EvidenceDirectory -RepositoryPath $repositoryPath
 
 $compose = @('compose', '-p', $ProjectName, '-f', $composeFile)
 $fixtureTrainA = '21000000-0000-4000-8000-000000000401'
@@ -96,7 +86,10 @@ function Invoke-Native {
     $previous = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $output = & $Command 2>&1
+        # Windows PowerShell represents native stderr as ErrorRecord objects.
+        # Convert them while the preference is non-terminating so normal Docker
+        # progress output cannot be re-thrown when the captured result is read.
+        $output = @(& $Command 2>&1 | ForEach-Object { [string]$_ })
         $exitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previous
@@ -449,6 +442,10 @@ try {
         throw 'Docker Compose v2 is unavailable'
     }
 
+    Assert-Milestone4ComposeProjectUnused -ProjectName $ProjectName -DockerInvoker {
+        param([string[]]$DockerArguments)
+        Invoke-Native -AllowFailure -Command { & docker @DockerArguments }
+    }
     $started = $true
     Invoke-Compose -Arguments @('up', '-d', '--build') `
         -CapturePath (Join-Path $EvidenceDirectory 'compose-up.log') | Out-Null

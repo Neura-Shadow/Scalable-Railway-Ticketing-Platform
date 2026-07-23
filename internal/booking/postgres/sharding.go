@@ -24,6 +24,7 @@ type bookingShardRouter interface {
 	ResolveTrainRun(context.Context, uuid.UUID) (sharding.ShardRoute, error)
 	RefreshTrainRun(context.Context, uuid.UUID) (sharding.ShardRoute, error)
 	ResolveReservation(context.Context, uuid.UUID) (sharding.ShardRoute, error)
+	ResolveReservationForOwner(context.Context, uuid.UUID, uuid.UUID) (sharding.ShardRoute, error)
 	BeginTrainRunWrite(context.Context, sharding.ShardRoute) (bookingRoutedTx, error)
 	BeginTrainRunRead(context.Context, sharding.ShardRoute) (bookingRoutedTx, error)
 	ListEnabledShards(context.Context) ([]sharding.ShardID, error)
@@ -41,6 +42,13 @@ func (adapter bookingRouterAdapter) RefreshTrainRun(ctx context.Context, id uuid
 
 func (adapter bookingRouterAdapter) ResolveReservation(ctx context.Context, id uuid.UUID) (sharding.ShardRoute, error) {
 	return adapter.router.ResolveReservation(ctx, id)
+}
+
+func (adapter bookingRouterAdapter) ResolveReservationForOwner(
+	ctx context.Context,
+	id, ownerUserID uuid.UUID,
+) (sharding.ShardRoute, error) {
+	return adapter.router.ResolveReservationForOwner(ctx, id, ownerUserID)
 }
 
 func (adapter bookingRouterAdapter) BeginTrainRunWrite(ctx context.Context, route sharding.ShardRoute) (bookingRoutedTx, error) {
@@ -94,7 +102,18 @@ func (s *Store) beginCreateHoldTransaction(ctx context.Context, trainRunID uuid.
 	return s.Begin(ctx)
 }
 
-func (s *Store) beginReservationWrite(ctx context.Context, reservationID uuid.UUID) (*Tx, error) {
+func (s *Store) beginReservationWrite(ctx context.Context, reservationID, ownerUserID uuid.UUID) (*Tx, error) {
+	if s == nil || s.shards == nil || reservationID == uuid.Nil || ownerUserID == uuid.Nil {
+		return nil, ErrInvalidArgument
+	}
+	route, err := s.shards.ResolveReservationForOwner(ctx, reservationID, ownerUserID)
+	if err != nil {
+		return nil, err
+	}
+	return s.beginResolvedWrite(ctx, route)
+}
+
+func (s *Store) beginReservationMaintenanceWrite(ctx context.Context, reservationID uuid.UUID) (*Tx, error) {
 	if s == nil || s.shards == nil || reservationID == uuid.Nil {
 		return nil, ErrInvalidArgument
 	}
@@ -105,9 +124,12 @@ func (s *Store) beginReservationWrite(ctx context.Context, reservationID uuid.UU
 	return s.beginResolvedWrite(ctx, route)
 }
 
-func (s *Store) beginReservationCommandTransaction(ctx context.Context, reservationID uuid.UUID) (*Tx, error) {
+func (s *Store) beginReservationCommandTransaction(
+	ctx context.Context,
+	reservationID, ownerUserID uuid.UUID,
+) (*Tx, error) {
 	if s != nil && s.shards != nil {
-		return s.beginReservationWrite(ctx, reservationID)
+		return s.beginReservationWrite(ctx, reservationID, ownerUserID)
 	}
 	return s.Begin(ctx)
 }
@@ -138,11 +160,11 @@ func (s *Store) beginTrainRunRead(ctx context.Context, trainRunID uuid.UUID) (*T
 	return s.beginResolvedRead(ctx, route)
 }
 
-func (s *Store) beginReservationRead(ctx context.Context, reservationID uuid.UUID) (*Tx, error) {
-	if s == nil || s.shards == nil || reservationID == uuid.Nil {
+func (s *Store) beginReservationRead(ctx context.Context, reservationID, ownerUserID uuid.UUID) (*Tx, error) {
+	if s == nil || s.shards == nil || reservationID == uuid.Nil || ownerUserID == uuid.Nil {
 		return nil, ErrInvalidArgument
 	}
-	route, err := s.shards.ResolveReservation(ctx, reservationID)
+	route, err := s.shards.ResolveReservationForOwner(ctx, reservationID, ownerUserID)
 	if err != nil {
 		return nil, err
 	}

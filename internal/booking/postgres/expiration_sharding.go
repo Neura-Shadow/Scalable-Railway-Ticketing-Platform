@@ -77,7 +77,12 @@ func (s *Store) findDueReservationOnShard(
 		excludedStrings[index] = id.String()
 	}
 	var reservationID uuid.UUID
-	if err := s.pool.QueryRow(ctx, query, excludedStrings).Scan(&reservationID); err != nil {
+	if err := s.pool.QueryRow(
+		ctx,
+		query,
+		excludedStrings,
+		sharding.SupportedFencingProtocolVersion,
+	).Scan(&reservationID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return uuid.Nil, false, nil
 		}
@@ -87,7 +92,7 @@ func (s *Store) findDueReservationOnShard(
 }
 
 func (s *Store) expireLocatedReservation(ctx context.Context, reservationID uuid.UUID) (bool, error) {
-	tx, err := s.beginReservationWrite(ctx, reservationID)
+	tx, err := s.beginReservationMaintenanceWrite(ctx, reservationID)
 	if err != nil {
 		return false, err
 	}
@@ -184,18 +189,34 @@ WHERE claim.user_id = expired.user_id
 
 func dueReservationQuery(shardID sharding.ShardID) (string, bool) {
 	const suffix = `
-WHERE status = 'held'
-  AND expires_at <= clock_timestamp()
-  AND NOT (id = ANY($1::uuid[]))
-ORDER BY expires_at, id
+JOIN public.reservation_shard_locators AS locator
+  ON locator.reservation_id = reservation.id
+ AND locator.train_run_id = reservation.train_run_id
+JOIN public.train_run_shard_assignments AS assignment
+  ON assignment.train_run_id = locator.train_run_id
+ AND assignment.shard_id = locator.shard_id
+ AND assignment.assignment_generation = locator.assignment_generation
+JOIN public.booking_shards AS catalog
+  ON catalog.shard_id = locator.shard_id
+WHERE reservation.status = 'held'
+  AND reservation.expires_at <= clock_timestamp()
+  AND NOT (reservation.id = ANY($1::uuid[]))
+  AND assignment.assignment_state IN ('stable', 'rollback_window')
+  AND catalog.enabled
+  AND catalog.write_enabled
+  AND catalog.state IN ('active', 'draining')
+  AND catalog.minimum_fencing_protocol_version <= $2
+  AND locator.shard_id = `
+	const order = `
+ORDER BY reservation.expires_at, reservation.id
 LIMIT 1`
 	switch shardID {
 	case sharding.ShardLegacy:
-		return "SELECT id FROM public.reservations" + suffix, true
+		return "SELECT reservation.id FROM public.reservations AS reservation" + suffix + "'legacy'" + order, true
 	case sharding.ShardZero:
-		return "SELECT id FROM booking_shard_0.reservations" + suffix, true
+		return "SELECT reservation.id FROM booking_shard_0.reservations AS reservation" + suffix + "'shard-0'" + order, true
 	case sharding.ShardOne:
-		return "SELECT id FROM booking_shard_1.reservations" + suffix, true
+		return "SELECT reservation.id FROM booking_shard_1.reservations AS reservation" + suffix + "'shard-1'" + order, true
 	default:
 		return "", false
 	}

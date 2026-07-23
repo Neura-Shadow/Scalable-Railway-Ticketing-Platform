@@ -29,7 +29,6 @@ export function legacy() {
   check(response, { 'legacy shard remains healthy': availabilityCountIsValid });
   sleep(0.1);
 }
-
 export function schema() {
   const response = readAvailability(baseURL(), required('SCHEMA_TRAIN_RUN_ID'), {
     operation: 'schema_shard_availability', trend: schemaDuration,
@@ -37,4 +36,3 @@ export function schema() {
   check(response, { 'schema shard remains healthy': availabilityCountIsValid });
   sleep(0.1);
 }
-

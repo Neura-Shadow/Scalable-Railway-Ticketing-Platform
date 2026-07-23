@@ -268,7 +268,7 @@ func (s *Store) ConfirmReservation(ctx context.Context, params ReservationComman
 	if err := validateReservationCommandParams(params); err != nil {
 		return ConfirmReservationResult{}, err
 	}
-	tx, err := s.beginReservationCommandTransaction(ctx, params.ReservationID)
+	tx, err := s.beginReservationCommandTransaction(ctx, params.ReservationID, params.UserID)
 	if err != nil {
 		return ConfirmReservationResult{}, err
 	}
@@ -396,7 +396,7 @@ func (s *Store) CancelReservation(ctx context.Context, params ReservationCommand
 	if err := validateReservationCommandParams(params); err != nil {
 		return CancelReservationResult{}, err
 	}
-	tx, err := s.beginReservationCommandTransaction(ctx, params.ReservationID)
+	tx, err := s.beginReservationCommandTransaction(ctx, params.ReservationID, params.UserID)
 	if err != nil {
 		return CancelReservationResult{}, err
 	}
@@ -615,7 +615,7 @@ func (s *Store) GetReservation(ctx context.Context, userID, reservationID uuid.U
 		err    error
 	)
 	if s.shards != nil {
-		tx, err = s.beginReservationRead(ctx, reservationID)
+		tx, err = s.beginReservationRead(ctx, reservationID, userID)
 		if err != nil {
 			if errors.Is(err, sharding.ErrLocatorNotFound) {
 				return ReservationRecord{}, ErrNotFound

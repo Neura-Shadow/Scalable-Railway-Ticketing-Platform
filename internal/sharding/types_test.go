@@ -1,6 +1,8 @@
 package sharding_test
 
 import (
+	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
@@ -32,6 +34,22 @@ func TestParseShardIDAcceptsOnlyFixedMilestoneFourTopology(t *testing.T) {
 				t.Fatalf("ParseShardID(%q) unexpectedly succeeded", raw)
 			}
 		})
+	}
+}
+
+func TestParseShardIDsPreservesOneBoundedUniqueSubset(t *testing.T) {
+	got, err := sharding.ParseShardIDs([]string{"legacy", "shard-1"})
+	if err != nil {
+		t.Fatalf("ParseShardIDs() error = %v", err)
+	}
+	want := []sharding.ShardID{sharding.ShardLegacy, sharding.ShardOne}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ParseShardIDs() = %#v, want %#v", got, want)
+	}
+	for _, input := range [][]string{nil, {}, {"legacy", "legacy"}, {"legacy", "shard-2"}, {"legacy", "shard-0", "shard-1", "legacy"}} {
+		if _, err := sharding.ParseShardIDs(input); !errors.Is(err, sharding.ErrInvalidShardID) {
+			t.Fatalf("ParseShardIDs(%q) error = %v, want %v", input, err, sharding.ErrInvalidShardID)
+		}
 	}
 }
 

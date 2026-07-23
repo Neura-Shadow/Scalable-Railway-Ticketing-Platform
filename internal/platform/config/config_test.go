@@ -61,24 +61,19 @@ func TestLoadFromForParsesSchemaPOCBookingShardControls(t *testing.T) {
 	t.Parallel()
 
 	env := map[string]string{
-		"APP_ENV":                                   "test",
-		"DATABASE_URL":                              "postgres://api@db.example/railway",
-		"REDIS_ADDRESS":                             "redis.example:6379",
-		"JWT_SECRET":                                "test-secret",
-		"ADMISSION_TOKEN_KEYRING":                   testAdmissionKeyring,
-		"ADMISSION_TOKEN_ISSUE_KEY_ID":              "current",
-		"ADMISSION_TOKEN_ACCEPT_KEY_IDS":            "current",
-		"BOOKING_SHARD_MODE":                        "schema_poc",
-		"BOOKING_SHARD_IDS":                         "legacy, shard-0, shard-1",
-		"BOOKING_ROUTE_CACHE_ENABLED":               "false",
-		"BOOKING_ROUTE_CACHE_TTL_SECONDS":           "25",
-		"BOOKING_ROUTE_CACHE_MAX_ENTRIES":           "200",
-		"BOOKING_SHARD_QUERY_TIMEOUT":               "750ms",
-		"BOOKING_SHARD_FANOUT_CONCURRENCY":          "3",
-		"BOOKING_SHARD_FANOUT_TIMEOUT":              "2s",
-		"BOOKING_MIGRATION_BATCH_SIZE":              "40",
-		"BOOKING_MIGRATION_QUIESCE_TIMEOUT":         "45s",
-		"BOOKING_MIGRATION_ROLLBACK_WINDOW_SECONDS": "180",
+		"APP_ENV":                         "test",
+		"DATABASE_URL":                    "postgres://api@db.example/railway",
+		"REDIS_ADDRESS":                   "redis.example:6379",
+		"JWT_SECRET":                      "test-secret",
+		"ADMISSION_TOKEN_KEYRING":         testAdmissionKeyring,
+		"ADMISSION_TOKEN_ISSUE_KEY_ID":    "current",
+		"ADMISSION_TOKEN_ACCEPT_KEY_IDS":  "current",
+		"BOOKING_SHARD_MODE":              "schema_poc",
+		"BOOKING_SHARD_IDS":               "legacy, shard-0, shard-1",
+		"BOOKING_ROUTE_CACHE_ENABLED":     "false",
+		"BOOKING_ROUTE_CACHE_TTL_SECONDS": "25",
+		"BOOKING_ROUTE_CACHE_MAX_ENTRIES": "200",
+		"BOOKING_SHARD_QUERY_TIMEOUT":     "750ms",
 	}
 
 	cfg, err := config.LoadFromFor(func(key string) (string, bool) {
@@ -91,10 +86,7 @@ func TestLoadFromForParsesSchemaPOCBookingShardControls(t *testing.T) {
 	if cfg.BookingShardMode != config.BookingShardModeSchemaPOC ||
 		!reflect.DeepEqual(cfg.BookingShardIDs, []string{"legacy", "shard-0", "shard-1"}) ||
 		cfg.BookingRouteCacheEnabled || cfg.BookingRouteCacheTTL != 25*time.Second ||
-		cfg.BookingRouteCacheMaxEntries != 200 || cfg.BookingShardQueryTimeout != 750*time.Millisecond ||
-		cfg.BookingShardFanoutConcurrency != 3 || cfg.BookingShardFanoutTimeout != 2*time.Second ||
-		cfg.BookingMigrationBatchSize != 40 || cfg.BookingMigrationQuiesceTimeout != 45*time.Second ||
-		cfg.BookingMigrationRollbackWindow != 180*time.Second {
+		cfg.BookingRouteCacheMaxEntries != 200 || cfg.BookingShardQueryTimeout != 750*time.Millisecond {
 		t.Fatalf("booking shard controls = %+v", cfg)
 	}
 }
@@ -158,16 +150,6 @@ func TestLoadFromForRejectsUnsafeBookingShardControls(t *testing.T) {
 			name: "query timeout not positive",
 			set:  map[string]string{"BOOKING_SHARD_QUERY_TIMEOUT": "0s"},
 			want: "BOOKING_SHARD_QUERY_TIMEOUT",
-		},
-		{
-			name: "fanout concurrency beyond bounded maximum",
-			set:  map[string]string{"BOOKING_SHARD_FANOUT_CONCURRENCY": "17"},
-			want: "BOOKING_SHARD_FANOUT_CONCURRENCY",
-		},
-		{
-			name: "migration batch beyond bounded maximum",
-			set:  map[string]string{"BOOKING_MIGRATION_BATCH_SIZE": "10001"},
-			want: "BOOKING_MIGRATION_BATCH_SIZE",
 		},
 	}
 

@@ -15,6 +15,50 @@ VALUES (
     'Legacy Compatibility Passenger'
 );
 
+-- A schema-aware legacy writer acquires the global key claim before its
+-- shard-local insert. The compatibility trigger must bind only the exact
+-- placeholder owned by that routed transaction.
+INSERT INTO public.booking_idempotency_key_claims (
+    user_id, operation, key_hash, request_fingerprint, train_run_id,
+    shard_id, assignment_generation, local_record_id, expires_at
+) VALUES (
+    '11111111-1111-4111-8111-111111111111',
+    'reservation.create', decode(repeat('b0', 32), 'hex'),
+    decode(repeat('a0', 32), 'hex'),
+    '66666666-6666-4666-8666-666666666666',
+    'legacy', 1, NULL, '2099-01-01 00:00:00+00'
+);
+
+INSERT INTO public.idempotency_records (
+    id, user_id, operation, key_hash, request_fingerprint, status,
+    expires_at, train_run_id
+) VALUES (
+    'e4000000-0000-4000-8000-000000000001',
+    '11111111-1111-4111-8111-111111111111',
+    'reservation.create', decode(repeat('b0', 32), 'hex'),
+    decode(repeat('a0', 32), 'hex'), 'in_progress',
+    '2099-01-01 00:00:00+00',
+    '66666666-6666-4666-8666-666666666666'
+);
+
+DO $assert$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM public.booking_idempotency_key_claims
+        WHERE user_id = '11111111-1111-4111-8111-111111111111'
+          AND operation = 'reservation.create'
+          AND key_hash = decode(repeat('b0', 32), 'hex')
+          AND local_record_id = 'e4000000-0000-4000-8000-000000000001'
+          AND train_run_id = '66666666-6666-4666-8666-666666666666'
+          AND shard_id = 'legacy'
+          AND assignment_generation = 1
+    ) THEN
+        RAISE EXCEPTION 'routed legacy key placeholder was not bound';
+    END IF;
+END
+$assert$;
+
 INSERT INTO public.seat_inventory (
     train_run_id, segment_count, seat_id, seat_class, occupied_segments,
     version

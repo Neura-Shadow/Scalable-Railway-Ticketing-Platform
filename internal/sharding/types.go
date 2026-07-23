@@ -40,6 +40,28 @@ func ParseShardID(raw string) (ShardID, error) {
 	}
 }
 
+// ParseShardIDs converts one bounded configured subset into opaque logical
+// identities. Ordering is preserved for deterministic worker traversal.
+func ParseShardIDs(raw []string) ([]ShardID, error) {
+	if len(raw) == 0 || len(raw) > 3 {
+		return nil, ErrInvalidShardID
+	}
+	result := make([]ShardID, 0, len(raw))
+	seen := make(map[ShardID]struct{}, len(raw))
+	for _, value := range raw {
+		id, err := ParseShardID(value)
+		if err != nil {
+			return nil, err
+		}
+		if _, duplicate := seen[id]; duplicate {
+			return nil, ErrInvalidShardID
+		}
+		seen[id] = struct{}{}
+		result = append(result, id)
+	}
+	return result, nil
+}
+
 func (id ShardID) String() string { return string(id) }
 
 // AssignmentGeneration is a positive, monotonically increasing fencing value.

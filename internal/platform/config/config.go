@@ -51,14 +51,9 @@ const (
 	// Keep this process-boundary validation aligned with
 	// admissionredis.MaxAdmissionBatch. Config deliberately does not import an
 	// infrastructure adapter solely to share a constant.
-	maxAdmissionWorkerBatchSize       = 1_000
-	maxBookingRouteCacheEntries       = 100_000
-	maxBookingShardQueryTimeout       = 30 * time.Second
-	maxBookingShardFanoutConcurrency  = 16
-	maxBookingShardFanoutTimeout      = time.Minute
-	maxBookingMigrationBatchSize      = 10_000
-	maxBookingMigrationQuiesceTimeout = 5 * time.Minute
-	maxBookingMigrationRollbackWindow = 24 * time.Hour
+	maxAdmissionWorkerBatchSize = 1_000
+	maxBookingRouteCacheEntries = 100_000
+	maxBookingShardQueryTimeout = 30 * time.Second
 )
 
 // Config contains the typed runtime settings used by the application and its
@@ -76,11 +71,6 @@ type Config struct {
 	BookingRouteCacheTTL                   time.Duration
 	BookingRouteCacheMaxEntries            int
 	BookingShardQueryTimeout               time.Duration
-	BookingShardFanoutConcurrency          int
-	BookingShardFanoutTimeout              time.Duration
-	BookingMigrationBatchSize              int
-	BookingMigrationQuiesceTimeout         time.Duration
-	BookingMigrationRollbackWindow         time.Duration
 
 	HTTPAddress   string
 	DatabaseURL   string
@@ -160,27 +150,22 @@ type LookupFunc func(key string) (string, bool)
 // invent credentials, secrets, or dependency addresses.
 func Defaults() Config {
 	return Config{
-		Environment:                                 EnvironmentDevelopment,
-		BookingShardMode:                            BookingShardModeLegacy,
-		BookingShardIDs:                             []string{"legacy"},
-		BookingRouteCacheEnabled:                    true,
-		BookingRouteCacheTTL:                        30 * time.Second,
-		BookingRouteCacheMaxEntries:                 1_000,
-		BookingShardQueryTimeout:                    2 * time.Second,
-		BookingShardFanoutConcurrency:               4,
-		BookingShardFanoutTimeout:                   5 * time.Second,
-		BookingMigrationBatchSize:                   100,
-		BookingMigrationQuiesceTimeout:              30 * time.Second,
-		BookingMigrationRollbackWindow:              5 * time.Minute,
-		HTTPAddress:                                 ":8080",
-		JWTIssuer:                                   "scalable-railway-ticketing-platform",
-		JWTAudience:                                 "railway-api",
-		AccessTokenTTL:                              15 * time.Minute,
-		RefreshTokenTTL:                             7 * 24 * time.Hour,
-		BcryptCost:                                  12,
-		HoldTTL:                                     10 * time.Minute,
-		MaxPassengersPerReservation:                 6,
-		ReservationMaxActiveHoldsPerUser:            10,
+		Environment:                      EnvironmentDevelopment,
+		BookingShardMode:                 BookingShardModeLegacy,
+		BookingShardIDs:                  []string{"legacy"},
+		BookingRouteCacheEnabled:         true,
+		BookingRouteCacheTTL:             30 * time.Second,
+		BookingRouteCacheMaxEntries:      1_000,
+		BookingShardQueryTimeout:         2 * time.Second,
+		HTTPAddress:                      ":8080",
+		JWTIssuer:                        "scalable-railway-ticketing-platform",
+		JWTAudience:                      "railway-api",
+		AccessTokenTTL:                   15 * time.Minute,
+		RefreshTokenTTL:                  7 * 24 * time.Hour,
+		BcryptCost:                       12,
+		HoldTTL:                          10 * time.Minute,
+		MaxPassengersPerReservation:      6,
+		ReservationMaxActiveHoldsPerUser: 10,
 		ReservationMaxActiveHoldsPerUserPerTrainRun: 3,
 		ReservationMaxActivePassengersPerUser:       24,
 		ReservationMaxInflightPerInstance:           32,
@@ -269,11 +254,6 @@ func (c Config) ValidateFor(process Process) error {
 		validationCheck{"BOOKING_ROUTE_CACHE_TTL_SECONDS", c.BookingRouteCacheTTL > 0 && c.BookingRouteCacheTTL <= 24*time.Hour},
 		validationCheck{"BOOKING_ROUTE_CACHE_MAX_ENTRIES", positiveBounded(c.BookingRouteCacheMaxEntries, maxBookingRouteCacheEntries)},
 		validationCheck{"BOOKING_SHARD_QUERY_TIMEOUT", c.BookingShardQueryTimeout > 0 && c.BookingShardQueryTimeout <= maxBookingShardQueryTimeout},
-		validationCheck{"BOOKING_SHARD_FANOUT_CONCURRENCY", positiveBounded(c.BookingShardFanoutConcurrency, maxBookingShardFanoutConcurrency)},
-		validationCheck{"BOOKING_SHARD_FANOUT_TIMEOUT", c.BookingShardFanoutTimeout > 0 && c.BookingShardFanoutTimeout <= maxBookingShardFanoutTimeout},
-		validationCheck{"BOOKING_MIGRATION_BATCH_SIZE", positiveBounded(c.BookingMigrationBatchSize, maxBookingMigrationBatchSize)},
-		validationCheck{"BOOKING_MIGRATION_QUIESCE_TIMEOUT", c.BookingMigrationQuiesceTimeout > 0 && c.BookingMigrationQuiesceTimeout <= maxBookingMigrationQuiesceTimeout},
-		validationCheck{"BOOKING_MIGRATION_ROLLBACK_WINDOW_SECONDS", c.BookingMigrationRollbackWindow > 0 && c.BookingMigrationRollbackWindow <= maxBookingMigrationRollbackWindow},
 	)
 	if err := validateBookingShardConfig(c); err != nil {
 		problems = append(problems, err)
@@ -705,8 +685,6 @@ func loadBookingShardSettings(lookup LookupFunc, cfg *Config) error {
 		target *int
 	}{
 		{"BOOKING_ROUTE_CACHE_MAX_ENTRIES", &cfg.BookingRouteCacheMaxEntries},
-		{"BOOKING_SHARD_FANOUT_CONCURRENCY", &cfg.BookingShardFanoutConcurrency},
-		{"BOOKING_MIGRATION_BATCH_SIZE", &cfg.BookingMigrationBatchSize},
 	} {
 		if err := setInt(lookup, item.name, item.target); err != nil {
 			return err
@@ -715,19 +693,7 @@ func loadBookingShardSettings(lookup LookupFunc, cfg *Config) error {
 	if err := setSeconds(lookup, "BOOKING_ROUTE_CACHE_TTL_SECONDS", &cfg.BookingRouteCacheTTL); err != nil {
 		return err
 	}
-	for _, item := range []struct {
-		name   string
-		target *time.Duration
-	}{
-		{"BOOKING_SHARD_QUERY_TIMEOUT", &cfg.BookingShardQueryTimeout},
-		{"BOOKING_SHARD_FANOUT_TIMEOUT", &cfg.BookingShardFanoutTimeout},
-		{"BOOKING_MIGRATION_QUIESCE_TIMEOUT", &cfg.BookingMigrationQuiesceTimeout},
-	} {
-		if err := setDuration(lookup, item.name, item.target); err != nil {
-			return err
-		}
-	}
-	return setSeconds(lookup, "BOOKING_MIGRATION_ROLLBACK_WINDOW_SECONDS", &cfg.BookingMigrationRollbackWindow)
+	return setDuration(lookup, "BOOKING_SHARD_QUERY_TIMEOUT", &cfg.BookingShardQueryTimeout)
 }
 
 func validateBookingShardConfig(c Config) error {

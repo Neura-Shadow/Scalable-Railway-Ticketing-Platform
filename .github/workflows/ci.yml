@@ -77,6 +77,9 @@ jobs:
         run: |
           go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
           actionlint .github/workflows/*.yml
+      - name: Milestone 4 evidence guardrail regression tests
+        shell: pwsh
+        run: ./scripts/test-milestone-4-evidence-guardrails.ps1
       - name: Gitleaks
         run: go run github.com/zricethezav/gitleaks/v8@v8.30.1 git --no-banner --redact
       - name: Trivy filesystem scan
@@ -202,6 +205,32 @@ jobs:
             --file migrations/testdata/assert_milestone4_v8_legacy_compatibility.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone4_v8_guards.sql
+      - name: Verify Milestone 4 down fails closed on unmanaged dependencies
+        shell: bash
+        run: |
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --command 'CREATE VIEW public.milestone4_cross_schema_down_guard AS SELECT train_run_id FROM booking_shard_1.seat_inventory'
+          if psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/000008_train_run_sharding.down.sql; then
+            echo 'Milestone 4 down unexpectedly removed a cross-schema dependency'
+            exit 1
+          fi
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone4_v8_down_failure_rollback.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --command 'DROP VIEW public.milestone4_cross_schema_down_guard'
+
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --command 'CREATE TABLE booking_shard_0.milestone4_unmanaged_down_guard (id bigint PRIMARY KEY)'
+          if psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/000008_train_run_sharding.down.sql; then
+            echo 'Milestone 4 down unexpectedly removed an unmanaged shard object'
+            exit 1
+          fi
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone4_v8_down_failure_rollback.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --command 'DROP TABLE booking_shard_0.milestone4_unmanaged_down_guard'
       - name: Rehearse Milestone 4 one-step down and up with populated data
         shell: bash
         run: |

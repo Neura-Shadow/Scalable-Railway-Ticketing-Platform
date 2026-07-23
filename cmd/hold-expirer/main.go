@@ -65,6 +65,11 @@ func main() {
 	defer shutdownWorkerHTTP(healthServer, cfg.ShutdownTimeout)
 	bookingStore := bookingpostgres.New(pool)
 	if cfg.BookingShardMode == config.BookingShardModeSchemaPOC {
+		allowedShards, parseErr := sharding.ParseShardIDs(cfg.BookingShardIDs)
+		if parseErr != nil {
+			logger.Error("hold expirer shard allowlist initialization failed")
+			os.Exit(1)
+		}
 		cache, cacheErr := routecache.New(routecache.Config{
 			Enabled: cfg.BookingRouteCacheEnabled, TTL: cfg.BookingRouteCacheTTL,
 			MaxEntries: cfg.BookingRouteCacheMaxEntries,
@@ -78,6 +83,7 @@ func main() {
 			cache,
 			shardingpostgres.WithMetrics(metrics),
 			shardingpostgres.WithQueryTimeout(cfg.BookingShardQueryTimeout),
+			shardingpostgres.WithAllowedShards(allowedShards...),
 		)
 		if routerErr != nil {
 			logger.Error("hold expirer shard router initialization failed")

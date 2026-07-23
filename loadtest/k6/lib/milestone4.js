@@ -22,7 +22,6 @@ export function required(name) {
   if (!value) throw new Error(`${name} is required`);
   return value;
 }
-
 export function positiveInteger(name, fallback) {
   const raw = (__ENV[name] || `${fallback}`).trim();
   const value = Number.parseInt(raw, 10);
@@ -198,4 +197,3 @@ export function availabilityCountIsValid(response) {
     return false;
   }
 }
-

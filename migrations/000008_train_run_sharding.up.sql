@@ -1774,9 +1774,25 @@ BEGIN
         updated_at = EXCLUDED.updated_at
     WHERE public.booking_idempotency_key_claims.expires_at <= clock_timestamp()
        OR (
-           public.booking_idempotency_key_claims.local_record_id = EXCLUDED.local_record_id
-           AND public.booking_idempotency_key_claims.request_fingerprint
-               = EXCLUDED.request_fingerprint
+            public.booking_idempotency_key_claims.local_record_id = EXCLUDED.local_record_id
+            AND public.booking_idempotency_key_claims.request_fingerprint
+                = EXCLUDED.request_fingerprint
+       )
+       OR (
+            -- A routed legacy writer acquires and locks the global claim
+            -- before inserting its local record. Permit only that exact
+            -- unbound placeholder to be completed by this compatibility
+            -- trigger; a different route, generation, or fingerprint remains
+            -- a conflict.
+            public.booking_idempotency_key_claims.local_record_id IS NULL
+            AND public.booking_idempotency_key_claims.request_fingerprint
+                = EXCLUDED.request_fingerprint
+            AND public.booking_idempotency_key_claims.train_run_id
+                = EXCLUDED.train_run_id
+            AND public.booking_idempotency_key_claims.shard_id
+                = EXCLUDED.shard_id
+            AND public.booking_idempotency_key_claims.assignment_generation
+                = EXCLUDED.assignment_generation
        )
     RETURNING id INTO synchronized_claim_id;
 

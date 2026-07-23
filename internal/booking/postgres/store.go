@@ -99,7 +99,15 @@ func (tx *Tx) Rollback(ctx context.Context) error {
 }
 
 func (s *Store) InitializeInventory(ctx context.Context, trainRunID uuid.UUID) (int64, error) {
-	tx, err := s.Begin(ctx)
+	var (
+		tx  *Tx
+		err error
+	)
+	if s != nil && s.shards != nil {
+		tx, err = s.beginTrainRunWrite(ctx, trainRunID)
+	} else {
+		tx, err = s.Begin(ctx)
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -108,6 +116,11 @@ func (s *Store) InitializeInventory(ctx context.Context, trainRunID uuid.UUID) (
 	inserted, err := tx.InitializeInventory(ctx, trainRunID)
 	if err != nil {
 		return 0, err
+	}
+	if inserted > 0 {
+		if err := tx.recordSuccessfulGenerationWrite(ctx); err != nil {
+			return 0, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err

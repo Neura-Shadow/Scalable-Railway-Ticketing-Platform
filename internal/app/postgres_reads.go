@@ -34,7 +34,7 @@ func (r *PostgresReads) GetReservationDetail(ctx context.Context, owner, reserva
 		err     error
 	)
 	if r.shards != nil {
-		tx, err = r.beginReservationRead(ctx, reservation)
+		tx, err = r.beginReservationRead(ctx, reservation, owner)
 		if err != nil {
 			if errors.Is(err, sharding.ErrLocatorNotFound) {
 				return ReservationDetail{}, ErrReadNotFound
@@ -161,7 +161,7 @@ func (r *PostgresReads) loadTickets(ctx context.Context, owner uuid.UUID, orderI
 		if parseErr != nil {
 			return nil, ErrReadNotFound
 		}
-		tx, err = r.beginTicketOrderRead(ctx, parsed)
+		tx, err = r.beginTicketOrderRead(ctx, parsed, owner)
 		if err != nil {
 			if errors.Is(err, sharding.ErrLocatorNotFound) {
 				return nil, ErrReadNotFound

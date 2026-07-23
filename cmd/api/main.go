@@ -25,6 +25,7 @@ import (
 	querycache "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/cache"
 	querypostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/postgres"
 	queryreadmodel "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/readmodel"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	shardingpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/postgres"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/routecache"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/transport/httpapi"
@@ -128,6 +129,10 @@ func run(logger *slog.Logger) error {
 	}
 	var shardRouter *shardingpostgres.Router
 	if cfg.BookingShardMode == config.BookingShardModeSchemaPOC {
+		allowedShards, parseErr := sharding.ParseShardIDs(cfg.BookingShardIDs)
+		if parseErr != nil {
+			return errors.New("booking shard allowlist initialization failed")
+		}
 		cache, cacheErr := routecache.New(routecache.Config{
 			Enabled: cfg.BookingRouteCacheEnabled, TTL: cfg.BookingRouteCacheTTL,
 			MaxEntries: cfg.BookingRouteCacheMaxEntries,
@@ -140,6 +145,7 @@ func run(logger *slog.Logger) error {
 			cache,
 			shardingpostgres.WithMetrics(metrics),
 			shardingpostgres.WithQueryTimeout(cfg.BookingShardQueryTimeout),
+			shardingpostgres.WithAllowedShards(allowedShards...),
 		)
 		if err != nil {
 			return errors.New("booking shard router initialization failed")

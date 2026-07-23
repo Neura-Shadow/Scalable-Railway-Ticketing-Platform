@@ -16,6 +16,24 @@ type migrationProbe func(context.Context) (int, bool, error)
 
 const currentSchemaVersion = 8
 
+const shardReadinessQuery = `
+SELECT
+    count(*) = 3
+    AND count(*) FILTER (WHERE
+        (shard_id = 'legacy' AND storage_kind = 'legacy')
+        OR (shard_id = 'shard-0' AND storage_kind = 'schema')
+        OR (shard_id = 'shard-1' AND storage_kind = 'schema')
+    ) = 3
+    AND to_regnamespace('booking_shard_0') IS NOT NULL
+    AND to_regnamespace('booking_shard_1') IS NOT NULL AS topology_valid,
+    count(*) FILTER (WHERE shard_id = ANY($2::text[])
+        AND enabled AND state IN ('active', 'draining')) AS serving_count,
+    count(*) FILTER (WHERE shard_id = ANY($2::text[])
+        AND enabled AND state IN ('active', 'draining')
+        AND minimum_fencing_protocol_version > $1) AS incompatible_serving_count
+FROM public.booking_shards
+WHERE shard_id IN ('legacy', 'shard-0', 'shard-1')`
+
 type ReadinessChecker struct {
 	postgres, redis, shards readinessProbe
 	migrations              migrationProbe
@@ -54,21 +72,12 @@ func NewReadinessChecker(pool *pgxpool.Pool, client redis.UniversalClient, cfg c
 		var topologyValid bool
 		var servingCount int
 		var incompatibleServingCount int
-		err := pool.QueryRow(ctx, `
-SELECT
-    count(*) = 3
-    AND count(*) FILTER (WHERE
-        (shard_id = 'legacy' AND storage_kind = 'legacy' AND schema_name = 'public')
-        OR (shard_id = 'shard-0' AND storage_kind = 'schema' AND schema_name = 'booking_shard_0')
-        OR (shard_id = 'shard-1' AND storage_kind = 'schema' AND schema_name = 'booking_shard_1')
-    ) = 3
-    AND to_regnamespace('booking_shard_0') IS NOT NULL
-    AND to_regnamespace('booking_shard_1') IS NOT NULL AS topology_valid,
-    count(*) FILTER (WHERE enabled AND state IN ('active', 'draining')) AS serving_count,
-    count(*) FILTER (WHERE enabled AND state IN ('active', 'draining')
-        AND minimum_fencing_protocol_version > $1) AS incompatible_serving_count
-FROM public.booking_shards
-WHERE shard_id IN ('legacy', 'shard-0', 'shard-1')`, sharding.SupportedFencingProtocolVersion).Scan(
+		err := pool.QueryRow(
+			ctx,
+			shardReadinessQuery,
+			sharding.SupportedFencingProtocolVersion,
+			cfg.BookingShardIDs,
+		).Scan(
 			&topologyValid,
 			&servingCount,
 			&incompatibleServingCount,

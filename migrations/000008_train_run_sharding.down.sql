@@ -131,8 +131,30 @@ DROP TABLE IF EXISTS public.reservation_shard_locators;
 DROP TABLE IF EXISTS public.reservation_quota_claims;
 DROP TABLE IF EXISTS public.booking_idempotency_key_claims;
 
-DROP SCHEMA IF EXISTS booking_shard_1 CASCADE;
-DROP SCHEMA IF EXISTS booking_shard_0 CASCADE;
+-- Remove only objects owned by this migration. Every DROP uses PostgreSQL's
+-- default RESTRICT behavior, so an unmanaged object or a dependency outside
+-- the logical shard aborts and rolls back the entire downgrade.
+DROP TABLE IF EXISTS booking_shard_1.tickets;
+DROP TABLE IF EXISTS booking_shard_1.ticket_orders;
+DROP TABLE IF EXISTS booking_shard_1.reservation_seats;
+DROP TABLE IF EXISTS booking_shard_1.reservations;
+DROP TABLE IF EXISTS booking_shard_1.seat_inventory;
+DROP TABLE IF EXISTS booking_shard_1.idempotency_records;
+DROP TABLE IF EXISTS booking_shard_1.train_run_write_fences;
+DROP FUNCTION IF EXISTS booking_shard_1.validate_reservation_seat();
+DROP FUNCTION IF EXISTS booking_shard_1.validate_inventory_seat_class();
+DROP SCHEMA IF EXISTS booking_shard_1 RESTRICT;
+
+DROP TABLE IF EXISTS booking_shard_0.tickets;
+DROP TABLE IF EXISTS booking_shard_0.ticket_orders;
+DROP TABLE IF EXISTS booking_shard_0.reservation_seats;
+DROP TABLE IF EXISTS booking_shard_0.reservations;
+DROP TABLE IF EXISTS booking_shard_0.seat_inventory;
+DROP TABLE IF EXISTS booking_shard_0.idempotency_records;
+DROP TABLE IF EXISTS booking_shard_0.train_run_write_fences;
+DROP FUNCTION IF EXISTS booking_shard_0.validate_reservation_seat();
+DROP FUNCTION IF EXISTS booking_shard_0.validate_inventory_seat_class();
+DROP SCHEMA IF EXISTS booking_shard_0 RESTRICT;
 
 ALTER TABLE public.train_run_shard_assignments
     DROP CONSTRAINT IF EXISTS train_run_shard_assignments_active_migration_fkey;

@@ -29,10 +29,27 @@ func (router *Router) ResolveReservation(ctx context.Context, reservationID uuid
 	if reservationID == uuid.Nil {
 		return sharding.ShardRoute{}, sharding.ErrLocatorNotFound
 	}
-	return router.resolveLocator(ctx, reservationID, `
+	return router.resolveLocator(ctx, `
 SELECT train_run_id, shard_id, assignment_generation
 FROM public.reservation_shard_locators
-WHERE reservation_id = $1`)
+WHERE reservation_id = $1`, reservationID)
+}
+
+// ResolveReservationForOwner performs the locator's early owner rejection.
+// Authoritative local storage still rechecks ownership inside the routed
+// transaction before returning or mutating protected state.
+func (router *Router) ResolveReservationForOwner(
+	ctx context.Context,
+	reservationID, ownerUserID uuid.UUID,
+) (sharding.ShardRoute, error) {
+	if reservationID == uuid.Nil || ownerUserID == uuid.Nil {
+		return sharding.ShardRoute{}, sharding.ErrLocatorNotFound
+	}
+	return router.resolveLocator(ctx, `
+SELECT train_run_id, shard_id, assignment_generation
+FROM public.reservation_shard_locators
+WHERE reservation_id = $1
+  AND owner_user_id = $2`, reservationID, ownerUserID)
 }
 
 // ResolveTicketOrder resolves one globally indexed order without shard fanout.
@@ -40,10 +57,26 @@ func (router *Router) ResolveTicketOrder(ctx context.Context, ticketOrderID uuid
 	if ticketOrderID == uuid.Nil {
 		return sharding.ShardRoute{}, sharding.ErrLocatorNotFound
 	}
-	return router.resolveLocator(ctx, ticketOrderID, `
+	return router.resolveLocator(ctx, `
 SELECT train_run_id, shard_id, assignment_generation
 FROM public.ticket_order_shard_locators
-WHERE ticket_order_id = $1`)
+WHERE ticket_order_id = $1`, ticketOrderID)
+}
+
+// ResolveTicketOrderForOwner rejects foreign resource IDs before touching a
+// shard. Local ticket-order reads retain their final owner predicate.
+func (router *Router) ResolveTicketOrderForOwner(
+	ctx context.Context,
+	ticketOrderID, ownerUserID uuid.UUID,
+) (sharding.ShardRoute, error) {
+	if ticketOrderID == uuid.Nil || ownerUserID == uuid.Nil {
+		return sharding.ShardRoute{}, sharding.ErrLocatorNotFound
+	}
+	return router.resolveLocator(ctx, `
+SELECT train_run_id, shard_id, assignment_generation
+FROM public.ticket_order_shard_locators
+WHERE ticket_order_id = $1
+  AND owner_user_id = $2`, ticketOrderID, ownerUserID)
 }
 
 // ResolveTicket resolves one globally indexed ticket without shard fanout.
@@ -51,13 +84,13 @@ func (router *Router) ResolveTicket(ctx context.Context, ticketID uuid.UUID) (sh
 	if ticketID == uuid.Nil {
 		return sharding.ShardRoute{}, sharding.ErrLocatorNotFound
 	}
-	return router.resolveLocator(ctx, ticketID, `
+	return router.resolveLocator(ctx, `
 SELECT train_run_id, shard_id, assignment_generation
 FROM public.ticket_shard_locators
-WHERE ticket_id = $1`)
+WHERE ticket_id = $1`, ticketID)
 }
 
-func (router *Router) resolveLocator(ctx context.Context, resourceID uuid.UUID, query string) (sharding.ShardRoute, error) {
+func (router *Router) resolveLocator(ctx context.Context, query string, arguments ...any) (sharding.ShardRoute, error) {
 	started := time.Now()
 	metricShardID := "unknown"
 	var resultErr error
@@ -71,7 +104,7 @@ func (router *Router) resolveLocator(ctx context.Context, resourceID uuid.UUID, 
 	var trainRunID uuid.UUID
 	var rawShardID string
 	var rawGeneration int64
-	if err := router.db.QueryRow(ctx, query, resourceID).Scan(&trainRunID, &rawShardID, &rawGeneration); err != nil {
+	if err := router.db.QueryRow(ctx, query, arguments...).Scan(&trainRunID, &rawShardID, &rawGeneration); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			resultErr = sharding.ErrLocatorNotFound
 			return sharding.ShardRoute{}, resultErr
@@ -80,7 +113,7 @@ func (router *Router) resolveLocator(ctx context.Context, resourceID uuid.UUID, 
 		return sharding.ShardRoute{}, resultErr
 	}
 	shardID, err := sharding.ParseShardID(rawShardID)
-	if err != nil {
+	if err != nil || !router.shardAllowed(shardID) {
 		resultErr = sharding.ErrShardUnavailable
 		return sharding.ShardRoute{}, resultErr
 	}
@@ -108,10 +141,12 @@ type RouteCache interface {
 
 // Router owns catalog lookups and all SQL schema selection.
 type Router struct {
-	db           DB
-	cache        RouteCache
-	metrics      Metrics
-	queryTimeout time.Duration
+	db             DB
+	cache          RouteCache
+	metrics        Metrics
+	queryTimeout   time.Duration
+	allowedShards  map[sharding.ShardID]struct{}
+	invalidOptions bool
 }
 
 func NewRouter(db DB, cache RouteCache, options ...Option) (*Router, error) {
@@ -121,13 +156,32 @@ func NewRouter(db DB, cache RouteCache, options ...Option) (*Router, error) {
 	if isNilInterface(cache) {
 		cache = nil
 	}
-	router := &Router{db: db, cache: cache}
+	router := &Router{
+		db:    db,
+		cache: cache,
+		allowedShards: map[sharding.ShardID]struct{}{
+			sharding.ShardLegacy: {},
+			sharding.ShardZero:   {},
+			sharding.ShardOne:    {},
+		},
+	}
 	for _, option := range options {
 		if option != nil {
 			option(router)
 		}
 	}
+	if router.invalidOptions || len(router.allowedShards) == 0 {
+		return nil, sharding.ErrShardUnavailable
+	}
 	return router, nil
+}
+
+func (router *Router) shardAllowed(shardID sharding.ShardID) bool {
+	if router == nil {
+		return false
+	}
+	_, allowed := router.allowedShards[shardID]
+	return allowed
 }
 
 func isNilInterface(value any) bool {
@@ -161,7 +215,7 @@ func (router *Router) ResolveTrainRun(ctx context.Context, trainRunID uuid.UUID)
 	defer cancel()
 	if router.cache != nil {
 		if route, ok := router.cache.Get(trainRunID); ok {
-			if validRoute(route) && route.TrainRunID() == trainRunID {
+			if validRoute(route) && route.TrainRunID() == trainRunID && router.shardAllowed(route.ShardID()) {
 				if router.metrics != nil {
 					router.metrics.RecordShardRouteCache("hit", "cache_hit", boundedShardID(route.ShardID()))
 				}
@@ -235,14 +289,20 @@ END`)
 			return nil, sharding.ErrShardUnavailable
 		}
 		shardID, err := sharding.ParseShardID(rawShardID)
-		if err != nil || len(result) == 3 || minimumFencingProtocolVersion <= 0 ||
-			minimumFencingProtocolVersion > sharding.SupportedFencingProtocolVersion {
+		if err != nil || len(seen) == 3 {
 			return nil, sharding.ErrShardUnavailable
 		}
 		if _, duplicate := seen[shardID]; duplicate {
 			return nil, sharding.ErrShardUnavailable
 		}
 		seen[shardID] = struct{}{}
+		if !router.shardAllowed(shardID) {
+			continue
+		}
+		if minimumFencingProtocolVersion <= 0 ||
+			minimumFencingProtocolVersion > sharding.SupportedFencingProtocolVersion {
+			return nil, sharding.ErrShardUnavailable
+		}
 		result = append(result, shardID)
 	}
 	if rows.Err() != nil || len(result) == 0 {
@@ -279,7 +339,7 @@ WHERE assignment.train_run_id = $1`, trainRunID).Scan(
 		return sharding.ShardRoute{}, sharding.ErrShardUnavailable
 	}
 	shardID, err := sharding.ParseShardID(rawShardID)
-	if err != nil {
+	if err != nil || !router.shardAllowed(shardID) {
 		return sharding.ShardRoute{}, sharding.ErrShardUnavailable
 	}
 	generation, err := sharding.NewAssignmentGeneration(rawGeneration)
