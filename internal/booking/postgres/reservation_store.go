@@ -113,7 +113,7 @@ func (s *Store) createHoldOnce(ctx context.Context, params CreateHoldParams) (Cr
 		ExpiresAt: params.IdempotencyExpiresAt,
 	})
 	if err != nil {
-		return CreateHoldResult{}, err
+		return CreateHoldResult{}, fmt.Errorf("acquire create-hold idempotency: %w", err)
 	}
 	if acquisition.Replayed {
 		result, err := tx.loadCreateHoldResult(ctx, params.UserID, acquisition.ResourceID)
@@ -127,10 +127,10 @@ func (s *Store) createHoldOnce(ctx context.Context, params CreateHoldParams) (Cr
 		return result, nil
 	}
 	if err := tx.recheckAdmissionPolicy(ctx, params.TrainRunID, seatClass, params.AdmissionPolicy); err != nil {
-		return CreateHoldResult{}, err
+		return CreateHoldResult{}, fmt.Errorf("recheck create-hold admission policy: %w", err)
 	}
 	if err := tx.enforceReservationQuota(ctx, params.UserID, params.TrainRunID, len(passengerIDs), s.reservationQuotaLimits); err != nil {
-		return CreateHoldResult{}, err
+		return CreateHoldResult{}, fmt.Errorf("enforce create-hold quota: %w", err)
 	}
 
 	var (
@@ -201,7 +201,7 @@ LIMIT 1`, params.TrainRunID, routeID, params.FromStopIndex, params.ToStopIndex, 
 
 	allocated, err := tx.AllocateSeats(ctx, params.TrainRunID, seatClass, requested, len(passengerIDs))
 	if err != nil {
-		return CreateHoldResult{}, err
+		return CreateHoldResult{}, fmt.Errorf("allocate create-hold seats: %w", err)
 	}
 
 	reservationID := uuid.New()
@@ -234,14 +234,14 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, reservationID, params.TrainRunID, segm
 	if err := tx.insertReservationQuotaClaim(
 		ctx, reservationID, params.UserID, params.TrainRunID, len(ownedPassengers),
 	); err != nil {
-		return CreateHoldResult{}, err
+		return CreateHoldResult{}, fmt.Errorf("persist create-hold quota claim: %w", err)
 	}
 	if err := tx.insertReservationLocator(ctx, reservationID, params.UserID); err != nil {
-		return CreateHoldResult{}, err
+		return CreateHoldResult{}, fmt.Errorf("persist create-hold locator: %w", err)
 	}
 
 	if err := tx.CompleteIdempotency(ctx, acquisition.RecordID, reservationID); err != nil {
-		return CreateHoldResult{}, err
+		return CreateHoldResult{}, fmt.Errorf("complete create-hold idempotency: %w", err)
 	}
 	if err := tx.appendReservationEvent(ctx, reservationID, "reservation.held", map[string]any{
 		"reservationId": reservationID,
@@ -250,10 +250,10 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, reservationID, params.TrainRunID, segm
 		"expiresAt":     params.HoldExpiresAt.UTC(),
 		"seatCount":     len(allocated),
 	}); err != nil {
-		return CreateHoldResult{}, err
+		return CreateHoldResult{}, fmt.Errorf("append create-hold outbox event: %w", err)
 	}
 	if err := tx.recordSuccessfulGenerationWrite(ctx); err != nil {
-		return CreateHoldResult{}, err
+		return CreateHoldResult{}, fmt.Errorf("record create-hold generation write: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return CreateHoldResult{}, err
