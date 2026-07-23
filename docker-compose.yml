@@ -49,7 +49,7 @@ services:
       HTTP_ADDR: :8080
       DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
       REDIS_ADDR: redis:6379
-      JWT_SECRET: ${JWT_SECRET:-local-development-secret-change-me-123456789}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET to a unique value of at least 32 bytes}
       JWT_ISSUER: scalable-railway-ticketing-platform
       JWT_AUDIENCE: railway-api
       # Synthetic local-only key. Production must inject a distinct 32-byte keyring.
@@ -63,13 +63,24 @@ services:
       RESERVATION_MAX_ACTIVE_PASSENGERS_PER_USER: 24
       RESERVATION_MAX_INFLIGHT_PER_INSTANCE: 32
       TRUSTED_PROXIES: 127.0.0.1
+      STATION_CACHE_ENABLED: "true"
+      STATION_CACHE_TTL_SECONDS: 300
+      STATION_CACHE_JITTER_SECONDS: 30
+      TRAIN_SEARCH_CACHE_ENABLED: "true"
+      TRAIN_SEARCH_CACHE_TTL_SECONDS: 60
+      TRAIN_SEARCH_CACHE_JITTER_SECONDS: 10
+      TRAIN_SEARCH_FALLBACK_ENABLED: "true"
+      AVAILABILITY_CACHE_ENABLED: "true"
+      AVAILABILITY_CACHE_TTL_SECONDS: 10
+      AVAILABILITY_CACHE_JITTER_SECONDS: 2
+      AVAILABILITY_CACHE_MAX_STALE_SECONDS: 10
     depends_on:
       migrate:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
@@ -144,7 +155,8 @@ services:
       APP_ENV: development
       DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
       OUTBOX_PUBLISHER_ENABLED: "true"
-      OUTBOX_PUBLISHER: log
+      OUTBOX_PUBLISHER: redis_stream
+      REDIS_ADDR: redis:6379
       OUTBOX_BATCH_SIZE: 100
       OUTBOX_POLL_INTERVAL_SECONDS: 2
       WORKER_HTTP_ADDRESS: :9090
@@ -152,6 +164,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     read_only: true
     security_opt:
       - no-new-privileges:true
@@ -159,6 +173,58 @@ services:
       - ALL
     init: true
     restart: unless-stopped
+
+  read-model-worker:
+    profiles: ["workers"]
+    build:
+      context: .
+      target: read-model-worker
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
+      REDIS_ADDR: redis:6379
+      READ_MODEL_WORKER_ENABLED: "true"
+      READ_MODEL_WORKER_BATCH_SIZE: 100
+      READ_MODEL_WORKER_INTERVAL_MILLISECONDS: 1000
+      READ_MODEL_CONSUMER_GROUP: railway-read-model
+      READ_MODEL_CONSUMER_NAME: read-model-compose-1
+      READ_MODEL_MAX_ATTEMPTS: 5
+      READ_MODEL_CLAIM_MIN_IDLE_SECONDS: 90
+      WORKER_HTTP_ADDRESS: :9090
+      WORKER_PASS_TIMEOUT: 60s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    restart: unless-stopped
+
+  read-model-admin:
+    profiles: ["tools"]
+    build:
+      context: .
+      target: read-model-admin
+    environment:
+      DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
+      REDIS_ADDR: redis:6379
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    restart: "no"
 
 volumes:
   postgres-data:

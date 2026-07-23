@@ -27,7 +27,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: api
-          image: scalable-railway-ticketing-platform:milestone-2
+          image: scalable-railway-ticketing-platform:milestone-3
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

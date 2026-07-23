@@ -13,7 +13,7 @@ import (
 type readinessProbe func(context.Context) error
 type migrationProbe func(context.Context) (int, bool, error)
 
-const currentSchemaVersion = 6
+const currentSchemaVersion = 7
 
 type ReadinessChecker struct {
 	postgres, redis readinessProbe

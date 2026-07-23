@@ -847,3 +847,122 @@ func TestLoadErrorsNameVariablesWithoutEchoingValues(t *testing.T) {
 		t.Fatal("LoadFrom() error exposed the invalid environment value")
 	}
 }
+
+func TestLoadReadModelWorkerUsesOnlyProcessOwnedSettings(t *testing.T) {
+	t.Parallel()
+	env := map[string]string{
+		"APP_ENV":                                 "test",
+		"DATABASE_URL":                            "postgres://worker@db.example/railway",
+		"REDIS_ADDR":                              "redis.example:6379",
+		"READ_MODEL_WORKER_ENABLED":               "true",
+		"READ_MODEL_WORKER_BATCH_SIZE":            "40",
+		"READ_MODEL_MAX_ATTEMPTS":                 "4",
+		"READ_MODEL_WORKER_INTERVAL_MILLISECONDS": "750",
+		"READ_MODEL_CLAIM_MIN_IDLE_SECONDS":       "90",
+		"READ_MODEL_CONSUMER_GROUP":               "railway-read-model-test",
+		"READ_MODEL_CONSUMER_NAME":                "replica-a",
+		"JWT_SECRET":                              "unused-invalid-secret",
+		"ADMISSION_TOKEN_KEYRING":                 "unused-invalid-keyring",
+	}
+	lookup := func(key string) (string, bool) {
+		value, ok := env[key]
+		return value, ok
+	}
+	cfg, err := config.LoadFromFor(lookup, config.ProcessReadModelWorker)
+	if err != nil {
+		t.Fatalf("LoadFromFor(read-model-worker) error = %v", err)
+	}
+	if !cfg.ReadModelWorkerEnabled || cfg.ReadModelWorkerBatchSize != 40 || cfg.ReadModelWorkerMaxAttempts != 4 ||
+		cfg.ReadModelWorkerPollInterval != 750*time.Millisecond || cfg.ReadModelWorkerPendingIdle != 90*time.Second ||
+		cfg.ReadModelConsumerGroup != "railway-read-model-test" || cfg.ReadModelConsumerName != "replica-a" {
+		t.Fatalf("read-model worker settings = %+v", cfg)
+	}
+}
+
+func TestLoadReadModelWorkerExactSettingsOverrideLegacyAliases(t *testing.T) {
+	t.Parallel()
+	env := map[string]string{
+		"APP_ENV":      "test",
+		"DATABASE_URL": "postgres://worker@db.example/railway",
+		"REDIS_ADDR":   "redis.example:6379",
+		"READ_MODEL_WORKER_INTERVAL_MILLISECONDS": "750",
+		"READ_MODEL_WORKER_POLL_INTERVAL":         "9s",
+		"READ_MODEL_CLAIM_MIN_IDLE_SECONDS":       "90",
+		"READ_MODEL_WORKER_PENDING_IDLE":          "150s",
+	}
+	cfg, err := config.LoadFromFor(func(key string) (string, bool) {
+		value, ok := env[key]
+		return value, ok
+	}, config.ProcessReadModelWorker)
+	if err != nil {
+		t.Fatalf("LoadFromFor(read-model-worker) error = %v", err)
+	}
+	if cfg.ReadModelWorkerPollInterval != 750*time.Millisecond || cfg.ReadModelWorkerPendingIdle != 90*time.Second {
+		t.Fatalf("exact settings lost precedence: interval=%v pending=%v", cfg.ReadModelWorkerPollInterval, cfg.ReadModelWorkerPendingIdle)
+	}
+}
+
+func TestLoadAPIUsesExplicitMilestoneThreeCacheControls(t *testing.T) {
+	t.Parallel()
+	env := map[string]string{
+		"APP_ENV":                              "test",
+		"DATABASE_URL":                         "postgres://api@db.example/railway",
+		"REDIS_ADDR":                           "redis.example:6379",
+		"JWT_SECRET":                           "test",
+		"ADMISSION_TOKEN_KEYRING":              "test=" + strings.Repeat("A", 43),
+		"ADMISSION_TOKEN_ISSUE_KEY_ID":         "test",
+		"ADMISSION_TOKEN_ACCEPT_KEY_IDS":       "test",
+		"STATION_CACHE_ENABLED":                "false",
+		"STATION_CACHE_TTL_SECONDS":            "120",
+		"STATION_CACHE_JITTER_SECONDS":         "12",
+		"TRAIN_SEARCH_CACHE_ENABLED":           "false",
+		"TRAIN_SEARCH_CACHE_TTL_SECONDS":       "45",
+		"TRAIN_SEARCH_CACHE_JITTER_SECONDS":    "5",
+		"TRAIN_SEARCH_FALLBACK_ENABLED":        "false",
+		"AVAILABILITY_CACHE_ENABLED":           "false",
+		"AVAILABILITY_CACHE_TTL_SECONDS":       "8",
+		"AVAILABILITY_CACHE_JITTER_SECONDS":    "1",
+		"AVAILABILITY_CACHE_MAX_STALE_SECONDS": "6",
+	}
+	cfg, err := config.LoadFromFor(func(key string) (string, bool) {
+		value, ok := env[key]
+		return value, ok
+	}, config.ProcessAPI)
+	if err != nil {
+		t.Fatalf("LoadFromFor(api) error = %v", err)
+	}
+	if cfg.StationCacheEnabled || cfg.TrainSearchCacheEnabled || cfg.TrainSearchFallbackEnabled ||
+		cfg.AvailabilityCacheEnabled || cfg.StationCacheTTL != 120*time.Second ||
+		cfg.StationCacheJitter != 12*time.Second || cfg.SearchCacheTTL != 45*time.Second ||
+		cfg.SearchCacheJitter != 5*time.Second || cfg.AvailabilityCacheTTL != 8*time.Second ||
+		cfg.AvailabilityCacheJitter != time.Second || cfg.AvailabilityCacheMaxStale != 6*time.Second {
+		t.Fatalf("Milestone 3 cache controls = %+v", cfg)
+	}
+}
+
+func TestValidateRejectsUnboundedReadCacheAndWorkerSettings(t *testing.T) {
+	t.Parallel()
+	api := config.Defaults()
+	api.DatabaseURL = "postgres://api@db.example/railway"
+	api.RedisAddress = "redis.example:6379"
+	api.JWTSecret = "test"
+	api.AdmissionTokenKeyring = "test=" + strings.Repeat("A", 43)
+	api.AdmissionTokenIssueKeyID = "test"
+	api.AdmissionTokenAcceptKeyIDs = "test"
+	api.SearchCacheJitter = api.SearchCacheTTL + time.Second
+	if err := api.ValidateFor(config.ProcessAPI); err == nil || !strings.Contains(err.Error(), "cache jitter") {
+		t.Fatalf("ValidateFor(api cache bounds) error = %v", err)
+	}
+	worker := config.Defaults()
+	worker.DatabaseURL = "postgres://worker@db.example/railway"
+	worker.RedisAddress = "redis.example:6379"
+	worker.ReadModelWorkerBatchSize = 101
+	if err := worker.ValidateFor(config.ProcessReadModelWorker); err == nil || !strings.Contains(err.Error(), "READ_MODEL_WORKER_BATCH_SIZE") {
+		t.Fatalf("ValidateFor(read-model worker bounds) error = %v", err)
+	}
+	worker.ReadModelWorkerBatchSize = 100
+	worker.ReadModelWorkerPendingIdle = worker.WorkerPassTimeout
+	if err := worker.ValidateFor(config.ProcessReadModelWorker); err == nil || !strings.Contains(err.Error(), "READ_MODEL_CLAIM_MIN_IDLE_SECONDS") {
+		t.Fatalf("ValidateFor(read-model worker lease) error = %v", err)
+	}
+}

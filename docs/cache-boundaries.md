@@ -2,20 +2,18 @@
 
 ## Current implementation status
 
-Milestone 2 retains the Milestone 1.1 behavior of reading station metadata,
-train search results, and availability directly from PostgreSQL. Their Redis
-cache keys and consistency rules are design boundaries only; implementing those
-caches is deferred to a later read-model/cache milestone. Availability remains
-a point-in-time hint even when read directly, and reservation correctness never
+Milestone 3 decorates PostgreSQL station, projected train-search, and
+authoritative availability reads with optional bounded Redis caches.
+Availability remains a point-in-time hint, and reservation correctness never
 depends on a cached availability value.
 
 ## Allowed uses
 
 | Use | Authority | TTL/failure behavior |
 |---|---|---|
-| Station metadata (deferred cache) | PostgreSQL | future versioned bounded TTL; database fallback |
-| Train search (deferred cache) | PostgreSQL | future normalized hash and bounded TTL; database fallback |
-| Availability count (deferred cache) | PostgreSQL seat inventory | future very short hint TTL; booking always rechecks |
+| Station metadata cache | PostgreSQL | versioned bounded TTL and payload; database fallback |
+| Train search cache | PostgreSQL source/projection | normalized hash, versioned bounded TTL; source fallback |
+| Availability hint cache | PostgreSQL seat inventory | very short max-stale/TTL; booking always rechecks |
 | Completed idempotency lookup (deferred cache) | PostgreSQL record | future optional hashed-key hint; database fallback |
 | Registration/login/passenger-create rate limit | Redis atomic Lua | production writes fail closed when limit state is unavailable |
 | Non-hot create-hold rate limit | Redis atomic Lua | limiter errors degrade open; PostgreSQL quotas, idempotency, and inventory remain authoritative |
@@ -38,8 +36,8 @@ A search or availability response is a point-in-time observation. Staleness may 
 
 ## Redis outage
 
-Current reads continue against PostgreSQL because the read caches are not
-implemented. Future read caches must be bypassable during Redis failure.
+Read caches are bypassed during Redis failure and reads continue against
+PostgreSQL.
 Read-only public browsing can use a documented fail-open policy for its rate
 counter. Authentication and passenger-profile creation fail closed in
 production.

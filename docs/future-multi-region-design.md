@@ -1,6 +1,6 @@
 # Future Multi-Region Design
 
-This document records direction only. Milestone 2 implements none of these
+This document records direction only. Milestone 3 implements none of these
 multi-region capabilities.
 
 ## Current truth
@@ -13,7 +13,7 @@ multi-region capabilities.
   or continuous across independent regional Redis deployments.
 - No multi-region active-active seat writes or global strong consistency exist.
 
-Milestone 2 may run multiple API and admission-worker replicas inside that one
+Milestone 3 may run multiple API, admission-worker, and read-model-worker replicas inside that one
 region. Redis Lua scripts make their policy-generation operations atomic, while
 PostgreSQL remains authoritative for policy classification, quotas,
 idempotency, reservations, and seat inventory. This replica topology must not
@@ -21,7 +21,12 @@ be described as regional failover.
 
 ## Potential read architecture
 
-Future regions may serve station, schedule, train-search, and availability read models from regional databases/caches. The transactional outbox can drive idempotent cache invalidation and read-model updates. Responses remain observations and booking rechecks authority.
+Today, API replicas in one region share one Redis cache and one PostgreSQL
+projection. There is no regional cache replication. Future regions may serve
+station, schedule, train-search, and availability read models from regional
+databases/caches. The transactional outbox could drive idempotent regional
+updates, but responses would remain observations and booking would recheck the
+single fenced authority.
 
 ## Authoritative write ownership
 
@@ -31,7 +36,7 @@ Any future regional admission design must route a train run's waiting-room
 joins and token lifecycle to the same fenced owner. A token issued under an old
 owner epoch cannot be accepted by a new owner merely because its HMAC and TTL
 remain valid. Cross-region FIFO, Redis continuity, token handoff, and draining
-outstanding leases require a separately reviewed protocol; Milestone 2 supplies
+outstanding leases require a separately reviewed protocol; Milestone 3 supplies
 none of them.
 
 Failover requires:

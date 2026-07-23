@@ -87,3 +87,24 @@ to one policy generation in one Redis deployment. The system does not claim
 global fairness, guaranteed post-admission inventory, national-scale
 throughput, unlimited horizontal write scaling, or multi-region active-active
 writes. No accepted sustained Milestone 2 benchmark is currently recorded.
+
+## Milestone 3 read concurrency
+
+Public station, search, and availability reads resolve exact random-generation
+Redis keys. Identical local misses are coalesced by exact-key singleflight;
+unrelated keys continue independently. Shared Redis lets a fill from one API
+replica serve another, while TTL jitter spreads ordinary expiry. No distributed
+cache lock or PostgreSQL/Redis transaction is introduced.
+
+Search reads the disposable journey projection and uses the normalized source
+query as a safe fallback. Availability batches use one PostgreSQL query for
+cache misses, avoiding a per-result N+1 loop. Redis loss therefore raises
+database read pressure but does not change the booking lock order or VARBIT
+allocator. Enabled-hot admission retains its existing fail-closed behavior.
+
+Projection replacement is one transaction per train run. Concurrent readers
+observe an old complete or new complete committed set. Event receipts make
+multiple worker replicas idempotent; pending claims, attempts, impact size, and
+DLQ length are bounded. These mechanisms are correctness and amplification
+bounds, not sustained capacity evidence. No accepted Milestone 3 benchmark is
+recorded.

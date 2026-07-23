@@ -46,7 +46,7 @@ func trainRunSearchHandler(dependencies Dependencies) gin.HandlerFunc {
 			writeError(c, ErrUnavailable)
 			return
 		}
-		page, ok := parsePageRequest(c, "departure_at", "departure_at", "arrival_at", "fare_minor")
+		page, ok := parsePageRequest(c, "departure_at", "departure_at", "fare_minor")
 		origin := strings.TrimSpace(c.Query("origin_station_code"))
 		destination := strings.TrimSpace(c.Query("destination_station_code"))
 		serviceDate, err := time.Parse("2006-01-02", c.Query("service_date"))

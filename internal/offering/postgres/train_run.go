@@ -114,6 +114,10 @@ func (s *Store) CommissionTrainRun(ctx context.Context, params CommissionTrainRu
 	if err != nil {
 		return TrainRun{}, safeError(err)
 	}
+	if err := appendReadModelEvent(ctx, tx, "train_run", run.ID, "trainrun.created"); err != nil {
+		return TrainRun{}, safeError(err)
+	}
+	run.OutboxCreated = true
 	if err := tx.Commit(ctx); err != nil {
 		return TrainRun{}, safeError(err)
 	}
@@ -177,14 +181,12 @@ func (s *Store) UpdateTrainRunStatus(ctx context.Context, trainRunID string, nex
 	if err != nil {
 		return TrainRun{}, safeError(err)
 	}
-	if next == domain.TrainRunStatusCancelled && current != domain.TrainRunStatusCancelled {
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload)
-			VALUES ('train_run', $1::uuid, 'trainrun.cancelled', jsonb_build_object(
-				'trainRunId', $1::text,
-				'status', 'cancelled'
-			))
-		`, lockedID); err != nil {
+	if current != next {
+		eventType := "trainrun.updated"
+		if next == domain.TrainRunStatusCancelled {
+			eventType = "trainrun.cancelled"
+		}
+		if err := appendReadModelEvent(ctx, tx, "train_run", lockedID, eventType); err != nil {
 			return TrainRun{}, safeError(err)
 		}
 		run.OutboxCreated = true

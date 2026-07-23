@@ -1,8 +1,8 @@
 # Scalable Railway Ticketing Platform
 
-A production-minded, single-region Go backend for railway booking with Redis-backed hot-train waiting-room admission, PostgreSQL-authoritative route-segment seat allocation, temporary holds, durable quotas, idempotency, and transactional outbox events under concurrency.
+A production-minded, single-region Go backend for railway booking with a disposable PostgreSQL journey read model, versioned Redis read caches, Redis-backed hot-train admission, and PostgreSQL-authoritative route-segment seat allocation under concurrency.
 
-Milestone 2 is intentionally bounded. Admission permits a booking attempt; it does not guarantee a seat. This is not a national-scale capacity claim and does not implement real payment, a complete anti-bot platform, or multi-region active-active writes. See [Milestone 2 limitations](docs/milestone-2-limitations.md).
+Milestone 3 is intentionally bounded. Projection/cache state can lag or disappear, availability is hint-only, and admission permits an attempt rather than a seat. This is not a national-scale capacity claim and does not implement payment, a search microservice, train-run sharding, or multi-region active-active writes. See [Milestone 3 limitations](docs/milestone-3-limitations.md).
 
 ## Architecture
 
@@ -15,7 +15,7 @@ HTTP transport
             -> PostgreSQL, Redis, Prometheus, and publisher adapters
 ```
 
-PostgreSQL is authoritative for policies, train-run status, seat inventory, reservation lifecycle, durable quotas, tickets, idempotency, outbox state, and all current station/search/availability reads. Redis provides rate controls, optional event transport, and ephemeral waiting-room/token control state. Redis never allocates a seat. Station, search, and availability Redis caches remain deferred to Milestone 3; any future cached availability remains only a hint and booking always rechecks PostgreSQL.
+PostgreSQL source tables are authoritative for policies, train-run status, seat inventory, reservation lifecycle, durable quotas, tickets, idempotency, and outbox state. A PostgreSQL journey projection and versioned Redis station/search/availability caches accelerate public reads but remain disposable. Redis also provides rate controls, event transport, and ephemeral waiting-room/token state. Redis never allocates a seat; booking always rechecks PostgreSQL.
 
 ### Module boundaries
 
@@ -25,7 +25,7 @@ PostgreSQL is authoritative for policies, train-run status, seat inventory, rese
 | Railway Offering | Stations, ordered routes/stops, trains/coaches/seats, fares, and dated train runs |
 | Admission | Durable hot policy resolution, bounded waiting-room control, token lifecycle, and global admission limits |
 | Booking | Segment masks, atomic allocation, holds, lifecycle transitions, tickets, idempotency, and reconciliation |
-| Query | Direct PostgreSQL browse, search, and availability projections/hints; Redis read caches deferred |
+| Query | Journey projection, source fallback, versioned station/search caches, and short-lived availability hints |
 | Event Relay | Outbox claim, publish, retry, stale-lease recovery, and finalize |
 | Platform | Configuration, pools, metrics, clock, middleware, and process lifecycle |
 
@@ -168,6 +168,11 @@ $env:JWT_SECRET = 'local-only-random-secret-at-least-32-bytes'
 docker compose up --build
 ```
 
+The single-replica Compose file refuses to start without `JWT_SECRET` and
+publishes the API on loopback only. Use a distinct random value for every
+environment; never reuse the example above or expose a development deployment
+to an untrusted network.
+
 Start the optional workers with:
 
 ```powershell
@@ -220,19 +225,19 @@ make migrate-up
 make migrate-status
 docker compose config
 docker compose -f docker-compose.multi-replica.yml config
-docker build -t scalable-railway-ticketing-platform:milestone-2 .
+docker build -t scalable-railway-ticketing-platform:milestone-3 .
 ```
 
 CI also verifies tidy/gofmt, action syntax, secret scanning,
-filesystem/image vulnerabilities, populated Migration 5-to-6 and destructive
-down/reapply rehearsals, integration tests, the Docker build, and a bounded
-three-API/two-worker smoke with API, worker, and real Redis failure recovery.
+filesystem/image vulnerabilities, populated version-6-to-7 and one-step
+down/reapply rehearsals, read-model/cache integration tests, the Docker build,
+and the bounded three-API/two-admission/two-read-worker topology.
 
 ## Load tests
 
-The original nine k6 scenarios remain, and eight Milestone 2 scenarios cover waiting-room join/status, admission, hot reservation, admission idempotency, durable quota, Redis outage, and multi-replica shared state. They accept configuration only through environment variables and contain no credentials or tokens.
+The original and Milestone 2 scenarios remain. Nine Milestone 3 scenarios cover station/search/availability caches, honest cold/warm search, mixed booking, invalidation, Redis/worker failure windows, and multi-replica shared cache behavior. They accept configuration only through environment variables and contain no credentials or tokens.
 
-See [Milestone 2 load testing](docs/milestone-2-load-testing.md) for setup and correctness gates. [benchmark-report-milestone-2.md](docs/benchmark-report-milestone-2.md) intentionally records no capacity numbers until a controlled run is executed. A smoke run is not evidence of production or national-scale throughput.
+See [Milestone 3 load testing](docs/milestone-3-load-testing.md) for setup and correctness gates. [benchmark-report-milestone-3.md](docs/benchmark-report-milestone-3.md) intentionally records no sustained capacity numbers until a controlled run is accepted. A smoke run is not production or national-scale evidence.
 
 ## Deployment
 
@@ -243,14 +248,14 @@ See [Milestone 2 load testing](docs/milestone-2-load-testing.md) for setup and c
 - Single-region PostgreSQL primary for all authoritative writes.
 - Redis AOF reduces loss risk but does not guarantee waiting-room continuity; hot-run Redis loss fails closed.
 - Admission does not guarantee a seat and token delivery is at-most-once.
-- Station, search, and availability Redis read caches are not implemented; current reads use PostgreSQL and future cached values remain hints.
+- Projection lag and cache staleness are possible; availability remains hint-only and cache loss increases PostgreSQL read load.
 - No real payment authorization/capture/refund integration.
 - No complete anti-bot/fraud system or real identity proof; account quotas do not prevent Sybil identities.
 - No multi-region active-active booking writes.
 - No accepted sustained benchmark or national-scale capacity claim.
 - No government-ID or real passenger identity verification.
 
-The complete list is in [milestone-2-limitations.md](docs/milestone-2-limitations.md). Future multi-region ideas are design direction only in [future-multi-region-design.md](docs/future-multi-region-design.md); none are implemented in Milestone 2.
+The complete list is in [milestone-3-limitations.md](docs/milestone-3-limitations.md). Future multi-region ideas are design direction only in [future-multi-region-design.md](docs/future-multi-region-design.md); none are implemented in Milestone 3.
 
 ## License
 

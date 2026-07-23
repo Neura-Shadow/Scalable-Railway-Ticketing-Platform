@@ -70,11 +70,26 @@ func (s *Store) CreateStation(ctx context.Context, params CreateStationParams) (
 	if err != nil {
 		return Station{}, err
 	}
-	return scanStation(s.db.QueryRow(ctx, `
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return Station{}, safeError(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	station, err := scanStation(tx.QueryRow(ctx, `
 		INSERT INTO stations (code, name, timezone)
 		VALUES ($1, $2, $3)
 		RETURNING id::text, code, name, timezone, active, created_at, updated_at
 	`, code.String(), name, timezone), false)
+	if err != nil {
+		return Station{}, err
+	}
+	if err := appendReadModelEvent(ctx, tx, "station", station.ID, "station.created"); err != nil {
+		return Station{}, safeError(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Station{}, safeError(err)
+	}
+	return station, nil
 }
 
 func (s *Store) UpdateStation(ctx context.Context, id string, params UpdateStationParams) (Station, error) {
@@ -85,12 +100,31 @@ func (s *Store) UpdateStation(ctx context.Context, id string, params UpdateStati
 	if err != nil {
 		return Station{}, err
 	}
-	return scanStation(s.db.QueryRow(ctx, `
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return Station{}, safeError(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	station, err := scanStation(tx.QueryRow(ctx, `
 		UPDATE stations
 		SET code = $2, name = $3, timezone = $4, active = $5
 		WHERE id = $1
 		RETURNING id::text, code, name, timezone, active, created_at, updated_at
 	`, id, code.String(), name, timezone, params.Active), true)
+	if err != nil {
+		return Station{}, err
+	}
+	eventType := "station.updated"
+	if !station.Active {
+		eventType = "station.disabled"
+	}
+	if err := appendReadModelEvent(ctx, tx, "station", station.ID, eventType); err != nil {
+		return Station{}, safeError(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Station{}, safeError(err)
+	}
+	return station, nil
 }
 
 func (s *Store) ListStations(ctx context.Context, activeOnly bool) ([]Station, error) {

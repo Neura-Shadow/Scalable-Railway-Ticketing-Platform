@@ -8,5 +8,6 @@ resources:
   - api-service.yaml
   - api-pdb.yaml
   - admission-worker-deployment.yaml
+  - read-model-worker-deployment.yaml
   - hold-expirer-deployment.yaml
   - outbox-worker-deployment.yaml

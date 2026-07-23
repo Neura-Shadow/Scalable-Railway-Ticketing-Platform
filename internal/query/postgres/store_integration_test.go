@@ -140,6 +140,41 @@ func TestStoreJourneyTimesSupportZeroFirstDepartureOffset(t *testing.T) {
 	}
 }
 
+func TestAvailabilityExcludesInactiveSeatsAndBatchCanonicalizesUUID(t *testing.T) {
+	conn := openQueryTestDatabase(t)
+	fixture := seedOffering(t, conn)
+	store, err := querypostgres.NewStore(conn)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	ctx := context.Background()
+	if _, err := conn.Exec(ctx, `
+		UPDATE seats
+		SET active = false
+		WHERE id = (
+			SELECT si.seat_id
+			FROM seat_inventory AS si
+			WHERE si.train_run_id = $1
+			ORDER BY si.seat_id
+			LIMIT 1
+		)
+	`, fixture.trainRunID); err != nil {
+		t.Fatalf("deactivate inventory seat: %v", err)
+	}
+	request := querypostgres.AvailabilityRequest{
+		TrainRunID: strings.ToUpper(fixture.trainRunID),
+		OriginCode: "TPE", DestinationCode: "KHH", SeatClass: "standard",
+	}
+	direct, err := store.Availability(ctx, request)
+	if err != nil || direct.AvailableSeats != 1 {
+		t.Fatalf("Availability(inactive seat) = %+v, %v, want one active seat", direct, err)
+	}
+	batch, err := store.AvailabilityBatch(ctx, []querypostgres.AvailabilityRequest{request})
+	if err != nil || len(batch) != 1 || batch[0].AvailableSeats != 1 {
+		t.Fatalf("AvailabilityBatch(uppercase UUID) = %+v, %v", batch, err)
+	}
+}
+
 type offeringFixture struct {
 	trainRunID  string
 	serviceDate time.Time
@@ -267,7 +302,7 @@ func openQueryTestDatabase(t *testing.T) *pgx.Conn {
 		t.Fatal("resolve integration test path")
 	}
 	root := filepath.Join(filepath.Dir(currentFile), "..", "..", "..")
-	for _, name := range []string{"000001_accounts.up.sql", "000002_railway_offering.up.sql", "000003_booking.up.sql", "000004_idempotency_outbox.up.sql", "000005_inventory_and_route_integrity.up.sql"} {
+	for _, name := range []string{"000001_accounts.up.sql", "000002_railway_offering.up.sql", "000003_booking.up.sql", "000004_idempotency_outbox.up.sql", "000005_inventory_and_route_integrity.up.sql", "000006_hot_train_admission.up.sql", "000007_read_model_cache.up.sql"} {
 		migration, err := os.ReadFile(filepath.Join(root, "migrations", name))
 		if err != nil {
 			t.Fatal(err)

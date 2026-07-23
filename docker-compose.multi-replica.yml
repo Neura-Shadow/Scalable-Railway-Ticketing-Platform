@@ -22,6 +22,17 @@ x-api-common: &api-common
     RESERVATION_MAX_ACTIVE_PASSENGERS_PER_USER: 24
     RESERVATION_MAX_INFLIGHT_PER_INSTANCE: 32
     TRUSTED_PROXIES: 0.0.0.0/0
+    STATION_CACHE_ENABLED: "true"
+    STATION_CACHE_TTL_SECONDS: 300
+    STATION_CACHE_JITTER_SECONDS: 30
+    TRAIN_SEARCH_CACHE_ENABLED: "true"
+    TRAIN_SEARCH_CACHE_TTL_SECONDS: 60
+    TRAIN_SEARCH_CACHE_JITTER_SECONDS: 10
+    TRAIN_SEARCH_FALLBACK_ENABLED: "true"
+    AVAILABILITY_CACHE_ENABLED: "true"
+    AVAILABILITY_CACHE_TTL_SECONDS: 10
+    AVAILABILITY_CACHE_JITTER_SECONDS: 2
+    AVAILABILITY_CACHE_MAX_STALE_SECONDS: 10
   depends_on:
     migrate:
       condition: service_completed_successfully
@@ -53,6 +64,35 @@ x-admission-worker-common: &admission-worker-common
     ADMISSION_TOKEN_ACCEPT_KEY_IDS: ${ADMISSION_TOKEN_ACCEPT_KEY_IDS:-local-current}
     WORKER_HTTP_ADDRESS: :9090
     WORKER_PASS_TIMEOUT: 60s
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  init: true
+  restart: unless-stopped
+
+x-read-model-worker-common: &read-model-worker-common
+  build:
+    context: .
+    target: read-model-worker
+  environment: &read-model-worker-environment
+    APP_ENV: development
+    DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
+    REDIS_ADDR: redis:6379
+    READ_MODEL_WORKER_ENABLED: "true"
+    READ_MODEL_WORKER_BATCH_SIZE: 100
+    READ_MODEL_WORKER_INTERVAL_MILLISECONDS: 1000
+    READ_MODEL_CONSUMER_GROUP: railway-read-model
+    READ_MODEL_MAX_ATTEMPTS: 5
+    READ_MODEL_CLAIM_MIN_IDLE_SECONDS: ${READ_MODEL_CLAIM_MIN_IDLE_SECONDS:-90}
+    WORKER_HTTP_ADDRESS: :9090
+    WORKER_PASS_TIMEOUT: ${READ_MODEL_WORKER_PASS_TIMEOUT:-60s}
   depends_on:
     migrate:
       condition: service_completed_successfully
@@ -128,6 +168,18 @@ services:
   admission-worker-2:
     <<: *admission-worker-common
 
+  read-model-worker-1:
+    <<: *read-model-worker-common
+    environment:
+      <<: *read-model-worker-environment
+      READ_MODEL_CONSUMER_NAME: read-model-multi-1
+
+  read-model-worker-2:
+    <<: *read-model-worker-common
+    environment:
+      <<: *read-model-worker-environment
+      READ_MODEL_CONSUMER_NAME: read-model-multi-2
+
   hold-expirer:
     build:
       context: .
@@ -159,7 +211,8 @@ services:
       APP_ENV: development
       DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
       OUTBOX_PUBLISHER_ENABLED: "true"
-      OUTBOX_PUBLISHER: log
+      OUTBOX_PUBLISHER: redis_stream
+      REDIS_ADDR: redis:6379
       OUTBOX_BATCH_SIZE: 100
       OUTBOX_POLL_INTERVAL_SECONDS: 2
       WORKER_HTTP_ADDRESS: :9090
@@ -167,6 +220,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     read_only: true
     security_opt:
       - no-new-privileges:true
@@ -179,7 +234,7 @@ services:
     build:
       context: .
       dockerfile: deploy/nginx/Dockerfile
-    image: scalable-railway-ticketing-proxy:milestone-2
+    image: scalable-railway-ticketing-proxy:milestone-3
     user: "101:101"
     depends_on:
       - api-1
@@ -209,6 +264,28 @@ services:
       RESERVATION_MAX_ACTIVE_HOLDS_PER_USER: 10
       RESERVATION_MAX_ACTIVE_HOLDS_PER_USER_PER_TRAIN_RUN: 3
       RESERVATION_MAX_ACTIVE_PASSENGERS_PER_USER: 24
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    restart: "no"
+
+  read-model-admin:
+    build:
+      context: .
+      target: read-model-admin
+    profiles:
+      - tools
+    environment:
+      DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
+      REDIS_ADDR: redis:6379
     depends_on:
       migrate:
         condition: service_completed_successfully

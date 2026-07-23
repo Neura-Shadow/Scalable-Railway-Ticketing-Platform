@@ -1,14 +1,14 @@
 # Production Deployment
 
-This guide describes a conservative single-region deployment. It does not turn Milestone 2 into a multi-region or nationally sized platform.
+This guide describes a conservative single-region deployment. It does not turn Milestone 3 into a multi-region or nationally sized platform.
 
-Deploying these artifacts adds a hot-train waiting-room control plane but does not add real payment, a complete anti-bot platform, multi-region active-active writes, national-scale capacity evidence, or real passenger identity verification. Admission permits an attempt and does not guarantee a seat.
+Deploying these artifacts adds disposable read projections/caches and a hot-train waiting-room control plane, but not payment, a complete anti-bot platform, multi-region active-active writes, national-scale capacity evidence, or real passenger identity verification. Cached availability is a hint and admission permits an attempt, not a seat.
 
 ## Authority and topology
 
 - One regional PostgreSQL primary is authoritative for train-run status, seat occupancy, reservations, tickets, durable idempotency, and outbox rows.
-- Redis provides rate-limit state, optional event transport, and ephemeral waiting-room/token control state. Station, search, and availability caches are deferred; current reads use PostgreSQL, and any future cached availability remains a hint that reservation writes must recheck.
-- API, admission-worker, hold-expirer, and outbox-worker processes use the same schema and documented lock ordering.
+- Redis provides rate-limit state, event transport, ephemeral waiting-room/token control state, and versioned station/search/availability read caches. Cache loss degrades read performance but cannot move booking authority out of PostgreSQL.
+- The PostgreSQL journey projection is disposable and rebuildable. API, admission-worker, read-model-worker, hold-expirer, and outbox-worker processes use the same schema and documented lock ordering.
 - Run migrations as an explicit release step before deploying compatible application processes. Do not run automatic schema mutation on application startup.
 
 The manifests under `deploy/kubernetes/base` are a security-conscious baseline, not a complete cloud platform. A production overlay must supply an immutable image digest, secret references, ingress/TLS, database and Redis endpoints, topology-specific network policy, resource sizing, autoscaling policy, and observability integration.
@@ -19,9 +19,9 @@ Create the referenced `railway-runtime-secrets` object out of band. Never commit
 
 Required keys, scoped to the process that consumes them:
 
-- `database-url`: TLS-enabled PostgreSQL URL required by the API and both workers; a production overlay should replace the baseline shared reference with process-specific least-privilege roles where their grants differ;
-- `redis-address`: regional Redis `host:port` endpoint used by the API and a Redis Streams outbox worker;
-- `redis-password`: Redis credential, if authentication is enabled, used only with those Redis clients; and
+- `database-url`: TLS-enabled PostgreSQL URL required by the API, admission-worker, read-model-worker, hold-expirer, and outbox-worker; a production overlay should replace the baseline shared reference with process-specific least-privilege roles where their grants differ;
+- `redis-address`: regional Redis `host:port` endpoint used by the API, admission-worker, read-model-worker, and Redis Streams outbox-worker;
+- `redis-password`: Redis credential, if authentication is enabled, used only by those Redis clients; and
 - `jwt-secret`: at least 32 random bytes, managed and rotated through the deployment secret system and mounted only into the API; and
 - `admission-token-keyring`: one to eight `key-id=base64url` entries whose decoded material is exactly 32 bytes, mounted only into APIs and admission workers with separately configured issue and accept key IDs.
 
@@ -39,6 +39,7 @@ Set `APP_ENV=production` and validate process-owned settings:
 
 - API: HTTP, PostgreSQL, Redis, JWT, admission accept keyring, hold TTL, passenger limit, durable quota, local execution bound, proxy/CORS, dependency, and lifecycle settings;
 - admission-worker: PostgreSQL, Redis, admission issue/accept keyring, bounded batch/interval, worker health, pass timeout, and lifecycle settings, with no JWT secret;
+- read-model-worker: PostgreSQL, Redis Stream, bounded batch/retry/pending/interval, worker health, pass timeout, and lifecycle settings, with no JWT or admission-token secret;
 - hold-expirer: PostgreSQL, expiration batch/interval, worker health, pass timeout, and lifecycle settings, with no JWT or Redis secret;
 - log outbox-worker: PostgreSQL, outbox loop, worker health, pass timeout, and lifecycle settings, with no JWT or Redis secret;
 - Redis Streams outbox-worker: the log-worker settings plus only its Redis publisher address/credential;
@@ -59,10 +60,12 @@ An enabled production outbox worker must use `OUTBOX_PUBLISHER=redis_stream` by 
 6. Run `migrate up` again and verify the current version/clean state.
 7. Deploy API instances in the single target region, pinned by digest.
 8. Wait for `/livez` and `/readyz`; do not route traffic before readiness succeeds.
-9. Deploy admission workers disabled, prove PostgreSQL/Redis/migration/config readiness, then enable one and verify policy generations before scaling to the tested count.
-10. Deploy one hold-expirer and one outbox-worker initially. Scale only after concurrency and database impact are measured.
-11. Run a sanitized hot/non-hot smoke flow and read-only seat, quota, and admission reconciliation against disposable production-like data.
-12. Observe queue depth, issuance/inflight bounds, token failures, quota/backpressure rejection, lock waits, connection saturation, outbox backlog, and worker failures through the rollback window.
+9. Run a dry-run and bounded initial projection backfill; reconcile the read model before enabling its worker.
+10. Deploy one read-model worker disabled, prove PostgreSQL/Redis/migration/config readiness, then enable it and validate pending/DLQ/cache rotation before scaling. Set a stable group and a unique consumer name per replica; require claim-min-idle to exceed the pass timeout.
+11. Deploy admission workers disabled, prove their PostgreSQL/Redis/migration/config readiness, then enable one and verify policy generations before scaling.
+12. Deploy one hold-expirer and one outbox-worker initially. Scale only after concurrency and database impact are measured.
+13. Run sanitized read, hot/non-hot booking, cache-loss, and source-fallback smokes plus seat, quota, admission, read-model, and cache-version reconciliation.
+14. Observe cache/fallback/projection lag, queue/inflight bounds, lock waits, connections, outbox backlog, DLQ, and worker failures through rollback.
 
 The release artifact contains the detect-only `reconcile` binary. Run the
 following checks with a read-only operational PostgreSQL role where the query
@@ -73,6 +76,8 @@ instance:
 reconcile seat-inventory --train-run-id <canonical-uuid>
 reconcile reservation-quotas
 reconcile admission-state
+reconcile read-model
+reconcile cache-versions
 ```
 
 Each command emits a bounded JSON summary and exits non-zero on a detected
@@ -117,6 +122,11 @@ events because the older constraints cannot represent them.
 - The API `/readyz` uses short checks for PostgreSQL, Redis, migrations, and required configuration without exposing credentials.
 - Each worker exposes a private `WORKER_HTTP_ADDRESS` (default `:9090`) with process-only `/livez`, dependency/config `/readyz`, and its own `/metrics`. Admission-worker readiness checks PostgreSQL, Redis, migrations, and its process-owned keyring/config; queue backlog does not fail readiness. Hold-expirer `/readyz` checks PostgreSQL; a Redis Streams outbox-worker checks both PostgreSQL and Redis; a log outbox-worker checks PostgreSQL only. Each pass is bounded by `WORKER_PASS_TIMEOUT`.
 - Outbox backlog, pending consumer work, or a dead-letter item is alertable but is not by itself a readiness failure.
+- The source stream is intentionally not blind-`MAXLEN` trimmed. Alert on
+  stream length, PEL size, pending age, and Redis memory. Do not trim below any
+  consumer group's delivered/pending floor. For a repaired DLQ event with
+  durable read-model progress, preview and apply `read-model-admin resume-event`
+  rather than deleting the progress gate.
 - `/metrics` must remain internal or protected by the platform network boundary.
 - Use graceful termination with a pre-stop/drain window long enough for the configured HTTP shutdown timeout.
 
@@ -136,7 +146,9 @@ reservation rate limiting preserves its existing documented fail-open behavior,
 while PostgreSQL still enforces durable quotas and seat correctness. Redis loss
 must not alter committed seat authority.
 
-Never use Redis `KEYS` in production. Never treat a cache hit as proof that a seat can be sold.
+Never use Redis `KEYS` in production. Read-cache request paths use only exact
+generation/data keys; bounded operator reconciliation reads only known version
+keys. Never treat a cache hit as proof that a seat can be sold.
 
 ## Monitoring and alerts
 
@@ -150,6 +162,7 @@ At minimum monitor:
   reservation-limiter fail-open events;
 - waiting-room join/duplicate/full/expiry, admission issuance/failure/wait, token lifecycle/conflict, quota rejection, local backpressure, and hot-reservation conflict/duration with bounded labels;
 - outbox pending age/count, processing leases, publish failures, retries, and dead letters;
+- read-model events/duplicates/rebuild duration/rows/lag/reconciliation and cache hit/miss/fill/invalidation/fallback metrics;
 - worker loop success/failure and last successful pass; and
 - reconciliation failures as correctness incidents.
 
@@ -171,4 +184,4 @@ reservation writes must fail; do not queue speculative bookings elsewhere.
 
 ## Capacity statement
 
-No sustained Milestone 2 benchmark is recorded in the repository. Replica counts in local Compose and resource requests in the baseline are evidence fixtures or starting configuration, not a capacity claim. Production sizing requires the controlled process in [milestone-2-load-testing.md](milestone-2-load-testing.md) and a completed [benchmark report](benchmark-report-milestone-2.md).
+No sustained Milestone 3 benchmark is recorded in the repository. Replica counts in local Compose and baseline resource requests are evidence fixtures, not a capacity claim. Production sizing requires [Milestone 3 load testing](milestone-3-load-testing.md) and a completed [benchmark report](benchmark-report-milestone-3.md).

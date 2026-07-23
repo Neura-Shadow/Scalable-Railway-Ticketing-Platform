@@ -89,6 +89,9 @@ func (s *Store) CreateRoute(ctx context.Context, params CreateRouteParams) (Rout
 			ArrivalOffsetMinutes: stop.ArrivalOffsetMinutes(), DepartureOffsetMinutes: stop.DepartureOffsetMinutes(),
 		})
 	}
+	if err := appendReadModelEvent(ctx, tx, "route", route.ID, "route.created"); err != nil {
+		return Route{}, safeError(err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return Route{}, safeError(err)
 	}
@@ -118,13 +121,24 @@ func (s *Store) CreateTrain(ctx context.Context, params CreateTrainParams) (Trai
 	if !entityCodePattern.MatchString(code) || runeLengthOutside(name, 1, 120) {
 		return Train{}, ErrInvalidInput
 	}
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return Train{}, safeError(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
 	var train Train
-	err := s.db.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO trains (code, name)
 		VALUES ($1, $2)
 		RETURNING id::text, code, name, active, created_at, updated_at
 	`, code, name).Scan(&train.ID, &train.Code, &train.Name, &train.Active, &train.CreatedAt, &train.UpdatedAt)
 	if err != nil {
+		return Train{}, safeError(err)
+	}
+	if err := appendReadModelEvent(ctx, tx, "train", train.ID, "train.updated"); err != nil {
+		return Train{}, safeError(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return Train{}, safeError(err)
 	}
 	train.CreatedAt = train.CreatedAt.UTC()
@@ -152,9 +166,14 @@ func (s *Store) CreateCoach(ctx context.Context, params CreateCoachParams) (Coac
 	if params.TrainID == "" || runeLengthOutside(number, 1, 16) || !params.SeatClass.IsValid() {
 		return Coach{}, ErrInvalidInput
 	}
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return Coach{}, safeError(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
 	var coach Coach
 	var seatClass string
-	err := s.db.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO coaches (train_id, coach_number, seat_class)
 		VALUES ($1, $2, $3)
 		RETURNING id::text, train_id::text, coach_number, seat_class, created_at, updated_at
@@ -162,6 +181,12 @@ func (s *Store) CreateCoach(ctx context.Context, params CreateCoachParams) (Coac
 		&coach.ID, &coach.TrainID, &coach.CoachNumber, &seatClass, &coach.CreatedAt, &coach.UpdatedAt,
 	)
 	if err != nil {
+		return Coach{}, safeError(err)
+	}
+	if err := appendReadModelEvent(ctx, tx, "coach", coach.ID, "coach.updated"); err != nil {
+		return Coach{}, safeError(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return Coach{}, safeError(err)
 	}
 	parsedClass, err := domain.ParseSeatClass(seatClass)
@@ -196,8 +221,13 @@ func (s *Store) CreateSeat(ctx context.Context, params CreateSeatParams) (Seat, 
 	if params.CoachID == "" || runeLengthOutside(number, 1, 16) || !validSeatType(seatType) {
 		return Seat{}, ErrInvalidInput
 	}
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return Seat{}, safeError(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
 	var seat Seat
-	err := s.db.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO seats (coach_id, seat_number, seat_type)
 		VALUES ($1, $2, $3)
 		RETURNING id::text, coach_id::text, seat_number, seat_type, active, created_at, updated_at
@@ -205,6 +235,12 @@ func (s *Store) CreateSeat(ctx context.Context, params CreateSeatParams) (Seat, 
 		&seat.ID, &seat.CoachID, &seat.SeatNumber, &seat.SeatType, &seat.Active, &seat.CreatedAt, &seat.UpdatedAt,
 	)
 	if err != nil {
+		return Seat{}, safeError(err)
+	}
+	if err := appendReadModelEvent(ctx, tx, "seat", seat.ID, "seat.updated"); err != nil {
+		return Seat{}, safeError(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return Seat{}, safeError(err)
 	}
 	seat.CreatedAt = seat.CreatedAt.UTC()
@@ -251,9 +287,14 @@ func (s *Store) CreateFare(ctx context.Context, params CreateFareParams) (Fare, 
 		return Fare{}, ErrInvalidInput
 	}
 
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return Fare{}, safeError(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
 	var row pgx.Row
 	if params.TrainRunID != "" {
-		row = s.db.QueryRow(ctx, `
+		row = tx.QueryRow(ctx, `
 			INSERT INTO fares (train_run_id, from_stop_index, to_stop_index, seat_class, amount_minor, currency)
 			SELECT id, $2, $3, $4, $5, $6
 			FROM train_runs
@@ -261,7 +302,7 @@ func (s *Store) CreateFare(ctx context.Context, params CreateFareParams) (Fare, 
 			RETURNING id::text, train_run_id::text, COALESCE(route_id::text, ''), from_stop_index, to_stop_index, seat_class, amount_minor, currency, active, created_at, updated_at
 		`, params.TrainRunID, params.FromStopIndex, params.ToStopIndex, params.SeatClass.String(), params.AmountMinor, currency)
 	} else {
-		row = s.db.QueryRow(ctx, `
+		row = tx.QueryRow(ctx, `
 			INSERT INTO fares (route_id, from_stop_index, to_stop_index, seat_class, amount_minor, currency)
 			SELECT r.id, $2, $3, $4, $5, $6
 			FROM routes AS r
@@ -270,7 +311,17 @@ func (s *Store) CreateFare(ctx context.Context, params CreateFareParams) (Fare, 
 			RETURNING id::text, COALESCE(train_run_id::text, ''), route_id::text, from_stop_index, to_stop_index, seat_class, amount_minor, currency, active, created_at, updated_at
 		`, params.RouteID, params.FromStopIndex, params.ToStopIndex, params.SeatClass.String(), params.AmountMinor, currency)
 	}
-	return scanFare(row)
+	fare, err := scanFare(row)
+	if err != nil {
+		return Fare{}, err
+	}
+	if err := appendReadModelEvent(ctx, tx, "fare", fare.ID, "fare.created"); err != nil {
+		return Fare{}, safeError(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Fare{}, safeError(err)
+	}
+	return fare, nil
 }
 
 func validCurrency(value string) bool {

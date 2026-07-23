@@ -105,11 +105,13 @@ func TestPassengerServiceRejectsInvalidDisplayNameBeforeStore(t *testing.T) {
 }
 
 type offeringQueriesFake struct {
-	stations     []querypostgres.Station
-	search       []querypostgres.SearchResult
-	availability querypostgres.Availability
-	err          error
-	searchInput  querypostgres.SearchRequest
+	stations            []querypostgres.Station
+	search              []querypostgres.SearchResult
+	availability        querypostgres.Availability
+	err                 error
+	searchInput         querypostgres.SearchRequest
+	availabilityCalls   int
+	availabilityBatches int
 }
 
 func (f *offeringQueriesFake) ListStations(context.Context) ([]querypostgres.Station, error) {
@@ -120,7 +122,20 @@ func (f *offeringQueriesFake) SearchTrainRuns(_ context.Context, input querypost
 	return f.search, f.err
 }
 func (f *offeringQueriesFake) Availability(context.Context, querypostgres.AvailabilityRequest) (querypostgres.Availability, error) {
+	f.availabilityCalls++
 	return f.availability, f.err
+}
+func (f *offeringQueriesFake) AvailabilityBatch(
+	_ context.Context,
+	requests []querypostgres.AvailabilityRequest,
+) ([]querypostgres.Availability, error) {
+	f.availabilityBatches++
+	results := make([]querypostgres.Availability, len(requests))
+	for index, request := range requests {
+		results[index] = f.availability
+		results[index].TrainRunID = request.TrainRunID
+	}
+	return results, f.err
 }
 
 func TestOfferingSearchMapsQueryResultsAndAvailability(t *testing.T) {
@@ -138,6 +153,9 @@ func TestOfferingSearchMapsQueryResultsAndAvailability(t *testing.T) {
 	}
 	if backend.searchInput.Sort != "fare_desc" || len(page.Items) != 1 || page.Items[0].AvailableSeatCount != 9 || page.Items[0].OriginStationCode != "TPE" {
 		t.Fatalf("page = %#v, query = %#v", page, backend.searchInput)
+	}
+	if backend.availabilityBatches != 1 || backend.availabilityCalls != 0 {
+		t.Fatalf("availability batch/single calls = %d/%d, want 1/0", backend.availabilityBatches, backend.availabilityCalls)
 	}
 }
 

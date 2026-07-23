@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"log/slog"
 	"net"
@@ -21,7 +22,9 @@ import (
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
 	platformmetrics "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/metrics"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/redisx"
+	querycache "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/cache"
 	querypostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/postgres"
+	queryreadmodel "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/readmodel"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/transport/httpapi"
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -31,10 +34,23 @@ import (
 )
 
 const (
-	maxRequestBodyBytes = 1 << 20
-	maxHeaderBytes      = 1 << 20
-	defaultIdleTimeout  = 60 * time.Second
+	maxRequestBodyBytes               = 1 << 20
+	maxHeaderBytes                    = 1 << 20
+	defaultIdleTimeout                = 60 * time.Second
+	projectionLagObservationInterval  = 5 * time.Second
+	reconciliationObservationInterval = time.Minute
 )
+
+type readModelOperationalStore interface {
+	ProjectionLag(context.Context, string) (time.Duration, error)
+	NextReconciliationTrainRun(context.Context, string) (string, bool, error)
+	ReconcileTrainRun(context.Context, string) (queryreadmodel.ReconcileResult, error)
+}
+
+type readModelOperationalMetrics interface {
+	SetProjectionLag(time.Duration)
+	AddReconciliationMismatches(string, int)
+}
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -79,6 +95,10 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return errors.New("metrics initialization failed")
 	}
+	readMetrics, err := platformmetrics.NewReadModelMetrics(registry)
+	if err != nil {
+		return errors.New("read-model metrics initialization failed")
+	}
 	keySelection, err := cfg.ParseAdmissionTokenKeys()
 	if err != nil {
 		return errors.New("admission token keyring invalid")
@@ -108,6 +128,54 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return errors.New("query store initialization failed")
 	}
+	projectionStore, err := queryreadmodel.NewStore(pool, clock.RealClock{})
+	if err != nil {
+		return errors.New("read-model store initialization failed")
+	}
+	stopReadModelObserver := startReadModelObserver(
+		signalContext, projectionStore, readMetrics, cfg.DatabaseTimeout, logger,
+	)
+	defer stopReadModelObserver()
+	versionManager, err := querycache.NewSecureVersionManager(redisClient)
+	if err != nil {
+		return errors.New("cache version manager initialization failed")
+	}
+	stationTTL, err := querycache.NewTTLPolicy(cfg.StationCacheTTL, cfg.StationCacheJitter, rand.Reader)
+	if err != nil {
+		return errors.New("station cache TTL configuration invalid")
+	}
+	searchTTL, err := querycache.NewTTLPolicy(cfg.SearchCacheTTL, cfg.SearchCacheJitter, rand.Reader)
+	if err != nil {
+		return errors.New("search cache TTL configuration invalid")
+	}
+	availabilityTTL, err := querycache.NewTTLPolicy(cfg.AvailabilityCacheTTL, cfg.AvailabilityCacheJitter, rand.Reader)
+	if err != nil {
+		return errors.New("availability cache TTL configuration invalid")
+	}
+	cachedQueryStore, err := querycache.NewStore(
+		queryStore,
+		projectionStore,
+		redisClient,
+		versionManager,
+		clock.RealClock{},
+		stationTTL,
+		searchTTL,
+		availabilityTTL,
+	)
+	if err != nil {
+		return errors.New("read cache store initialization failed")
+	}
+	cachedQueryStore, err = cachedQueryStore.WithPolicy(querycache.Policy{
+		StationEnabled:        cfg.StationCacheEnabled,
+		SearchEnabled:         cfg.TrainSearchCacheEnabled,
+		SearchFallbackEnabled: cfg.TrainSearchFallbackEnabled,
+		AvailabilityEnabled:   cfg.AvailabilityCacheEnabled,
+		AvailabilityMaxStale:  cfg.AvailabilityCacheMaxStale,
+	})
+	if err != nil {
+		return errors.New("read cache policy invalid")
+	}
+	cachedQueryStore.WithMetrics(readMetrics)
 	bookingStore := bookingpostgres.NewWithReservationQuotaLimits(pool, bookingpostgres.ReservationQuotaLimits{
 		MaxActiveHoldsPerUser:            cfg.ReservationMaxActiveHoldsPerUser,
 		MaxActiveHoldsPerUserPerTrainRun: cfg.ReservationMaxActiveHoldsPerUserPerTrainRun,
@@ -146,7 +214,7 @@ func run(logger *slog.Logger) error {
 		MaxPassengers:       cfg.MaxPassengersPerReservation,
 		HTTPMetrics:         metrics,
 		MetricsHandler:      promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
-		Offering:            app.NewOfferingQueries(queryStore),
+		Offering:            app.NewOfferingQueries(cachedQueryStore),
 		Auth:                auth,
 		RateLimiter:         app.NewRateLimiter(rateLimitBackend),
 		Passengers:          passengers,
@@ -217,6 +285,80 @@ func readinessTimeout(cfg config.Config) time.Duration {
 		return 2 * time.Second
 	}
 	return timeout
+}
+
+func startReadModelObserver(
+	parent context.Context,
+	store readModelOperationalStore,
+	metrics readModelOperationalMetrics,
+	timeout time.Duration,
+	logger *slog.Logger,
+) func() {
+	observerContext, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		lagTicker := time.NewTicker(projectionLagObservationInterval)
+		defer lagTicker.Stop()
+		reconciliationTicker := time.NewTicker(reconciliationObservationInterval)
+		defer reconciliationTicker.Stop()
+		cursor := ""
+		observeLag := func() {
+			ctx, stop := context.WithTimeout(observerContext, timeout)
+			defer stop()
+			lag, err := store.ProjectionLag(ctx, queryreadmodel.DurableConsumerName)
+			if err != nil {
+				logger.Warn("read-model observation failed", "operation", "projection_lag")
+				return
+			}
+			metrics.SetProjectionLag(lag)
+		}
+		observeReconciliation := func() {
+			ctx, stop := context.WithTimeout(observerContext, timeout)
+			defer stop()
+			candidate, found, err := store.NextReconciliationTrainRun(ctx, cursor)
+			if err != nil {
+				logger.Warn("read-model observation failed", "operation", "reconciliation_candidate")
+				return
+			}
+			if !found {
+				cursor = ""
+				return
+			}
+			result, err := store.ReconcileTrainRun(ctx, candidate)
+			if err != nil {
+				logger.Warn("read-model observation failed", "operation", "reconciliation")
+				return
+			}
+			recordReconciliationMismatches(metrics, result)
+			cursor = candidate
+		}
+		observeLag()
+		observeReconciliation()
+		for {
+			select {
+			case <-observerContext.Done():
+				return
+			case <-lagTicker.C:
+				observeLag()
+			case <-reconciliationTicker.C:
+				observeReconciliation()
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+func recordReconciliationMismatches(metrics readModelOperationalMetrics, result queryreadmodel.ReconcileResult) {
+	metrics.AddReconciliationMismatches("missing", result.MissingRows)
+	metrics.AddReconciliationMismatches("extra", result.ExtraRows)
+	metrics.AddReconciliationMismatches("duplicate", result.DuplicateRows)
+	metrics.AddReconciliationMismatches("stale", result.StaleRows)
+	metrics.AddReconciliationMismatches("mismatch", result.MismatchedRows)
+	metrics.AddReconciliationMismatches("invalid", result.InvalidRows)
 }
 
 // publicReason deliberately bounds startup errors so connection strings and

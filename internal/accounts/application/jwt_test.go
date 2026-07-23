@@ -173,6 +173,14 @@ func TestJWTServiceRejectsInvalidTokenContracts(t *testing.T) {
 			wantErr: application.ErrTokenVersionMismatch,
 		},
 		{
+			name: "signed role differs from authoritative role",
+			mutate: func(claims *application.TokenClaims) {
+				claims.Role = domain.RoleAdmin
+			},
+			state:   activeSubjectState,
+			wantErr: application.ErrTokenRoleMismatch,
+		},
+		{
 			name:     "subject state lookup failure",
 			state:    activeSubjectState,
 			stateErr: readerFailure,
@@ -284,7 +292,7 @@ func TestJWTServiceRejectsInvalidConfigurationAndIssueClaims(t *testing.T) {
 
 var (
 	testJWTSecret      = bytes.Repeat([]byte{0xa5}, application.MinJWTSecretBytes)
-	activeSubjectState = application.SubjectState{Active: true, TokenVersion: 7}
+	activeSubjectState = application.SubjectState{Active: true, Role: domain.RoleCustomer, TokenVersion: 7}
 )
 
 const (
@@ -372,7 +380,7 @@ func TestJWTServiceIssuesAndParsesTypedTokenPair(t *testing.T) {
 		AccessTTL:  15 * time.Minute,
 		RefreshTTL: 24 * time.Hour,
 		Clock:      fixedClock{now: now},
-	}, stubSubjectStateReader{state: application.SubjectState{Active: true, TokenVersion: 0}})
+	}, stubSubjectStateReader{state: application.SubjectState{Active: true, Role: domain.RoleCustomer, TokenVersion: 0}})
 	if err != nil {
 		t.Fatalf("NewJWTService() error = %v", err)
 	}

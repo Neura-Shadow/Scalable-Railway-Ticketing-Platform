@@ -15,8 +15,8 @@ concurrency:
 
 env:
   GO_VERSION: "1.25.12"
-  IMAGE_NAME: scalable-railway-ticketing-platform:milestone-2
-  EVIDENCE_PROXY_IMAGE: scalable-railway-ticketing-proxy:milestone-2
+  IMAGE_NAME: scalable-railway-ticketing-platform:milestone-3
+  EVIDENCE_PROXY_IMAGE: scalable-railway-ticketing-proxy:milestone-3
 
 jobs:
   quality:
@@ -46,9 +46,9 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Unit tests
-        run: go test ./... -count=1 -timeout 300s
+        run: go test ./... -count=1 -timeout 420s
       - name: Race detector
-        run: go test -race ./... -count=1 -timeout 300s
+        run: go test -race ./... -count=1 -timeout 540s
       - name: Install pinned Go analyzers
         run: |
           go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
@@ -133,38 +133,23 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: go.sum
-      - name: Seed a populated version-5 migration fixture
+      - name: Seed a populated version-6 migration fixture
         shell: bash
         run: |
           psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --command 'CREATE DATABASE railway_migration_rehearsal'
-          mkdir -p "$RUNNER_TEMP/migrations-v5"
-          cp migrations/00000[1-5]_*.sql "$RUNNER_TEMP/migrations-v5/"
+          mkdir -p "$RUNNER_TEMP/migrations-v6"
+          cp migrations/00000[1-6]_*.sql "$RUNNER_TEMP/migrations-v6/"
           go run ./cmd/migrate \
-            -path "$RUNNER_TEMP/migrations-v5" \
+            -path "$RUNNER_TEMP/migrations-v6" \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             up
           go run ./cmd/migrate \
-            -path "$RUNNER_TEMP/migrations-v5" \
+            -path "$RUNNER_TEMP/migrations-v6" \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             version
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/populated_v5_fixture.sql
-          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
-            --file migrations/testdata/assert_populated_v5_data.sql
-          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
-            --file migrations/testdata/assert_hot_train_v5_schema.sql
-      - name: Rehearse the populated version-5 to version-6 upgrade
-        shell: bash
-        run: |
-          go run ./cmd/migrate \
-            -path migrations \
-            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
-            up
-          go run ./cmd/migrate \
-            -path migrations \
-            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
-            version
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_populated_v5_data.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
@@ -173,6 +158,27 @@ jobs:
             --file migrations/testdata/seed_hot_train_v6_fixture.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_hot_train_v6_data.sql
+      - name: Rehearse the populated version-6 to version-7 upgrade
+        shell: bash
+        run: |
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            up
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            version
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_populated_v5_data.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_hot_train_v6_data.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_read_model_v7_schema.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/seed_read_model_v7_fixture.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_read_model_v7_data.sql
       - name: Rehearse one-step down and up with populated data
         shell: bash
         run: |
@@ -187,7 +193,9 @@ jobs:
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_populated_v5_data.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
-            --file migrations/testdata/assert_hot_train_v5_schema.sql
+            --file migrations/testdata/assert_hot_train_v6_data.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_read_model_v6_after_down.sql
           go run ./cmd/migrate \
             -path migrations \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
@@ -199,7 +207,9 @@ jobs:
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_populated_v5_data.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
-            --file migrations/testdata/assert_hot_train_v6_schema.sql
+            --file migrations/testdata/assert_read_model_v7_schema.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_read_model_v7_empty.sql
       - name: Apply migrations to an empty database
         run: go run ./cmd/migrate -path migrations up
       - name: Verify migration-up is safe to repeat
@@ -207,11 +217,13 @@ jobs:
       - name: Verify clean migration version
         run: go run ./cmd/migrate -path migrations version
       - name: Run integration and constraint tests
-        run: go test ./... -count=1 -timeout 300s
+        run: go test ./... -count=1 -timeout 420s
       - name: Run focused admission, token, quota, and concurrency tests
         run: go test ./internal/admission/... ./internal/booking/postgres ./internal/app -count=3 -timeout 300s
+      - name: Run focused projection, cache, fallback, and reconciliation tests repeatedly
+        run: go test ./internal/query/cache ./internal/query/readmodel ./internal/query/postgres ./internal/app -count=3 -timeout 420s
       - name: Run race-enabled persistence and concurrency tests
-        run: go test -race ./internal/accounts/postgres ./internal/admission/... ./internal/booking/postgres ./internal/offering/postgres ./internal/eventrelay/postgres -count=1 -timeout 300s
+        run: go test -race ./internal/accounts/postgres ./internal/admission/... ./internal/booking/postgres ./internal/offering/postgres ./internal/eventrelay/postgres ./internal/query/cache ./internal/query/readmodel ./internal/query/postgres -count=1 -timeout 540s
 
   multi-replica-evidence:
     name: Multi-replica admission evidence
@@ -273,6 +285,51 @@ jobs:
           }
           Write-Host '::endgroup::'
 
+  read-model-multi-replica-evidence:
+    name: Multi-replica read-model and cache evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Validate topology and Milestone 3 k6 modules
+        shell: bash
+        run: |
+          docker compose -f docker-compose.multi-replica.yml config --quiet
+          for script in \
+            station-cache.js train-search-cold-cache.js train-search-warm-cache.js \
+            availability-cache.js mixed-search-booking.js cache-invalidation-storm.js \
+            redis-cache-outage.js read-model-worker-pause.js multi-replica-search-cache.js
+          do
+            docker run --rm -v "$PWD/loadtest/k6:/scripts:ro" grafana/k6:0.54.0 \
+              inspect "/scripts/$script" >/dev/null
+          done
+      - name: Run bounded shared-cache, worker/API/Redis recovery evidence
+        shell: pwsh
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP 'milestone-3-evidence'
+          ./scripts/run-milestone-3-multi-replica-evidence.ps1 `
+            -EvidenceDirectory $evidence
+          Get-Content -Raw (Join-Path $evidence 'evidence-summary.json')
+      - name: Print bounded read-model failure diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP 'milestone-3-evidence'
+          foreach ($name in @(
+            'compose-up.log', 'api-1-cold-search.log', 'api-2-warm-search.log',
+            'multi-replica-after-rotation.log', 'redis-outage-read-fallback.log'
+          )) {
+            $path = Join-Path $evidence $name
+            if (Test-Path -LiteralPath $path) {
+              Write-Host "::group::$name"
+              Get-Content -LiteralPath $path
+              Write-Host '::endgroup::'
+            }
+          }
+
   container:
     name: Container build and image scan
     runs-on: ubuntu-latest
@@ -294,7 +351,7 @@ jobs:
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: scalable-railway-ticketing-platform:milestone-2
+          image-ref: scalable-railway-ticketing-platform:milestone-3
           format: table
           severity: CRITICAL,HIGH
           ignore-unfixed: true
@@ -303,7 +360,7 @@ jobs:
       - name: Trivy evidence proxy image scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: scalable-railway-ticketing-proxy:milestone-2
+          image-ref: scalable-railway-ticketing-proxy:milestone-3
           format: table
           severity: CRITICAL,HIGH
           ignore-unfixed: true

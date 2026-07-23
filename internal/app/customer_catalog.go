@@ -127,6 +127,10 @@ type offeringQueryStore interface {
 	Availability(context.Context, querypostgres.AvailabilityRequest) (querypostgres.Availability, error)
 }
 
+type offeringBatchAvailabilityStore interface {
+	AvailabilityBatch(context.Context, []querypostgres.AvailabilityRequest) ([]querypostgres.Availability, error)
+}
+
 type OfferingQueries struct{ store offeringQueryStore }
 
 func NewOfferingQueries(store offeringQueryStore) *OfferingQueries {
@@ -176,10 +180,31 @@ func (q *OfferingQueries) SearchTrainRuns(ctx context.Context, search httpapi.Tr
 		return httpapi.TrainRunPage{}, mapQueryError(err)
 	}
 	views := make([]httpapi.TrainRunView, 0, len(items))
-	for _, item := range items {
-		availability, err := q.store.Availability(ctx, querypostgres.AvailabilityRequest{TrainRunID: item.TrainRunID, OriginCode: search.OriginStationCode, DestinationCode: search.DestinationStationCode, SeatClass: search.SeatClass})
+	availabilityByRun := make(map[string]querypostgres.Availability, len(items))
+	if batchStore, ok := q.store.(offeringBatchAvailabilityStore); ok && len(items) > 0 {
+		requests := make([]querypostgres.AvailabilityRequest, 0, len(items))
+		for _, item := range items {
+			requests = append(requests, querypostgres.AvailabilityRequest{
+				TrainRunID: item.TrainRunID, OriginCode: search.OriginStationCode,
+				DestinationCode: search.DestinationStationCode, SeatClass: search.SeatClass,
+			})
+		}
+		availabilityItems, err := batchStore.AvailabilityBatch(ctx, requests)
 		if err != nil {
 			return httpapi.TrainRunPage{}, mapQueryError(err)
+		}
+		for _, availability := range availabilityItems {
+			availabilityByRun[availability.TrainRunID] = availability
+		}
+	}
+	for _, item := range items {
+		availability, exists := availabilityByRun[item.TrainRunID]
+		if !exists {
+			var err error
+			availability, err = q.store.Availability(ctx, querypostgres.AvailabilityRequest{TrainRunID: item.TrainRunID, OriginCode: search.OriginStationCode, DestinationCode: search.DestinationStationCode, SeatClass: search.SeatClass})
+			if err != nil {
+				return httpapi.TrainRunPage{}, mapQueryError(err)
+			}
 		}
 		views = append(views, httpapi.TrainRunView{ID: item.TrainRunID, TrainCode: item.TrainCode, OriginStationCode: search.OriginStationCode, DestinationStationCode: search.DestinationStationCode, DepartureAt: item.DepartureAt, ArrivalAt: item.ArrivalAt, SeatClass: item.SeatClass.String(), AvailableSeatCount: int(availability.AvailableSeats), FareMinor: item.FareAmountMinor, Currency: item.Currency})
 	}
@@ -207,10 +232,6 @@ func querySort(value string) (string, bool) {
 		return "fare_asc", true
 	case "-fare_minor":
 		return "fare_desc", true
-	case "arrival_at":
-		return "departure_asc", true
-	case "-arrival_at":
-		return "departure_desc", true
 	default:
 		return "", false
 	}

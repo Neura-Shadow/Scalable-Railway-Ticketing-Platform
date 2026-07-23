@@ -51,3 +51,15 @@ VARBIT allocator. Rehearse its table/index/constraint changes against a recent
 restore, apply `up` twice, and verify clean version 6 before enabling an
 admission worker or policy. Its `down` deletes durable hot-policy outbox events
 and the policy table; it is never an automatic production rollback.
+
+## Migration 7 operator material
+
+| File | Intended schema state | Purpose |
+|---|---|---|
+| [migration-7-production-rollout.md](migration-7-production-rollout.md) | Clean version 6 before rollout; clean version 7 after rollout | Projection/receipt DDL, bounded initial backfill, worker enablement, sizing, rollback, and destructive-down warning |
+
+Migration 7 leaves authoritative railway and booking tables unchanged and
+starts with an empty disposable projection. Rehearse its outbox constraints and
+index locks on a production-like restore, measure disk/WAL growth, apply `up`
+twice, then perform a bounded explicit backfill before enabling one read-model
+worker. No zero-downtime claim is made.

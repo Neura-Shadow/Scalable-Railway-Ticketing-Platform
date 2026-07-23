@@ -5,3 +5,5 @@ FROM nginx:1.29.8-alpine-slim@sha256:c9366b8c560169b101ca0e5422ed063b20779e6454c
 RUN apk upgrade --no-cache
 
 COPY deploy/nginx/multi-replica.conf /etc/nginx/nginx.conf
+
+USER 101:101
