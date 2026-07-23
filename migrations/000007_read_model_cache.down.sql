@@ -5,7 +5,8 @@ BEGIN;
 -- preserves every pre-existing reservation, ticket, cancellation, and hot
 -- policy event.
 DELETE FROM outbox_events
-WHERE event_type IN (
+WHERE aggregate_type IN ('station', 'route', 'train', 'coach', 'seat', 'fare')
+   OR event_type IN (
     'trainrun.created',
     'trainrun.updated',
     'station.created',
@@ -22,7 +23,11 @@ WHERE event_type IN (
     'fare.disabled'
 );
 
+DROP INDEX outbox_events_read_model_replay_idx;
+DROP INDEX outbox_events_read_model_lag_idx;
+
 ALTER TABLE outbox_events
+    DROP CONSTRAINT outbox_events_event_pair_check,
     DROP CONSTRAINT outbox_events_aggregate_type_check,
     ADD CONSTRAINT outbox_events_aggregate_type_check
         CHECK (aggregate_type IN (

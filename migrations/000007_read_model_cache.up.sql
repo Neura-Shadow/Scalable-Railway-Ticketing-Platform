@@ -174,6 +174,30 @@ CREATE TABLE read_model_projection_state (
 INSERT INTO read_model_projection_state (projection_name)
 VALUES ('journey_search');
 
+CREATE INDEX outbox_events_read_model_replay_idx
+    ON outbox_events (published_at, id)
+    WHERE status = 'published'
+      AND event_type IN (
+        'reservation.held', 'reservation.confirmed', 'reservation.expired', 'reservation.cancelled',
+        'ticket.created',
+        'trainrun.created', 'trainrun.updated', 'trainrun.cancelled',
+        'hot_train_policy.created', 'hot_train_policy.updated', 'hot_train_policy.disabled',
+        'station.created', 'station.updated', 'station.disabled',
+        'route.created', 'route.updated', 'route.disabled',
+        'train.updated', 'coach.updated', 'seat.updated',
+        'fare.created', 'fare.updated', 'fare.disabled'
+      );
+
+CREATE INDEX outbox_events_read_model_lag_idx
+    ON outbox_events (created_at, id)
+    WHERE event_type IN (
+        'trainrun.created', 'trainrun.updated', 'trainrun.cancelled',
+        'station.created', 'station.updated', 'station.disabled',
+        'route.created', 'route.updated', 'route.disabled',
+        'train.updated',
+        'fare.created', 'fare.updated', 'fare.disabled'
+    );
+
 ALTER TABLE outbox_events
     DROP CONSTRAINT outbox_events_aggregate_type_check,
     ADD CONSTRAINT outbox_events_aggregate_type_check
@@ -215,6 +239,31 @@ ALTER TABLE outbox_events
             'fare.created',
             'fare.updated',
             'fare.disabled'
-        ));
+        )),
+    ADD CONSTRAINT outbox_events_event_pair_check
+        CHECK (
+            (aggregate_type = 'reservation' AND event_type IN (
+                'reservation.held', 'reservation.confirmed', 'reservation.expired', 'reservation.cancelled'
+            ))
+            OR (aggregate_type = 'ticket' AND event_type = 'ticket.created')
+            OR (aggregate_type = 'train_run' AND event_type IN (
+                'trainrun.created', 'trainrun.updated', 'trainrun.cancelled'
+            ))
+            OR (aggregate_type = 'hot_train_policy' AND event_type IN (
+                'hot_train_policy.created', 'hot_train_policy.updated', 'hot_train_policy.disabled'
+            ))
+            OR (aggregate_type = 'station' AND event_type IN (
+                'station.created', 'station.updated', 'station.disabled'
+            ))
+            OR (aggregate_type = 'route' AND event_type IN (
+                'route.created', 'route.updated', 'route.disabled'
+            ))
+            OR (aggregate_type = 'train' AND event_type = 'train.updated')
+            OR (aggregate_type = 'coach' AND event_type = 'coach.updated')
+            OR (aggregate_type = 'seat' AND event_type = 'seat.updated')
+            OR (aggregate_type = 'fare' AND event_type IN (
+                'fare.created', 'fare.updated', 'fare.disabled'
+            ))
+        );
 
 COMMIT;

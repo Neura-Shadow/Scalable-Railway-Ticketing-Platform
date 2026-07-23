@@ -17,17 +17,8 @@ import (
 )
 
 func TestRedisStreamTransportAtomicallyContinuesAndDeadLettersSafeFields(t *testing.T) {
-	address := os.Getenv("TEST_REDIS_ADDR")
-	if address == "" {
-		address = "127.0.0.1:56379"
-	}
-	client := redis.NewClient(&redis.Options{Addr: address, DB: 13})
+	client := openReadModelRedis(t, 13)
 	ctx := context.Background()
-	if err := client.Ping(ctx).Err(); err != nil {
-		client.Close()
-		t.Skipf("Redis integration dependency unavailable: %v", err)
-	}
-	t.Cleanup(func() { _ = client.Close() })
 	if err := client.FlushDB(ctx).Err(); err != nil {
 		t.Fatalf("flush Redis test database: %v", err)
 	}
@@ -106,17 +97,8 @@ func TestRedisStreamTransportAtomicallyContinuesAndDeadLettersSafeFields(t *test
 }
 
 func TestRedisContinuationDoesNotTrimMoreThanTenThousandPendingEntries(t *testing.T) {
-	address := os.Getenv("TEST_REDIS_ADDR")
-	if address == "" {
-		address = "127.0.0.1:56379"
-	}
-	client := redis.NewClient(&redis.Options{Addr: address, DB: 13})
+	client := openReadModelRedis(t, 13)
 	ctx := context.Background()
-	if err := client.Ping(ctx).Err(); err != nil {
-		client.Close()
-		t.Skipf("Redis integration dependency unavailable: %v", err)
-	}
-	t.Cleanup(func() { _ = client.Close() })
 	if err := client.FlushDB(ctx).Err(); err != nil {
 		t.Fatalf("flush Redis test database: %v", err)
 	}
@@ -162,17 +144,8 @@ func TestRedisContinuationDoesNotTrimMoreThanTenThousandPendingEntries(t *testin
 }
 
 func TestRedisClaimPendingAdvancesAcrossThePELInsteadOfReclaimingTheFront(t *testing.T) {
-	address := os.Getenv("TEST_REDIS_ADDR")
-	if address == "" {
-		address = "127.0.0.1:56379"
-	}
-	client := redis.NewClient(&redis.Options{Addr: address, DB: 13})
+	client := openReadModelRedis(t, 13)
 	ctx := context.Background()
-	if err := client.Ping(ctx).Err(); err != nil {
-		client.Close()
-		t.Skipf("Redis integration dependency unavailable: %v", err)
-	}
-	t.Cleanup(func() { _ = client.Close() })
 	if err := client.FlushDB(ctx).Err(); err != nil {
 		t.Fatalf("flush Redis test database: %v", err)
 	}
@@ -231,17 +204,8 @@ func TestDeadLetteredProgressConvergesAfterOperatorRedrive(t *testing.T) {
 		t.Fatalf("NewEventCoordinator() error = %v", err)
 	}
 
-	address := os.Getenv("TEST_REDIS_ADDR")
-	if address == "" {
-		address = "127.0.0.1:56379"
-	}
-	client := redis.NewClient(&redis.Options{Addr: address, DB: 13})
+	client := openReadModelRedis(t, 13)
 	ctx := context.Background()
-	if err := client.Ping(ctx).Err(); err != nil {
-		client.Close()
-		t.Skipf("Redis integration dependency unavailable: %v", err)
-	}
-	t.Cleanup(func() { _ = client.Close() })
 	if err := client.FlushDB(ctx).Err(); err != nil {
 		t.Fatalf("flush Redis test database: %v", err)
 	}
@@ -318,4 +282,111 @@ func TestDeadLetteredProgressConvergesAfterOperatorRedrive(t *testing.T) {
 	) {
 		t.Fatalf("redrive rotations = %v", rotator.keys)
 	}
+}
+
+func TestPublishedOutboxReplaysAfterCompleteRedisStreamLoss(t *testing.T) {
+	conn := openMigrationSevenDatabase(t)
+	trainRunID := seedProjectionSource(t, conn)
+	markProjectionReady(t, conn)
+	store, err := readmodel.NewStore(conn, clock.NewDeterministic(time.Now().UTC()))
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	resolver, err := readmodel.NewPostgresImpactResolver(conn)
+	if err != nil {
+		t.Fatalf("NewPostgresImpactResolver() error = %v", err)
+	}
+	coordinator, err := readmodel.NewEventCoordinator(store, resolver, &versionRotatorFake{})
+	if err != nil {
+		t.Fatalf("NewEventCoordinator() error = %v", err)
+	}
+	client := openReadModelRedis(t, 14)
+	ctx := context.Background()
+	if err := client.FlushDB(ctx).Err(); err != nil {
+		t.Fatalf("flush Redis test database: %v", err)
+	}
+	transport, err := readmodel.NewRedisStreamTransport(
+		client, "railway:test:stream-loss", readmodel.DurableConsumerName, "railway:test:stream-loss:dlq",
+	)
+	if err != nil {
+		t.Fatalf("NewRedisStreamTransport() error = %v", err)
+	}
+	if err := transport.EnsureGroup(ctx); err != nil {
+		t.Fatalf("EnsureGroup() error = %v", err)
+	}
+	event := projectionTrainRunEvent(trainRunID)
+	if _, err := conn.Exec(ctx, `
+		INSERT INTO outbox_events (
+			id, aggregate_type, aggregate_id, event_type, payload,
+			status, published_at
+		) VALUES ($1, $2, $3, $4, '{}'::jsonb, 'published', clock_timestamp())
+	`, event.EventID, event.AggregateType, event.AggregateID, event.EventType); err != nil {
+		t.Fatalf("seed published outbox event: %v", err)
+	}
+	if _, err := transport.EnqueueEvent(ctx, event); err != nil {
+		t.Fatalf("EnqueueEvent(before loss) error = %v", err)
+	}
+	pending, err := transport.ReadNew(ctx, "lost-owner", 1)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("ReadNew(before loss) = %+v, %v", pending, err)
+	}
+	if err := client.FlushDB(ctx).Err(); err != nil {
+		t.Fatalf("simulate complete Redis loss: %v", err)
+	}
+	page, err := store.MissingPublishedEvents(
+		ctx, readmodel.DurableConsumerName, readmodel.OutboxReplayOptions{Limit: 10},
+	)
+	if err != nil || len(page.Events) != 1 || page.Events[0].EventID != event.EventID {
+		t.Fatalf("MissingPublishedEvents(after loss) = %+v, %v", page, err)
+	}
+	recoveredTransport, err := readmodel.NewRedisStreamTransport(
+		client, "railway:test:stream-loss", readmodel.DurableConsumerName, "railway:test:stream-loss:dlq",
+	)
+	if err != nil {
+		t.Fatalf("NewRedisStreamTransport(recovered) error = %v", err)
+	}
+	if _, err := recoveredTransport.EnqueueEvent(ctx, page.Events[0]); err != nil {
+		t.Fatalf("EnqueueEvent(replay) error = %v", err)
+	}
+	worker, err := readmodel.NewWorker(recoveredTransport, coordinator, readmodel.WorkerConfig{
+		ConsumerName: "recovery-owner", BatchSize: 10, MaxAttempts: 3, PendingIdle: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewWorker() error = %v", err)
+	}
+	result, err := worker.RunOnce(ctx)
+	if err != nil || result.Processed != 1 || result.Acked != 1 {
+		t.Fatalf("RunOnce(replayed) = %+v, %v", result, err)
+	}
+	var receipts int
+	if err := conn.QueryRow(ctx, `
+		SELECT count(*) FROM read_model_event_receipts
+		WHERE consumer_name = $1 AND event_id = $2
+	`, readmodel.DurableConsumerName, event.EventID).Scan(&receipts); err != nil || receipts != 1 {
+		t.Fatalf("replayed receipt count = %d, %v", receipts, err)
+	}
+	page, err = store.MissingPublishedEvents(
+		ctx, readmodel.DurableConsumerName, readmodel.OutboxReplayOptions{Limit: 10},
+	)
+	if err != nil || len(page.Events) != 0 {
+		t.Fatalf("MissingPublishedEvents(after convergence) = %+v, %v", page, err)
+	}
+}
+
+func openReadModelRedis(t *testing.T, database int) *redis.Client {
+	t.Helper()
+	address, configured := os.LookupEnv("TEST_REDIS_ADDR")
+	if !configured {
+		address = "127.0.0.1:56379"
+	}
+	client := redis.NewClient(&redis.Options{Addr: address, DB: database})
+	if err := client.Ping(context.Background()).Err(); err != nil {
+		client.Close()
+		if configured {
+			t.Fatalf("configured Redis integration dependency unavailable: %v", err)
+		}
+		t.Skipf("Redis integration dependency unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	return client
 }

@@ -18,6 +18,8 @@ read-model-admin reconcile --limit 100
 read-model-admin inspect-lag
 read-model-admin resume-event --event-id <uuid>
 read-model-admin resume-event --event-id <uuid> --apply
+read-model-admin replay-outbox --batch-size 100
+read-model-admin replay-outbox --batch-size 100 --apply
 ```
 
 Rebuild commands default to dry-run. `rebuild-all` selects stable
@@ -37,6 +39,22 @@ DLQ after creating durable fan-out progress. Dry-run verifies that progress
 still exists. Apply re-enqueues only the bounded event envelope after the failed
 dependency is repaired. It never deletes progress or bypasses projection
 fallback; successful worker completion does that atomically with the receipt.
+
+`replay-outbox` is the bounded recovery path after complete Redis stream/PEL
+loss or a DLQ failure that occurred before progress was created. It scans only
+published PostgreSQL outbox events without the durable read-model receipt,
+returns a stable `(published_at,event_id)` cursor, and re-enqueues only validated
+safe envelope fields. Repeating a page is harmless because normal receipt and
+current-source rebuild rules remain authoritative. Projection search fails
+closed to the source while a published projection event has neither progress
+nor a receipt.
+
+`reconcile --limit 100` scans at most 100 train runs in UUID order and reports
+only aggregate mismatch counts plus a bounded `next_cursor`. Pass that cursor
+back with `--after`; `--train-run-id` remains available for one-run diagnosis.
+`inspect-lag` reports both projection/source drift and the age of the oldest
+projection-affecting outbox event without a durable receipt, including events
+that have not yet created a progress row.
 
 ## Initial backfill
 

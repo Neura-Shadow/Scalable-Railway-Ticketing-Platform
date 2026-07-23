@@ -753,12 +753,6 @@ func loadReadModelWorkerSettings(lookup LookupFunc, cfg *Config) error {
 	if err := setInt(lookup, "READ_MODEL_MAX_ATTEMPTS", &cfg.ReadModelWorkerMaxAttempts); err != nil {
 		return err
 	}
-	if err := setMilliseconds(lookup, "READ_MODEL_WORKER_INTERVAL_MILLISECONDS", &cfg.ReadModelWorkerPollInterval); err != nil {
-		return err
-	}
-	if err := setSeconds(lookup, "READ_MODEL_CLAIM_MIN_IDLE_SECONDS", &cfg.ReadModelWorkerPendingIdle); err != nil {
-		return err
-	}
 	for _, item := range []struct {
 		name   string
 		target *time.Duration
@@ -771,6 +765,14 @@ func loadReadModelWorkerSettings(lookup LookupFunc, cfg *Config) error {
 		if err := setDuration(lookup, item.name, item.target); err != nil {
 			return err
 		}
+	}
+	// The documented Milestone 3 names are authoritative when both a legacy
+	// duration alias and the exact unit-bearing setting are present.
+	if err := setMilliseconds(lookup, "READ_MODEL_WORKER_INTERVAL_MILLISECONDS", &cfg.ReadModelWorkerPollInterval); err != nil {
+		return err
+	}
+	if err := setSeconds(lookup, "READ_MODEL_CLAIM_MIN_IDLE_SECONDS", &cfg.ReadModelWorkerPendingIdle); err != nil {
+		return err
 	}
 	return nil
 }

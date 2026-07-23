@@ -89,6 +89,17 @@ func TestMigrationSevenCreatesProjectionAndReceiptSchema(t *testing.T) {
 	if !equalStrings(gotIndexes, wantIndexes) {
 		t.Fatalf("migration 7 indexes = %v, want %v", gotIndexes, wantIndexes)
 	}
+	var replayIndexes, lagIndexes int
+	if err := conn.QueryRow(ctx, `
+		SELECT
+			count(*) FILTER (WHERE indexname = 'outbox_events_read_model_replay_idx'),
+			count(*) FILTER (WHERE indexname = 'outbox_events_read_model_lag_idx')
+		FROM pg_indexes
+		WHERE schemaname = current_schema()
+		  AND tablename = 'outbox_events'
+	`).Scan(&replayIndexes, &lagIndexes); err != nil || replayIndexes != 1 || lagIndexes != 1 {
+		t.Fatalf("outbox read-model indexes = replay %d lag %d, %v, want 1 and 1", replayIndexes, lagIndexes, err)
+	}
 
 	var projectionColumns, receiptColumns, progressColumns, stateColumns int
 	if err := conn.QueryRow(ctx, `
@@ -171,6 +182,18 @@ func TestMigrationSevenAllowsOnlyBoundedReadModelSourceEvents(t *testing.T) {
 	var pgError *pgconn.PgError
 	if !errors.As(err, &pgError) || pgError.Code != "23514" {
 		t.Fatalf("unknown read-model event error = %v, want check violation", err)
+	}
+
+	_, err = conn.Exec(ctx, `
+		INSERT INTO outbox_events (
+			aggregate_type,
+			aggregate_id,
+			event_type,
+			payload
+		) VALUES ('station', gen_random_uuid(), 'reservation.held', '{}'::jsonb)
+	`)
+	if !errors.As(err, &pgError) || pgError.Code != "23514" {
+		t.Fatalf("mismatched aggregate/event pair error = %v, want check violation", err)
 	}
 }
 

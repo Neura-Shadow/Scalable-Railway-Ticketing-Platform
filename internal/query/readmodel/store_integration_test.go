@@ -764,6 +764,118 @@ func TestProjectionSearchKeepsGateAndRowsInOneRepeatableSnapshot(t *testing.T) {
 	}
 }
 
+func TestPublishedOutboxWithoutReceiptGatesSearchAndIsReplayable(t *testing.T) {
+	conn := openMigrationSevenDatabase(t)
+	trainRunID := seedProjectionSource(t, conn)
+	store, err := readmodel.NewStore(conn, clock.NewDeterministic(time.Now().UTC()))
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	if _, err := store.RebuildAll(context.Background(), readmodel.RebuildAllOptions{Limit: 100}); err != nil {
+		t.Fatalf("RebuildAll() error = %v", err)
+	}
+	request := querypostgres.SearchRequest{
+		OriginCode: "TPE", DestinationCode: "KHH", ServiceDate: time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC),
+		SeatClass: "standard", Page: 1, PageSize: 20, Sort: "departure_asc",
+	}
+	if _, err := store.SearchTrainRuns(context.Background(), request); err != nil {
+		t.Fatalf("SearchTrainRuns(baseline) error = %v", err)
+	}
+	eventID := uuid.New()
+	if _, err := conn.Exec(context.Background(), `
+		INSERT INTO outbox_events (
+			id, aggregate_type, aggregate_id, event_type, payload,
+			status, published_at
+		) VALUES ($1, 'train_run', $2, 'trainrun.updated', '{}'::jsonb, 'published', clock_timestamp())
+	`, eventID, trainRunID); err != nil {
+		t.Fatalf("seed published missing-receipt event: %v", err)
+	}
+	if _, err := store.SearchTrainRuns(context.Background(), request); !errors.Is(err, readmodel.ErrProjectionUnavailable) {
+		t.Fatalf("SearchTrainRuns(missing receipt) error = %v, want unavailable", err)
+	}
+	page, err := store.MissingPublishedEvents(
+		context.Background(),
+		readmodel.DurableConsumerName,
+		readmodel.OutboxReplayOptions{Limit: 1},
+	)
+	if err != nil || len(page.Events) != 1 || page.Events[0].EventID != eventID.String() || page.NextCursor == "" {
+		t.Fatalf("MissingPublishedEvents() = %+v, %v", page, err)
+	}
+	recoverable, err := store.PendingEvent(context.Background(), readmodel.DurableConsumerName, eventID.String())
+	if err != nil || recoverable != page.Events[0] {
+		t.Fatalf("PendingEvent(outbox fallback) = %+v, %v", recoverable, err)
+	}
+	if _, err := conn.Exec(context.Background(), `
+		INSERT INTO read_model_event_receipts (
+			consumer_name, event_id, event_type, aggregate_type, aggregate_id, processed_at
+		) VALUES ($1, $2, 'trainrun.updated', 'train_run', $3, clock_timestamp())
+	`, readmodel.DurableConsumerName, eventID, trainRunID); err != nil {
+		t.Fatalf("complete missing-receipt event: %v", err)
+	}
+	page, err = store.MissingPublishedEvents(
+		context.Background(), readmodel.DurableConsumerName, readmodel.OutboxReplayOptions{Limit: 1},
+	)
+	if err != nil || len(page.Events) != 0 {
+		t.Fatalf("MissingPublishedEvents(after receipt) = %+v, %v", page, err)
+	}
+	if _, err := store.SearchTrainRuns(context.Background(), request); err != nil {
+		t.Fatalf("SearchTrainRuns(after receipt) error = %v", err)
+	}
+}
+
+func TestProjectionLagTracksOldestUnreceiptedOutboxEventAndClearsAtReceipt(t *testing.T) {
+	conn := openMigrationSevenDatabase(t)
+	trainRunID := seedProjectionSource(t, conn)
+	store, err := readmodel.NewStore(conn, clock.NewDeterministic(time.Now().UTC()))
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	eventID := uuid.New()
+	if _, err := conn.Exec(context.Background(), `
+		INSERT INTO outbox_events (
+			id, aggregate_type, aggregate_id, event_type, payload,
+			status, created_at, next_attempt_at
+		) VALUES (
+			$1, 'train_run', $2, 'trainrun.updated', '{}'::jsonb,
+			'pending', clock_timestamp() - interval '5 seconds', clock_timestamp()
+		)
+	`, eventID, trainRunID); err != nil {
+		t.Fatalf("seed lagging outbox event: %v", err)
+	}
+	lag, err := store.ProjectionLag(context.Background(), readmodel.DurableConsumerName)
+	if err != nil || lag < 4*time.Second {
+		t.Fatalf("ProjectionLag() = %v, %v, want at least 4s", lag, err)
+	}
+	if _, err := conn.Exec(context.Background(), `
+		INSERT INTO read_model_event_receipts (
+			consumer_name, event_id, event_type, aggregate_type, aggregate_id, processed_at
+		) VALUES ($1, $2, 'trainrun.updated', 'train_run', $3, clock_timestamp())
+	`, readmodel.DurableConsumerName, eventID, trainRunID); err != nil {
+		t.Fatalf("seed durable receipt: %v", err)
+	}
+	lag, err = store.ProjectionLag(context.Background(), readmodel.DurableConsumerName)
+	if err != nil || lag != 0 {
+		t.Fatalf("ProjectionLag(after receipt) = %v, %v, want zero", lag, err)
+	}
+}
+
+func TestNextReconciliationTrainRunUsesStableBoundedCursor(t *testing.T) {
+	conn := openMigrationSevenDatabase(t)
+	trainRunID := seedProjectionSource(t, conn)
+	store, err := readmodel.NewStore(conn, clock.NewDeterministic(time.Now().UTC()))
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	candidate, found, err := store.NextReconciliationTrainRun(context.Background(), "")
+	if err != nil || !found || candidate != trainRunID.String() {
+		t.Fatalf("NextReconciliationTrainRun(first) = %q, %v, %v", candidate, found, err)
+	}
+	candidate, found, err = store.NextReconciliationTrainRun(context.Background(), candidate)
+	if err != nil || found || candidate != "" {
+		t.Fatalf("NextReconciliationTrainRun(end) = %q, %v, %v", candidate, found, err)
+	}
+}
+
 type searchSnapshotBarrier struct {
 	conn     *pgx.Conn
 	observed chan struct{}

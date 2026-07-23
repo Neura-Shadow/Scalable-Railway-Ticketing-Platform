@@ -37,6 +37,29 @@ type lagResult struct {
 	TrainRunsWithoutProjection int64         `json:"train_runs_without_projection"`
 	MaximumSourceAhead         time.Duration `json:"maximum_source_ahead"`
 	OldestProgressAge          time.Duration `json:"oldest_progress_age"`
+	OldestUnreceiptedEventAge  time.Duration `json:"oldest_unreceipted_event_age"`
+}
+
+type replayResult struct {
+	Selected   int            `json:"selected"`
+	Enqueued   int            `json:"enqueued"`
+	NextCursor string         `json:"next_cursor,omitempty"`
+	HasMore    bool           `json:"has_more"`
+	EventTypes map[string]int `json:"event_types"`
+}
+
+type reconcilePageResult struct {
+	Selected       int    `json:"selected"`
+	Consistent     int    `json:"consistent"`
+	Mismatched     int    `json:"mismatched"`
+	MissingRows    int    `json:"missing_rows"`
+	ExtraRows      int    `json:"extra_rows"`
+	DuplicateRows  int    `json:"duplicate_rows"`
+	StaleRows      int    `json:"stale_rows"`
+	MismatchedRows int    `json:"mismatched_rows"`
+	InvalidRows    int    `json:"invalid_rows"`
+	NextCursor     string `json:"next_cursor,omitempty"`
+	HasMore        bool   `json:"has_more"`
 }
 
 func main() {
@@ -78,6 +101,19 @@ func run(parent context.Context, args []string, lookup func(string) (string, boo
 			redisPassword,
 			args[1:],
 		)
+	case "replay-outbox":
+		redisAddress, _ := lookup("REDIS_ADDRESS")
+		if strings.TrimSpace(redisAddress) == "" {
+			redisAddress, _ = lookup("REDIS_ADDR")
+		}
+		redisPassword, _ := lookup("REDIS_PASSWORD")
+		result, err = replayOutbox(
+			parent,
+			databaseURL,
+			strings.TrimSpace(redisAddress),
+			redisPassword,
+			args[1:],
+		)
 	default:
 		writeUsage(stderr)
 		return 2
@@ -95,6 +131,67 @@ func run(parent context.Context, args []string, lookup func(string) (string, boo
 		return 1
 	}
 	return 0
+}
+
+func replayOutbox(
+	parent context.Context,
+	databaseURL string,
+	redisAddress string,
+	redisPassword string,
+	args []string,
+) (envelope, error) {
+	flags := flag.NewFlagSet("replay-outbox", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	after := flags.String("after", "", "opaque published-event resume cursor")
+	batchSize := flags.Int("batch-size", 50, "bounded published-event batch size")
+	consumerName := flags.String("consumer-name", queryreadmodel.DurableConsumerName, "durable receipt consumer")
+	apply := flags.Bool("apply", false, "enqueue safe event envelopes")
+	timeout := flags.Duration("timeout", defaultAdminTimeout, "maximum command duration")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || *timeout <= 0 ||
+		*batchSize < 1 || *batchSize > queryreadmodel.MaxOutboxReplayBatchSize {
+		return envelope{}, errors.New("usage: read-model-admin replay-outbox [--after CURSOR] [--batch-size 50] [--consumer-name railway-read-model] [--apply] [--timeout 2m]")
+	}
+	result := envelope{Command: "replay-outbox", Status: "dry-run", ReadOnly: !*apply}
+	ctx, store, closeStore, err := openStore(parent, databaseURL, *timeout)
+	if err != nil {
+		return result, err
+	}
+	defer closeStore()
+	page, err := store.MissingPublishedEvents(ctx, strings.TrimSpace(*consumerName), queryreadmodel.OutboxReplayOptions{
+		After: strings.TrimSpace(*after), Limit: *batchSize,
+	})
+	if err != nil {
+		return result, err
+	}
+	summary := replayResult{
+		Selected: len(page.Events), NextCursor: page.NextCursor, HasMore: page.HasMore,
+		EventTypes: make(map[string]int),
+	}
+	for _, event := range page.Events {
+		summary.EventTypes[event.EventType]++
+	}
+	result.Result = summary
+	if !*apply {
+		return result, nil
+	}
+	if redisAddress == "" {
+		return result, errors.New("REDIS_ADDRESS is required to replay outbox events")
+	}
+	client := redis.NewClient(redisx.BoundedClientOptions(redisAddress, redisPassword, 3*time.Second))
+	defer func() { _ = client.Close() }()
+	transport, err := queryreadmodel.NewRedisStreamTransport(client, readModelStream, readModelGroup, readModelDLQ)
+	if err != nil {
+		return result, err
+	}
+	for _, event := range page.Events {
+		if _, err := transport.EnqueueEvent(ctx, event); err != nil {
+			return result, err
+		}
+		summary.Enqueued++
+	}
+	result.Status = "replayed"
+	result.Result = summary
+	return result, nil
 }
 
 func resumeEvent(
@@ -213,19 +310,72 @@ func reconcile(parent context.Context, databaseURL string, args []string) (envel
 	flags := flag.NewFlagSet("reconcile", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	trainRunText := flags.String("train-run-id", "", "canonical train-run UUID")
+	after := flags.String("after", "", "canonical train-run resume cursor")
+	limit := flags.Int("limit", queryreadmodel.MaxRebuildAllBatchSize, "bounded train-run reconciliation batch")
 	timeout := flags.Duration("timeout", defaultAdminTimeout, "maximum command duration")
-	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || *timeout <= 0 {
-		return envelope{}, errors.New("usage: read-model-admin reconcile --train-run-id UUID [--timeout 2m]")
-	}
-	trainRunID, err := canonicalUUID(*trainRunText)
-	if err != nil {
-		return envelope{}, err
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || *timeout <= 0 ||
+		*limit < 1 || *limit > queryreadmodel.MaxRebuildAllBatchSize ||
+		(strings.TrimSpace(*trainRunText) != "" && strings.TrimSpace(*after) != "") {
+		return envelope{}, errors.New("usage: read-model-admin reconcile [--train-run-id UUID | --after UUID --limit 100] [--timeout 2m]")
 	}
 	ctx, store, closeStore, err := openStore(parent, databaseURL, *timeout)
 	if err != nil {
 		return envelope{}, err
 	}
 	defer closeStore()
+	if strings.TrimSpace(*trainRunText) == "" {
+		cursor := strings.TrimSpace(*after)
+		if cursor != "" {
+			cursor, err = canonicalUUID(cursor)
+			if err != nil {
+				return envelope{}, err
+			}
+		}
+		page := reconcilePageResult{}
+		for page.Selected < *limit {
+			candidate, found, candidateErr := store.NextReconciliationTrainRun(ctx, cursor)
+			if candidateErr != nil {
+				return envelope{Command: "reconcile", Status: "failed", ReadOnly: true, Result: page}, candidateErr
+			}
+			if !found {
+				break
+			}
+			comparison, comparisonErr := store.ReconcileTrainRun(ctx, candidate)
+			if comparisonErr != nil {
+				return envelope{Command: "reconcile", Status: "failed", ReadOnly: true, Result: page}, comparisonErr
+			}
+			page.Selected++
+			page.NextCursor = candidate
+			cursor = candidate
+			if comparison.Consistent {
+				page.Consistent++
+			} else {
+				page.Mismatched++
+			}
+			page.MissingRows += comparison.MissingRows
+			page.ExtraRows += comparison.ExtraRows
+			page.DuplicateRows += comparison.DuplicateRows
+			page.StaleRows += comparison.StaleRows
+			page.MismatchedRows += comparison.MismatchedRows
+			page.InvalidRows += comparison.InvalidRows
+		}
+		if page.Selected == *limit {
+			_, page.HasMore, err = store.NextReconciliationTrainRun(ctx, cursor)
+			if err != nil {
+				return envelope{Command: "reconcile", Status: "failed", ReadOnly: true, Result: page}, err
+			}
+		}
+		result := envelope{Command: "reconcile", Status: "healthy", ReadOnly: true, Result: page}
+		if page.Mismatched > 0 {
+			result.Status = "mismatched"
+			return result, errors.New("projection mismatches detected")
+		}
+		return result, nil
+	}
+	trainRunID, err := canonicalUUID(*trainRunText)
+	if err != nil {
+		return envelope{}, err
+	}
 	comparison, err := store.ReconcileTrainRun(ctx, trainRunID)
 	result := envelope{Command: "reconcile", Status: "healthy", ReadOnly: true, Result: comparison}
 	if err != nil {
@@ -251,6 +401,10 @@ func inspectLag(parent context.Context, databaseURL string, args []string) (enve
 		return envelope{}, errors.New("postgres configuration invalid")
 	}
 	defer pool.Close()
+	store, err := queryreadmodel.NewStore(pool, clock.RealClock{})
+	if err != nil {
+		return envelope{}, errors.New("read-model store initialization failed")
+	}
 	var missing int64
 	var sourceAheadSeconds, progressAgeSeconds float64
 	err = pool.QueryRow(ctx, `
@@ -269,10 +423,15 @@ func inspectLag(parent context.Context, databaseURL string, args []string) (enve
 	if err != nil {
 		return envelope{}, errors.New("read-model lag inspection failed")
 	}
+	projectionLag, err := store.ProjectionLag(ctx, queryreadmodel.DurableConsumerName)
+	if err != nil {
+		return envelope{}, errors.New("read-model lag inspection failed")
+	}
 	result := lagResult{
 		TrainRunsWithoutProjection: missing,
 		MaximumSourceAhead:         time.Duration(sourceAheadSeconds * float64(time.Second)),
 		OldestProgressAge:          time.Duration(progressAgeSeconds * float64(time.Second)),
+		OldestUnreceiptedEventAge:  projectionLag,
 	}
 	return envelope{Command: "inspect-lag", Status: "completed", ReadOnly: true, Result: result}, nil
 }
@@ -312,5 +471,5 @@ func publicAdminError(err error) string {
 }
 
 func writeUsage(output io.Writer) {
-	fmt.Fprintln(output, "usage: read-model-admin {rebuild-train-run|rebuild-all|reconcile|inspect-lag|resume-event} [options]")
+	fmt.Fprintln(output, "usage: read-model-admin {rebuild-train-run|rebuild-all|reconcile|inspect-lag|resume-event|replay-outbox} [options]")
 }

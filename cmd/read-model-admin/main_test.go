@@ -32,3 +32,21 @@ func TestRebuildAllRejectsUnboundedBatchBeforeOpeningDatabase(t *testing.T) {
 		t.Fatalf("unbounded exit/stdout/stderr = %d/%q/%q", exitCode, stdout.String(), stderr.String())
 	}
 }
+
+func TestReplayOutboxRejectsUnboundedBatchBeforeOpeningDatabase(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	lookup := func(key string) (string, bool) { return "postgres://unused.example/railway", key == "DATABASE_URL" }
+	exitCode := run(context.Background(), []string{"replay-outbox", "--batch-size", "101"}, lookup, &stdout, &stderr)
+	if exitCode != 1 || !strings.Contains(stderr.String(), "admin command failed") {
+		t.Fatalf("unbounded replay exit/stdout/stderr = %d/%q/%q", exitCode, stdout.String(), stderr.String())
+	}
+}
+
+func TestReconcileRejectsUnboundedBatchBeforeOpeningDatabase(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	lookup := func(key string) (string, bool) { return "postgres://unused.example/railway", key == "DATABASE_URL" }
+	exitCode := run(context.Background(), []string{"reconcile", "--limit", "101"}, lookup, &stdout, &stderr)
+	if exitCode != 1 || !strings.Contains(stderr.String(), "admin command failed") {
+		t.Fatalf("unbounded reconcile exit/stdout/stderr = %d/%q/%q", exitCode, stdout.String(), stderr.String())
+	}
+}

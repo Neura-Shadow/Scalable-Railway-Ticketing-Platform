@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"os"
 	"runtime"
 	"strings"
@@ -97,6 +98,55 @@ func TestCacheStoreUsesProjectionThenFallsBackToSourceForEmptyProjection(t *test
 	}
 }
 
+func TestSearchCacheRejectsSemanticPoisonAndOversizedValues(t *testing.T) {
+	client := openCacheRedis(t)
+	request := searchFixture()
+	normalized, err := querypostgres.NormalizeSearch(request)
+	if err != nil {
+		t.Fatalf("NormalizeSearch() error = %v", err)
+	}
+	valid := searchResultFixture(1300)
+	projection := &cacheSourceFake{search: []querypostgres.SearchResult{valid}}
+	store := newCacheStore(t, projection, projection, client)
+	version, err := store.versions.GetOrCreate(context.Background(), SearchVersionKey())
+	if err != nil {
+		t.Fatalf("GetOrCreate(search) error = %v", err)
+	}
+	key, err := SearchDataKey(version, SearchQueryHash(normalized))
+	if err != nil {
+		t.Fatalf("SearchDataKey() error = %v", err)
+	}
+	poison := valid
+	poison.TrainRunID = "00000000-0000-0000-0000-000000000000"
+	payload := searchCachePayload([]querypostgres.SearchResult{poison}, normalized)
+	if err := store.writeJSON(context.Background(), key, payload, store.searchTTL); err != nil {
+		t.Fatalf("seed semantic poison: %v", err)
+	}
+	results, err := store.SearchTrainRuns(context.Background(), request)
+	if err != nil || len(results) != 1 || results[0].FareAmountMinor != 1300 {
+		t.Fatalf("SearchTrainRuns(semantic poison) = %+v, %v", results, err)
+	}
+	if err := client.Set(context.Background(), key, strings.Repeat("x", MaxCachePayloadBytes+1), time.Minute).Err(); err != nil {
+		t.Fatalf("seed oversized cache value: %v", err)
+	}
+	results, err = store.SearchTrainRuns(context.Background(), request)
+	if err != nil || len(results) != 1 || results[0].FareAmountMinor != 1300 {
+		t.Fatalf("SearchTrainRuns(oversized poison) = %+v, %v", results, err)
+	}
+	if projection.searchCalls.Load() != 2 {
+		t.Fatalf("poison fallback projection calls = %d, want 2", projection.searchCalls.Load())
+	}
+	payload = searchCachePayload([]querypostgres.SearchResult{valid}, normalized)
+	payload.OriginCode = "TXG"
+	if err := store.writeJSON(context.Background(), key, payload, store.searchTTL); err != nil {
+		t.Fatalf("seed cross-scope poison: %v", err)
+	}
+	results, err = store.SearchTrainRuns(context.Background(), request)
+	if err != nil || len(results) != 1 || projection.searchCalls.Load() != 3 {
+		t.Fatalf("SearchTrainRuns(cross-scope poison) = %+v, %v, calls %d", results, err, projection.searchCalls.Load())
+	}
+}
+
 func TestAvailabilityHintIsSharedAcrossReplicasAndRotationReobservesPostgres(t *testing.T) {
 	client := openCacheRedis(t)
 	trainRunID := uuid.NewString()
@@ -148,6 +198,61 @@ func TestAvailabilityHintCanonicalizesUppercaseTrainRunIDForWarmHit(t *testing.T
 	}
 	if source.availabilityCalls.Load() != 1 {
 		t.Fatalf("uppercase UUID source calls = %d, want one warm cache fill", source.availabilityCalls.Load())
+	}
+}
+
+func TestUnknownAvailabilityDoesNotCreatePersistentNamespace(t *testing.T) {
+	client := openCacheRedis(t)
+	trainRunID := uuid.NewString()
+	request := querypostgres.AvailabilityRequest{
+		TrainRunID: trainRunID, OriginCode: "TPE", DestinationCode: "KHH", SeatClass: "standard",
+	}
+	source := &cacheSourceFake{availabilityErr: querypostgres.ErrNotFound}
+	store := newCacheStore(t, source, source, client)
+	if _, err := store.Availability(context.Background(), request); !errors.Is(err, querypostgres.ErrNotFound) {
+		t.Fatalf("Availability(unknown train run) error = %v, want not found", err)
+	}
+	versionKey, _ := AvailabilityVersionKey(trainRunID)
+	if exists, err := client.Exists(context.Background(), versionKey).Result(); err != nil || exists != 0 {
+		t.Fatalf("unknown availability namespace exists = %d, %v", exists, err)
+	}
+}
+
+func TestAvailabilityFillReobservesSourceWhenConcurrentInvalidationCreatesGeneration(t *testing.T) {
+	client := openCacheRedis(t)
+	trainRunID := uuid.NewString()
+	request := querypostgres.AvailabilityRequest{
+		TrainRunID: trainRunID, OriginCode: "TPE", DestinationCode: "KHH", SeatClass: "standard",
+	}
+	source := &rotationRaceSource{
+		trainRunID: trainRunID,
+		entered:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	store := newCacheStore(t, source, source, client)
+	type result struct {
+		value querypostgres.Availability
+		err   error
+	}
+	outcome := make(chan result, 1)
+	go func() {
+		value, err := store.Availability(context.Background(), request)
+		outcome <- result{value: value, err: err}
+	}()
+	<-source.entered
+	manager, _ := NewSecureVersionManager(client)
+	versionKey, _ := AvailabilityVersionKey(trainRunID)
+	if _, err := manager.Rotate(context.Background(), versionKey); err != nil {
+		t.Fatalf("Rotate(concurrent invalidation) error = %v", err)
+	}
+	close(source.release)
+	first := <-outcome
+	if first.err != nil || first.value.AvailableSeats != 2 {
+		t.Fatalf("Availability(concurrent invalidation) = %+v, %v, want reobserved value", first.value, first.err)
+	}
+	warm, err := store.Availability(context.Background(), request)
+	if err != nil || warm.AvailableSeats != 2 || source.calls.Load() != 2 {
+		t.Fatalf("Availability(warm current generation) = %+v, %v, source calls %d", warm, err, source.calls.Load())
 	}
 }
 
@@ -328,13 +433,16 @@ func TestCacheStoreSkipsOversizedPayloadWithoutFailingSourceRead(t *testing.T) {
 
 func openCacheRedis(t *testing.T) *redis.Client {
 	t.Helper()
-	address := os.Getenv("TEST_REDIS_ADDR")
-	if address == "" {
+	address, configured := os.LookupEnv("TEST_REDIS_ADDR")
+	if !configured {
 		address = "127.0.0.1:56379"
 	}
 	client := redis.NewClient(&redis.Options{Addr: address, DB: 12})
 	if err := client.Ping(context.Background()).Err(); err != nil {
 		client.Close()
+		if configured {
+			t.Fatalf("configured Redis integration dependency unavailable: %v", err)
+		}
 		t.Skipf("Redis integration dependency unavailable: %v", err)
 	}
 	if err := client.FlushDB(context.Background()).Err(); err != nil {
@@ -386,6 +494,7 @@ type cacheSourceFake struct {
 	stations          []querypostgres.Station
 	search            []querypostgres.SearchResult
 	availability      querypostgres.Availability
+	availabilityErr   error
 	stationCalls      atomic.Int64
 	searchCalls       atomic.Int64
 	availabilityCalls atomic.Int64
@@ -396,6 +505,36 @@ type cacheBatchSourceFake struct {
 	entered    chan struct{}
 	release    chan struct{}
 	once       sync.Once
+}
+
+type rotationRaceSource struct {
+	trainRunID string
+	entered    chan struct{}
+	release    chan struct{}
+	calls      atomic.Int64
+}
+
+func (source *rotationRaceSource) ListStations(context.Context) ([]querypostgres.Station, error) {
+	return nil, nil
+}
+
+func (source *rotationRaceSource) SearchTrainRuns(
+	context.Context,
+	querypostgres.SearchRequest,
+) ([]querypostgres.SearchResult, error) {
+	return nil, nil
+}
+
+func (source *rotationRaceSource) Availability(
+	context.Context,
+	querypostgres.AvailabilityRequest,
+) (querypostgres.Availability, error) {
+	if source.calls.Add(1) == 1 {
+		close(source.entered)
+		<-source.release
+		return availabilityFixture(source.trainRunID, 7), nil
+	}
+	return availabilityFixture(source.trainRunID, 2), nil
 }
 
 func (source *cacheBatchSourceFake) ListStations(context.Context) ([]querypostgres.Station, error) {
@@ -448,7 +587,7 @@ func (source *cacheSourceFake) Availability(context.Context, querypostgres.Avail
 	source.availabilityCalls.Add(1)
 	source.mu.Lock()
 	defer source.mu.Unlock()
-	return source.availability, nil
+	return source.availability, source.availabilityErr
 }
 
 func stationFixture(t *testing.T) []querypostgres.Station {
@@ -469,8 +608,11 @@ func searchFixture() querypostgres.SearchRequest {
 
 func searchResultFixture(fare int64) querypostgres.SearchResult {
 	return querypostgres.SearchResult{
-		TrainRunID: uuid.NewString(), TrainCode: "TR200", DepartureAt: time.Date(2026, 7, 22, 1, 0, 0, 0, time.UTC),
-		ArrivalAt: time.Date(2026, 7, 22, 3, 0, 0, 0, time.UTC), SeatClass: domain.SeatClassStandard,
+		TrainRunID: uuid.NewString(), TrainID: uuid.NewString(), TrainCode: "TR200", RouteID: uuid.NewString(),
+		ServiceDate: time.Date(2026, 7, 22, 0, 0, 0, 0, time.UTC), Status: domain.TrainRunStatusScheduled,
+		FromStopIndex: 0, ToStopIndex: 2,
+		DepartureAt: time.Date(2026, 7, 22, 1, 0, 0, 0, time.UTC),
+		ArrivalAt:   time.Date(2026, 7, 22, 3, 0, 0, 0, time.UTC), SeatClass: domain.SeatClassStandard,
 		FareAmountMinor: fare, Currency: "TWD",
 	}
 }

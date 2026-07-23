@@ -13,6 +13,8 @@ import (
 
 const (
 	MaxDeadLetterStreamLength = 10_000
+	maxSafeStreamFieldLength  = 128
+	invalidSafeStreamField    = "invalid"
 )
 
 var ErrInvalidStreamTransport = errors.New("read-model stream transport configuration invalid")
@@ -170,7 +172,7 @@ func (transport *RedisStreamTransport) DeliveryCount(ctx context.Context, messag
 		return 0, fmt.Errorf("inspect Redis pending entry: %w", err)
 	}
 	if len(pending) != 1 || pending[0].ID != messageID || pending[0].RetryCount < 1 {
-		return 0, errors.New("Redis pending entry unavailable")
+		return 0, errors.New("redis pending entry unavailable")
 	}
 	return pending[0].RetryCount, nil
 }
@@ -191,7 +193,7 @@ func (transport *RedisStreamTransport) ContinueAndAck(ctx context.Context, messa
 		return fmt.Errorf("continue and acknowledge Redis stream event: %w", err)
 	}
 	if continuationID == "" {
-		return errors.New("Redis stream continuation conflict")
+		return errors.New("redis stream continuation conflict")
 	}
 	return nil
 }
@@ -221,7 +223,7 @@ func (transport *RedisStreamTransport) DeadLetterAndAck(
 		return fmt.Errorf("dead-letter and acknowledge Redis stream event: %w", err)
 	}
 	if deadLetterID == "" {
-		return errors.New("Redis stream dead-letter conflict")
+		return errors.New("redis stream dead-letter conflict")
 	}
 	return nil
 }
@@ -232,7 +234,7 @@ func (transport *RedisStreamTransport) Ack(ctx context.Context, messageID string
 		return fmt.Errorf("ack Redis stream event: %w", err)
 	}
 	if acked != 1 {
-		return errors.New("Redis stream event acknowledgment conflict")
+		return errors.New("redis stream event acknowledgment conflict")
 	}
 	return nil
 }
@@ -243,12 +245,19 @@ func safeStreamMessages(messages []redis.XMessage) []StreamMessage {
 		values := make(map[string]string, 4)
 		for _, name := range []string{"event_id", "event_type", "aggregate_type", "aggregate_id"} {
 			if value, exists := message.Values[name]; exists {
-				values[name] = fmt.Sprint(value)
+				values[name] = boundedStreamField(fmt.Sprint(value))
 			}
 		}
 		result = append(result, StreamMessage{ID: message.ID, Values: values})
 	}
 	return result
+}
+
+func boundedStreamField(value string) string {
+	if len(value) > maxSafeStreamFieldLength {
+		return invalidSafeStreamField
+	}
+	return value
 }
 
 func validRedisStreamName(value string) bool {

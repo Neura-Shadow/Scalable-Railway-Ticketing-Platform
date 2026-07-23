@@ -242,10 +242,10 @@ func (s *Store) AuthenticationState(ctx context.Context, subject string) (applic
 
 	var state application.SubjectState
 	err := s.db.QueryRow(ctx, `
-		SELECT active, token_version
+		SELECT active, role, token_version
 		FROM users
 		WHERE id = $1
-	`, subject).Scan(&state.Active, &state.TokenVersion)
+	`, subject).Scan(&state.Active, &state.Role, &state.TokenVersion)
 	if errors.Is(err, pgx.ErrNoRows) || hasPostgresCode(err, "22P02") {
 		return application.SubjectState{}, ErrUserNotFound
 	}

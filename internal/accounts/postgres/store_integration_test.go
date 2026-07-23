@@ -261,8 +261,8 @@ func TestStoreReadsAuthenticationStateWithoutCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AuthenticationState() error = %v", err)
 	}
-	if !state.Active || state.TokenVersion != 1 {
-		t.Fatalf("AuthenticationState() = %#v, want active version 1", state)
+	if !state.Active || state.Role != domain.RoleCustomer || state.TokenVersion != 1 {
+		t.Fatalf("AuthenticationState() = %#v, want active customer version 1", state)
 	}
 
 	for _, subject := range []string{"not-a-uuid", "00000000-0000-0000-0000-000000000000"} {

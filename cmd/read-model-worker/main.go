@@ -25,9 +25,10 @@ import (
 )
 
 const (
-	readModelStream = "railway:outbox:v1"
-	readModelDLQ    = "railway:outbox:v1:read-model:dlq"
-	schemaVersion   = 7
+	readModelStream                = "railway:outbox:v1"
+	readModelDLQ                   = "railway:outbox:v1:read-model:dlq"
+	schemaVersion                  = 7
+	projectionLagObservationPeriod = 5 * time.Second
 )
 
 func main() {
@@ -78,6 +79,10 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return errors.New("read-model metrics initialization failed")
 	}
+	stopLagObserver := startProjectionLagObserver(
+		ctx, projectionStore, readMetrics, cfg.DatabaseTimeout, logger,
+	)
+	defer stopLagObserver()
 	coordinator.WithMetrics(readMetrics)
 	transport, err := queryreadmodel.NewRedisStreamTransport(
 		redisClient, readModelStream, cfg.ReadModelConsumerGroup, readModelDLQ,
@@ -117,9 +122,6 @@ func run(logger *slog.Logger) error {
 		passContext, cancel := context.WithTimeout(ctx, cfg.WorkerPassTimeout)
 		defer cancel()
 		result, passErr := worker.RunOnce(passContext)
-		if lagErr := observeProjectionLag(passContext, pool, readMetrics); lagErr != nil {
-			logger.Warn("read-model lag observation failed", "reason", "database")
-		}
 		if passErr != nil {
 			logger.Warn("read-model pass completed with handled failures",
 				"claimed", result.Claimed, "read", result.Read, "processed", result.Processed,
@@ -148,27 +150,43 @@ func run(logger *slog.Logger) error {
 	}
 }
 
-func observeProjectionLag(
-	ctx context.Context,
-	pool *pgxpool.Pool,
+func startProjectionLagObserver(
+	parent context.Context,
+	store *queryreadmodel.Store,
 	readMetrics *platformmetrics.ReadModelMetrics,
-) error {
-	if ctx == nil || pool == nil || readMetrics == nil {
-		return errors.New("projection lag observer unavailable")
+	timeout time.Duration,
+	logger *slog.Logger,
+) func() {
+	observerContext, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(projectionLagObservationPeriod)
+		defer ticker.Stop()
+		observe := func() {
+			ctx, stop := context.WithTimeout(observerContext, timeout)
+			defer stop()
+			lag, err := store.ProjectionLag(ctx, queryreadmodel.DurableConsumerName)
+			if err != nil {
+				logger.Warn("read-model lag observation failed", "reason", "database")
+				return
+			}
+			readMetrics.SetProjectionLag(lag)
+		}
+		observe()
+		for {
+			select {
+			case <-observerContext.Done():
+				return
+			case <-ticker.C:
+				observe()
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
 	}
-	var lagSeconds float64
-	if err := pool.QueryRow(ctx, `
-		SELECT COALESCE(
-			max(EXTRACT(EPOCH FROM (clock_timestamp() - updated_at))),
-			0
-		)
-		FROM read_model_event_progress
-		WHERE projection_affecting
-	`).Scan(&lagSeconds); err != nil {
-		return err
-	}
-	readMetrics.SetProjectionLag(time.Duration(lagSeconds * float64(time.Second)))
-	return nil
 }
 
 func readModelReadiness(

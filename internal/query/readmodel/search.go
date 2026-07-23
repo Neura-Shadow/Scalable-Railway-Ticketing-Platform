@@ -27,10 +27,24 @@ func (s *Store) SearchTrainRuns(
 	if err := tx.QueryRow(ctx, `
 		SELECT state.ready AND NOT EXISTS (
 			SELECT 1 FROM read_model_event_progress WHERE projection_affecting
+		) AND NOT EXISTS (
+			SELECT 1
+			FROM outbox_events AS event
+			WHERE event.status = 'published'
+			  AND event.published_at IS NOT NULL
+			  AND event.event_type = ANY($2::text[])
+			  AND NOT EXISTS (
+				SELECT 1 FROM read_model_event_receipts AS receipt
+				WHERE receipt.consumer_name = $1 AND receipt.event_id = event.id
+			  )
+			  AND NOT EXISTS (
+				SELECT 1 FROM read_model_event_progress AS progress
+				WHERE progress.consumer_name = $1 AND progress.event_id = event.id
+			  )
 		)
 		FROM read_model_projection_state AS state
 		WHERE state.projection_name = 'journey_search'
-	`).Scan(&projectionAvailable); err != nil {
+	`, DurableConsumerName, projectionReadModelEventTypes()).Scan(&projectionAvailable); err != nil {
 		return nil, fmt.Errorf("%w: inspect projection progress", ErrPersistence)
 	}
 	if !projectionAvailable {

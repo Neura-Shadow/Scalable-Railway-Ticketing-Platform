@@ -38,6 +38,7 @@ type ReadModelMetrics struct {
 	cacheFillFailure         *prometheus.CounterVec
 	cacheSingleflightShared  *prometheus.CounterVec
 	cacheFillDuration        *prometheus.HistogramVec
+	cacheSourceQuery         *prometheus.CounterVec
 }
 
 func NewReadModelMetrics(registerer prometheus.Registerer) (*ReadModelMetrics, error) {
@@ -64,6 +65,7 @@ func NewReadModelMetrics(registerer prometheus.Registerer) (*ReadModelMetrics, e
 		cacheFillFailure:         prometheus.NewCounterVec(prometheus.CounterOpts{Name: "cache_fill_failure_total", Help: "Cache fill failures by bounded cache type and reason."}, []string{"cache_type", "reason"}),
 		cacheSingleflightShared:  prometheus.NewCounterVec(prometheus.CounterOpts{Name: "cache_singleflight_shared_total", Help: "Cache singleflight shared results by bounded cache type."}, []string{"cache_type"}),
 		cacheFillDuration:        prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "cache_fill_duration_seconds", Help: "Cache fill duration by bounded cache type.", Buckets: prometheus.DefBuckets}, []string{"cache_type"}),
+		cacheSourceQuery:         prometheus.NewCounterVec(prometheus.CounterOpts{Name: "cache_source_query_total", Help: "Authoritative source queries issued by bounded read-cache type."}, []string{"cache_type"}),
 	}
 	for _, collector := range []prometheus.Collector{
 		metrics.readModelEvent, metrics.readModelDuplicateEvent, metrics.readModelRebuild,
@@ -72,10 +74,14 @@ func NewReadModelMetrics(registerer prometheus.Registerer) (*ReadModelMetrics, e
 		metrics.cacheRequest, metrics.cacheHit, metrics.cacheMiss, metrics.cacheFailure,
 		metrics.cacheInvalidation, metrics.cacheInvalidationFailure, metrics.cacheFill,
 		metrics.cacheFillFailure, metrics.cacheSingleflightShared, metrics.cacheFillDuration,
+		metrics.cacheSourceQuery,
 	} {
 		if err := registerer.Register(collector); err != nil {
 			return nil, fmt.Errorf("read-model metrics: register collector: %w", err)
 		}
+	}
+	for _, reason := range []string{"missing", "extra", "duplicate", "stale", "mismatch", "invalid"} {
+		metrics.readModelReconciliation.WithLabelValues(reason).Add(0)
 	}
 	return metrics, nil
 }
@@ -107,6 +113,13 @@ func (metrics *ReadModelMetrics) RecordReconciliationMismatch(reason string) {
 	metrics.readModelReconciliation.WithLabelValues(normalize(reason, allowedReadReasons, "unknown")).Inc()
 }
 
+func (metrics *ReadModelMetrics) AddReconciliationMismatches(reason string, count int) {
+	if count <= 0 {
+		return
+	}
+	metrics.readModelReconciliation.WithLabelValues(normalize(reason, allowedReadReasons, "unknown")).Add(float64(count))
+}
+
 func (metrics *ReadModelMetrics) SetProjectionLag(duration time.Duration) {
 	metrics.readModelProjectionLag.Set(nonNegativeSeconds(duration))
 }
@@ -136,6 +149,14 @@ func (metrics *ReadModelMetrics) RecordCacheFill(cacheType, result, reason strin
 		metrics.cacheSingleflightShared.WithLabelValues(cacheType).Inc()
 	}
 	metrics.cacheFillDuration.WithLabelValues(cacheType).Observe(nonNegativeSeconds(duration))
+}
+
+func (metrics *ReadModelMetrics) RecordCacheSingleflightShared(cacheType string) {
+	metrics.cacheSingleflightShared.WithLabelValues(normalize(cacheType, allowedCacheTypes, "unknown")).Inc()
+}
+
+func (metrics *ReadModelMetrics) RecordCacheSourceQuery(cacheType string) {
+	metrics.cacheSourceQuery.WithLabelValues(normalize(cacheType, allowedCacheTypes, "unknown")).Inc()
 }
 
 func (metrics *ReadModelMetrics) RecordCacheInvalidation(cacheType, eventType, result, reason string) {

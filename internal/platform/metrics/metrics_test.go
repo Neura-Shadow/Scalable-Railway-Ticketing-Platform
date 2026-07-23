@@ -226,6 +226,7 @@ func TestReadModelMetricsExposeExactFamiliesWithOnlyBoundedLabels(t *testing.T) 
 	recorder.RecordCacheRequest("train_search", "read", "miss", "none")
 	recorder.RecordCacheFill(malicious, "failure", malicious, time.Second, true)
 	recorder.RecordCacheFill("stations", "success", "none", time.Second, false)
+	recorder.RecordCacheSourceQuery("train_search")
 	recorder.RecordCacheInvalidation(malicious, malicious, "failure", malicious)
 	recorder.RecordCacheInvalidation("stations", "station.updated", "success", "none")
 	families, err := registry.Gather()
@@ -241,6 +242,7 @@ func TestReadModelMetricsExposeExactFamiliesWithOnlyBoundedLabels(t *testing.T) 
 		"cache_request_total", "cache_hit_total", "cache_miss_total", "cache_failure_total",
 		"cache_invalidation_total", "cache_invalidation_failure_total", "cache_fill_total",
 		"cache_fill_failure_total", "cache_singleflight_shared_total", "cache_fill_duration_seconds",
+		"cache_source_query_total",
 	} {
 		wantNames[name] = struct{}{}
 	}

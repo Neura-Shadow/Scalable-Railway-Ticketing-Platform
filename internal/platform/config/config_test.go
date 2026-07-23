@@ -879,6 +879,29 @@ func TestLoadReadModelWorkerUsesOnlyProcessOwnedSettings(t *testing.T) {
 	}
 }
 
+func TestLoadReadModelWorkerExactSettingsOverrideLegacyAliases(t *testing.T) {
+	t.Parallel()
+	env := map[string]string{
+		"APP_ENV":      "test",
+		"DATABASE_URL": "postgres://worker@db.example/railway",
+		"REDIS_ADDR":   "redis.example:6379",
+		"READ_MODEL_WORKER_INTERVAL_MILLISECONDS": "750",
+		"READ_MODEL_WORKER_POLL_INTERVAL":         "9s",
+		"READ_MODEL_CLAIM_MIN_IDLE_SECONDS":       "90",
+		"READ_MODEL_WORKER_PENDING_IDLE":          "150s",
+	}
+	cfg, err := config.LoadFromFor(func(key string) (string, bool) {
+		value, ok := env[key]
+		return value, ok
+	}, config.ProcessReadModelWorker)
+	if err != nil {
+		t.Fatalf("LoadFromFor(read-model-worker) error = %v", err)
+	}
+	if cfg.ReadModelWorkerPollInterval != 750*time.Millisecond || cfg.ReadModelWorkerPendingIdle != 90*time.Second {
+		t.Fatalf("exact settings lost precedence: interval=%v pending=%v", cfg.ReadModelWorkerPollInterval, cfg.ReadModelWorkerPendingIdle)
+	}
+}
+
 func TestLoadAPIUsesExplicitMilestoneThreeCacheControls(t *testing.T) {
 	t.Parallel()
 	env := map[string]string{

@@ -168,6 +168,11 @@ $env:JWT_SECRET = 'local-only-random-secret-at-least-32-bytes'
 docker compose up --build
 ```
 
+The single-replica Compose file refuses to start without `JWT_SECRET` and
+publishes the API on loopback only. Use a distinct random value for every
+environment; never reuse the example above or expose a development deployment
+to an untrusted network.
+
 Start the optional workers with:
 
 ```powershell

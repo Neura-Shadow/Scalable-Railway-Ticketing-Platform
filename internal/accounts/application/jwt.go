@@ -23,6 +23,7 @@ var (
 	ErrUnexpectedSigningMethod = errors.New("unexpected JWT signing method")
 	ErrUserInactive            = errors.New("user is inactive")
 	ErrTokenVersionMismatch    = errors.New("token version mismatch")
+	ErrTokenRoleMismatch       = errors.New("token role mismatch")
 )
 
 type TokenType string
@@ -47,6 +48,7 @@ type Clock interface {
 
 type SubjectState struct {
 	Active       bool
+	Role         domain.Role
 	TokenVersion int64
 }
 
@@ -234,6 +236,9 @@ func (s *JWTService) parseToken(ctx context.Context, raw string, expectedType To
 	}
 	if state.TokenVersion != *claims.TokenVersion {
 		return TokenClaims{}, ErrTokenVersionMismatch
+	}
+	if state.Role != claims.Role {
+		return TokenClaims{}, ErrTokenRoleMismatch
 	}
 	return claims.public(), nil
 }

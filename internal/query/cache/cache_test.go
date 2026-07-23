@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"runtime"
 	"strings"
 	"sync"
@@ -119,5 +120,52 @@ func TestCoalescerSharesIdenticalFillButDoesNotSerializeUnrelatedKeys(t *testing
 	wait.Wait()
 	if identicalCalls.Load() != 1 {
 		t.Fatalf("identical fills = %d, want 1", identicalCalls.Load())
+	}
+}
+
+func TestCoalescerLeaderCancellationDoesNotAbortHealthyWaiter(t *testing.T) {
+	coalescer := &Coalescer{}
+	leaderContext, cancelLeader := context.WithCancel(context.Background())
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int64
+	fill := func(ctx context.Context) (any, error) {
+		calls.Add(1)
+		close(entered)
+		select {
+		case <-release:
+			return "filled", nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	type outcome struct {
+		value any
+		err   error
+	}
+	leader := make(chan outcome, 1)
+	go func() {
+		value, err, _ := coalescer.Do(leaderContext, "shared-key", fill)
+		leader <- outcome{value: value, err: err}
+	}()
+	<-entered
+	waiter := make(chan outcome, 1)
+	go func() {
+		value, err, _ := coalescer.Do(context.Background(), "shared-key", fill)
+		waiter <- outcome{value: value, err: err}
+	}()
+	for attempt := 0; attempt < 1024; attempt++ {
+		runtime.Gosched()
+	}
+	cancelLeader()
+	if result := <-leader; !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("leader result = %+v, want context cancellation", result)
+	}
+	close(release)
+	if result := <-waiter; result.err != nil || result.value != "filled" {
+		t.Fatalf("waiter result = %+v, want shared fill", result)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("fill calls = %d, want 1", calls.Load())
 	}
 }

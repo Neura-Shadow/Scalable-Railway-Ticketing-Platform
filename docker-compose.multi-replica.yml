@@ -90,9 +90,9 @@ x-read-model-worker-common: &read-model-worker-common
     READ_MODEL_WORKER_INTERVAL_MILLISECONDS: 1000
     READ_MODEL_CONSUMER_GROUP: railway-read-model
     READ_MODEL_MAX_ATTEMPTS: 5
-    READ_MODEL_CLAIM_MIN_IDLE_SECONDS: 90
+    READ_MODEL_CLAIM_MIN_IDLE_SECONDS: ${READ_MODEL_CLAIM_MIN_IDLE_SECONDS:-90}
     WORKER_HTTP_ADDRESS: :9090
-    WORKER_PASS_TIMEOUT: 60s
+    WORKER_PASS_TIMEOUT: ${READ_MODEL_WORKER_PASS_TIMEOUT:-60s}
   depends_on:
     migrate:
       condition: service_completed_successfully
@@ -285,9 +285,12 @@ services:
       - tools
     environment:
       DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
+      REDIS_ADDR: redis:6379
     depends_on:
       migrate:
         condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     read_only: true
     security_opt:
       - no-new-privileges:true

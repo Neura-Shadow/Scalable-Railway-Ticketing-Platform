@@ -27,6 +27,11 @@
 - The multi-replica Compose topology is local functional evidence, not a
   production high-availability design. PostgreSQL and Redis remain single
   local instances in that topology.
+- The digest-pinned evidence proxy currently requires a build-time
+  `apk upgrade` because the pinned nginx base contains fixed High-severity
+  OpenSSL packages. The resulting package set depends on Alpine repository
+  state, so that evidence image is not claimed to be bit-for-bit reproducible;
+  both the rebuilt application and proxy images remain release-scan gates.
 - Redis persistence does not turn cache data into authority. A flush can reduce
   performance until refill and can disrupt existing Milestone 2 ephemeral
   admission state according to its fail-closed policy.

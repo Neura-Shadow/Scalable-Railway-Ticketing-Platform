@@ -38,7 +38,7 @@ Claim and finalize are separate short PostgreSQL transactions. Publication happe
 ## Publisher adapters
 
 - `log`: default development adapter; logs event metadata only. An enabled production worker rejects it unless the explicit emergency override is set.
-- `redis_stream`: production baseline adapter; sends the minimized envelope with explicit stream length management. Worker readiness checks Redis when this adapter is selected.
+- `redis_stream`: production baseline adapter; sends the minimized envelope without blind `MAXLEN` trimming. Worker readiness checks Redis when this adapter is selected. Production must monitor stream length, PEL size, pending age, and Redis memory, then apply group-floor-aware retention that never trims below any consumer group's delivered or pending floor.
 
 `OUTBOX_PUBLISHER_ENABLED=false` disables the publisher without requiring Redis. The emergency log override emits a bounded configuration warning and never adds event payloads to logs.
 

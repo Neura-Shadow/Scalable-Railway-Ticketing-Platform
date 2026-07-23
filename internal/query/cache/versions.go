@@ -20,10 +20,10 @@ var ErrVersionStore = errors.New("cache version store failure")
 var getOrCreateVersionScript = redis.NewScript(`
 local current = redis.call('GET', KEYS[1])
 if current and string.len(current) == 24 and string.match(current, '^[A-Za-z0-9_-]+$') then
-  return current
+  return {current, 0}
 end
 redis.call('SET', KEYS[1], ARGV[1])
-return ARGV[1]
+return {ARGV[1], 1}
 `)
 
 var rotateVersionScript = redis.NewScript(`
@@ -52,22 +52,56 @@ func NewSecureVersionManager(client redis.UniversalClient) (*VersionManager, err
 	return NewVersionManager(client, rand.Reader)
 }
 
-func (manager *VersionManager) GetOrCreate(ctx context.Context, key string) (string, error) {
+func (manager *VersionManager) Get(ctx context.Context, key string) (string, bool, error) {
 	if !validVersionKey(key) {
-		return "", ErrInvalidCacheKey
+		return "", false, ErrInvalidCacheKey
+	}
+	value, err := manager.client.Get(ctx, key).Result()
+	if errors.Is(err, redis.Nil) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("%w: get namespace", ErrVersionStore)
+	}
+	if !ValidVersionToken(value) {
+		return "", false, nil
+	}
+	return value, true, nil
+}
+
+func (manager *VersionManager) GetOrCreate(ctx context.Context, key string) (string, error) {
+	value, _, err := manager.GetOrCreateWithStatus(ctx, key)
+	return value, err
+}
+
+// GetOrCreateWithStatus reports whether this call installed the returned
+// generation. Callers that observed no generation before reading a mutable
+// source can re-read when installed=false, preventing a concurrent rotation
+// from being populated with a pre-invalidation snapshot.
+func (manager *VersionManager) GetOrCreateWithStatus(ctx context.Context, key string) (string, bool, error) {
+	if !validVersionKey(key) {
+		return "", false, ErrInvalidCacheKey
 	}
 	candidate, err := manager.nextToken()
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	value, err := getOrCreateVersionScript.Run(ctx, manager.client, []string{key}, candidate).Text()
+	result, err := getOrCreateVersionScript.Run(ctx, manager.client, []string{key}, candidate).Slice()
 	if err != nil {
-		return "", fmt.Errorf("%w: get or create namespace", ErrVersionStore)
+		return "", false, fmt.Errorf("%w: get or create namespace", ErrVersionStore)
 	}
+	if len(result) != 2 {
+		return "", false, fmt.Errorf("%w: invalid namespace result", ErrVersionStore)
+	}
+	value, valueOK := result[0].(string)
+	created, createdOK := result[1].(int64)
 	if !ValidVersionToken(value) {
-		return "", fmt.Errorf("%w: invalid namespace result", ErrVersionStore)
+		return "", false, fmt.Errorf("%w: invalid namespace result", ErrVersionStore)
 	}
-	return value, nil
+	if !valueOK || !createdOK || (created != 0 && created != 1) {
+		return "", false, fmt.Errorf("%w: invalid namespace result", ErrVersionStore)
+	}
+	return value, created == 1, nil
 }
 
 func (manager *VersionManager) Rotate(ctx context.Context, key string) (string, error) {

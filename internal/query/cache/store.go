@@ -36,6 +36,8 @@ type timeSource interface {
 type Metrics interface {
 	RecordCacheRequest(cacheType, operation, result, reason string)
 	RecordCacheFill(cacheType, result, reason string, duration time.Duration, shared bool)
+	RecordCacheSingleflightShared(cacheType string)
+	RecordCacheSourceQuery(cacheType string)
 	RecordFallback(reason string)
 }
 
@@ -100,6 +102,18 @@ type cachedAvailability struct {
 	Source          string                     `json:"source"`
 }
 
+type cachedSearch struct {
+	Schema          string                       `json:"schema"`
+	OriginCode      string                       `json:"origin_code"`
+	DestinationCode string                       `json:"destination_code"`
+	ServiceDate     string                       `json:"service_date"`
+	SeatClass       string                       `json:"seat_class"`
+	Page            int                          `json:"page"`
+	PageSize        int                          `json:"page_size"`
+	Sort            string                       `json:"sort"`
+	Results         []querypostgres.SearchResult `json:"results"`
+}
+
 type fillOutcome struct {
 	value    any
 	writeErr error
@@ -114,6 +128,17 @@ const (
 	cacheReadRedisFailure cacheReadStatus = "redis_failure"
 	cacheReadInvalid      cacheReadStatus = "invalid"
 )
+
+var boundedCacheGetScript = redis.NewScript(`
+local value = redis.call('GET', KEYS[1])
+if not value then
+  return {0, ''}
+end
+if string.len(value) > tonumber(ARGV[1]) then
+  return {2, ''}
+end
+return {1, value}
+`)
 
 func NewStore(
 	source SourceStore,
@@ -139,12 +164,14 @@ func NewStore(
 
 func (store *Store) ListStations(ctx context.Context) ([]querypostgres.Station, error) {
 	if !store.stationEnabled {
+		store.recordSourceQuery("stations")
 		return store.source.ListStations(ctx)
 	}
 	version, err := store.versions.GetOrCreate(ctx, StationVersionKey())
 	if err != nil {
 		store.recordRequest("stations", "version_get", "failure", "redis")
 		store.recordFallback("redis")
+		store.recordSourceQuery("stations")
 		return store.source.ListStations(ctx)
 	}
 	key, err := StationDataKey(version)
@@ -157,15 +184,17 @@ func (store *Store) ListStations(ctx context.Context) ([]querypostgres.Station, 
 	} else {
 		store.recordReadStatus("stations", status)
 	}
-	started := time.Now()
 	value, err, shared := store.coalescer.Do(ctx, key, func(fillContext context.Context) (any, error) {
 		if stations, status := store.readStations(fillContext, key); status == cacheReadHit {
 			return fillOutcome{value: stations}, nil
 		} else if status == cacheReadRedisFailure || status == cacheReadInvalid {
 			store.recordReadStatus("stations", status)
 		}
+		started := time.Now()
+		store.recordSourceQuery("stations")
 		stations, sourceErr := store.source.ListStations(fillContext)
 		if sourceErr != nil {
+			store.recordFill("stations", "failure", "database", time.Since(started), false)
 			return nil, sourceErr
 		}
 		sort.Slice(stations, func(i, j int) bool { return stations[i].Code.String() < stations[j].Code.String() })
@@ -175,20 +204,21 @@ func (store *Store) ListStations(ctx context.Context) ([]querypostgres.Station, 
 				ID: station.ID, Code: station.Code.String(), Name: station.Name, Timezone: station.Timezone,
 			})
 		}
-		return fillOutcome{
-			value: stations, writeErr: store.writeJSON(fillContext, key, payload, store.stationTTL),
-		}, nil
+		outcome := fillOutcome{value: stations, writeErr: store.writeJSON(fillContext, key, payload, store.stationTTL)}
+		if outcome.writeErr != nil {
+			store.recordFill("stations", "failure", "redis", time.Since(started), false)
+		} else {
+			store.recordFill("stations", "success", "none", time.Since(started), false)
+		}
+		return outcome, nil
 	})
+	if shared {
+		store.recordSingleflightShared("stations")
+	}
 	if err != nil {
-		store.recordFill("stations", "failure", "database", time.Since(started), shared)
 		return nil, err
 	}
 	outcome := value.(fillOutcome)
-	if outcome.writeErr != nil {
-		store.recordFill("stations", "failure", "redis", time.Since(started), shared)
-	} else {
-		store.recordFill("stations", "success", "none", time.Since(started), shared)
-	}
 	return append([]querypostgres.Station(nil), outcome.value.([]querypostgres.Station)...), nil
 }
 
@@ -207,43 +237,51 @@ func (store *Store) SearchTrainRuns(
 	if err != nil {
 		store.recordRequest("train_search", "version_get", "failure", "redis")
 		store.recordFallback("redis")
+		store.recordSourceQuery("train_search")
 		return store.source.SearchTrainRuns(ctx, request)
 	}
 	key, err := SearchDataKey(version, SearchQueryHash(normalized))
 	if err != nil {
 		return nil, err
 	}
-	if results, status := store.readSearch(ctx, key); status == cacheReadHit {
+	if results, status := store.readSearch(ctx, key, normalized); status == cacheReadHit {
 		store.recordReadStatus("train_search", status)
 		return results, nil
 	} else {
 		store.recordReadStatus("train_search", status)
 	}
-	started := time.Now()
 	value, err, shared := store.coalescer.Do(ctx, key, func(fillContext context.Context) (any, error) {
-		if results, status := store.readSearch(fillContext, key); status == cacheReadHit {
+		if results, status := store.readSearch(fillContext, key, normalized); status == cacheReadHit {
 			return fillOutcome{value: results}, nil
 		} else if status == cacheReadRedisFailure || status == cacheReadInvalid {
 			store.recordReadStatus("train_search", status)
 		}
+		started := time.Now()
 		results, projectionErr := store.searchProjectionOrSource(fillContext, request)
 		if projectionErr != nil {
+			store.recordFill("train_search", "failure", "database", time.Since(started), false)
 			return nil, projectionErr
 		}
-		return fillOutcome{
-			value: results, writeErr: store.writeJSON(fillContext, key, results, store.searchTTL),
-		}, nil
+		outcome := fillOutcome{
+			value: results,
+			writeErr: store.writeJSON(
+				fillContext, key, searchCachePayload(results, normalized), store.searchTTL,
+			),
+		}
+		if outcome.writeErr != nil {
+			store.recordFill("train_search", "failure", "redis", time.Since(started), false)
+		} else {
+			store.recordFill("train_search", "success", "none", time.Since(started), false)
+		}
+		return outcome, nil
 	})
+	if shared {
+		store.recordSingleflightShared("train_search")
+	}
 	if err != nil {
-		store.recordFill("train_search", "failure", "database", time.Since(started), shared)
 		return nil, err
 	}
 	outcome := value.(fillOutcome)
-	if outcome.writeErr != nil {
-		store.recordFill("train_search", "failure", "redis", time.Since(started), shared)
-	} else {
-		store.recordFill("train_search", "success", "none", time.Since(started), shared)
-	}
 	return outcome.value.([]querypostgres.SearchResult), nil
 }
 
@@ -252,66 +290,121 @@ func (store *Store) Availability(
 	request querypostgres.AvailabilityRequest,
 ) (querypostgres.Availability, error) {
 	if !store.availabilityEnabled {
+		store.recordSourceQuery("availability")
 		return store.source.Availability(ctx, request)
 	}
 	versionKey, err := AvailabilityVersionKey(request.TrainRunID)
 	if err != nil {
 		return querypostgres.Availability{}, querypostgres.ErrInvalidQuery
 	}
-	version, err := store.versions.GetOrCreate(ctx, versionKey)
+	version, found, err := store.versions.Get(ctx, versionKey)
 	if err != nil {
 		store.recordRequest("availability", "version_get", "failure", "redis")
 		store.recordFallback("redis")
+		store.recordSourceQuery("availability")
 		return store.source.Availability(ctx, request)
 	}
-	key, err := AvailabilityDataKey(
-		version,
-		request.TrainRunID,
-		request.OriginCode,
-		request.DestinationCode,
-		request.SeatClass,
-	)
-	if err != nil {
-		return querypostgres.Availability{}, querypostgres.ErrInvalidJourney
-	}
-	if availability, status := store.readAvailability(ctx, key, request); status == cacheReadHit {
-		store.recordReadStatus("availability", status)
-		return availability, nil
-	} else {
-		store.recordReadStatus("availability", status)
-	}
-	started := time.Now()
-	value, err, shared := store.coalescer.Do(ctx, key, func(fillContext context.Context) (any, error) {
-		if availability, status := store.readAvailability(fillContext, key, request); status == cacheReadHit {
-			return fillOutcome{value: availability}, nil
-		} else if status == cacheReadRedisFailure || status == cacheReadInvalid {
+	key := ""
+	if found {
+		key, err = AvailabilityDataKey(
+			version,
+			request.TrainRunID,
+			request.OriginCode,
+			request.DestinationCode,
+			request.SeatClass,
+		)
+		if err != nil {
+			return querypostgres.Availability{}, querypostgres.ErrInvalidJourney
+		}
+		if availability, status := store.readAvailability(ctx, key, request); status == cacheReadHit {
+			store.recordReadStatus("availability", status)
+			return availability, nil
+		} else {
 			store.recordReadStatus("availability", status)
 		}
+	}
+	flightKey, err := availabilityRequestFlightKey(request)
+	if err != nil {
+		return querypostgres.Availability{}, err
+	}
+	value, err, shared := store.coalescer.Do(ctx, flightKey, func(fillContext context.Context) (any, error) {
+		fillVersion, fillFound, versionErr := store.versions.Get(fillContext, versionKey)
+		fillKey := ""
+		if versionErr == nil && fillFound {
+			fillKey, versionErr = AvailabilityDataKey(
+				fillVersion, request.TrainRunID, request.OriginCode, request.DestinationCode, request.SeatClass,
+			)
+			if versionErr == nil {
+				if availability, status := store.readAvailability(fillContext, fillKey, request); status == cacheReadHit {
+					return fillOutcome{value: availability}, nil
+				} else if status == cacheReadRedisFailure || status == cacheReadInvalid {
+					store.recordReadStatus("availability", status)
+				}
+			}
+		}
+		started := time.Now()
+		store.recordSourceQuery("availability")
 		availability, sourceErr := store.source.Availability(fillContext, request)
 		if sourceErr != nil {
+			store.recordFill("availability", "failure", "database", time.Since(started), false)
 			return nil, sourceErr
 		}
 		if availability.AvailableSeats < 0 {
+			store.recordFill("availability", "failure", "database", time.Since(started), false)
 			return nil, querypostgres.ErrPersistence
 		}
 		payload, valid := availabilityCachePayload(availability, request, store.clock.Now().UTC())
 		if !valid {
+			store.recordFill("availability", "failure", "database", time.Since(started), false)
 			return nil, querypostgres.ErrPersistence
 		}
-		return fillOutcome{
-			value: availability, writeErr: store.writeJSON(fillContext, key, payload, store.availabilityTTL),
-		}, nil
+		if fillKey == "" {
+			var created bool
+			fillVersion, created, versionErr = store.versions.GetOrCreateWithStatus(fillContext, versionKey)
+			if versionErr == nil {
+				fillKey, versionErr = AvailabilityDataKey(
+					fillVersion, request.TrainRunID, request.OriginCode, request.DestinationCode, request.SeatClass,
+				)
+			}
+			if versionErr == nil && !created {
+				store.recordSourceQuery("availability")
+				availability, sourceErr = store.source.Availability(fillContext, request)
+				if sourceErr != nil {
+					store.recordFill("availability", "failure", "database", time.Since(started), false)
+					return nil, sourceErr
+				}
+				if availability.AvailableSeats < 0 {
+					store.recordFill("availability", "failure", "database", time.Since(started), false)
+					return nil, querypostgres.ErrPersistence
+				}
+				payload, valid = availabilityCachePayload(availability, request, store.clock.Now().UTC())
+				if !valid {
+					store.recordFill("availability", "failure", "database", time.Since(started), false)
+					return nil, querypostgres.ErrPersistence
+				}
+			}
+		}
+		if versionErr != nil {
+			store.recordFill("availability", "failure", "redis", time.Since(started), false)
+			return fillOutcome{value: availability, writeErr: versionErr}, nil
+		}
+		outcome := fillOutcome{
+			value: availability, writeErr: store.writeJSON(fillContext, fillKey, payload, store.availabilityTTL),
+		}
+		if outcome.writeErr != nil {
+			store.recordFill("availability", "failure", "redis", time.Since(started), false)
+		} else {
+			store.recordFill("availability", "success", "none", time.Since(started), false)
+		}
+		return outcome, nil
 	})
+	if shared {
+		store.recordSingleflightShared("availability")
+	}
 	if err != nil {
-		store.recordFill("availability", "failure", "database", time.Since(started), shared)
 		return querypostgres.Availability{}, err
 	}
 	outcome := value.(fillOutcome)
-	if outcome.writeErr != nil {
-		store.recordFill("availability", "failure", "redis", time.Since(started), shared)
-	} else {
-		store.recordFill("availability", "success", "none", time.Since(started), shared)
-	}
 	return outcome.value.(querypostgres.Availability), nil
 }
 
@@ -324,10 +417,12 @@ func (store *Store) AvailabilityBatch(
 	}
 	if !store.availabilityEnabled {
 		if batch, ok := store.source.(availabilityBatchSource); ok {
+			store.recordSourceQuery("availability")
 			return batch.AvailabilityBatch(ctx, requests)
 		}
 		results := make([]querypostgres.Availability, 0, len(requests))
 		for _, request := range requests {
+			store.recordSourceQuery("availability")
 			availability, err := store.source.Availability(ctx, request)
 			if err != nil {
 				return nil, err
@@ -336,6 +431,39 @@ func (store *Store) AvailabilityBatch(
 		}
 		return results, nil
 	}
+	results, misses, _, _, err := store.readAvailabilityBatch(ctx, requests)
+	if err != nil {
+		return nil, err
+	}
+	if len(misses) == 0 {
+		return results, nil
+	}
+	flightKey, err := availabilityBatchFlightKey(requests)
+	if err != nil {
+		return nil, err
+	}
+	value, err, shared := store.coalescer.Do(ctx, flightKey, func(fillContext context.Context) (any, error) {
+		return store.loadAvailabilityBatch(fillContext, requests)
+	})
+	if shared {
+		store.recordSingleflightShared("availability")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return value.([]querypostgres.Availability), nil
+}
+
+func (store *Store) readAvailabilityBatch(
+	ctx context.Context,
+	requests []querypostgres.AvailabilityRequest,
+) (
+	[]querypostgres.Availability,
+	[]querypostgres.AvailabilityRequest,
+	[]int,
+	[]string,
+	error,
+) {
 	results := make([]querypostgres.Availability, len(requests))
 	keys := make([]string, len(requests))
 	misses := make([]querypostgres.AvailabilityRequest, 0)
@@ -344,15 +472,15 @@ func (store *Store) AvailabilityBatch(
 	for index, request := range requests {
 		versionKey, err := AvailabilityVersionKey(request.TrainRunID)
 		if err != nil {
-			return nil, querypostgres.ErrInvalidQuery
+			return nil, nil, nil, nil, querypostgres.ErrInvalidQuery
 		}
-		version, versionErr := store.versions.GetOrCreate(ctx, versionKey)
-		if versionErr == nil {
+		version, found, versionErr := store.versions.Get(ctx, versionKey)
+		if versionErr == nil && found {
 			keys[index], err = AvailabilityDataKey(
 				version, request.TrainRunID, request.OriginCode, request.DestinationCode, request.SeatClass,
 			)
 			if err != nil {
-				return nil, querypostgres.ErrInvalidJourney
+				return nil, nil, nil, nil, querypostgres.ErrInvalidJourney
 			}
 			if availability, status := store.readAvailability(ctx, keys[index], request); status == cacheReadHit {
 				store.recordReadStatus("availability", status)
@@ -361,7 +489,7 @@ func (store *Store) AvailabilityBatch(
 			} else {
 				store.recordReadStatus("availability", status)
 			}
-		} else {
+		} else if versionErr != nil {
 			store.recordRequest("availability", "version_get", "failure", "redis")
 			store.recordFallback("redis")
 		}
@@ -369,23 +497,29 @@ func (store *Store) AvailabilityBatch(
 		missIndexes = append(missIndexes, index)
 		missKeys = append(missKeys, keys[index])
 	}
+	return results, misses, missIndexes, missKeys, nil
+}
+
+func (store *Store) loadAvailabilityBatch(
+	ctx context.Context,
+	requests []querypostgres.AvailabilityRequest,
+) ([]querypostgres.Availability, error) {
+	results, misses, missIndexes, missKeys, err := store.readAvailabilityBatch(ctx, requests)
+	if err != nil {
+		return nil, err
+	}
 	if len(misses) == 0 {
 		return results, nil
 	}
-	flightKey, err := availabilityBatchFlightKey(misses, missKeys)
+	loaded, err := store.fillAvailabilityMisses(ctx, misses, missKeys)
 	if err != nil {
 		return nil, err
 	}
-	value, err, _ := store.coalescer.Do(ctx, flightKey, func(fillContext context.Context) (any, error) {
-		return store.fillAvailabilityMisses(fillContext, misses, missKeys)
-	})
-	if err != nil {
-		return nil, err
+	if len(loaded) != len(missIndexes) {
+		return nil, querypostgres.ErrPersistence
 	}
-	loaded := value.([]querypostgres.Availability)
 	for offset, availability := range loaded {
-		index := missIndexes[offset]
-		results[index] = availability
+		results[missIndexes[offset]] = availability
 	}
 	return results, nil
 }
@@ -416,12 +550,14 @@ func (store *Store) fillAvailabilityMisses(
 	loaded := make([]querypostgres.Availability, 0, len(sourceRequests))
 	if batch, ok := store.source.(availabilityBatchSource); ok {
 		var err error
+		store.recordSourceQuery("availability")
 		loaded, err = batch.AvailabilityBatch(ctx, sourceRequests)
 		if err != nil {
 			return nil, err
 		}
 	} else {
 		for _, request := range sourceRequests {
+			store.recordSourceQuery("availability")
 			availability, err := store.source.Availability(ctx, request)
 			if err != nil {
 				return nil, err
@@ -439,7 +575,39 @@ func (store *Store) fillAvailabilityMisses(
 		}
 		results[index] = availability
 		if keys[index] == "" {
-			continue
+			versionKey, keyErr := AvailabilityVersionKey(requests[index].TrainRunID)
+			created := false
+			if keyErr == nil {
+				version, installed, versionErr := store.versions.GetOrCreateWithStatus(ctx, versionKey)
+				created = installed
+				if versionErr == nil {
+					keys[index], keyErr = AvailabilityDataKey(
+						version,
+						requests[index].TrainRunID,
+						requests[index].OriginCode,
+						requests[index].DestinationCode,
+						requests[index].SeatClass,
+					)
+				} else {
+					keyErr = versionErr
+				}
+			}
+			if keyErr != nil {
+				store.recordFill("availability", "failure", "redis", 0, false)
+				continue
+			}
+			if !created {
+				store.recordSourceQuery("availability")
+				refreshed, sourceErr := store.source.Availability(ctx, requests[index])
+				if sourceErr != nil {
+					return nil, sourceErr
+				}
+				if refreshed.AvailableSeats < 0 {
+					return nil, querypostgres.ErrPersistence
+				}
+				availability = refreshed
+				results[index] = refreshed
+			}
 		}
 		payload, valid := availabilityCachePayload(availability, requests[index], store.clock.Now().UTC())
 		if !valid {
@@ -455,17 +623,26 @@ func (store *Store) fillAvailabilityMisses(
 	return results, nil
 }
 
-func availabilityBatchFlightKey(requests []querypostgres.AvailabilityRequest, keys []string) (string, error) {
-	if len(requests) == 0 || len(requests) != len(keys) {
+func availabilityRequestFlightKey(request querypostgres.AvailabilityRequest) (string, error) {
+	trainRunID, origin, destination, seatClass, valid := normalizedAvailabilityScope(request)
+	if !valid {
+		return "", querypostgres.ErrInvalidJourney
+	}
+	sum := sha256.Sum256([]byte(trainRunID + "\x00" + origin + "\x00" + destination + "\x00" + seatClass))
+	return "availability:" + hex.EncodeToString(sum[:]), nil
+}
+
+func availabilityBatchFlightKey(requests []querypostgres.AvailabilityRequest) (string, error) {
+	if len(requests) == 0 {
 		return "", querypostgres.ErrInvalidQuery
 	}
 	hash := sha256.New()
-	for index, request := range requests {
+	for _, request := range requests {
 		trainRunID, origin, destination, seatClass, valid := normalizedAvailabilityScope(request)
 		if !valid {
 			return "", querypostgres.ErrInvalidJourney
 		}
-		_, _ = hash.Write([]byte(keys[index] + "\x00" + trainRunID + "\x00" + origin + "\x00" + destination + "\x00" + seatClass + "\n"))
+		_, _ = hash.Write([]byte(trainRunID + "\x00" + origin + "\x00" + destination + "\x00" + seatClass + "\n"))
 	}
 	return "availability-batch:" + hex.EncodeToString(hash.Sum(nil)), nil
 }
@@ -492,16 +669,72 @@ func (store *Store) readStations(ctx context.Context, key string) ([]querypostgr
 	return stations, cacheReadHit
 }
 
-func (store *Store) readSearch(ctx context.Context, key string) ([]querypostgres.SearchResult, cacheReadStatus) {
-	var results []querypostgres.SearchResult
-	status := store.readJSON(ctx, key, &results)
+func (store *Store) readSearch(
+	ctx context.Context,
+	key string,
+	search querypostgres.NormalizedSearch,
+) ([]querypostgres.SearchResult, cacheReadStatus) {
+	var cached cachedSearch
+	status := store.readJSON(ctx, key, &cached)
 	if status != cacheReadHit {
 		return nil, status
 	}
-	if results == nil {
+	if cached.Schema != searchSchema || cached.OriginCode != search.OriginCode.String() ||
+		cached.DestinationCode != search.DestinationCode.String() ||
+		cached.ServiceDate != search.ServiceDate.Format(time.DateOnly) ||
+		cached.SeatClass != search.SeatClass.String() || cached.Page != search.Page ||
+		cached.PageSize != search.PageSize || cached.Sort != string(search.Sort) ||
+		cached.Results == nil || len(cached.Results) > search.PageSize {
 		return nil, cacheReadInvalid
 	}
-	return results, cacheReadHit
+	seen := make(map[string]struct{}, len(cached.Results))
+	for _, result := range cached.Results {
+		trainRunID, trainRunErr := uuid.Parse(result.TrainRunID)
+		trainID, trainErr := uuid.Parse(result.TrainID)
+		routeID, routeErr := uuid.Parse(result.RouteID)
+		serviceDate := time.Date(
+			result.ServiceDate.Year(), result.ServiceDate.Month(), result.ServiceDate.Day(), 0, 0, 0, 0, time.UTC,
+		)
+		if trainRunErr != nil || trainErr != nil || routeErr != nil ||
+			trainRunID == uuid.Nil || trainID == uuid.Nil || routeID == uuid.Nil ||
+			trainRunID.String() != result.TrainRunID || trainID.String() != result.TrainID || routeID.String() != result.RouteID ||
+			len(result.TrainCode) < 1 || len(result.TrainCode) > 32 ||
+			serviceDate != search.ServiceDate || result.Status != domain.TrainRunStatusScheduled ||
+			result.FromStopIndex < 0 || result.ToStopIndex <= result.FromStopIndex ||
+			result.DepartureAt.IsZero() || !result.ArrivalAt.After(result.DepartureAt) ||
+			result.SeatClass != search.SeatClass || result.FareAmountMinor < 0 || !validCurrency(result.Currency) {
+			return nil, cacheReadInvalid
+		}
+		identity := trainRunID.String() + "|" + result.SeatClass.String()
+		if _, duplicate := seen[identity]; duplicate {
+			return nil, cacheReadInvalid
+		}
+		seen[identity] = struct{}{}
+	}
+	return cached.Results, cacheReadHit
+}
+
+func searchCachePayload(
+	results []querypostgres.SearchResult,
+	search querypostgres.NormalizedSearch,
+) cachedSearch {
+	return cachedSearch{
+		Schema: searchSchema, OriginCode: search.OriginCode.String(), DestinationCode: search.DestinationCode.String(),
+		ServiceDate: search.ServiceDate.Format(time.DateOnly), SeatClass: search.SeatClass.String(),
+		Page: search.Page, PageSize: search.PageSize, Sort: string(search.Sort), Results: results,
+	}
+}
+
+func validCurrency(value string) bool {
+	if len(value) != 3 {
+		return false
+	}
+	for _, character := range value {
+		if character < 'A' || character > 'Z' {
+			return false
+		}
+	}
+	return true
 }
 
 func (store *Store) readAvailability(
@@ -581,18 +814,30 @@ func (store *Store) searchProjectionOrSource(
 		return nil, projectionErr
 	}
 	store.recordFallback("projection")
+	store.recordSourceQuery("train_search")
 	return store.source.SearchTrainRuns(ctx, request)
 }
 
 func (store *Store) readJSON(ctx context.Context, key string, target any) cacheReadStatus {
-	encoded, err := store.client.Get(ctx, key).Bytes()
-	if errors.Is(err, redis.Nil) {
-		return cacheReadMiss
-	}
+	result, err := boundedCacheGetScript.Run(ctx, store.client, []string{key}, MaxCachePayloadBytes).Slice()
 	if err != nil {
 		return cacheReadRedisFailure
 	}
-	if json.Unmarshal(encoded, target) != nil {
+	if len(result) != 2 {
+		return cacheReadRedisFailure
+	}
+	status, statusOK := result[0].(int64)
+	encoded, encodedOK := result[1].(string)
+	if !statusOK || !encodedOK {
+		return cacheReadRedisFailure
+	}
+	if status == 0 {
+		return cacheReadMiss
+	}
+	if status != 1 || len(encoded) > MaxCachePayloadBytes {
+		return cacheReadInvalid
+	}
+	if json.Unmarshal([]byte(encoded), target) != nil {
 		return cacheReadInvalid
 	}
 	return cacheReadHit
@@ -637,6 +882,18 @@ func (store *Store) recordReadStatus(cacheType string, status cacheReadStatus) {
 func (store *Store) recordFill(cacheType, result, reason string, duration time.Duration, shared bool) {
 	if store.metrics != nil {
 		store.metrics.RecordCacheFill(cacheType, result, reason, duration, shared)
+	}
+}
+
+func (store *Store) recordSingleflightShared(cacheType string) {
+	if store.metrics != nil {
+		store.metrics.RecordCacheSingleflightShared(cacheType)
+	}
+}
+
+func (store *Store) recordSourceQuery(cacheType string) {
+	if store.metrics != nil {
+		store.metrics.RecordCacheSourceQuery(cacheType)
 	}
 }
 

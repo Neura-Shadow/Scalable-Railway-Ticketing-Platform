@@ -2,76 +2,98 @@
 
 ## Evidence status
 
-The nine Milestone 3 k6 modules passed syntax inspection. A bounded local
-Compose run also exercised three APIs, two admission workers, two read-model
-workers, PostgreSQL, Redis, and the reverse proxy. It proved a cross-replica
-warm hit, worker-driven generation rotation, one-worker failover/restart,
-one-API restart, Redis-outage PostgreSQL read fallback, fresh namespace
-recovery, and clean read-model reconciliation. This is functional evidence,
-not a sustained benchmark. Throughput, latency, ratios, utilization, and
-capacity fields remain **not measured**.
+Milestone 3 has accepted **bounded local evidence**, not a production-capacity
+benchmark. The accepted run used one Docker Desktop host with three API
+replicas, two admission workers, two read-model workers, one PostgreSQL 16.14
+instance, one Redis 7.4.9 instance, and the evidence reverse proxy. k6 0.54.0
+generated the client load. The host exposed 24 logical CPUs and 16.62 GiB of
+memory to Docker Desktop.
 
-A syntax check, unit test, short functional run, container build, or CI pass is
-not production-capacity evidence. No national-scale, 12306-equivalent,
-multi-region, or zero-downtime claim is made.
+Every accepted search measurement below was taken only after a paginated
+`rebuild-all` completed and `read_model_projection_state.ready` was true.
+Earlier search runs made before global readiness was proved were rejected and
+are not used for the cold/warm comparison. Raw summaries and server telemetry
+were kept outside Git; no credentials, customer data, or machine-local paths
+are committed.
 
-## Run identity
+This report does not establish sustained throughput, production sizing,
+national-scale capacity, multi-region behavior, or zero downtime.
+
+## Run identity and bounds
 
 | Field | Observed value |
 |---|---|
-| Commit SHA | Working-tree validation before final delivery commit; CI rerun required |
-| UTC start/end | Bounded local run completed 2026-07-22; duration not retained as benchmark evidence |
-| Environment/region | Local Docker Desktop, single host; not a production region |
-| API/admission/read-model replicas | 3 / 2 / 2 in isolated Compose |
-| PostgreSQL/Redis versions and topology | PostgreSQL 16 Alpine and Redis 7 Alpine, one instance each |
-| CPU, memory, disk, network | Not run |
-| Source/projection/cache cardinality | Not run |
-| TTL/jitter/worker bounds | Not run |
-| k6 version and script commit | Syntax inspected with k6 0.54.0; no load run |
+| Source state | Milestone 3 delivery working tree; final PR head is the delivery trace |
+| Run date | 2026-07-22, Asia/Taipei |
+| Environment | Local Docker Desktop, one host, one region |
+| API / admission / read-model replicas | 3 / 2 / 2 |
+| PostgreSQL / Redis | PostgreSQL 16.14 / Redis 7.4.9, one instance each |
+| Client | k6 0.54.0 |
+| Search fixture | 2 stations, 2 train runs, 160 authoritative seat rows, 2 journey rows |
+| Steady-state scenario bound | 5 VUs for 15 seconds unless stated otherwise |
+| Cold-search method | 30 sequential requests, each after an exact version reset, through all 3 upstreams |
 
-## Functional and recovery evidence
+## Accepted measurements
 
-| Scenario | Status | Accepted evidence |
-|---|---|---|
-| Station/search/availability cache | Not run | Pending controlled smoke |
-| Cold versus warm search | Not run | Pending independent-generation samples |
-| Shared multi-replica fill/rotation | Passed bounded local functional run | API 1 fill, API 2 hit, worker event rotation, LB smoke |
-| Redis restart and refill | Passed bounded local functional run | read fallback during stop; fresh valid generation after restart |
-| Worker pause/restart | Passed bounded local functional run | worker 2 processed event while worker 1 stopped; worker 1 returned ready |
-| Invalidation storm | Not run | Pending bounded synthetic event run |
-| Mixed search/booking | Not run | Pending conflicts plus reconciliation |
-| Projection live rebuild | Not run | Pending old/new-complete observation |
+Latency is client-observed HTTP duration. RPS is only the achieved rate in this
+short local run. It is not a service-level objective or capacity claim.
 
-## Sustained measurements
+| Scenario | Requests | RPS | p50 ms | p95 ms | p99 ms | Checks failed | Unexpected 5xx |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Station cache | 32,800 | 2,186.37 | 1.854 | 3.188 | 4.407 | 0 | 0 |
+| Projection-ready warm search | 20,498 | 1,365.69 | 2.999 | 5.057 | 7.792 | 0 | 0 |
+| Availability hint cache | 14,174 | 849.80 | 2.867 | 12.086 | 15.302 | 0 | 0 |
+| Projection-ready mixed search/booking | 14,776 | 984.51 | 4.097 | 6.890 | 10.784 | 0 | 0 |
+| Projection-ready multi-replica search | 15,775 | 946.29 | 3.866 | 6.811 | 10.785 | 0 | 0 |
+| Invalidation storm, 30 events | 15,048 | 900.62 | 4.011 | 7.335 | 10.720 | 0 | 0 |
+| Worker-pause window | 26,733 | 1,781.83 | 2.324 | 3.757 | 5.371 | 0 | 0 |
+| Redis-outage window | 41 | 2.29 | 1,072.782 | 3,830.257 | 4,023.320 | 0 | 0 |
 
-| Measurement | Result |
+The Redis-outage latency is intentionally reported rather than hidden: reads
+remained schema-valid and returned no unexpected 5xx, but bounded synchronous
+Redis attempts made fallback very slow in this local outage. This is recovery
+evidence and an operational limitation, not healthy-state performance.
+
+## Independent cold versus warm search
+
+Thirty cold samples each used a fresh exact version namespace and reached all
+three API upstreams. Their latency was p50 23.305 ms, p95 48.450 ms, and p99
+54.170 ms (minimum 13.205 ms, maximum 54.521 ms). The projection-ready warm
+run measured p50 2.999 ms, p95 5.057 ms, and p99 7.792 ms.
+
+On this bounded fixture, the cold-to-warm latency ratios were 7.77x at p50,
+9.58x at p95, and 6.95x at p99. These ratios describe this run only.
+
+## Correctness and recovery observations
+
+| Gate | Accepted observation |
 |---|---|
-| Station/search/availability RPS | Not measured |
-| Cold search p50/p95/p99 | Not measured |
-| Warm search p50/p95/p99 | Not measured |
-| Cache hit/miss/failure ratio | Not measured |
-| Fallback/source-query count | Not measured |
-| Singleflight shared count | Not measured |
-| Projection rebuild duration/lag | Not measured |
-| Invalidation rate/failures | Not measured |
-| Redis latency/errors | Not measured |
-| PostgreSQL connections/locks | Not measured |
-| Booking conflicts/unexpected 5xx | Not measured |
+| Global projection readiness | Bounded paginated rebuild completed; `ready=true` before accepted search runs |
+| Multi-replica cache | Three upstreams observed; cross-replica warm hit and version rotation passed |
+| Mixed booking safety | 5 holds succeeded and all 5 were cancelled; cancellation failures 0 |
+| Worker pause and recovery | Aggregate lag grew from 0 to 16.562979 seconds, then returned to 0; durable receipt present |
+| Redis outage and recovery | Read fallback increased 11 to 87 and cache failures 11 to 87; recovery used a fresh namespace |
+| Invalidation storm | 30 events at 4 events/second; 30,096 checks passed; no pending or DLQ residue |
+| Safety fallback during invalidation | Projection fallback increased by 56 while event progress existed, then stopped increasing after convergence |
+| Final reconciliation | Read model 2/2 consistent; seat inventory, quotas, admission state, and cache versions passed |
 
-## Correctness verdict
+The bounded fallback during invalidation is expected safety behavior: search
+does not read a projection while a projection-affecting event is in progress.
+After convergence, projection readiness was true, progress rows and pending
+entries were zero, and a follow-up warm run left the fallback counter unchanged.
 
-| Gate | Result |
-|---|---|
-| PostgreSQL source and seat authority preserved | Covered by automated tests; load run not evaluated |
-| No partial projection set | Covered by transaction tests; load run not evaluated |
-| Duplicate/out-of-order convergence | Covered by integration tests; load run not evaluated |
-| Redis loss creates fresh namespaces | Covered by real Redis tests; load run not evaluated |
-| Stale hint cannot oversell | Covered by booking boundary tests; load run not evaluated |
-| Seat/read-model reconciliation clean | Read-model clean in bounded local run; sustained mixed-booking seat gate not evaluated |
+## Dependency telemetry snapshot
 
-When a controlled run occurs, replace `Not run`/`Not measured` only with
-observed values and cite sanitized raw artifacts stored outside git. Record
-warm-up, repetitions, failures, variance, and rejected runs. The current honest
-verdict is that the repository has bounded local functional evidence and
-executable sustained-test procedures, but no accepted sustained Milestone 3
-performance result.
+At final reconciliation Redis reported about 1.48 MiB used memory, 40,630
+processed commands, 5,037 keyspace hits, 4,512 misses, zero evictions, and zero
+rejected connections. PostgreSQL reported 14 connections, zero deadlocks, zero
+temporary files, and no ungranted locks. These are point-in-time diagnostics,
+not utilization envelopes.
+
+## Verdict
+
+The run provides bounded evidence for cache acceleration, multi-replica shared
+namespace behavior, safe projection fallback, worker recovery, Redis fallback,
+and authoritative booking reconciliation. It does not provide a sustained
+benchmark: dataset size, duration, failure-window latency, and single-host
+topology are deliberately too small for production sizing.

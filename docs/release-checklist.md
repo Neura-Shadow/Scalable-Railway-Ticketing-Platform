@@ -13,10 +13,10 @@ key paths into it.
   databases, logs, coverage, benchmark output, or runtime volumes.
 - [ ] Required unit, integration, concurrency, race, static, vulnerability,
   secret, migration, container, and deployment checks pass.
-- [ ] Payment, multi-region active-active writes, and deferred read-cache work
-  are not represented as part of this release; the Milestone 2 waiting room,
-  admission worker, durable quotas, and reconciliation commands are included
-  only with the evidence gates below.
+- [ ] Payment and multi-region active-active writes are not represented as part
+  of this release. The Milestone 2 waiting room/admission controls and the
+  Milestone 3 PostgreSQL read model/Redis read caches are included only with
+  the evidence gates below; Redis never becomes booking authority.
 
 ## Configuration and recovery
 
@@ -79,6 +79,32 @@ key paths into it.
 
 ## Application rollout
 
+### Migration 7 and read-model/cache gate
+
+- [ ] The operator followed
+  [migration-7-production-rollout.md](migrations/migration-7-production-rollout.md),
+  starting from `version=6 dirty=false`, and recorded preflight, capacity,
+  timeout, lock, backup, and abort decisions.
+- [ ] Fresh up, repeated up, populated version-6 to version-7, and disposable
+  down/up rehearsals pass. Version 7 constraints reject unknown and mismatched
+  aggregate/event pairs while preserving every version-6 booking outbox event.
+- [ ] `rebuild-all` dry-run/apply pages use the exact returned cursor, expose
+  source fallback until the final readiness checkpoint, and complete without a
+  partial visible projection. `reconcile --limit 100` is clean before enablement.
+- [ ] The read-model worker first starts disabled; PostgreSQL, Redis, migration,
+  private health/metrics, and process-owned configuration pass before one
+  replica is enabled and then scaled to two distinct consumer identities.
+- [ ] Bounded tests prove duplicate/out-of-order convergence, pending-entry
+  takeover, Redis stream/PEL loss recovery through `replay-outbox`, poison-event
+  recovery through `resume-event`, and clean reconciliation after recovery.
+- [ ] Station/search/availability cache loss produces safe source fallback;
+  restoration creates fresh generations without key enumeration. Availability
+  remains a hint and a stale/poisoned value cannot authorize a booking.
+- [ ] Stream length, PEL size, pending age, projection lag, Redis memory, cache
+  failures/fallbacks, invalidations, and reconciliation mismatches have alert
+  ownership. Any source-stream retention is group-floor-aware and never blind
+  `MAXLEN` trimming.
+
 - [ ] One canary reports liveness and version-aware readiness before traffic.
 - [ ] Synthetic smoke checks cover authentication, station/search/availability,
   one reservation lifecycle, outbox progress, and reconciliation without using
@@ -111,7 +137,8 @@ key paths into it.
   and migration state remains clean through the observation window.
 - [ ] No Critical or High review/security finding remains open.
 - [ ] Application rollback remains available; migration 5's compatibility
-  trigger is not removed, and Migration 6 down remains a separately approved
-  destructive incident action rather than the default rollback.
+  trigger is not removed, Migration 6 down remains a separately approved
+  destructive incident action, and the default Milestone 3 rollback leaves
+  additive migration 7 in place with workers disabled and source reads enabled.
 - [ ] The release record contains decisions and bounded evidence, not secrets or
   unsupported availability/throughput claims.

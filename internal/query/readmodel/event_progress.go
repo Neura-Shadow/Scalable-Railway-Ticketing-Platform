@@ -49,9 +49,25 @@ func (s *Store) PendingEvent(ctx context.Context, consumerName, rawEventID strin
 		WHERE consumer_name = $1 AND event_id = $2
 	`, consumerName, eventID).Scan(&event.EventType, &event.AggregateType, &event.AggregateID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return ProjectionEvent{}, ErrEventProgressNotFound
+			if outboxErr := tx.QueryRow(ctx, `
+				SELECT event_type, aggregate_type, aggregate_id::text
+				FROM outbox_events AS event
+				WHERE event.id = $2
+				  AND event.status = 'published'
+				  AND event.published_at IS NOT NULL
+				  AND NOT EXISTS (
+					SELECT 1 FROM read_model_event_receipts AS receipt
+					WHERE receipt.consumer_name = $1 AND receipt.event_id = event.id
+				  )
+			`, consumerName, eventID).Scan(&event.EventType, &event.AggregateType, &event.AggregateID); outboxErr != nil {
+				if errors.Is(outboxErr, pgx.ErrNoRows) {
+					return ProjectionEvent{}, ErrEventProgressNotFound
+				}
+				return ProjectionEvent{}, fmt.Errorf("%w: read recoverable outbox event", ErrPersistence)
+			}
+		} else {
+			return ProjectionEvent{}, fmt.Errorf("%w: read pending event", ErrPersistence)
 		}
-		return ProjectionEvent{}, fmt.Errorf("%w: read pending event", ErrPersistence)
 	}
 	if !validEventPair(event.EventType, event.AggregateType) {
 		return ProjectionEvent{}, ErrInvalidEvent

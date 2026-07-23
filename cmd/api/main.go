@@ -34,10 +34,23 @@ import (
 )
 
 const (
-	maxRequestBodyBytes = 1 << 20
-	maxHeaderBytes      = 1 << 20
-	defaultIdleTimeout  = 60 * time.Second
+	maxRequestBodyBytes               = 1 << 20
+	maxHeaderBytes                    = 1 << 20
+	defaultIdleTimeout                = 60 * time.Second
+	projectionLagObservationInterval  = 5 * time.Second
+	reconciliationObservationInterval = time.Minute
 )
+
+type readModelOperationalStore interface {
+	ProjectionLag(context.Context, string) (time.Duration, error)
+	NextReconciliationTrainRun(context.Context, string) (string, bool, error)
+	ReconcileTrainRun(context.Context, string) (queryreadmodel.ReconcileResult, error)
+}
+
+type readModelOperationalMetrics interface {
+	SetProjectionLag(time.Duration)
+	AddReconciliationMismatches(string, int)
+}
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -119,6 +132,10 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return errors.New("read-model store initialization failed")
 	}
+	stopReadModelObserver := startReadModelObserver(
+		signalContext, projectionStore, readMetrics, cfg.DatabaseTimeout, logger,
+	)
+	defer stopReadModelObserver()
 	versionManager, err := querycache.NewSecureVersionManager(redisClient)
 	if err != nil {
 		return errors.New("cache version manager initialization failed")
@@ -268,6 +285,80 @@ func readinessTimeout(cfg config.Config) time.Duration {
 		return 2 * time.Second
 	}
 	return timeout
+}
+
+func startReadModelObserver(
+	parent context.Context,
+	store readModelOperationalStore,
+	metrics readModelOperationalMetrics,
+	timeout time.Duration,
+	logger *slog.Logger,
+) func() {
+	observerContext, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		lagTicker := time.NewTicker(projectionLagObservationInterval)
+		defer lagTicker.Stop()
+		reconciliationTicker := time.NewTicker(reconciliationObservationInterval)
+		defer reconciliationTicker.Stop()
+		cursor := ""
+		observeLag := func() {
+			ctx, stop := context.WithTimeout(observerContext, timeout)
+			defer stop()
+			lag, err := store.ProjectionLag(ctx, queryreadmodel.DurableConsumerName)
+			if err != nil {
+				logger.Warn("read-model observation failed", "operation", "projection_lag")
+				return
+			}
+			metrics.SetProjectionLag(lag)
+		}
+		observeReconciliation := func() {
+			ctx, stop := context.WithTimeout(observerContext, timeout)
+			defer stop()
+			candidate, found, err := store.NextReconciliationTrainRun(ctx, cursor)
+			if err != nil {
+				logger.Warn("read-model observation failed", "operation", "reconciliation_candidate")
+				return
+			}
+			if !found {
+				cursor = ""
+				return
+			}
+			result, err := store.ReconcileTrainRun(ctx, candidate)
+			if err != nil {
+				logger.Warn("read-model observation failed", "operation", "reconciliation")
+				return
+			}
+			recordReconciliationMismatches(metrics, result)
+			cursor = candidate
+		}
+		observeLag()
+		observeReconciliation()
+		for {
+			select {
+			case <-observerContext.Done():
+				return
+			case <-lagTicker.C:
+				observeLag()
+			case <-reconciliationTicker.C:
+				observeReconciliation()
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+func recordReconciliationMismatches(metrics readModelOperationalMetrics, result queryreadmodel.ReconcileResult) {
+	metrics.AddReconciliationMismatches("missing", result.MissingRows)
+	metrics.AddReconciliationMismatches("extra", result.ExtraRows)
+	metrics.AddReconciliationMismatches("duplicate", result.DuplicateRows)
+	metrics.AddReconciliationMismatches("stale", result.StaleRows)
+	metrics.AddReconciliationMismatches("mismatch", result.MismatchedRows)
+	metrics.AddReconciliationMismatches("invalid", result.InvalidRows)
 }
 
 // publicReason deliberately bounds startup errors so connection strings and

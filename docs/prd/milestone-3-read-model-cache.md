@@ -312,7 +312,8 @@ Cache metrics are `cache_request_total`, `cache_hit_total`,
 `cache_miss_total`, `cache_failure_total`, `cache_invalidation_total`,
 `cache_invalidation_failure_total`, `cache_fill_total`,
 `cache_fill_failure_total`, `cache_singleflight_shared_total`, and
-`cache_fill_duration_seconds`.
+`cache_fill_duration_seconds`. `cache_source_query_total` is the bounded
+load-evidence counter for authoritative station/search/availability queries.
 
 Only bounded allowlisted `cache_type`, `operation`, `result`, `reason`, and
 `event_type` labels are permitted. IDs, station or route input, reservation,
