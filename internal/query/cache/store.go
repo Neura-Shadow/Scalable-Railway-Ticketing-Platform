@@ -29,6 +29,10 @@ type availabilityBatchSource interface {
 	AvailabilityBatch(context.Context, []querypostgres.AvailabilityRequest) ([]querypostgres.Availability, error)
 }
 
+type availabilityAssignmentSource interface {
+	AvailabilityAssignmentGeneration(context.Context, string) (int64, error)
+}
+
 type timeSource interface {
 	Now() time.Time
 }
@@ -94,12 +98,13 @@ type cachedStation struct {
 }
 
 type cachedAvailability struct {
-	Value           querypostgres.Availability `json:"value"`
-	OriginCode      string                     `json:"origin_code"`
-	DestinationCode string                     `json:"destination_code"`
-	SeatClass       string                     `json:"seat_class"`
-	ObservedAt      time.Time                  `json:"observed_at"`
-	Source          string                     `json:"source"`
+	Value                querypostgres.Availability `json:"value"`
+	AssignmentGeneration int64                      `json:"assignment_generation"`
+	OriginCode           string                     `json:"origin_code"`
+	DestinationCode      string                     `json:"destination_code"`
+	SeatClass            string                     `json:"seat_class"`
+	ObservedAt           time.Time                  `json:"observed_at"`
+	Source               string                     `json:"source"`
 }
 
 type cachedSearch struct {
@@ -316,7 +321,11 @@ func (store *Store) Availability(
 		if err != nil {
 			return querypostgres.Availability{}, querypostgres.ErrInvalidJourney
 		}
-		if availability, status := store.readAvailability(ctx, key, request); status == cacheReadHit {
+		generation, enforceGeneration, generationErr := store.availabilityAssignmentGeneration(ctx, request.TrainRunID)
+		if generationErr != nil {
+			return querypostgres.Availability{}, generationErr
+		}
+		if availability, status := store.readAvailability(ctx, key, request, generation, enforceGeneration); status == cacheReadHit {
 			store.recordReadStatus("availability", status)
 			return availability, nil
 		} else {
@@ -335,7 +344,15 @@ func (store *Store) Availability(
 				fillVersion, request.TrainRunID, request.OriginCode, request.DestinationCode, request.SeatClass,
 			)
 			if versionErr == nil {
-				if availability, status := store.readAvailability(fillContext, fillKey, request); status == cacheReadHit {
+				generation, enforceGeneration, generationErr := store.availabilityAssignmentGeneration(
+					fillContext, request.TrainRunID,
+				)
+				if generationErr != nil {
+					return nil, generationErr
+				}
+				if availability, status := store.readAvailability(
+					fillContext, fillKey, request, generation, enforceGeneration,
+				); status == cacheReadHit {
 					return fillOutcome{value: availability}, nil
 				} else if status == cacheReadRedisFailure || status == cacheReadInvalid {
 					store.recordReadStatus("availability", status)
@@ -482,7 +499,15 @@ func (store *Store) readAvailabilityBatch(
 			if err != nil {
 				return nil, nil, nil, nil, querypostgres.ErrInvalidJourney
 			}
-			if availability, status := store.readAvailability(ctx, keys[index], request); status == cacheReadHit {
+			generation, enforceGeneration, generationErr := store.availabilityAssignmentGeneration(
+				ctx, request.TrainRunID,
+			)
+			if generationErr != nil {
+				return nil, nil, nil, nil, generationErr
+			}
+			if availability, status := store.readAvailability(
+				ctx, keys[index], request, generation, enforceGeneration,
+			); status == cacheReadHit {
 				store.recordReadStatus("availability", status)
 				results[index] = availability
 				continue
@@ -534,7 +559,15 @@ func (store *Store) fillAvailabilityMisses(
 	sourceIndexes := make([]int, 0, len(requests))
 	for index, request := range requests {
 		if keys[index] != "" {
-			if availability, status := store.readAvailability(ctx, keys[index], request); status == cacheReadHit {
+			generation, enforceGeneration, generationErr := store.availabilityAssignmentGeneration(
+				ctx, request.TrainRunID,
+			)
+			if generationErr != nil {
+				return nil, generationErr
+			}
+			if availability, status := store.readAvailability(
+				ctx, keys[index], request, generation, enforceGeneration,
+			); status == cacheReadHit {
 				results[index] = availability
 				continue
 			} else if status == cacheReadRedisFailure || status == cacheReadInvalid {
@@ -741,6 +774,8 @@ func (store *Store) readAvailability(
 	ctx context.Context,
 	key string,
 	request querypostgres.AvailabilityRequest,
+	expectedGeneration int64,
+	enforceGeneration bool,
 ) (querypostgres.Availability, cacheReadStatus) {
 	var cached cachedAvailability
 	status := store.readJSON(ctx, key, &cached)
@@ -751,6 +786,7 @@ func (store *Store) readAvailability(
 	cachedTrainRunID, cachedErr := uuid.Parse(cached.Value.TrainRunID)
 	_, origin, destination, seatClass, scopeValid := normalizedAvailabilityScope(request)
 	if cached.Source != "postgres" || cached.ObservedAt.IsZero() ||
+		(enforceGeneration && cached.AssignmentGeneration != expectedGeneration) ||
 		cached.Value.AvailableSeats < 0 || requestErr != nil || cachedErr != nil ||
 		requestTrainRunID == uuid.Nil || cachedTrainRunID != requestTrainRunID || !scopeValid ||
 		cached.OriginCode != origin || cached.DestinationCode != destination || cached.SeatClass != seatClass ||
@@ -775,9 +811,28 @@ func availabilityCachePayload(
 		return cachedAvailability{}, false
 	}
 	return cachedAvailability{
-		Value: value, OriginCode: origin, DestinationCode: destination, SeatClass: seatClass,
+		Value: value, AssignmentGeneration: value.AssignmentGeneration,
+		OriginCode: origin, DestinationCode: destination, SeatClass: seatClass,
 		ObservedAt: observedAt, Source: "postgres",
 	}, true
+}
+
+func (store *Store) availabilityAssignmentGeneration(
+	ctx context.Context,
+	rawTrainRunID string,
+) (int64, bool, error) {
+	source, ok := store.source.(availabilityAssignmentSource)
+	if !ok {
+		return 0, false, nil
+	}
+	generation, err := source.AvailabilityAssignmentGeneration(ctx, rawTrainRunID)
+	if err != nil {
+		return 0, true, err
+	}
+	if generation < 0 {
+		return 0, true, querypostgres.ErrPersistence
+	}
+	return generation, true, nil
 }
 
 func normalizedAvailabilityScope(

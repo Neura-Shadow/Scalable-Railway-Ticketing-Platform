@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/domain"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
@@ -100,7 +101,7 @@ func (s *Store) createHoldOnce(ctx context.Context, params CreateHoldParams) (Cr
 		}
 	}
 
-	tx, err := s.Begin(ctx)
+	tx, err := s.beginCreateHoldTransaction(ctx, params.TrainRunID)
 	if err != nil {
 		return CreateHoldResult{}, err
 	}
@@ -230,6 +231,14 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, reservationID, params.TrainRunID, segm
 			return CreateHoldResult{}, fmt.Errorf("insert reservation seat: %w", err)
 		}
 	}
+	if err := tx.insertReservationQuotaClaim(
+		ctx, reservationID, params.UserID, params.TrainRunID, len(ownedPassengers),
+	); err != nil {
+		return CreateHoldResult{}, err
+	}
+	if err := tx.insertReservationLocator(ctx, reservationID, params.UserID); err != nil {
+		return CreateHoldResult{}, err
+	}
 
 	if err := tx.CompleteIdempotency(ctx, acquisition.RecordID, reservationID); err != nil {
 		return CreateHoldResult{}, err
@@ -241,6 +250,9 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, reservationID, params.TrainRunID, segm
 		"expiresAt":     params.HoldExpiresAt.UTC(),
 		"seatCount":     len(allocated),
 	}); err != nil {
+		return CreateHoldResult{}, err
+	}
+	if err := tx.recordSuccessfulGenerationWrite(ctx); err != nil {
 		return CreateHoldResult{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -256,7 +268,7 @@ func (s *Store) ConfirmReservation(ctx context.Context, params ReservationComman
 	if err := validateReservationCommandParams(params); err != nil {
 		return ConfirmReservationResult{}, err
 	}
-	tx, err := s.Begin(ctx)
+	tx, err := s.beginReservationCommandTransaction(ctx, params.ReservationID)
 	if err != nil {
 		return ConfirmReservationResult{}, err
 	}
@@ -294,6 +306,9 @@ func (s *Store) ConfirmReservation(ctx context.Context, params ReservationComman
 		if err != nil {
 			return ConfirmReservationResult{}, err
 		}
+		if err := tx.recordSuccessfulGenerationWrite(ctx); err != nil {
+			return ConfirmReservationResult{}, err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return ConfirmReservationResult{}, err
 		}
@@ -314,13 +329,24 @@ WHERE id = $1
 	if commandTag.RowsAffected() != 1 {
 		return ConfirmReservationResult{}, ErrReservationExpired
 	}
+	if err := tx.closeReservationQuotaClaim(ctx, params.ReservationID); err != nil {
+		return ConfirmReservationResult{}, err
+	}
 
 	orderID := uuid.New()
-	_, err = tx.tx.Exec(ctx, `
+	var orderCreatedAt time.Time
+	err = tx.tx.QueryRow(ctx, `
 INSERT INTO ticket_orders (id, reservation_id, user_id, status, total_amount_minor, currency)
-VALUES ($1, $2, $3, 'confirmed', $4, $5)`, orderID, params.ReservationID, params.UserID, totalAmount, currency)
+VALUES ($1, $2, $3, 'confirmed', $4, $5)
+RETURNING created_at`, orderID, params.ReservationID, params.UserID, totalAmount, currency).Scan(&orderCreatedAt)
 	if err != nil {
 		return ConfirmReservationResult{}, fmt.Errorf("insert ticket order: %w", err)
+	}
+	if err := tx.insertTicketOrderLocator(
+		ctx, orderID, params.ReservationID, params.UserID,
+		"confirmed", totalAmount, currency, orderCreatedAt,
+	); err != nil {
+		return ConfirmReservationResult{}, err
 	}
 
 	reservationSeatIDs, err := tx.reservationSeatIDs(ctx, params.ReservationID)
@@ -339,6 +365,9 @@ VALUES ($1, $2, $3, $4, 'active')`, ticketID, orderID, reservationSeatID, ticket
 		if err != nil {
 			return ConfirmReservationResult{}, fmt.Errorf("insert ticket: %w", err)
 		}
+		if err := tx.insertTicketLocator(ctx, ticketID, orderID, params.ReservationID, params.UserID); err != nil {
+			return ConfirmReservationResult{}, err
+		}
 		if err := tx.appendTicketEvent(ctx, ticketID, map[string]any{
 			"ticketId": ticketID, "orderId": orderID, "reservationId": params.ReservationID,
 		}); err != nil {
@@ -354,6 +383,9 @@ VALUES ($1, $2, $3, $4, 'active')`, ticketID, orderID, reservationSeatID, ticket
 	}); err != nil {
 		return ConfirmReservationResult{}, err
 	}
+	if err := tx.recordSuccessfulGenerationWrite(ctx); err != nil {
+		return ConfirmReservationResult{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return ConfirmReservationResult{}, err
 	}
@@ -364,7 +396,7 @@ func (s *Store) CancelReservation(ctx context.Context, params ReservationCommand
 	if err := validateReservationCommandParams(params); err != nil {
 		return CancelReservationResult{}, err
 	}
-	tx, err := s.Begin(ctx)
+	tx, err := s.beginReservationCommandTransaction(ctx, params.ReservationID)
 	if err != nil {
 		return CancelReservationResult{}, err
 	}
@@ -398,6 +430,9 @@ func (s *Store) CancelReservation(ctx context.Context, params ReservationCommand
 		if err := tx.CompleteIdempotency(ctx, acquisition.RecordID, params.ReservationID); err != nil {
 			return CancelReservationResult{}, err
 		}
+		if err := tx.recordSuccessfulGenerationWrite(ctx); err != nil {
+			return CancelReservationResult{}, err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return CancelReservationResult{}, err
 		}
@@ -428,6 +463,12 @@ SET status = 'cancelled'
 WHERE ticket_order_id = (SELECT id FROM ticket_orders WHERE reservation_id = $1)`, params.ReservationID); err != nil {
 			return CancelReservationResult{}, fmt.Errorf("cancel tickets: %w", err)
 		}
+		if err := tx.updateTicketOrderLocatorStatus(ctx, params.ReservationID, "cancelled"); err != nil {
+			return CancelReservationResult{}, err
+		}
+	}
+	if err := tx.closeReservationQuotaClaim(ctx, params.ReservationID); err != nil {
+		return CancelReservationResult{}, err
 	}
 	if err := tx.CompleteIdempotency(ctx, acquisition.RecordID, params.ReservationID); err != nil {
 		return CancelReservationResult{}, err
@@ -435,6 +476,9 @@ WHERE ticket_order_id = (SELECT id FROM ticket_orders WHERE reservation_id = $1)
 	if err := tx.appendReservationEvent(ctx, params.ReservationID, "reservation.cancelled", map[string]any{
 		"reservationId": params.ReservationID, "status": "cancelled", "releasedSeatCount": released,
 	}); err != nil {
+		return CancelReservationResult{}, err
+	}
+	if err := tx.recordSuccessfulGenerationWrite(ctx); err != nil {
 		return CancelReservationResult{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -446,6 +490,9 @@ WHERE ticket_order_id = (SELECT id FROM ticket_orders WHERE reservation_id = $1)
 func (s *Store) ExpireDue(ctx context.Context, now time.Time, limit int) ([]uuid.UUID, error) {
 	if now.IsZero() || limit <= 0 || limit > 1000 {
 		return nil, ErrInvalidArgument
+	}
+	if s.shards != nil {
+		return s.expireDueAcrossShards(ctx, limit)
 	}
 	var (
 		expired  []uuid.UUID
@@ -548,6 +595,9 @@ WHERE id = $1
 	}); err != nil {
 		return id, true, err
 	}
+	if err := tx.closeReservationQuotaClaim(ctx, id); err != nil {
+		return id, true, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return id, true, err
 	}
@@ -558,8 +608,22 @@ func (s *Store) GetReservation(ctx context.Context, userID, reservationID uuid.U
 	if s == nil || s.pool == nil || userID == uuid.Nil || reservationID == uuid.Nil {
 		return ReservationRecord{}, ErrInvalidArgument
 	}
-	var record ReservationRecord
-	err := s.pool.QueryRow(ctx, `
+	var (
+		record ReservationRecord
+		row    pgx.Row
+		tx     *Tx
+		err    error
+	)
+	if s.shards != nil {
+		tx, err = s.beginReservationRead(ctx, reservationID)
+		if err != nil {
+			if errors.Is(err, sharding.ErrLocatorNotFound) {
+				return ReservationRecord{}, ErrNotFound
+			}
+			return ReservationRecord{}, err
+		}
+		defer func() { _ = tx.Rollback(context.Background()) }()
+		row = tx.tx.QueryRow(ctx, `
 SELECT r.id, r.status, r.total_amount_minor, r.currency,
        (SELECT count(*) FROM reservation_seats AS rs WHERE rs.reservation_id = r.id),
        (SELECT count(*) FROM tickets AS t
@@ -568,7 +632,20 @@ SELECT r.id, r.status, r.total_amount_minor, r.currency,
        (SELECT count(*) FROM outbox_events AS e
         WHERE e.aggregate_type = 'reservation' AND e.aggregate_id = r.id)
 FROM reservations AS r
-WHERE r.id = $1 AND r.user_id = $2`, reservationID, userID).Scan(
+WHERE r.id = $1 AND r.user_id = $2`, reservationID, userID)
+	} else {
+		row = s.pool.QueryRow(ctx, `
+SELECT r.id, r.status, r.total_amount_minor, r.currency,
+       (SELECT count(*) FROM reservation_seats AS rs WHERE rs.reservation_id = r.id),
+       (SELECT count(*) FROM tickets AS t
+        JOIN ticket_orders AS o ON o.id = t.ticket_order_id
+        WHERE o.reservation_id = r.id AND t.status = 'active'),
+       (SELECT count(*) FROM outbox_events AS e
+        WHERE e.aggregate_type = 'reservation' AND e.aggregate_id = r.id)
+FROM reservations AS r
+WHERE r.id = $1 AND r.user_id = $2`, reservationID, userID)
+	}
+	err = row.Scan(
 		&record.ReservationID, &record.Status, &record.TotalAmountMinor, &record.Currency,
 		&record.SeatCount, &record.ActiveTicketCount, &record.OutboxEventCount,
 	)
@@ -577,6 +654,11 @@ WHERE r.id = $1 AND r.user_id = $2`, reservationID, userID).Scan(
 			return ReservationRecord{}, ErrNotFound
 		}
 		return ReservationRecord{}, fmt.Errorf("get reservation: %w", err)
+	}
+	if tx != nil {
+		if err := tx.Commit(ctx); err != nil {
+			return ReservationRecord{}, err
+		}
 	}
 	return record, nil
 }

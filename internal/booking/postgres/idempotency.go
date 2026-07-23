@@ -41,6 +41,7 @@ type IdempotencyAcquisition struct {
 
 type CompletedCreateHoldLookupParams struct {
 	UserID             uuid.UUID
+	TrainRunID         uuid.UUID
 	IdempotencyKeyHash []byte
 	RequestFingerprint []byte
 }
@@ -66,7 +67,47 @@ func (s *Store) LookupCompletedCreateHold(
 		currency      *string
 		seatCount     *int
 	)
-	err := s.pool.QueryRow(ctx, `
+	var (
+		row pgx.Row
+		tx  *Tx
+		err error
+	)
+	if s.shards != nil {
+		if params.TrainRunID == uuid.Nil {
+			return CreateHoldResult{}, false, ErrInvalidArgument
+		}
+		tx, err = s.beginTrainRunRead(ctx, params.TrainRunID)
+		if err != nil {
+			return CreateHoldResult{}, false, err
+		}
+		defer func() { _ = tx.Rollback(context.Background()) }()
+		row = tx.tx.QueryRow(ctx, `
+SELECT ir.request_fingerprint, ir.status, ir.resource_id,
+       r.id, r.total_amount_minor, r.currency,
+       (SELECT count(*) FROM reservation_seats AS rs WHERE rs.reservation_id = r.id)
+FROM idempotency_records AS ir
+JOIN public.booking_idempotency_key_claims AS claim
+  ON claim.user_id = ir.user_id
+ AND claim.operation = ir.operation
+ AND claim.key_hash = ir.key_hash
+LEFT JOIN reservations AS r
+  ON r.id = ir.resource_id
+ AND r.user_id = ir.user_id
+WHERE ir.user_id = $1
+  AND ir.operation = 'reservation.create'
+  AND ir.key_hash = $2
+  AND ir.expires_at > clock_timestamp()
+  AND claim.train_run_id = $3
+  AND claim.shard_id = $4
+  AND claim.assignment_generation = $5`,
+			params.UserID,
+			params.IdempotencyKeyHash,
+			params.TrainRunID,
+			tx.route.ShardID().String(),
+			tx.route.Generation().Int64(),
+		)
+	} else {
+		row = s.pool.QueryRow(ctx, `
 SELECT ir.request_fingerprint, ir.status, ir.resource_id,
        r.id, r.total_amount_minor, r.currency,
        (SELECT count(*) FROM reservation_seats AS rs WHERE rs.reservation_id = r.id)
@@ -76,10 +117,12 @@ LEFT JOIN reservations AS r
  AND r.user_id = ir.user_id
 WHERE ir.user_id = $1
   AND ir.operation = 'reservation.create'
-  AND ir.key_hash = $2
-  AND ir.expires_at > clock_timestamp()`,
-		params.UserID, params.IdempotencyKeyHash,
-	).Scan(
+	  AND ir.key_hash = $2
+	  AND ir.expires_at > clock_timestamp()`,
+			params.UserID, params.IdempotencyKeyHash,
+		)
+	}
+	err = row.Scan(
 		&fingerprint, &status, &resourceID,
 		&reservationID, &totalAmount, &currency, &seatCount,
 	)
@@ -103,6 +146,11 @@ WHERE ir.user_id = $1
 		ReservationID: *reservationID, TotalAmountMinor: *totalAmount,
 		Currency: *currency, SeatCount: *seatCount, Replayed: true,
 	}
+	if tx != nil {
+		if err := tx.Commit(ctx); err != nil {
+			return CreateHoldResult{}, false, err
+		}
+	}
 	return result, true, nil
 }
 
@@ -111,9 +159,14 @@ func (tx *Tx) AcquireIdempotency(ctx context.Context, input IdempotencyInput) (I
 		len(input.KeyHash) != 32 || len(input.RequestFingerprint) != 32 || input.ExpiresAt.IsZero() {
 		return IdempotencyAcquisition{}, ErrInvalidArgument
 	}
+	if tx.routed != nil {
+		if err := tx.acquireGlobalIdempotencyClaim(ctx, input); err != nil {
+			return IdempotencyAcquisition{}, err
+		}
+	}
 
 	var insertedID uuid.UUID
-	err := tx.tx.QueryRow(ctx, `
+	insertQuery := `
 INSERT INTO idempotency_records (
     user_id, operation, key_hash, request_fingerprint, expires_at
 )
@@ -128,7 +181,29 @@ SET id = gen_random_uuid(),
     created_at = clock_timestamp(),
     updated_at = clock_timestamp()
 WHERE idempotency_records.expires_at <= clock_timestamp()
-RETURNING id`, input.UserID, input.Operation, input.KeyHash, input.RequestFingerprint, input.ExpiresAt.UTC()).Scan(&insertedID)
+RETURNING id`
+	insertArgs := []any{input.UserID, input.Operation, input.KeyHash, input.RequestFingerprint, input.ExpiresAt.UTC()}
+	if tx.routed != nil {
+		insertQuery = `
+INSERT INTO idempotency_records (
+    user_id, operation, key_hash, request_fingerprint, expires_at, train_run_id
+)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (user_id, operation, key_hash) DO UPDATE
+SET id = gen_random_uuid(),
+    request_fingerprint = EXCLUDED.request_fingerprint,
+    status = 'in_progress',
+    resource_type = NULL,
+    resource_id = NULL,
+    train_run_id = EXCLUDED.train_run_id,
+    expires_at = EXCLUDED.expires_at,
+    created_at = clock_timestamp(),
+    updated_at = clock_timestamp()
+WHERE idempotency_records.expires_at <= clock_timestamp()
+RETURNING id`
+		insertArgs = append(insertArgs, tx.route.TrainRunID())
+	}
+	err := tx.tx.QueryRow(ctx, insertQuery, insertArgs...).Scan(&insertedID)
 	inserted := err == nil
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return IdempotencyAcquisition{}, fmt.Errorf("insert idempotency record: %w", err)
@@ -152,6 +227,11 @@ FOR UPDATE`, input.UserID, input.Operation, input.KeyHash).Scan(&recordID, &fing
 	}
 	if !bytes.Equal(fingerprint, input.RequestFingerprint) {
 		return IdempotencyAcquisition{}, ErrIdempotencyConflict
+	}
+	if tx.routed != nil {
+		if err := tx.bindGlobalIdempotencyClaim(ctx, input, recordID); err != nil {
+			return IdempotencyAcquisition{}, err
+		}
 	}
 
 	switch status {

@@ -52,7 +52,7 @@ func (tx *Tx) enforceReservationQuota(
 	}
 
 	var activeHolds, activeRunHolds, activePassengers int64
-	err := tx.tx.QueryRow(ctx, `
+	query := `
 SELECT
     (SELECT count(*)
      FROM reservations
@@ -63,9 +63,19 @@ SELECT
     (SELECT count(*)
      FROM reservation_seats AS rs
      JOIN reservations AS r ON r.id = rs.reservation_id
-     WHERE r.user_id = $1 AND r.status = 'held')`,
-		userID, trainRunID,
-	).Scan(&activeHolds, &activeRunHolds, &activePassengers)
+     WHERE r.user_id = $1 AND r.status = 'held')`
+	if tx.routed != nil {
+		query = `
+SELECT
+    count(*) FILTER (WHERE active),
+    count(*) FILTER (WHERE active AND train_run_id = $2),
+    coalesce(sum(passenger_count) FILTER (WHERE active), 0)
+FROM public.reservation_quota_claims
+WHERE user_id = $1`
+	}
+	err := tx.tx.QueryRow(ctx, query, userID, trainRunID).Scan(
+		&activeHolds, &activeRunHolds, &activePassengers,
+	)
 	if err != nil {
 		return fmt.Errorf("count active reservation quota: %w", err)
 	}

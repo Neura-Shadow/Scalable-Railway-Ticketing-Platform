@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/domain"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -34,6 +35,7 @@ var (
 type Store struct {
 	pool                   *pgxpool.Pool
 	reservationQuotaLimits ReservationQuotaLimits
+	shards                 bookingShardRouter
 }
 
 func New(pool *pgxpool.Pool) *Store {
@@ -53,7 +55,9 @@ func isRetryableTransactionError(err error) bool {
 }
 
 type Tx struct {
-	tx pgx.Tx
+	tx     pgx.Tx
+	route  sharding.ShardRoute
+	routed bookingRoutedTx
 }
 
 func (s *Store) Begin(ctx context.Context) (*Tx, error) {
@@ -71,6 +75,9 @@ func (tx *Tx) Commit(ctx context.Context) error {
 	if tx == nil || tx.tx == nil {
 		return ErrInvalidArgument
 	}
+	if tx.routed != nil {
+		return tx.routed.Commit(ctx)
+	}
 	if err := tx.tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit booking transaction: %w", err)
 	}
@@ -80,6 +87,9 @@ func (tx *Tx) Commit(ctx context.Context) error {
 func (tx *Tx) Rollback(ctx context.Context) error {
 	if tx == nil || tx.tx == nil {
 		return ErrInvalidArgument
+	}
+	if tx.routed != nil {
+		return tx.routed.Rollback(ctx)
 	}
 	err := tx.tx.Rollback(ctx)
 	if err != nil && !errors.Is(err, pgx.ErrTxClosed) {

@@ -8,6 +8,7 @@ import (
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/offering/domain"
 	querydomain "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query"
+	shardingpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/postgres"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -19,7 +20,8 @@ type DBTX interface {
 }
 
 type Store struct {
-	db DBTX
+	db     DBTX
+	shards *shardingpostgres.Router
 }
 
 func NewStore(db DBTX) (*Store, error) {
@@ -217,6 +219,10 @@ type Availability struct {
 	AvailableSeats                  int64
 	FareAmountMinor                 int64
 	Currency                        string
+	// AssignmentGeneration is internal routing provenance. HTTP response
+	// adapters intentionally project Availability into public view types, and
+	// the json tag prevents accidental topology disclosure by direct encoding.
+	AssignmentGeneration int64 `json:"-"`
 }
 
 func (s *Store) Availability(ctx context.Context, request AvailabilityRequest) (Availability, error) {
@@ -235,10 +241,24 @@ func (s *Store) Availability(ctx context.Context, request AvailabilityRequest) (
 	if err != nil {
 		return Availability{}, err
 	}
+	trainRunID, err := uuid.Parse(request.TrainRunID)
+	if err != nil || trainRunID == uuid.Nil {
+		return Availability{}, ErrInvalidQuery
+	}
 
 	var result Availability
 	var firstDepartureOffsetMinutes int
-	err = s.db.QueryRow(ctx, `
+	queryer := s.db
+	var routed *shardingpostgres.RoutedTx
+	if s.shards != nil {
+		routed, err = s.beginTrainRunRead(ctx, trainRunID)
+		if err != nil {
+			return Availability{}, safeQueryError(err)
+		}
+		defer func() { _ = routed.Rollback(context.Background()) }()
+		queryer = routed.PGXTx()
+	}
+	err = queryer.QueryRow(ctx, `
 		WITH journey AS (
 			SELECT tr.id, tr.route_id, tr.segment_count, t.code AS train_code,
 			       tr.scheduled_departure_at,
@@ -321,6 +341,12 @@ func (s *Store) Availability(ctx context.Context, request AvailabilityRequest) (
 	if err != nil {
 		return Availability{}, ErrPersistence
 	}
+	if routed != nil {
+		result.AssignmentGeneration = routed.Route().Generation().Int64()
+		if err := routed.Commit(ctx); err != nil {
+			return Availability{}, safeQueryError(err)
+		}
+	}
 	return result, nil
 }
 
@@ -351,6 +377,17 @@ func (s *Store) AvailabilityBatch(ctx context.Context, requests []AvailabilityRe
 			return nil, ErrInvalidQuery
 		}
 		trainRunIDs = append(trainRunIDs, trainRunID)
+	}
+	if s.shards != nil {
+		results := make([]Availability, 0, len(requests))
+		for _, request := range requests {
+			result, err := s.Availability(ctx, request)
+			if err != nil {
+				return nil, err
+			}
+			results = append(results, result)
+		}
+		return results, nil
 	}
 	rows, err := s.db.Query(ctx, `
 		WITH journeys AS (

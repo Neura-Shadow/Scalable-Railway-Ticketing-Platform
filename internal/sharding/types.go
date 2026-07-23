@@ -20,6 +20,11 @@ var (
 type ShardID string
 
 const (
+	// SupportedFencingProtocolVersion is the highest train-run fencing
+	// protocol this binary can enforce. Catalog rows requiring a newer
+	// protocol must fail closed before a route can serve traffic.
+	SupportedFencingProtocolVersion int32 = 1
+
 	ShardLegacy ShardID = "legacy"
 	ShardZero   ShardID = "shard-0"
 	ShardOne    ShardID = "shard-1"

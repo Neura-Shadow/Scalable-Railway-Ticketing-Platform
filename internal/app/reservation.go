@@ -13,6 +13,7 @@ import (
 	bookingpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/postgres"
 	offeringdomain "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/offering/domain"
 	querypostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/postgres"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/transport/httpapi"
 	"github.com/google/uuid"
 )
@@ -237,7 +238,7 @@ func (s *ReservationService) lookupCompletedCreateHold(
 		return bookingpostgres.CreateHoldResult{}, false, nil
 	}
 	result, found, err := s.replays.LookupCompletedCreateHold(ctx, bookingpostgres.CompletedCreateHoldLookupParams{
-		UserID: prepared.owner, IdempotencyKeyHash: prepared.idempotencyKeyHash[:],
+		UserID: prepared.owner, TrainRunID: prepared.run, IdempotencyKeyHash: prepared.idempotencyKeyHash[:],
 		RequestFingerprint: prepared.bookingFingerprint[:],
 	})
 	if err != nil {
@@ -701,6 +702,12 @@ func mapBookingError(err error) error {
 		return httpapi.ErrAdmissionRequired
 	case errors.Is(err, bookingpostgres.ErrAdmissionPolicyChanged):
 		return httpapi.ErrAdmissionExpired
+	case errors.Is(err, sharding.ErrAssignmentStale),
+		errors.Is(err, sharding.ErrWriteFenced),
+		errors.Is(err, sharding.ErrTrainRunMigrating):
+		return httpapi.WithRetryAfter(httpapi.ErrServiceTemporarilyRebalancing, 1)
+	case errors.Is(err, sharding.ErrShardUnavailable):
+		return httpapi.WithRetryAfter(httpapi.ErrUnavailable, 1)
 	case errors.Is(err, bookingpostgres.ErrInsufficientInventory), errors.Is(err, bookingpostgres.ErrNotBookable), errors.Is(err, bookingpostgres.ErrReservationExpired), errors.Is(err, bookingpostgres.ErrPassengerConflict), errors.Is(err, bookingpostgres.ErrInvalidState), errors.Is(err, bookingpostgres.ErrIdempotencyConflict), errors.Is(err, bookingpostgres.ErrIdempotencyInProgress):
 		return httpapi.ErrConflict
 	default:

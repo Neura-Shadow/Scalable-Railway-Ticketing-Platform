@@ -9,6 +9,7 @@ import (
 	bookingapp "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/application"
 	bookingpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/postgres"
 	querypostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/postgres"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/transport/httpapi"
 	"github.com/google/uuid"
 )
@@ -177,12 +178,16 @@ func TestReservationMapsTypedStoreFailuresToSafeSentinels(t *testing.T) {
 		{bookingpostgres.ErrAdmissionPolicyChanged, httpapi.ErrAdmissionExpired},
 		{bookingpostgres.ErrNotFound, httpapi.ErrNotFound},
 		{bookingpostgres.ErrInvalidArgument, httpapi.ErrInvalidInput},
+		{sharding.ErrAssignmentStale, httpapi.ErrServiceTemporarilyRebalancing},
+		{sharding.ErrWriteFenced, httpapi.ErrServiceTemporarilyRebalancing},
+		{sharding.ErrTrainRunMigrating, httpapi.ErrServiceTemporarilyRebalancing},
+		{sharding.ErrShardUnavailable, httpapi.ErrUnavailable},
 		{errors.New("database secret"), httpapi.ErrUnavailable},
 	}
 	for _, test := range tests {
 		service := NewReservationService(&reservationCommandsFake{err: test.err}, &journeyResolverFake{journey: querypostgres.Journey{FromStopIndex: 0, ToStopIndex: 1}}, &reservationReaderFake{}, fixedClock{time.Now()}, time.Minute, 6)
 		_, err := service.CreateHold(context.Background(), httpapi.CreateReservationCommand{OwnerID: uuid.NewString(), IdempotencyKey: "key", TrainRunID: uuid.NewString(), OriginStationCode: "TPE", DestinationStationCode: "KHH", SeatClass: "standard", PassengerIDs: []string{uuid.NewString()}})
-		if err != test.want {
+		if !errors.Is(err, test.want) {
 			t.Fatalf("error %v mapped to %v, want %v", test.err, err, test.want)
 		}
 	}
