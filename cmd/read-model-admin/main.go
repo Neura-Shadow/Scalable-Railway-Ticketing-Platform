@@ -203,7 +203,7 @@ func resumeEvent(
 ) (envelope, error) {
 	flags := flag.NewFlagSet("resume-event", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	eventIDText := flags.String("event-id", "", "canonical event UUID from the read-model DLQ")
+	eventIDText := flags.String("event-id", "", "canonical event UUID from the read-model or outbox dead letter")
 	consumerName := flags.String("consumer-name", queryreadmodel.DurableConsumerName, "durable receipt consumer")
 	apply := flags.Bool("apply", false, "enqueue a safe-field continuation")
 	timeout := flags.Duration("timeout", defaultAdminTimeout, "maximum command duration")

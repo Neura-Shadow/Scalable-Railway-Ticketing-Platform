@@ -34,20 +34,21 @@ fail-closed to the authoritative source until the final page commits and marks
 the state ready. A skipped or stale cursor is rejected, so an interrupted
 backfill cannot silently expose a non-empty partial projection.
 
-`resume-event` is the controlled recovery path for an event that reached the
-DLQ after creating durable fan-out progress. Dry-run verifies that progress
-still exists. Apply re-enqueues only the bounded event envelope after the failed
-dependency is repaired. It never deletes progress or bypasses projection
-fallback; successful worker completion does that atomically with the receipt.
+`resume-event` is the controlled exact-ID recovery path for an event that
+reached the read-model DLQ after creating durable fan-out progress or the
+PostgreSQL outbox dead letter before publication. Dry-run verifies that durable
+progress or the unreceipted dead-lettered outbox event still exists. Apply
+re-enqueues only the bounded event envelope after the failed dependency is
+repaired. It never deletes progress or bypasses projection fallback; successful
+worker completion does that atomically with the receipt.
 
 `replay-outbox` is the bounded recovery path after complete Redis stream/PEL
-loss or a DLQ failure that occurred before progress was created. It scans only
-published PostgreSQL outbox events without the durable read-model receipt,
-returns a stable `(published_at,event_id)` cursor, and re-enqueues only validated
-safe envelope fields. Repeating a page is harmless because normal receipt and
-current-source rebuild rules remain authoritative. Projection search fails
-closed to the source while a published projection event has neither progress
-nor a receipt.
+loss. It scans only published PostgreSQL outbox events without the durable
+read-model receipt, returns a stable `(published_at,event_id)` cursor, and
+re-enqueues only validated safe envelope fields. Repeating a page is harmless
+because normal receipt and current-source rebuild rules remain authoritative.
+Projection search fails closed to the source while a published projection event
+has neither progress nor a receipt.
 
 `reconcile --limit 100` scans at most 100 train runs in UUID order and reports
 only aggregate mismatch counts plus a bounded `next_cursor`. Pass that cursor

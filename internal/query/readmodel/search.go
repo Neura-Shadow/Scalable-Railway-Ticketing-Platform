@@ -30,9 +30,7 @@ func (s *Store) SearchTrainRuns(
 		) AND NOT EXISTS (
 			SELECT 1
 			FROM outbox_events AS event
-			WHERE event.status = 'published'
-			  AND event.published_at IS NOT NULL
-			  AND event.event_type = ANY($2::text[])
+			WHERE event.event_type = ANY($2::text[])
 			  AND NOT EXISTS (
 				SELECT 1 FROM read_model_event_receipts AS receipt
 				WHERE receipt.consumer_name = $1 AND receipt.event_id = event.id

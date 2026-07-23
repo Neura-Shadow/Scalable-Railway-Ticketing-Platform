@@ -45,9 +45,11 @@
   alerting, and a group-floor-aware retention procedure remain deployment
   responsibilities; an extended worker outage can therefore increase Redis
   storage until recovery.
-- A repeatedly failing event is DLQ-bound after bounded attempts, but its
-  PostgreSQL progress intentionally keeps search on correct source fallback.
-  Recovery requires the documented `read-model-admin resume-event` redrive
-  after the dependency or data defect is repaired.
+- A repeatedly failing event is DLQ-bound after bounded attempts. On a search
+  cache miss, durable progress or an unreceipted projection-affecting outbox row
+  keeps projection access on correct source fallback; an existing cache hit
+  retains only its documented bounded TTL. Recovery requires the exact-ID
+  `read-model-admin resume-event` redrive after the dependency or data defect
+  is repaired, including for a pre-publication outbox dead letter.
 - No national-scale, 12306-equivalent, global fairness, or production capacity
   claim is supported.

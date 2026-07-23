@@ -105,8 +105,10 @@ read-model-admin resume-event --event-id <uuid> --apply
 The apply form requires secret-managed `DATABASE_URL`, `REDIS_ADDR` (or
 `REDIS_ADDRESS`), and optional `REDIS_PASSWORD`. It reconstructs only the four
 safe stream fields from PostgreSQL progress or, if failure preceded progress,
-the exact published outbox row. It does not copy payloads or clear the safety
-gate. The normal worker removes progress only after convergence.
+the exact published or dead-lettered outbox row. It does not copy payloads or
+clear the safety gate. The normal worker removes progress only after
+convergence. A pre-publication outbox dead letter is recovered with the same
+exact-ID preview/apply command using the outbox event ID.
 
 After complete Redis stream/PEL loss, preview and replay every missing receipt
 in bounded stable-cursor pages:

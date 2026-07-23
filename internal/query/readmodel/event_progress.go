@@ -53,8 +53,7 @@ func (s *Store) PendingEvent(ctx context.Context, consumerName, rawEventID strin
 				SELECT event_type, aggregate_type, aggregate_id::text
 				FROM outbox_events AS event
 				WHERE event.id = $2
-				  AND event.status = 'published'
-				  AND event.published_at IS NOT NULL
+				  AND event.status IN ('published', 'dead_letter')
 				  AND NOT EXISTS (
 					SELECT 1 FROM read_model_event_receipts AS receipt
 					WHERE receipt.consumer_name = $1 AND receipt.event_id = event.id
