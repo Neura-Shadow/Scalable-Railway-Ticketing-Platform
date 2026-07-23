@@ -15,8 +15,8 @@ concurrency:
 
 env:
   GO_VERSION: "1.25.12"
-  IMAGE_NAME: scalable-railway-ticketing-platform:milestone-3
-  EVIDENCE_PROXY_IMAGE: scalable-railway-ticketing-proxy:milestone-3
+  IMAGE_NAME: scalable-railway-ticketing-platform:milestone-4
+  EVIDENCE_PROXY_IMAGE: scalable-railway-ticketing-proxy:milestone-4
 
 jobs:
   quality:
@@ -139,7 +139,9 @@ jobs:
           psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --command 'CREATE DATABASE railway_migration_rehearsal'
           mkdir -p "$RUNNER_TEMP/migrations-v6"
+          mkdir -p "$RUNNER_TEMP/migrations-v7"
           cp migrations/00000[1-6]_*.sql "$RUNNER_TEMP/migrations-v6/"
+          cp migrations/00000[1-7]_*.sql "$RUNNER_TEMP/migrations-v7/"
           go run ./cmd/migrate \
             -path "$RUNNER_TEMP/migrations-v6" \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
@@ -162,11 +164,11 @@ jobs:
         shell: bash
         run: |
           go run ./cmd/migrate \
-            -path migrations \
+            -path "$RUNNER_TEMP/migrations-v7" \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             up
           go run ./cmd/migrate \
-            -path migrations \
+            -path "$RUNNER_TEMP/migrations-v7" \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             version
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
@@ -179,7 +181,28 @@ jobs:
             --file migrations/testdata/seed_read_model_v7_fixture.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_read_model_v7_data.sql
-      - name: Rehearse one-step down and up with populated data
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/seed_milestone4_v7_fixture.sql
+      - name: Rehearse the populated version-7 to version-8 upgrade
+        shell: bash
+        run: |
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            up
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            version
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone4_v8_schema.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone4_v8_data.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone4_v8_legacy_compatibility.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone4_v8_guards.sql
+      - name: Rehearse Milestone 4 one-step down and up with populated data
         shell: bash
         run: |
           go run ./cmd/migrate \
@@ -195,7 +218,9 @@ jobs:
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_hot_train_v6_data.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
-            --file migrations/testdata/assert_read_model_v6_after_down.sql
+            --file migrations/testdata/assert_read_model_v7_data.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone4_v7_after_down.sql
           go run ./cmd/migrate \
             -path migrations \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
@@ -209,7 +234,11 @@ jobs:
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_read_model_v7_schema.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
-            --file migrations/testdata/assert_read_model_v7_empty.sql
+            --file migrations/testdata/assert_read_model_v7_data.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone4_v8_schema.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone4_v8_data.sql
       - name: Apply migrations to an empty database
         run: go run ./cmd/migrate -path migrations up
       - name: Verify migration-up is safe to repeat
@@ -222,6 +251,8 @@ jobs:
         run: go test ./internal/admission/... ./internal/booking/postgres ./internal/app -count=3 -timeout 300s
       - name: Run focused projection, cache, fallback, and reconciliation tests repeatedly
         run: go test ./internal/query/cache ./internal/query/readmodel ./internal/query/postgres ./internal/app -count=3 -timeout 420s
+      - name: Run focused shard routing, fencing, migration, locator, and reconciliation tests repeatedly
+        run: go test ./internal/sharding/... ./internal/booking/postgres ./cmd/shard-admin ./cmd/reconcile -count=3 -timeout 420s
       - name: Run race-enabled persistence and concurrency tests
         run: go test -race ./internal/accounts/postgres ./internal/admission/... ./internal/booking/postgres ./internal/offering/postgres ./internal/eventrelay/postgres ./internal/query/cache ./internal/query/readmodel ./internal/query/postgres -count=1 -timeout 540s
 
@@ -330,6 +361,56 @@ jobs:
             }
           }
 
+  shard-multi-replica-evidence:
+    name: Multi-replica shard routing and cutover evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Validate topology and Milestone 4 k6 modules
+        shell: bash
+        run: |
+          docker compose -f docker-compose.multi-replica.yml config --quiet
+          docker compose -f docker-compose.multi-replica.yml --profile tools config --quiet
+          for script in \
+            shard-routing.js shard-route-cache.js two-hot-train-shards.js \
+            shard-cutover.js stale-router-refresh.js shard-outage-isolation.js \
+            cross-shard-admin.js legacy-vs-schema-shard.js
+          do
+            docker run --rm -v "$PWD/loadtest/k6:/scripts:ro" grafana/k6:0.54.0 \
+              inspect "/scripts/$script" >/dev/null
+          done
+      - name: Run bounded shard routing, cutover, outage, and reconciliation evidence
+        shell: pwsh
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP 'milestone-4-evidence'
+          ./scripts/run-milestone-4-multi-replica-evidence.ps1 `
+            -CustomerCount 12 `
+            -LoadDuration 15s `
+            -EvidenceDirectory $evidence
+          Get-Content -Raw (Join-Path $evidence 'milestone-4-summary.json')
+      - name: Print bounded shard-evidence failure diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP 'milestone-4-evidence'
+          foreach ($name in @(
+            'evidence-status.json', 'compose-up.log', 'shard-admin-build.log',
+            'operator-health-baseline.json', 'operator-health-partial.json',
+            'train-a-reconcile.json', 'train-b-reconcile.json',
+            'integrity-evidence.json', 'compose-failure-ps.log'
+          )) {
+            $path = Join-Path $evidence $name
+            if (Test-Path -LiteralPath $path) {
+              Write-Host "::group::$name"
+              Get-Content -LiteralPath $path
+              Write-Host '::endgroup::'
+            }
+          }
+
   container:
     name: Container build and image scan
     runs-on: ubuntu-latest
@@ -351,7 +432,7 @@ jobs:
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: scalable-railway-ticketing-platform:milestone-3
+          image-ref: scalable-railway-ticketing-platform:milestone-4
           format: table
           severity: CRITICAL,HIGH
           ignore-unfixed: true
@@ -360,7 +441,7 @@ jobs:
       - name: Trivy evidence proxy image scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: scalable-railway-ticketing-proxy:milestone-3
+          image-ref: scalable-railway-ticketing-proxy:milestone-4
           format: table
           severity: CRITICAL,HIGH
           ignore-unfixed: true
