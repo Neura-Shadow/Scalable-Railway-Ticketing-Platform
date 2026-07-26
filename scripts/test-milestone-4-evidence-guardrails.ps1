@@ -373,7 +373,12 @@ try {
         "GREATEST(reservation.created_at + interval '1 second', clock_timestamp() + interval '1 second')",
         "`$fixtureExpiryArmCount.Trim() -ne '2'",
         "`$postCutoverExpiryArmCount.Trim() -ne '1'",
+        "`$failureCategory = 'stale_probe_cache_reset'",
+        "Invoke-Compose -Arguments @('restart', 'api-1', 'api-2', 'api-3')",
+        'foreach ($api in $apis) { Wait-Ready -Service $api -Port 8080 }',
         '$prewarmCustomer = $overlapCustomers[$index]',
+        "Save-Metrics -Label 'stale-probe-baseline'",
+        "stale_probe_cache_setup = 'api_processes_restarted_then_prewarms_completed_before_cutover'",
         'operation="write",shard_id="legacy"',
         'operation="refresh",result="success",shard_id="shard-0"',
         'operation="write",result="success",reason="none",shard_id="shard-0"',
@@ -422,6 +427,23 @@ try {
                 throw "runner omitted final source-to-target identity anti-join: shard-$shardIndex/$copiedTable"
             }
         }
+    }
+
+    $staleCacheReset = $runner.IndexOf(
+        "Invoke-Compose -Arguments @('restart', 'api-1', 'api-2', 'api-3')",
+        [StringComparison]::Ordinal
+    )
+    $stalePrewarm = $runner.IndexOf(
+        '$prewarmCustomer = $overlapCustomers[$index]',
+        [StringComparison]::Ordinal
+    )
+    $trainAMigration = $runner.IndexOf(
+        'Invoke-MigrationToCutoverReady -TrainRunID $fixtureTrainA',
+        [StringComparison]::Ordinal
+    )
+    if ($staleCacheReset -lt 0 -or $stalePrewarm -le $staleCacheReset -or
+        $trainAMigration -le $stalePrewarm) {
+        throw 'stale-route probe does not reset, prewarm, and then cut over in order'
     }
 
     foreach ($requiredReceiptContract in @(

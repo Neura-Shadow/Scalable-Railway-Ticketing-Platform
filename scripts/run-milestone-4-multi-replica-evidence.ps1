@@ -1181,8 +1181,13 @@ SELECT count(*) FROM armed;
     }
     $routeCacheHitRatio = [Math]::Round($routeCacheHitDelta / $routeCacheLookups, 6)
 
-    $failureCategory = 'route_cache_prewarm'
     $apis = @('api-1', 'api-2', 'api-3')
+    $failureCategory = 'stale_probe_cache_reset'
+    Invoke-Compose -Arguments @('restart', 'api-1', 'api-2', 'api-3') `
+        -CapturePath (Join-Path $EvidenceDirectory 'stale-probe-api-restart.log') | Out-Null
+    foreach ($api in $apis) { Wait-Ready -Service $api -Port 8080 }
+
+    $failureCategory = 'route_cache_prewarm'
     for ($index = 0; $index -lt $apis.Count; $index++) {
         $api = $apis[$index]
         # Prewarm with identities that are used later on the other train run.
@@ -1197,6 +1202,7 @@ SELECT count(*) FROM armed;
         $prewarmEnvironment['TRAIN_RUN_ID'] = $fixtureTrainA
         Invoke-K6 -Script 'shard-route-prewarm.js' -Name "prewarm-$api" -Environment $prewarmEnvironment
     }
+    Save-Metrics -Label 'stale-probe-baseline'
     $failureCategory = 'train_a_read_model_catchup'
     $trainAPreCutoverReceiptCount = Wait-TrainRunReadModelCaughtUp -TrainRunID $fixtureTrainA
     $assignmentBeforeCutover = Get-AssignmentState -TrainRunID $fixtureTrainA `
@@ -1967,6 +1973,7 @@ SELECT json_build_object(
             miss_count_delta = $routeCacheMissDelta
             lookup_count_delta = $routeCacheLookups
             hit_ratio = $routeCacheHitRatio
+            stale_probe_cache_setup = 'api_processes_restarted_then_prewarms_completed_before_cutover'
         }
         stale_router_refresh_count_delta = $staleRouterRefreshCountDelta
         refresh_latency_mean_ms = $refreshLatencyMeanMilliseconds
