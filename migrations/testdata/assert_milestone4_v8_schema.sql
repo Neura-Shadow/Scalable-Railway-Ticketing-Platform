@@ -23,6 +23,13 @@ BEGIN
         RAISE EXCEPTION 'fixed booking shard schemas are missing';
     END IF;
 
+    IF to_regclass('public.train_run_journey_read_model') IS NULL
+       OR to_regclass('public.read_model_event_receipts') IS NULL
+       OR to_regclass('public.train_run_journey_read_model_search_idx') IS NULL
+       OR to_regclass('public.train_run_journey_read_model_fare_search_idx') IS NULL THEN
+        RAISE EXCEPTION 'inherited read-model schema is incomplete';
+    END IF;
+
     IF to_regclass('public.train_run_shard_assignments') IS NULL
        OR to_regclass('public.train_run_shard_migrations') IS NULL
        OR to_regclass('public.train_run_generation_writes') IS NULL

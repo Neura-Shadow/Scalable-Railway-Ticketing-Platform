@@ -813,7 +813,10 @@ function Start-BookingBlocker {
         [string]$ApplicationName
     )
 
-    $query = "BEGIN; SELECT id FROM train_runs WHERE id='$script:hotTrainRunID' FOR UPDATE; SELECT pg_sleep(30); COMMIT;"
+    # Permit the train-run foreign-key KEY SHARE taken by the global M4
+    # idempotency claim, then block the booking transaction at its later
+    # explicit train-run FOR SHARE after its provisional writes have run.
+    $query = "BEGIN; SELECT id FROM train_runs WHERE id='$script:hotTrainRunID' FOR NO KEY UPDATE; SELECT pg_sleep(30); COMMIT;"
     & docker @script:composeArguments exec -T -d `
         -e "PGAPPNAME=$ApplicationName" `
         postgres psql -U railway -d railway -v ON_ERROR_STOP=1 -c $query 2>$null
