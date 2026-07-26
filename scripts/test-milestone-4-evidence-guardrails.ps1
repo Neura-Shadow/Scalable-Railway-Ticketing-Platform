@@ -379,9 +379,16 @@ try {
         '$prewarmCustomer = $overlapCustomers[$index]',
         "Save-Metrics -Label 'stale-probe-baseline'",
         "stale_probe_cache_setup = 'api_processes_restarted_then_prewarms_completed_before_cutover'",
-        'operation="write",shard_id="legacy"',
+        'operation="read",shard_id="legacy"',
         'operation="refresh",result="success",shard_id="shard-0"',
+        'operation="write",result="success",reason="none",shard_id="legacy"',
         'operation="write",result="success",reason="none",shard_id="shard-0"',
+        '$stalePreflightDelta -ne 1',
+        '$refreshDelta -ne 1',
+        '$sourceWriteDelta -ne 0',
+        '$targetWriteDelta -ne 1',
+        'stale_preflight_rejection_delta = $stalePreflightDelta',
+        'source_write_success_delta = $sourceWriteDelta',
         "-Artifact 'admin-fanout-partial.json' -AllowFailure",
         "-Artifact 'admin-fanout-complete-after.json'",
         "'reconcile-shard-assignments.json'",
@@ -410,6 +417,7 @@ try {
     foreach ($forbiddenRunnerContract in @(
         '$staleAfter', '$staleBefore', "-Name 'cross-shard-healthy'", "-Name 'cross-shard-partial'",
         '$prewarmCustomer = $staleCustomers[$index]',
+        '$staleWriteDelta', 'stale_write_rejection_delta',
         "SET expires_at = clock_timestamp() - interval '1 minute'",
         "SET expires_at=clock_timestamp() - interval '1 minute'"
     )) {

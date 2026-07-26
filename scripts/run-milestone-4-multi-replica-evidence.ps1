@@ -1214,10 +1214,12 @@ SELECT count(*) FROM armed;
     $replicaMetricBaselines = [ordered]@{}
     foreach ($api in $apis) {
         $replicaMetricBaselines[$api] = [ordered]@{
-            stale_write = Get-APIMetricTotal -Family 'shard_assignment_stale_total' `
-                -RequiredLabel 'operation="write",shard_id="legacy"' -Services @($api)
+            stale_preflight = Get-APIMetricTotal -Family 'shard_assignment_stale_total' `
+                -RequiredLabel 'operation="read",shard_id="legacy"' -Services @($api)
             refresh_success = Get-APIMetricTotal -Family 'shard_route_refresh_total' `
                 -RequiredLabel 'operation="refresh",result="success",shard_id="shard-0"' -Services @($api)
+            source_write_success = Get-APIMetricTotal -Family 'shard_route_total' `
+                -RequiredLabel 'operation="write",result="success",reason="none",shard_id="legacy"' -Services @($api)
             target_write = Get-APIMetricTotal -Family 'shard_route_total' `
                 -RequiredLabel 'operation="write",result="success",reason="none",shard_id="shard-0"' -Services @($api)
         }
@@ -1265,22 +1267,27 @@ SELECT count(*) FROM armed;
     Invoke-K6 -Script 'stale-router-refresh.js' -Name 'stale-router-refresh' -Environment $refreshEnvironment
     foreach ($api in $apis) {
         $replicaStaleCount = Get-APIMetricTotal -Family 'shard_assignment_stale_total' -Services @($api)
-        $replicaStaleWrites = Get-APIMetricTotal -Family 'shard_assignment_stale_total' `
-            -RequiredLabel 'operation="write",shard_id="legacy"' -Services @($api)
+        $replicaStalePreflights = Get-APIMetricTotal -Family 'shard_assignment_stale_total' `
+            -RequiredLabel 'operation="read",shard_id="legacy"' -Services @($api)
         $replicaRefreshes = Get-APIMetricTotal -Family 'shard_route_refresh_total' `
             -RequiredLabel 'operation="refresh",result="success",shard_id="shard-0"' -Services @($api)
+        $replicaSourceWrites = Get-APIMetricTotal -Family 'shard_route_total' `
+            -RequiredLabel 'operation="write",result="success",reason="none",shard_id="legacy"' -Services @($api)
         $replicaTargetWrites = Get-APIMetricTotal -Family 'shard_route_total' `
             -RequiredLabel 'operation="write",result="success",reason="none",shard_id="shard-0"' -Services @($api)
-        $staleWriteDelta = $replicaStaleWrites - [double]$replicaMetricBaselines[$api].stale_write
+        $stalePreflightDelta = $replicaStalePreflights - [double]$replicaMetricBaselines[$api].stale_preflight
         $refreshDelta = $replicaRefreshes - [double]$replicaMetricBaselines[$api].refresh_success
+        $sourceWriteDelta = $replicaSourceWrites - [double]$replicaMetricBaselines[$api].source_write_success
         $targetWriteDelta = $replicaTargetWrites - [double]$replicaMetricBaselines[$api].target_write
-        if ($staleWriteDelta -lt 1 -or $refreshDelta -lt 1 -or $targetWriteDelta -lt 1) {
-            throw "$api did not prove stale write rejection, authoritative refresh, and target write success"
+        if ($stalePreflightDelta -ne 1 -or $refreshDelta -ne 1 -or
+            $sourceWriteDelta -ne 0 -or $targetWriteDelta -ne 1) {
+            throw "$api did not prove stale preflight rejection, authoritative refresh, zero source writes, and target write success"
         }
         $replicaRouteEvidence[$api] = [ordered]@{
             stale_assignment_rejections_total = $replicaStaleCount
-            stale_write_rejection_delta = $staleWriteDelta
+            stale_preflight_rejection_delta = $stalePreflightDelta
             refresh_success_delta = $refreshDelta
+            source_write_success_delta = $sourceWriteDelta
             target_write_success_delta = $targetWriteDelta
         }
     }

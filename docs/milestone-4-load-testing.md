@@ -94,6 +94,15 @@ event's receipt, and only then accepts a changed Redis namespace as cutover
 evidence. Do not merge these observations or the deterministic 100-request test
 into a throughput claim.
 
+For the public `CreateHold` path, the shard-local idempotency replay lookup is
+the first routed database transaction. A cached legacy generation is therefore
+rejected on that preflight read, the replica performs one authoritative refresh,
+and the booking write starts only on the target. The runtime gate requires this
+sequence on all three APIs, plus a zero legacy-write delta and a successful
+target-write delta. It does not relabel the preflight rejection as a stale
+write. Direct stale-write fencing remains covered by the deterministic
+100-attempt routed-transaction gate described above.
+
 Parse all scripts before a runtime attempt:
 
 ```powershell
