@@ -21,6 +21,9 @@ and release acceptance remain **pending**, not assumed.
 - stable serving state has exactly one write-enabled fence;
 - permitted migration phases may have zero writers but never two;
 - source and target generations match the durable migration plan; and
+- terminal `failed` authority has one enabled endpoint fence at the exact
+  assignment generation, while `rolled_back` source authority uses either the
+  original source generation or the exact durable rollback generation; and
 - retained source is disabled after cutover.
 
 ### Locators and ownership
@@ -39,7 +42,13 @@ and release acceptance remain **pending**, not assumed.
   masks for the same train run and seat;
 - no reservation/resource identity is authoritatively duplicated across
   storages;
-- active global quota claims match active holds and passenger membership;
+- global quota-claim identity and passenger counts match every inspected
+  source or target copy, while active/inactive lifecycle parity is checked on
+  both quiesced pre-cutover copies and only the assignment-authoritative copy
+  after cutover, failure, or rollback;
+- the bounded global quota-claim count exactly matches the authoritative
+  reservation count, so an orphan claim cannot be hidden by a one-way local
+  reservation scan;
 - ticket orders/tickets reference valid confirmed/cancelled lifecycle state;
 - local idempotency completion points to an existing resource and agrees with
   the global key claim and expiry; and
@@ -53,7 +62,15 @@ and release acceptance remain **pending**, not assumed.
 - global quota/key claims and locators cover copied authority;
 - copy cursor/counts describe committed bounded batches;
 - latest validation is complete and untruncated; and
-- target-write evidence agrees with rollback eligibility.
+- target-generation write evidence is present for cutover authority, and a
+  completed direct post-cutover rollback proves that its exact target evidence
+  recorded zero successful writes.
+
+After a terminal failure or rollback restores serving authority, new writes on
+that authoritative side may legitimately make live source/target counts
+diverge. Reconciliation still checks the frozen non-authoritative copy's
+structure and audited copy counts, but does not mistake expected post-resume
+growth for copy corruption.
 
 ## Scope and shard-awareness matrix
 

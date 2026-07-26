@@ -607,12 +607,14 @@ func (source *postgresSource) Migration(
 			assignmentID                     pgtype.UUID
 			assignmentShard, assignmentState pgtype.Text
 			assignmentGeneration             pgtype.Int8
+			rollbackGeneration               pgtype.Int8
 			sourceEnabled, targetEnabled     pgtype.Bool
 		)
 		err := query.QueryRow(ctx, `
 SELECT migration.id, migration.train_run_id,
        migration.source_shard_id, migration.target_shard_id,
        migration.source_generation, migration.target_generation,
+       migration.rollback_generation,
        migration.state, migration.copy_phase, migration.copy_complete,
        migration.copied_rows, migration.inventory_rows_copied,
        migration.reservation_rows_copied, migration.reservation_seat_rows_copied,
@@ -632,7 +634,8 @@ LEFT JOIN public.booking_shards AS target_catalog
   ON target_catalog.shard_id = migration.target_shard_id
 WHERE migration.id = $1`, migrationID).Scan(
 			&result.ID, &result.TrainRunID, &result.SourceShardID, &result.TargetShardID,
-			&result.SourceGeneration, &result.TargetGeneration, &result.State, &result.CopyPhase,
+			&result.SourceGeneration, &result.TargetGeneration, &rollbackGeneration,
+			&result.State, &result.CopyPhase,
 			&result.CopyComplete, &result.CopiedRows, &result.InventoryRowsCopied,
 			&result.ReservationRowsCopied, &result.ReservationSeatRowsCopied,
 			&result.TicketOrderRowsCopied, &result.TicketRowsCopied,
@@ -654,6 +657,10 @@ WHERE migration.id = $1`, migrationID).Scan(
 		}
 		if assignmentGeneration.Valid {
 			result.AssignmentGeneration = assignmentGeneration.Int64
+		}
+		if rollbackGeneration.Valid {
+			value := rollbackGeneration.Int64
+			result.RollbackGeneration = &value
 		}
 		if assignmentState.Valid {
 			result.AssignmentState = assignmentState.String
@@ -691,7 +698,8 @@ func (source *postgresSource) StorageSnapshot(
 			&result.Counts.IdempotencyRecords,
 			&result.SeatMaskViolations,
 			&result.OrphanActiveSeats,
-			&result.QuotaViolations,
+			&result.QuotaStructuralViolations,
+			&result.QuotaActivityViolations,
 			&result.TicketViolations,
 			&result.IdempotencyViolations,
 			&result.Truncated,
@@ -767,7 +775,7 @@ inventory_violations AS (
       ON inventory.train_run_id = reservation.train_run_id
      AND inventory.seat_id = reservation_seat.seat_id
     WHERE reservation.status IN ('held', 'confirmed') AND inventory.seat_id IS NULL
-), quota_violations AS (
+), quota_structural_violations AS (
     SELECT reservation.id
     FROM reservation
     LEFT JOIN public.reservation_quota_claims AS claim
@@ -779,7 +787,14 @@ inventory_violations AS (
            SELECT count(*)::integer FROM reservation_seat
            WHERE reservation_seat.reservation_id = reservation.id
        )
-       OR claim.active <> (reservation.status = 'held')
+), quota_activity_violations AS (
+    SELECT reservation.id
+    FROM reservation
+    JOIN public.reservation_quota_claims AS claim
+      ON claim.reservation_id = reservation.id
+     AND claim.user_id = reservation.user_id
+     AND claim.train_run_id = reservation.train_run_id
+    WHERE claim.active <> (reservation.status = 'held')
 ), ticket_violations AS (
     SELECT ticket.id
     FROM ticket
@@ -821,7 +836,8 @@ SELECT
     (SELECT count(*) FROM idempotency),
     (SELECT count(*) FROM inventory_violations),
     (SELECT count(*) FROM orphan_active_seats),
-    (SELECT count(*) FROM quota_violations),
+    (SELECT count(*) FROM quota_structural_violations),
+    (SELECT count(*) FROM quota_activity_violations),
     (SELECT count(*) FROM ticket_violations),
     (SELECT count(*) FROM idempotency_violations),
     ((SELECT count(*) FROM inventory_page) > $2
@@ -841,7 +857,7 @@ func (source *postgresSource) CentralMigrationSnapshot(
 	}
 	var result centralMigrationSnapshot
 	err := source.withQuery(ctx, func(query pgx.Tx) error {
-		return query.QueryRow(ctx, centralMigrationSnapshotQuery, record.TrainRunID, limit).Scan(
+		return query.QueryRow(ctx, centralMigrationSnapshotQuery, record.TrainRunID, limit, record.ID).Scan(
 			&result.QuotaClaims,
 			&result.IdempotencyClaims,
 			&result.ReservationLocators,
@@ -851,6 +867,8 @@ func (source *postgresSource) CentralMigrationSnapshot(
 			&result.MigrationsForTrainRun,
 			&result.ActiveMigrations,
 			&result.GenerationWriteRows,
+			&result.TargetGenerationWriteRows,
+			&result.TargetGenerationWrites,
 			&result.LocatorRouteViolations,
 			&result.IdempotencyRouteViolations,
 			&result.OutboxProvenanceViolations,
@@ -940,6 +958,14 @@ locator_route_violations AS (
        OR (evidence.successful_write_count > 0 AND (
            evidence.first_successful_write_at IS NULL OR evidence.last_successful_write_at IS NULL
        ))
+), target_generation_write AS (
+    SELECT evidence.*
+    FROM generation_write AS evidence
+    JOIN migration
+      ON migration.id = $3
+     AND migration.id = evidence.migration_id
+     AND migration.target_shard_id = evidence.shard_id
+     AND migration.target_generation = evidence.assignment_generation
 )
 SELECT
     (SELECT count(*) FROM quota),
@@ -951,6 +977,8 @@ SELECT
     (SELECT count(*) FROM migration),
     (SELECT count(*) FROM migration WHERE state NOT IN ('completed', 'failed', 'rolled_back')),
     (SELECT count(*) FROM generation_write),
+    (SELECT count(*) FROM target_generation_write),
+    (SELECT count(*) FROM target_generation_write WHERE successful_write_count > 0),
     (SELECT count(*) FROM invalid_locator_routes),
     (SELECT count(*) FROM invalid_claim_routes),
     (SELECT count(*) FROM invalid_outbox),

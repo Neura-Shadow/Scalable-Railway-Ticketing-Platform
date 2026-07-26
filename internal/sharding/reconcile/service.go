@@ -145,6 +145,7 @@ type migrationObservation struct {
 	TargetShardID             string
 	SourceGeneration          int64
 	TargetGeneration          int64
+	RollbackGeneration        *int64
 	State                     string
 	CopyPhase                 string
 	CopyComplete              bool
@@ -173,13 +174,14 @@ func (observation migrationObservation) auditedRows() int64 {
 }
 
 type storageSnapshot struct {
-	Counts                DatasetCounts
-	SeatMaskViolations    int64
-	OrphanActiveSeats     int64
-	QuotaViolations       int64
-	TicketViolations      int64
-	IdempotencyViolations int64
-	Truncated             bool
+	Counts                    DatasetCounts
+	SeatMaskViolations        int64
+	OrphanActiveSeats         int64
+	QuotaStructuralViolations int64
+	QuotaActivityViolations   int64
+	TicketViolations          int64
+	IdempotencyViolations     int64
+	Truncated                 bool
 }
 
 type centralMigrationSnapshot struct {
@@ -192,6 +194,8 @@ type centralMigrationSnapshot struct {
 	MigrationsForTrainRun      int64
 	ActiveMigrations           int64
 	GenerationWriteRows        int64
+	TargetGenerationWriteRows  int64
+	TargetGenerationWrites     int64
 	LocatorRouteViolations     int64
 	IdempotencyRouteViolations int64
 	OutboxProvenanceViolations int64
@@ -734,14 +738,20 @@ func (service *service) Migration(
 	}
 
 	if sourceValid {
-		service.inspectMigrationStorage(ctx, &report, &work, failedStorage, sourceStorage, record.TrainRunID, true)
+		service.inspectMigrationStorage(
+			ctx, &report, &work, failedStorage, sourceStorage, record.TrainRunID, true,
+			validateQuotaClaimActivity(record, sourceStorage),
+		)
 	}
 	if targetValid {
-		service.inspectMigrationStorage(ctx, &report, &work, failedStorage, targetStorage, record.TrainRunID, false)
+		service.inspectMigrationStorage(
+			ctx, &report, &work, failedStorage, targetStorage, record.TrainRunID, false,
+			validateQuotaClaimActivity(record, targetStorage),
+		)
 	}
 	if sourceValid && targetValid && sourceStorage != targetStorage &&
 		!failedStorage[sourceStorage] && !failedStorage[targetStorage] {
-		if usesCutoverValidationEvidence(record.State) {
+		if usesPersistedValidationEvidence(record) {
 			if validValidation {
 				cutoverSourceCounts := validationEvidence.sourceCounts
 				cutoverTargetCounts := validationEvidence.targetCounts
@@ -761,6 +771,13 @@ func (service *service) Migration(
 						retainedSourceViolation = 1
 					}
 					report.addCheck("rollback_source_retained_counts", validationEvidence.tables,
+						summary.SourceCounts.total(), retainedSourceViolation)
+				} else if record.State == "failed" && record.AssignmentShardID == record.TargetShardID {
+					retainedSourceViolation := int64(0)
+					if summary.SourceCounts != validationEvidence.sourceCounts {
+						retainedSourceViolation = 1
+					}
+					report.addCheck("failed_source_retained_counts", validationEvidence.tables,
 						summary.SourceCounts.total(), retainedSourceViolation)
 				}
 			}
@@ -802,6 +819,23 @@ func (service *service) Migration(
 				summary.OutboxEvents = central.OutboxEvents
 				summary.MigrationsForTrainRun = central.MigrationsForTrainRun
 				summary.GenerationWriteRows = central.GenerationWriteRows
+				authorityStorage, authorityValid := parseStorage(record.AssignmentShardID)
+				if authorityValid && !failedStorage[authorityStorage] {
+					authoritativeReservations := int64(0)
+					authorityIsMigrationEndpoint := true
+					switch authorityStorage {
+					case sourceStorage:
+						authoritativeReservations = summary.SourceCounts.Reservations
+					case targetStorage:
+						authoritativeReservations = summary.TargetCounts.Reservations
+					default:
+						authorityIsMigrationEndpoint = false
+					}
+					if authorityIsMigrationEndpoint {
+						report.addCheck("quota_claim_cardinality", authoritativeReservations,
+							central.QuotaClaims, boolViolation(central.QuotaClaims != authoritativeReservations))
+					}
+				}
 				report.addCheck("locator_route_generation", central.ReservationLocators+central.TicketOrderLocators+central.TicketLocators,
 					0, central.LocatorRouteViolations)
 				report.addCheck("idempotency_claim_route", central.IdempotencyClaims, 0, central.IdempotencyRouteViolations)
@@ -809,10 +843,18 @@ func (service *service) Migration(
 				report.addCheck("migration_cardinality", central.MigrationsForTrainRun, central.ActiveMigrations,
 					boolViolation(central.ActiveMigrations > 1))
 				generationWriteViolations := central.GenerationWriteViolations
-				if usesCutoverValidationEvidence(record.State) && central.GenerationWriteRows == 0 {
+				requireTargetWriteEvidence := usesCutoverValidationEvidence(record.State) ||
+					(record.State == "failed" && record.AssignmentShardID == record.TargetShardID) ||
+					(record.State == "rolled_back" && record.RollbackGeneration != nil)
+				if requireTargetWriteEvidence && central.TargetGenerationWriteRows != 1 {
 					generationWriteViolations++
 				}
-				report.addCheck("generation_write_evidence", central.GenerationWriteRows, 0,
+				if record.State == "rolled_back" && record.RollbackGeneration != nil &&
+					central.TargetGenerationWrites != 0 {
+					generationWriteViolations++
+				}
+				report.addCheck("generation_write_evidence", central.GenerationWriteRows,
+					central.TargetGenerationWrites,
 					generationWriteViolations)
 			}
 		}
@@ -829,6 +871,7 @@ func (service *service) inspectMigrationStorage(
 	storage fixedStorage,
 	trainRunID uuid.UUID,
 	source bool,
+	validateQuotaActivity bool,
 ) {
 	index := slices.Index(fixedStorages[:], storage)
 	if index < 0 || failed[storage] {
@@ -861,13 +904,17 @@ func (service *service) inspectMigrationStorage(
 	}
 	addShardCheck(&report.Shards[index], "seat_masks", snapshot.Counts.Inventory,
 		snapshot.SeatMaskViolations+snapshot.OrphanActiveSeats)
-	addShardCheck(&report.Shards[index], "quota_claims", snapshot.Counts.Reservations, snapshot.QuotaViolations)
+	quotaViolations := snapshot.QuotaStructuralViolations
+	if validateQuotaActivity {
+		quotaViolations += snapshot.QuotaActivityViolations
+	}
+	addShardCheck(&report.Shards[index], "quota_claims", snapshot.Counts.Reservations, quotaViolations)
 	addShardCheck(&report.Shards[index], "ticket_integrity", snapshot.Counts.Tickets, snapshot.TicketViolations)
 	addShardCheck(&report.Shards[index], "idempotency_claims", snapshot.Counts.IdempotencyRecords,
 		snapshot.IdempotencyViolations)
 	report.addCheck("seat_mask_integrity", snapshot.Counts.Inventory, 0,
 		snapshot.SeatMaskViolations+snapshot.OrphanActiveSeats)
-	report.addCheck("quota_claim_integrity", snapshot.Counts.Reservations, 0, snapshot.QuotaViolations)
+	report.addCheck("quota_claim_integrity", snapshot.Counts.Reservations, 0, quotaViolations)
 	report.addCheck("ticket_integrity", snapshot.Counts.Tickets, 0, snapshot.TicketViolations)
 	report.addCheck("idempotency_integrity", snapshot.Counts.IdempotencyRecords, 0,
 		snapshot.IdempotencyViolations)
@@ -898,18 +945,31 @@ func (service *service) checkMigrationFences(
 		stateViolation = !sourceExists || sourceFence.Enabled || !targetExists || targetFence.Enabled
 	case "rollback_window", "completed":
 		stateViolation = !sourceExists || sourceFence.Enabled || !targetExists || !targetFence.Enabled
+	case "failed":
+		switch record.AssignmentShardID {
+		case record.SourceShardID:
+			stateViolation = !sourceExists || !sourceFence.Enabled || (targetExists && targetFence.Enabled)
+		case record.TargetShardID:
+			stateViolation = !targetExists || !targetFence.Enabled || (sourceExists && sourceFence.Enabled)
+		default:
+			stateViolation = true
+		}
 	case "rolled_back":
 		stateViolation = !sourceExists || !sourceFence.Enabled || (targetExists && targetFence.Enabled)
 	}
 	report.addCheck("migration_fence_state", 1, 0, boolViolation(stateViolation))
 	staleSource := false
-	if stateAtOrAfterCutover(record.State) {
+	if stateAtOrAfterCutover(record.State) ||
+		(record.State == "failed" && record.AssignmentShardID == record.TargetShardID) {
 		staleSource = !sourceExists || sourceFence.Enabled
 	}
 	report.addCheck("stale_source_fence", 1, boolCount(sourceExists && sourceFence.Enabled), boolViolation(staleSource))
 	fenceGenerationViolation := false
-	if sourceExists && sourceFence.Generation != record.SourceGeneration &&
-		!(record.State == "rolled_back" && sourceFence.Generation > record.TargetGeneration) {
+	expectedSourceGeneration := record.SourceGeneration
+	if record.State == "rolled_back" && record.RollbackGeneration != nil {
+		expectedSourceGeneration = *record.RollbackGeneration
+	}
+	if sourceExists && sourceFence.Generation != expectedSourceGeneration {
 		fenceGenerationViolation = true
 	}
 	if targetExists && targetFence.Generation != record.TargetGeneration {
@@ -930,8 +990,26 @@ func validateMigrationAssignment(record migrationObservation) int64 {
 		}
 		return 0
 	}
-	if record.State == "failed" || record.State == "rolled_back" {
-		if record.ActiveMigrationID != nil || record.AssignmentState != "stable" {
+	if record.State == "failed" {
+		if record.ActiveMigrationID != nil || record.AssignmentState != "stable" ||
+			(record.AssignmentShardID == record.SourceShardID &&
+				record.AssignmentGeneration != record.SourceGeneration) ||
+			(record.AssignmentShardID == record.TargetShardID &&
+				record.AssignmentGeneration != record.TargetGeneration) ||
+			(record.AssignmentShardID != record.SourceShardID && record.AssignmentShardID != record.TargetShardID) {
+			return 1
+		}
+		return 0
+	}
+	if record.State == "rolled_back" {
+		expectedGeneration := record.SourceGeneration
+		if record.RollbackGeneration != nil {
+			expectedGeneration = *record.RollbackGeneration
+		}
+		if record.ActiveMigrationID != nil || record.AssignmentState != "stable" ||
+			record.AssignmentShardID != record.SourceShardID ||
+			record.AssignmentGeneration != expectedGeneration ||
+			(record.RollbackGeneration != nil && *record.RollbackGeneration <= record.TargetGeneration) {
 			return 1
 		}
 		return 0
@@ -961,6 +1039,15 @@ func validateMigrationAssignment(record migrationObservation) int64 {
 	return 0
 }
 
+func validateQuotaClaimActivity(record migrationObservation, storage fixedStorage) bool {
+	switch record.State {
+	case "rollback_window", "completed", "failed", "rolled_back":
+		return record.AssignmentPresent && record.AssignmentShardID == storage.shardID()
+	default:
+		return true
+	}
+}
+
 type migrationValidationEvidence struct {
 	sourceCounts DatasetCounts
 	targetCounts DatasetCounts
@@ -971,7 +1058,8 @@ type migrationValidationEvidence struct {
 func validateLastValidation(record migrationObservation, validPassedValidation bool) int64 {
 	if record.ValidationStatus != "passed" {
 		if record.State == "cutover_ready" || record.State == "cutting_over" ||
-			record.State == "rollback_window" || record.State == "completed" {
+			record.State == "rollback_window" || record.State == "completed" ||
+			(record.State == "failed" && record.AssignmentShardID == record.TargetShardID) {
 			return 1
 		}
 		return 0
@@ -1063,6 +1151,9 @@ func knownMigrationState(state string) bool {
 }
 
 func requiresEqualCopy(state string, copyComplete bool) bool {
+	if state == "failed" || state == "rolled_back" {
+		return false
+	}
 	if copyComplete {
 		return true
 	}
@@ -1076,6 +1167,11 @@ func requiresEqualCopy(state string, copyComplete bool) bool {
 
 func usesCutoverValidationEvidence(state string) bool {
 	return state == "rollback_window" || state == "completed"
+}
+
+func usesPersistedValidationEvidence(record migrationObservation) bool {
+	return usesCutoverValidationEvidence(record.State) ||
+		(record.State == "failed" && record.AssignmentShardID == record.TargetShardID)
 }
 
 func stateAtOrAfterCutover(state string) bool {

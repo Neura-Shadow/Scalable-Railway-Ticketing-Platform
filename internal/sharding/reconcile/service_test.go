@@ -507,6 +507,494 @@ func TestMigrationPostCutoverUsesPersistedValidationInsteadOfLiveTargetCounts(t 
 	}
 }
 
+func TestMigrationQuotaClaimActivityUsesMigrationAuthority(t *testing.T) {
+	counts := migrationDatasetCounts()
+	tests := []struct {
+		name                       string
+		state                      string
+		sourceStructuralViolations int64
+		sourceActivityViolations   int64
+		targetStructuralViolations int64
+		targetActivityViolations   int64
+		wantSourceViolations       int64
+		wantTargetViolations       int64
+	}{
+		{
+			name: "pre-cutover source structural violation", state: "validating",
+			sourceStructuralViolations: 1, wantSourceViolations: 1,
+		},
+		{
+			name: "pre-cutover source activity violation", state: "validating",
+			sourceActivityViolations: 1, wantSourceViolations: 1,
+		},
+		{
+			name: "pre-cutover target structural violation", state: "validating",
+			targetStructuralViolations: 1, wantTargetViolations: 1,
+		},
+		{
+			name: "cutting-over target activity violation", state: "cutting_over",
+			targetActivityViolations: 1, wantTargetViolations: 1,
+		},
+		{
+			name: "rollback-window retained source activity drift", state: "rollback_window",
+			sourceActivityViolations: 1,
+		},
+		{
+			name: "rollback-window retained source structural violation", state: "rollback_window",
+			sourceStructuralViolations: 1, wantSourceViolations: 1,
+		},
+		{
+			name: "rollback-window target structural violation", state: "rollback_window",
+			targetStructuralViolations: 1, wantTargetViolations: 1,
+		},
+		{
+			name: "rollback-window target activity violation", state: "rollback_window",
+			targetActivityViolations: 1, wantTargetViolations: 1,
+		},
+		{
+			name: "completed retained source activity drift", state: "completed",
+			sourceActivityViolations: 1,
+		},
+		{
+			name: "rolled-back retained target activity drift", state: "rolled_back",
+			targetActivityViolations: 1,
+		},
+		{
+			name: "rolled-back source activity violation", state: "rolled_back",
+			sourceActivityViolations: 1, wantSourceViolations: 1,
+		},
+		{
+			name: "failed migration follows surviving source authority", state: "failed",
+			sourceActivityViolations: 1, targetActivityViolations: 1, wantSourceViolations: 1,
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			migrationID := uuid.New()
+			runID := uuid.New()
+			record := healthyMigration(t, migrationID, runID)
+			fake := &fakeSource{
+				migration: record, migrationFound: true,
+				fences: map[fixedStorage][]fenceObservation{
+					storageLegacy: {{TrainRunID: runID, Generation: 1, Enabled: false}},
+					storageZero:   {{TrainRunID: runID, Generation: 2, Enabled: false}},
+				},
+				fenceErrors: make(map[fixedStorage]error),
+				snapshots: map[fixedStorage]storageSnapshot{
+					storageLegacy: {Counts: counts}, storageZero: {Counts: counts},
+				},
+				snapshotErrors: make(map[fixedStorage]error),
+				central: centralMigrationSnapshot{
+					QuotaClaims: counts.Reservations, MigrationsForTrainRun: 1, ActiveMigrations: 1,
+				},
+			}
+			switch testCase.state {
+			case "rollback_window", "completed":
+				record = postCutoverMigration(t, migrationID, runID, testCase.state)
+				fake = postCutoverMigrationSource(record, counts, counts)
+			case "cutting_over":
+				record.State = testCase.state
+			case "rolled_back":
+				record.State = testCase.state
+				record.AssignmentState = "stable"
+				record.ActiveMigrationID = nil
+				fake.fences[storageLegacy] = []fenceObservation{{
+					TrainRunID: runID, Generation: record.SourceGeneration, Enabled: true,
+				}}
+				fake.central.ActiveMigrations = 0
+			case "failed":
+				record.State = testCase.state
+				record.AssignmentState = "stable"
+				record.ActiveMigrationID = nil
+				fake.fences[storageLegacy] = []fenceObservation{{
+					TrainRunID: runID, Generation: record.SourceGeneration, Enabled: true,
+				}}
+				fake.central.ActiveMigrations = 0
+			}
+			fake.migration = record
+			sourceSnapshot := fake.snapshots[storageLegacy]
+			sourceSnapshot.QuotaStructuralViolations = testCase.sourceStructuralViolations
+			sourceSnapshot.QuotaActivityViolations = testCase.sourceActivityViolations
+			fake.snapshots[storageLegacy] = sourceSnapshot
+			targetSnapshot := fake.snapshots[storageZero]
+			targetSnapshot.QuotaStructuralViolations = testCase.targetStructuralViolations
+			targetSnapshot.QuotaActivityViolations = testCase.targetActivityViolations
+			fake.snapshots[storageZero] = targetSnapshot
+
+			report, err := newService(fake).Migration(
+				context.Background(), migrationID, Limits{PageSize: 10, MaxPages: 30, MaxRows: 1_000},
+			)
+			wantViolations := testCase.wantSourceViolations + testCase.wantTargetViolations
+			if wantViolations == 0 && err != nil {
+				t.Fatalf("Migration() report=%+v error=%v, want clean report", report, err)
+			}
+			if wantViolations > 0 && !errors.Is(err, ErrViolations) {
+				t.Fatalf("Migration() report=%+v error=%v, want violations", report, err)
+			}
+			if report.Completeness != CompletenessComplete || report.Truncated ||
+				report.Violations != wantViolations {
+				t.Fatalf("Migration() report=%+v, want complete with %d violations", report, wantViolations)
+			}
+			quotaCheck := findCheck(t, report.Checks, "quota_claim_integrity")
+			if quotaCheck.Checked != 2*counts.Reservations || quotaCheck.Violations != wantViolations {
+				t.Fatalf("authoritative quota check = %+v", quotaCheck)
+			}
+			sourceCheck := findCheck(t, report.Shards[int(storageLegacy)].Checks, "quota_claims")
+			targetCheck := findCheck(t, report.Shards[int(storageZero)].Checks, "quota_claims")
+			if sourceCheck.Checked != counts.Reservations || targetCheck.Checked != counts.Reservations ||
+				sourceCheck.Violations != testCase.wantSourceViolations ||
+				targetCheck.Violations != testCase.wantTargetViolations {
+				t.Fatalf("source quota check=%+v target quota check=%+v", sourceCheck, targetCheck)
+			}
+		})
+	}
+}
+
+func TestMigrationDetectsOrphanQuotaClaimByCardinality(t *testing.T) {
+	migrationID := uuid.New()
+	runID := uuid.New()
+	record := healthyMigration(t, migrationID, runID)
+	counts := migrationDatasetCounts()
+	fake := &fakeSource{
+		migration: record, migrationFound: true,
+		fences: map[fixedStorage][]fenceObservation{
+			storageLegacy: {{TrainRunID: runID, Generation: 1, Enabled: false}},
+			storageZero:   {{TrainRunID: runID, Generation: 2, Enabled: false}},
+		},
+		fenceErrors: make(map[fixedStorage]error),
+		snapshots: map[fixedStorage]storageSnapshot{
+			storageLegacy: {Counts: counts}, storageZero: {Counts: counts},
+		},
+		snapshotErrors: make(map[fixedStorage]error),
+		central: centralMigrationSnapshot{
+			QuotaClaims: counts.Reservations + 1, MigrationsForTrainRun: 1, ActiveMigrations: 1,
+		},
+	}
+
+	report, err := newService(fake).Migration(
+		context.Background(), migrationID, Limits{PageSize: 10, MaxPages: 30, MaxRows: 1_000},
+	)
+	if !errors.Is(err, ErrViolations) || report.Violations < 1 ||
+		report.Completeness != CompletenessComplete {
+		t.Fatalf("Migration() report=%+v error=%v, want one complete cardinality violation", report, err)
+	}
+	check := findCheck(t, report.Checks, "quota_claim_cardinality")
+	if check.Checked != counts.Reservations || check.Observed != counts.Reservations+1 || check.Violations != 1 {
+		t.Fatalf("quota cardinality check = %+v", check)
+	}
+}
+
+func TestMigrationTerminalAssignmentMustReferenceAnEndpoint(t *testing.T) {
+	migrationID := uuid.New()
+	runID := uuid.New()
+	record := healthyMigration(t, migrationID, runID)
+	record.State = "failed"
+	record.AssignmentShardID = "shard-1"
+	record.AssignmentState = "stable"
+	record.ActiveMigrationID = nil
+	counts := migrationDatasetCounts()
+	fake := &fakeSource{
+		migration: record, migrationFound: true,
+		fences: map[fixedStorage][]fenceObservation{
+			storageLegacy: {{TrainRunID: runID, Generation: 1, Enabled: false}},
+			storageZero:   {{TrainRunID: runID, Generation: 2, Enabled: false}},
+		},
+		fenceErrors: make(map[fixedStorage]error),
+		snapshots: map[fixedStorage]storageSnapshot{
+			storageLegacy: {Counts: counts}, storageZero: {Counts: counts},
+		},
+		snapshotErrors: make(map[fixedStorage]error),
+		central: centralMigrationSnapshot{
+			QuotaClaims: counts.Reservations, MigrationsForTrainRun: 1,
+		},
+	}
+
+	report, err := newService(fake).Migration(
+		context.Background(), migrationID, Limits{PageSize: 10, MaxPages: 30, MaxRows: 1_000},
+	)
+	if !errors.Is(err, ErrViolations) || report.Violations < 1 ||
+		findCheck(t, report.Checks, "migration_assignment").Violations != 1 {
+		t.Fatalf("Migration() report=%+v error=%v, want invalid terminal assignment", report, err)
+	}
+}
+
+func TestMigrationFailedTargetAuthorityUsesPersistedCutoverEvidence(t *testing.T) {
+	migrationID := uuid.New()
+	runID := uuid.New()
+	record := postCutoverMigration(t, migrationID, runID, "rollback_window")
+	record.State = "failed"
+	record.AssignmentState = "stable"
+	record.ActiveMigrationID = nil
+	cutoverCounts := migrationDatasetCounts()
+	liveTargetCounts := cutoverCounts
+	liveTargetCounts.Reservations++
+	fake := postCutoverMigrationSource(record, cutoverCounts, liveTargetCounts)
+	fake.central.ActiveMigrations = 0
+
+	report, err := newService(fake).Migration(
+		context.Background(), migrationID, Limits{PageSize: 10, MaxPages: 30, MaxRows: 1_000},
+	)
+	if err != nil || report.Violations != 0 || report.Migration == nil ||
+		report.Migration.TargetCounts != liveTargetCounts {
+		t.Fatalf("Migration() report=%+v error=%v, want healthy failed target authority", report, err)
+	}
+	if findCheck(t, report.Checks, "cutover_validation_exact_copy").Violations != 0 ||
+		findCheck(t, report.Checks, "quota_claim_cardinality").Violations != 0 {
+		t.Fatalf("failed target authority checks = %+v", report.Checks)
+	}
+	fake.central.TargetGenerationWriteRows = 0
+	report, err = newService(fake).Migration(
+		context.Background(), migrationID, Limits{PageSize: 10, MaxPages: 30, MaxRows: 1_000},
+	)
+	if !errors.Is(err, ErrViolations) ||
+		findCheck(t, report.Checks, "generation_write_evidence").Violations != 1 {
+		t.Fatalf("Migration() report=%+v error=%v, want failed target evidence violation", report, err)
+	}
+	fake.central.TargetGenerationWriteRows = 1
+
+	sourceSnapshot := fake.snapshots[storageLegacy]
+	sourceSnapshot.Counts.Reservations--
+	fake.snapshots[storageLegacy] = sourceSnapshot
+	report, err = newService(fake).Migration(
+		context.Background(), migrationID, Limits{PageSize: 10, MaxPages: 30, MaxRows: 1_000},
+	)
+	if !errors.Is(err, ErrViolations) ||
+		findCheck(t, report.Checks, "failed_source_retained_counts").Violations != 1 {
+		t.Fatalf("Migration() report=%+v error=%v, want failed retained-source loss", report, err)
+	}
+	sourceSnapshot.Counts = cutoverCounts
+	fake.snapshots[storageLegacy] = sourceSnapshot
+
+	fake.fences[storageLegacy] = []fenceObservation{{
+		TrainRunID: runID, Generation: record.SourceGeneration, Enabled: true,
+	}}
+	fake.fences[storageZero] = []fenceObservation{{
+		TrainRunID: runID, Generation: record.TargetGeneration, Enabled: false,
+	}}
+	report, err = newService(fake).Migration(
+		context.Background(), migrationID, Limits{PageSize: 10, MaxPages: 30, MaxRows: 1_000},
+	)
+	if !errors.Is(err, ErrViolations) ||
+		findCheck(t, report.Checks, "migration_fence_state").Violations != 1 ||
+		findCheck(t, report.Checks, "stale_source_fence").Violations != 1 {
+		t.Fatalf("Migration() report=%+v error=%v, want failed target fence violations", report, err)
+	}
+}
+
+func TestMigrationTerminalSourceAuthorityAllowsLiveSourceGrowth(t *testing.T) {
+	for _, state := range []string{"failed", "rolled_back"} {
+		t.Run(state, func(t *testing.T) {
+			migrationID := uuid.New()
+			runID := uuid.New()
+			record := healthyMigration(t, migrationID, runID)
+			record.State = state
+			record.AssignmentState = "stable"
+			record.ActiveMigrationID = nil
+			copiedCounts := migrationDatasetCounts()
+			liveSourceCounts := copiedCounts
+			liveSourceCounts.Reservations++
+			fake := &fakeSource{
+				migration: record, migrationFound: true,
+				fences: map[fixedStorage][]fenceObservation{
+					storageLegacy: {{
+						TrainRunID: runID, Generation: record.SourceGeneration, Enabled: true,
+					}},
+					storageZero: {{
+						TrainRunID: runID, Generation: record.TargetGeneration, Enabled: false,
+					}},
+				},
+				fenceErrors: make(map[fixedStorage]error),
+				snapshots: map[fixedStorage]storageSnapshot{
+					storageLegacy: {Counts: liveSourceCounts}, storageZero: {Counts: copiedCounts},
+				},
+				snapshotErrors: make(map[fixedStorage]error),
+				central: centralMigrationSnapshot{
+					QuotaClaims: liveSourceCounts.Reservations, MigrationsForTrainRun: 1,
+				},
+			}
+
+			report, err := newService(fake).Migration(
+				context.Background(), migrationID, Limits{PageSize: 10, MaxPages: 30, MaxRows: 1_000},
+			)
+			if err != nil || report.Violations != 0 || report.Migration == nil ||
+				report.Migration.SourceCounts != liveSourceCounts {
+				t.Fatalf("Migration() report=%+v error=%v, want healthy terminal source growth", report, err)
+			}
+		})
+	}
+}
+
+func TestMigrationTerminalGenerationMatchesAssignmentAndFence(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*migrationObservation, *fakeSource)
+		checkName string
+	}{
+		{
+			name: "failed source assignment generation",
+			configure: func(record *migrationObservation, fake *fakeSource) {
+				record.State = "failed"
+				record.AssignmentState = "stable"
+				record.ActiveMigrationID = nil
+				record.AssignmentGeneration = record.TargetGeneration
+				fake.fences[storageLegacy] = []fenceObservation{{
+					TrainRunID: record.TrainRunID, Generation: record.SourceGeneration, Enabled: true,
+				}}
+				fake.central.ActiveMigrations = 0
+			},
+			checkName: "migration_assignment",
+		},
+		{
+			name: "failed target assignment generation",
+			configure: func(record *migrationObservation, fake *fakeSource) {
+				record.State = "failed"
+				record.AssignmentShardID = record.TargetShardID
+				record.AssignmentGeneration = record.SourceGeneration
+				record.AssignmentState = "stable"
+				record.ActiveMigrationID = nil
+				fake.fences[storageZero] = []fenceObservation{{
+					TrainRunID: record.TrainRunID, Generation: record.TargetGeneration, Enabled: true,
+				}}
+				fake.central.ActiveMigrations = 0
+			},
+			checkName: "migration_assignment",
+		},
+		{
+			name: "rolled-back assignment generation",
+			configure: func(record *migrationObservation, fake *fakeSource) {
+				rollbackGeneration := record.TargetGeneration + 2
+				record.State = "rolled_back"
+				record.RollbackGeneration = &rollbackGeneration
+				record.AssignmentGeneration = rollbackGeneration - 1
+				record.AssignmentState = "stable"
+				record.ActiveMigrationID = nil
+				fake.fences[storageLegacy] = []fenceObservation{{
+					TrainRunID: record.TrainRunID, Generation: rollbackGeneration, Enabled: true,
+				}}
+				fake.central.ActiveMigrations = 0
+			},
+			checkName: "migration_assignment",
+		},
+		{
+			name: "rolled-back fence generation",
+			configure: func(record *migrationObservation, fake *fakeSource) {
+				rollbackGeneration := record.TargetGeneration + 2
+				record.State = "rolled_back"
+				record.RollbackGeneration = &rollbackGeneration
+				record.AssignmentGeneration = rollbackGeneration
+				record.AssignmentState = "stable"
+				record.ActiveMigrationID = nil
+				fake.fences[storageLegacy] = []fenceObservation{{
+					TrainRunID: record.TrainRunID, Generation: rollbackGeneration - 1, Enabled: true,
+				}}
+				fake.central.ActiveMigrations = 0
+			},
+			checkName: "migration_fence_generation",
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			migrationID := uuid.New()
+			runID := uuid.New()
+			record := healthyMigration(t, migrationID, runID)
+			counts := migrationDatasetCounts()
+			fake := &fakeSource{
+				migration: record, migrationFound: true,
+				fences: map[fixedStorage][]fenceObservation{
+					storageLegacy: {{TrainRunID: runID, Generation: 1, Enabled: false}},
+					storageZero:   {{TrainRunID: runID, Generation: 2, Enabled: false}},
+				},
+				fenceErrors: make(map[fixedStorage]error),
+				snapshots: map[fixedStorage]storageSnapshot{
+					storageLegacy: {Counts: counts}, storageZero: {Counts: counts},
+				},
+				snapshotErrors: make(map[fixedStorage]error),
+				central: centralMigrationSnapshot{
+					QuotaClaims: counts.Reservations, MigrationsForTrainRun: 1,
+				},
+			}
+			testCase.configure(&record, fake)
+			fake.migration = record
+
+			report, err := newService(fake).Migration(
+				context.Background(), migrationID, Limits{PageSize: 10, MaxPages: 30, MaxRows: 1_000},
+			)
+			if !errors.Is(err, ErrViolations) || findCheck(t, report.Checks, testCase.checkName).Violations != 1 {
+				t.Fatalf("Migration() report=%+v error=%v, want %s violation", report, err, testCase.checkName)
+			}
+		})
+	}
+}
+
+func TestMigrationPostCutoverRollbackRequiresZeroTargetWrites(t *testing.T) {
+	migrationID := uuid.New()
+	runID := uuid.New()
+	record := healthyMigration(t, migrationID, runID)
+	rollbackGeneration := record.TargetGeneration + 2
+	record.State = "rolled_back"
+	record.RollbackGeneration = &rollbackGeneration
+	record.AssignmentGeneration = rollbackGeneration
+	record.AssignmentState = "stable"
+	record.ActiveMigrationID = nil
+	counts := migrationDatasetCounts()
+	newFake := func() *fakeSource {
+		return &fakeSource{
+			migration: record, migrationFound: true,
+			fences: map[fixedStorage][]fenceObservation{
+				storageLegacy: {{TrainRunID: runID, Generation: rollbackGeneration, Enabled: true}},
+				storageZero:   {{TrainRunID: runID, Generation: record.TargetGeneration, Enabled: false}},
+			},
+			fenceErrors: make(map[fixedStorage]error),
+			snapshots: map[fixedStorage]storageSnapshot{
+				storageLegacy: {Counts: counts}, storageZero: {Counts: counts},
+			},
+			snapshotErrors: make(map[fixedStorage]error),
+			central: centralMigrationSnapshot{
+				QuotaClaims: counts.Reservations, MigrationsForTrainRun: 1,
+				GenerationWriteRows: 1, TargetGenerationWriteRows: 1,
+			},
+		}
+	}
+
+	report, err := newService(newFake()).Migration(
+		context.Background(), migrationID, Limits{PageSize: 10, MaxPages: 30, MaxRows: 1_000},
+	)
+	if err != nil || report.Violations != 0 {
+		t.Fatalf("Migration() report=%+v error=%v, want safe post-cutover rollback", report, err)
+	}
+
+	tests := []struct {
+		name      string
+		configure func(*centralMigrationSnapshot)
+	}{
+		{
+			name: "missing target evidence",
+			configure: func(snapshot *centralMigrationSnapshot) {
+				snapshot.TargetGenerationWriteRows = 0
+			},
+		},
+		{
+			name: "successful target write",
+			configure: func(snapshot *centralMigrationSnapshot) {
+				snapshot.TargetGenerationWrites = 1
+			},
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			fake := newFake()
+			testCase.configure(&fake.central)
+			report, err := newService(fake).Migration(
+				context.Background(), migrationID, Limits{PageSize: 10, MaxPages: 30, MaxRows: 1_000},
+			)
+			if !errors.Is(err, ErrViolations) ||
+				findCheck(t, report.Checks, "generation_write_evidence").Violations != 1 {
+				t.Fatalf("Migration() report=%+v error=%v, want rollback evidence violation", report, err)
+			}
+		})
+	}
+}
+
 func TestMigrationPreCutoverStillComparesLiveCountsAndCopyCounters(t *testing.T) {
 	migrationID := uuid.New()
 	runID := uuid.New()
@@ -525,7 +1013,9 @@ func TestMigrationPreCutoverStillComparesLiveCountsAndCopyCounters(t *testing.T)
 			storageLegacy: {Counts: counts}, storageZero: {Counts: liveTargetCounts},
 		},
 		snapshotErrors: make(map[fixedStorage]error),
-		central:        centralMigrationSnapshot{MigrationsForTrainRun: 1, ActiveMigrations: 1},
+		central: centralMigrationSnapshot{
+			QuotaClaims: counts.Reservations, MigrationsForTrainRun: 1, ActiveMigrations: 1,
+		},
 	}
 	report, err := newService(fake).Migration(
 		context.Background(), migrationID, Limits{PageSize: 10, MaxPages: 30, MaxRows: 1_000},
@@ -577,6 +1067,7 @@ func TestMigrationPostCutoverRejectsInvalidValidationFenceAuthorityAndProvenance
 			name: "missing generation write evidence", state: "rollback_window", checkName: "generation_write_evidence",
 			mutate: func(_ *testing.T, _ *migrationObservation, fake *fakeSource) {
 				fake.central.GenerationWriteRows = 0
+				fake.central.TargetGenerationWriteRows = 0
 			},
 		},
 		{
@@ -767,7 +1258,8 @@ func postCutoverMigrationSource(
 		},
 		snapshotErrors: make(map[fixedStorage]error),
 		central: centralMigrationSnapshot{
-			MigrationsForTrainRun: 1, ActiveMigrations: activeMigrations, GenerationWriteRows: 1,
+			QuotaClaims: targetCounts.Reservations, MigrationsForTrainRun: 1,
+			ActiveMigrations: activeMigrations, GenerationWriteRows: 1, TargetGenerationWriteRows: 1,
 		},
 	}
 }
