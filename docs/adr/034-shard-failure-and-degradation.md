@@ -75,11 +75,13 @@ continues the existing bounded claim/publish/finalize protocol in `public`.
 Admission work remains shard-neutral until token use enters the booking path.
 
 Customer hot paths never return an incomplete fanout as complete data.
-Operator/admin fanout alone may aggregate the fixed allowlisted shard set, with
-bounded concurrency, per-shard and global deadlines, stable ordering, bounded
-memory/output, and explicit `complete`, `partial`, or `unavailable` status. One
-failed shard cannot starve healthy work. Cancellation stops dispatching new
-work and allows only already bounded operations to finish.
+Operator/admin traversal alone may aggregate the fixed allowlisted shard set.
+The current implementation is serial, with effective concurrency `1`, stable
+ordering, bounded time/memory/output, and explicit `complete`, `partial`, or
+`unavailable` status.
+
+One failed shard cannot starve healthy work. Cancellation stops new traversal
+and allows only already bounded operations to finish.
 
 Migration failure policy preserves the current authority:
 

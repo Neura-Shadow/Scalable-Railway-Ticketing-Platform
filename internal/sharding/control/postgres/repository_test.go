@@ -355,6 +355,9 @@ func TestActivateRouteUpdatesProvenanceAndAppendsCutoverEvent(t *testing.T) {
 				if !strings.Contains(sql, "'trainRunId'") || !strings.Contains(sql, "'reason'") {
 					t.Fatalf("outbox sql = %q", sql)
 				}
+				if !strings.Contains(sql, "$1::uuid") || !strings.Contains(sql, "$1::uuid::text") {
+					t.Fatalf("outbox train-run parameter is not explicitly typed: %q", sql)
+				}
 			}
 			return pgconn.NewCommandTag("UPDATE 1"), nil
 		},

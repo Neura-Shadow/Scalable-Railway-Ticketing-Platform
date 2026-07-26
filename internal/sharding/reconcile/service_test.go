@@ -232,6 +232,76 @@ func TestAssignmentsReturnsPartialWithoutHidingHealthyShards(t *testing.T) {
 	}
 }
 
+func TestAssignmentsReturnsPartialForDisabledCatalogShardWithoutHidingHealthyShards(t *testing.T) {
+	runID := uuid.MustParse("10000000-0000-0000-0000-000000000003")
+	catalog := healthyCatalog()
+	catalog[1].Enabled = false
+	fake := &fakeSource{
+		catalog: catalog,
+		assignments: []assignmentObservation{{
+			TrainRunID: runID, AssignmentPresent: true, ShardID: "legacy", Generation: 1,
+			State: "stable", CatalogPresent: true, CatalogEnabled: true, CatalogWriteEnabled: true,
+		}},
+		fences: map[fixedStorage][]fenceObservation{
+			storageLegacy: {{TrainRunID: runID, Generation: 1, Enabled: true}},
+		},
+		fenceErrors: make(map[fixedStorage]error),
+	}
+	report, err := newService(fake).Assignments(
+		context.Background(), Limits{PageSize: 10, MaxPages: 20, MaxRows: 100},
+	)
+	if !errors.Is(err, ErrPartial) || report.Completeness != CompletenessPartial {
+		t.Fatalf("report=%+v error=%v, want partial", report, err)
+	}
+	if report.Shards[0].Status != "healthy" || report.Shards[1].Status != "unavailable" ||
+		report.Shards[2].Status != "healthy" {
+		t.Fatalf("disabled catalog shard hid healthy targets: %+v", report.Shards)
+	}
+	if report.Shards[1].Failure != "catalog_disabled" || report.Shards[1].Pages != 0 {
+		t.Fatalf("disabled shard evidence = %+v", report.Shards[1])
+	}
+	if report.Shards[0].Pages != 1 || report.Shards[0].Rows != 1 || report.Shards[2].Pages != 1 {
+		t.Fatalf("healthy shard evidence was not retained: %+v", report.Shards)
+	}
+	wantOrder := []fixedStorage{storageLegacy, storageOne}
+	if len(fake.fenceCallOrder) != len(wantOrder) {
+		t.Fatalf("fence calls = %v, want %v", fake.fenceCallOrder, wantOrder)
+	}
+	for index := range wantOrder {
+		if fake.fenceCallOrder[index] != wantOrder[index] {
+			t.Fatalf("fence calls = %v, want %v", fake.fenceCallOrder, wantOrder)
+		}
+	}
+}
+
+func TestAssignmentsPartialStillDetectsHealthyShardFenceViolation(t *testing.T) {
+	runID := uuid.New()
+	catalog := healthyCatalog()
+	catalog[1].Enabled = false
+	fake := &fakeSource{
+		catalog: catalog,
+		assignments: []assignmentObservation{{
+			TrainRunID: runID, AssignmentPresent: true, ShardID: "legacy", Generation: 1,
+			State: "stable", CatalogPresent: true, CatalogEnabled: true, CatalogWriteEnabled: true,
+		}},
+		fences: map[fixedStorage][]fenceObservation{
+			storageLegacy: {{TrainRunID: runID, Generation: 2, Enabled: true}},
+		},
+		fenceErrors: make(map[fixedStorage]error),
+	}
+	report, err := newService(fake).Assignments(
+		context.Background(), Limits{PageSize: 10, MaxPages: 20, MaxRows: 100},
+	)
+	if !errors.Is(err, ErrPartial) || !errors.Is(err, ErrViolations) ||
+		report.Completeness != CompletenessPartial {
+		t.Fatalf("report=%+v error=%v, want partial with retained violations", report, err)
+	}
+	if findCheck(t, report.Checks, "active_fence_generation").Violations == 0 ||
+		findCheck(t, report.Checks, "available_writer_consistency").Violations == 0 {
+		t.Fatalf("healthy shard fence violation was hidden: %+v", report.Checks)
+	}
+}
+
 func TestAssignmentsReturnsPartialWhenCentralPagingFailsAfterCatalog(t *testing.T) {
 	fake := &fakeSource{
 		catalog:         healthyCatalog(),
@@ -397,6 +467,150 @@ func TestMigrationDetectsDualWriterAndStaleSourceFence(t *testing.T) {
 	}
 }
 
+func TestMigrationPostCutoverUsesPersistedValidationInsteadOfLiveTargetCounts(t *testing.T) {
+	states := []string{"rollback_window", "completed"}
+	for _, state := range states {
+		t.Run(state, func(t *testing.T) {
+			migrationID := uuid.New()
+			runID := uuid.New()
+			record := postCutoverMigration(t, migrationID, runID, state)
+			cutoverCounts := migrationDatasetCounts()
+			liveTargetCounts := cutoverCounts
+			liveTargetCounts.Reservations++
+			fake := postCutoverMigrationSource(record, cutoverCounts, liveTargetCounts)
+
+			report, err := newService(fake).Migration(
+				context.Background(), migrationID, Limits{PageSize: 10, MaxPages: 30, MaxRows: 1_000},
+			)
+			if err != nil || report.Violations != 0 || report.Migration == nil {
+				t.Fatalf("Migration() report=%+v error=%v, want valid post-cutover divergence", report, err)
+			}
+			if report.Migration.SourceCounts != cutoverCounts || report.Migration.TargetCounts != liveTargetCounts {
+				t.Fatalf("live counts were not retained: %+v", report.Migration)
+			}
+			if report.Migration.CutoverSourceCounts == nil || report.Migration.CutoverTargetCounts == nil ||
+				*report.Migration.CutoverSourceCounts != cutoverCounts ||
+				*report.Migration.CutoverTargetCounts != cutoverCounts {
+				t.Fatalf("persisted cutover counts were not retained: %+v", report.Migration)
+			}
+			if findCheck(t, report.Checks, "migration_validation").Violations != 0 ||
+				findCheck(t, report.Checks, "cutover_validation_exact_copy").Violations != 0 ||
+				findCheck(t, report.Checks, "migration_audit_vs_cutover_counts").Violations != 0 ||
+				findCheck(t, report.Checks, "generation_write_evidence").Violations != 0 {
+				t.Fatalf("post-cutover evidence checks = %+v", report.Checks)
+			}
+			if state == "rollback_window" &&
+				findCheck(t, report.Checks, "rollback_source_retained_counts").Violations != 0 {
+				t.Fatalf("rollback-window retained source check = %+v", report.Checks)
+			}
+		})
+	}
+}
+
+func TestMigrationPreCutoverStillComparesLiveCountsAndCopyCounters(t *testing.T) {
+	migrationID := uuid.New()
+	runID := uuid.New()
+	record := healthyMigration(t, migrationID, runID)
+	counts := migrationDatasetCounts()
+	liveTargetCounts := counts
+	liveTargetCounts.Reservations++
+	fake := &fakeSource{
+		migration: record, migrationFound: true,
+		fences: map[fixedStorage][]fenceObservation{
+			storageLegacy: {{TrainRunID: runID, Generation: 1, Enabled: false}},
+			storageZero:   {{TrainRunID: runID, Generation: 2, Enabled: false}},
+		},
+		fenceErrors: make(map[fixedStorage]error),
+		snapshots: map[fixedStorage]storageSnapshot{
+			storageLegacy: {Counts: counts}, storageZero: {Counts: liveTargetCounts},
+		},
+		snapshotErrors: make(map[fixedStorage]error),
+		central:        centralMigrationSnapshot{MigrationsForTrainRun: 1, ActiveMigrations: 1},
+	}
+	report, err := newService(fake).Migration(
+		context.Background(), migrationID, Limits{PageSize: 10, MaxPages: 30, MaxRows: 1_000},
+	)
+	if !errors.Is(err, ErrViolations) {
+		t.Fatalf("Migration() report=%+v error=%v, want pre-cutover violations", report, err)
+	}
+	if findCheck(t, report.Checks, "source_target_dataset_counts").Violations != 1 ||
+		findCheck(t, report.Checks, "migration_audit_vs_target_counts").Violations != 1 {
+		t.Fatalf("missing pre-cutover count violations: %+v", report.Checks)
+	}
+}
+
+func TestMigrationPostCutoverRejectsInvalidValidationFenceAuthorityAndProvenance(t *testing.T) {
+	tests := []struct {
+		name      string
+		state     string
+		mutate    func(*testing.T, *migrationObservation, *fakeSource)
+		checkName string
+	}{
+		{
+			name: "truncated validation", state: "rollback_window", checkName: "migration_validation",
+			mutate: func(t *testing.T, record *migrationObservation, _ *fakeSource) {
+				record.LastValidation = encodedValidation(t, migrationDatasetCounts(), migrationDatasetCounts(), true, true)
+			},
+		},
+		{
+			name: "mismatched validation digest", state: "rollback_window", checkName: "migration_validation",
+			mutate: func(t *testing.T, record *migrationObservation, _ *fakeSource) {
+				record.LastValidation = encodedMismatchedValidation(t, migrationDatasetCounts())
+			},
+		},
+		{
+			name: "source fence still writable", state: "rollback_window", checkName: "stale_source_fence",
+			mutate: func(_ *testing.T, record *migrationObservation, fake *fakeSource) {
+				fake.fences[storageLegacy] = []fenceObservation{{
+					TrainRunID: record.TrainRunID, Generation: record.SourceGeneration, Enabled: true,
+				}}
+			},
+		},
+		{
+			name: "completed assignment lacks target authority", state: "completed", checkName: "migration_assignment",
+			mutate: func(_ *testing.T, record *migrationObservation, _ *fakeSource) {
+				record.AssignmentShardID = record.SourceShardID
+				record.AssignmentGeneration = record.SourceGeneration
+			},
+		},
+		{
+			name: "missing generation write evidence", state: "rollback_window", checkName: "generation_write_evidence",
+			mutate: func(_ *testing.T, _ *migrationObservation, fake *fakeSource) {
+				fake.central.GenerationWriteRows = 0
+			},
+		},
+		{
+			name: "rollback retained source count drift", state: "rollback_window", checkName: "rollback_source_retained_counts",
+			mutate: func(_ *testing.T, _ *migrationObservation, fake *fakeSource) {
+				drifted := fake.snapshots[storageLegacy]
+				drifted.Counts.Reservations++
+				fake.snapshots[storageLegacy] = drifted
+			},
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			migrationID := uuid.New()
+			runID := uuid.New()
+			record := postCutoverMigration(t, migrationID, runID, testCase.state)
+			counts := migrationDatasetCounts()
+			fake := postCutoverMigrationSource(record, counts, counts)
+			testCase.mutate(t, &record, fake)
+			fake.migration = record
+
+			report, err := newService(fake).Migration(
+				context.Background(), migrationID, Limits{PageSize: 10, MaxPages: 30, MaxRows: 1_000},
+			)
+			if !errors.Is(err, ErrViolations) {
+				t.Fatalf("Migration() report=%+v error=%v, want violations", report, err)
+			}
+			if findCheck(t, report.Checks, testCase.checkName).Violations == 0 {
+				t.Fatalf("missing %s violation: %+v", testCase.checkName, report.Checks)
+			}
+		})
+	}
+}
+
 func TestMigrationReportsCentralFailureAsPartialWithoutInventingLimit(t *testing.T) {
 	migrationID := uuid.MustParse("30000000-0000-0000-0000-000000000003")
 	runID := uuid.MustParse("31000000-0000-0000-0000-000000000003")
@@ -484,13 +698,8 @@ func healthyCatalog() []catalogObservation {
 
 func healthyMigration(t *testing.T, migrationID, runID uuid.UUID) migrationObservation {
 	t.Helper()
-	outcome := control.ValidationOutcome{
-		Snapshot: control.ValidationSnapshot{RowsExamined: 12}, Passed: true, CheckedAt: fixedNow(),
-	}
-	encoded, err := json.Marshal(outcome)
-	if err != nil {
-		t.Fatal(err)
-	}
+	counts := migrationDatasetCounts()
+	encoded := encodedValidation(t, counts, counts, true, false)
 	return migrationObservation{
 		ID: migrationID, TrainRunID: runID, SourceShardID: "legacy", TargetShardID: "shard-0",
 		SourceGeneration: 1, TargetGeneration: 2, State: "validating", CopyPhase: "complete",
@@ -501,6 +710,118 @@ func healthyMigration(t *testing.T, migrationID, runID uuid.UUID) migrationObser
 		AssignmentState: "migrating", ActiveMigrationID: &migrationID,
 		SourceCatalogEnabled: true, TargetCatalogEnabled: true,
 	}
+}
+
+func migrationDatasetCounts() DatasetCounts {
+	return DatasetCounts{
+		Inventory: 3, Reservations: 2, ReservationSeats: 2,
+		TicketOrders: 1, Tickets: 2, IdempotencyRecords: 2,
+	}
+}
+
+func postCutoverMigration(
+	t *testing.T,
+	migrationID uuid.UUID,
+	runID uuid.UUID,
+	state string,
+) migrationObservation {
+	t.Helper()
+	record := healthyMigration(t, migrationID, runID)
+	record.State = state
+	record.AssignmentShardID = record.TargetShardID
+	record.AssignmentGeneration = record.TargetGeneration
+	switch state {
+	case "rollback_window":
+		record.AssignmentState = "rollback_window"
+	case "completed":
+		record.AssignmentState = "stable"
+		record.ActiveMigrationID = nil
+	default:
+		t.Fatalf("unsupported post-cutover test state %q", state)
+	}
+	return record
+}
+
+func postCutoverMigrationSource(
+	record migrationObservation,
+	sourceCounts DatasetCounts,
+	targetCounts DatasetCounts,
+) *fakeSource {
+	activeMigrations := int64(1)
+	if record.State == "completed" {
+		activeMigrations = 0
+	}
+	return &fakeSource{
+		migration: record, migrationFound: true,
+		fences: map[fixedStorage][]fenceObservation{
+			storageLegacy: {{
+				TrainRunID: record.TrainRunID, Generation: record.SourceGeneration, Enabled: false,
+			}},
+			storageZero: {{
+				TrainRunID: record.TrainRunID, Generation: record.TargetGeneration, Enabled: true,
+			}},
+		},
+		fenceErrors: make(map[fixedStorage]error),
+		snapshots: map[fixedStorage]storageSnapshot{
+			storageLegacy: {Counts: sourceCounts}, storageZero: {Counts: targetCounts},
+		},
+		snapshotErrors: make(map[fixedStorage]error),
+		central: centralMigrationSnapshot{
+			MigrationsForTrainRun: 1, ActiveMigrations: activeMigrations, GenerationWriteRows: 1,
+		},
+	}
+}
+
+func encodedValidation(
+	t *testing.T,
+	sourceCounts DatasetCounts,
+	targetCounts DatasetCounts,
+	passed bool,
+	truncated bool,
+) []byte {
+	t.Helper()
+	outcome := control.ValidationOutcome{
+		Snapshot: control.ValidationSnapshot{
+			Source:       validationDigest(sourceCounts, "matching"),
+			Target:       validationDigest(targetCounts, "matching"),
+			RowsExamined: sourceCounts.total() + targetCounts.total(),
+			Truncated:    truncated,
+		},
+		Passed: passed, CheckedAt: fixedNow(),
+	}
+	encoded, err := json.Marshal(outcome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+func encodedMismatchedValidation(t *testing.T, counts DatasetCounts) []byte {
+	t.Helper()
+	outcome := control.ValidationOutcome{
+		Snapshot: control.ValidationSnapshot{
+			Source:       validationDigest(counts, "source"),
+			Target:       validationDigest(counts, "target"),
+			RowsExamined: counts.total() * 2,
+		},
+		Passed: true, CheckedAt: fixedNow(),
+	}
+	encoded, err := json.Marshal(outcome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+func validationDigest(counts DatasetCounts, checksum string) control.DatasetDigest {
+	return control.DatasetDigest{Tables: []control.TableDigest{
+		{Name: "seat_inventory", Rows: counts.Inventory, Checksum: checksum + "-inventory"},
+		{Name: "reservations", Rows: counts.Reservations, Checksum: checksum + "-reservations"},
+		{Name: "reservation_seats", Rows: counts.ReservationSeats, Checksum: checksum + "-reservation-seats"},
+		{Name: "ticket_orders", Rows: counts.TicketOrders, Checksum: checksum + "-ticket-orders"},
+		{Name: "tickets", Rows: counts.Tickets, Checksum: checksum + "-tickets"},
+		{Name: "idempotency_records", Rows: counts.IdempotencyRecords, Checksum: checksum + "-idempotency"},
+	}}
 }
 
 func findCheck(t *testing.T, checks []Check, name string) Check {

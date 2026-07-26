@@ -19,6 +19,7 @@ export const options = boundedOptions({
   unavailable_shard: { executor: 'constant-vus', exec: 'unavailableShard', vus: 3, duration, gracefulStop: '5s' },
   healthy_shard: { executor: 'constant-vus', exec: 'healthyShard', vus: 3, duration, gracefulStop: '5s' },
 }, {
+  checks: ['rate==1'],
   expected_outage_503: ['count>0'],
   healthy_shard_success: ['count>0'],
 });

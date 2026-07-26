@@ -2,7 +2,22 @@
 
 ## Executive summary
 
-Milestone 4 adds fixed, schema-isolated logical booking shards inside one PostgreSQL cluster. The dominant risks are not ordinary shard-selection mistakes: they are stale-writer races that could permit two authoritative writers, unsafe identifier handling that could cross schema boundaries, and migration or rollback operations that could discard committed booking state. The design therefore depends on PostgreSQL-enforced assignment and fence locks, fixed shard-to-schema mappings, atomic locator and target-write evidence, and bounded operator workflows. Redis, route caches, and public inputs remain non-authoritative. These controls are planned by the Milestone 4 PRD and ADRs; they must not be credited as implemented until migration 8, runtime code, tests, and operational evidence exist.
+Milestone 4 adds fixed, schema-isolated logical booking shards inside one PostgreSQL cluster. The dominant risks are stale-writer races, unsafe identifier handling, and migration or rollback operations that could discard committed booking state.
+
+The work-in-progress branch contains Migration 8, runtime code, focused tests,
+and operator tooling. These controls are not accepted until final controlled
+runtime, CI, independent security review, and release evidence pass.
+
+## Evidence status
+
+This threat model originated as a pre-implementation baseline. Table entries
+that say a Milestone 4 control did not exist describe that baseline, not the
+current source inventory. Treat them as acceptance requirements and historical
+gap context.
+
+Current implementation is present but final runtime, CI, independent review,
+and release acceptance remain pending. Redis, route caches, and public inputs
+remain non-authoritative.
 
 ## Scope and assumptions
 
@@ -10,7 +25,7 @@ In scope:
 
 - Runtime code under `cmd/` and `internal/` that routes, reads, or mutates booking state.
 - PostgreSQL migrations and schema boundaries under `migrations/`.
-- The planned `cmd/shard-admin` command, shard-aware lifecycle workers, reconciliation, metrics, and readiness behavior.
+- The `cmd/shard-admin` command, shard-aware lifecycle workers, reconciliation, metrics, and readiness behavior.
 - The logical legacy, `booking_shard_0`, and `booking_shard_1` storage targets in one PostgreSQL cluster.
 - Existing Redis admission and read-cache interactions when assignment or migration state changes.
 - CI and deployment configuration only where it affects secret exposure, database privilege, or operational-surface reachability.
@@ -28,7 +43,7 @@ Assumptions materially affecting priority:
 - The topology is fixed to `legacy`, `shard-0`, and `shard-1`; arbitrary catalog rows or environment strings are not trusted as SQL identifiers.
 - Redis may be stale, unavailable, restored, or actively modified, but it cannot authorize a PostgreSQL booking write.
 - PostgreSQL remains one transaction domain. The minimal global idempotency-key claim, global quota claims, public locators, central outbox, and shard-local booking state can therefore commit atomically.
-- Current repository code is the pre-Milestone 4 baseline. The existing API constructs all PostgreSQL stores from one pool, and current booking SQL targets unqualified public tables. Fencing, locators, schema handles, migration state, and database guards are planned rather than implemented.
+- The current work-in-progress branch contains fencing, locators, fixed schema handles, migration state, and retained-public guards. Their final runtime, CI, review, and release acceptance is pending.
 
 Open deployment questions that can change likelihood are whether API and `shard-admin` use separate least-privilege database roles, how operator identity is established for CLI audit, whether schema `CREATE` is revoked from runtime roles, and how private health/metrics/CLI access is enforced.
 
@@ -61,7 +76,10 @@ Open deployment questions that can change likelihood are whether API and `shard-
 - Normal target mutation/rollback -> target-write evidence: every successful target mutation and any direct rollback take conflicting assignment/fence locks. Target-write evidence is recorded within the mutation transaction, so rollback cannot race a first target write after checking for zero writes.
 - API/admission worker -> Redis: admission tokens bind train run and request identity, not shard. A migration or stale-route rejection must release/recover the processing lease without permanently consuming the token or completing booking idempotency.
 - Public availability read -> route -> authoritative storage -> Redis cache: availability includes assignment generation in its internal cache envelope/namespace. Cutover rotates the affected namespace; booking never trusts cached availability.
-- Worker/admin fanout -> fixed storage workset: enumeration is allowlisted and capped, with per-shard/global deadlines, bounded concurrency and memory, fair scheduling, cancellation, and explicit partial results.
+- Worker/admin fanout -> fixed storage workset: enumeration is allowlisted and
+  capped, with per-shard/global deadlines, bounded memory, cancellation, and
+  explicit partial results. The current admin reconciliation traversal is
+  deterministic and serial, with effective concurrency `1`.
 - Runtime -> logs/metrics/health: only bounded result categories and allowlisted shard aliases cross into observability. Schema names, generations, resource IDs, migration IDs, DSNs, SQL, secrets, and PII do not.
 
 #### Diagram
@@ -161,7 +179,7 @@ flowchart LR
 
 ## Threat model table
 
-| Threat ID | Threat source | Prerequisites | Threat action | Impact | Impacted assets | Existing controls (evidence) | Gaps | Recommended mitigations | Detection ideas | Likelihood | Impact severity | Priority |
+| Threat ID | Threat source | Prerequisites | Threat action | Impact | Impacted assets | Pre-implementation controls (baseline) | Pre-implementation gaps | Required/current mitigation | Detection ideas | Likelihood | Impact severity | Priority |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | TM-025 | Remote client, corrupted catalog, or unsafe configuration | Any attacker-controlled or merely unvalidated value can influence a schema identifier or connection `search_path` | Select another schema, introduce an identifier payload, or leak a previous transaction's path through the pool | Cross-schema read/write, owner bypass, or booking corruption | Schema mapping, booking/PII, DB availability | Current production booking SQL is static; tests use `pgx.Identifier.Sanitize` for isolated schemas | No M4 allowlist/handle/reset evidence exists; identifier quoting alone would still allow unauthorized valid schemas | Fixed enum-to-schema map; reject every row/config outside it; prefer prebuilt qualified SQL. If `search_path` is used, set it locally only after validation and test commit, rollback, error, cancellation, and pool reuse. Revoke runtime schema creation | Identifier-rejection counters with bounded reasons; startup topology validation; pooled reset integration tests | medium | high | high |
 | TM-026 | Concurrent customer or stale API/worker replica | Route validation does not hold a lock conflicting with cutover, or a mutation path omits the guard | Commit a source write after assignment changes to target | Split-brain inventory, duplicate reservation, overlapping allocation | Assignment, fences, inventory, reservations, tickets | ADR 018 already requires a PostgreSQL fenced generation; current allocation uses row locks and atomic predicates | Current Read Committed booking transactions have no assignment/fence lock | Lock assignment then selected fence before any side effect and hold through commit; cutover takes conflicting locks on assignment and both fences; all public/shard tables enforce DB guards; one authoritative refresh/retry only | Stale/fence rejection metrics; reconciliation for dual writable fences, duplicate reservation, mask mismatch; deterministic three-replica/100-request barrier tests | high | high | critical |

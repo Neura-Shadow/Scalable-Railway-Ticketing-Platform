@@ -12,6 +12,7 @@ export const identityMismatches = new Counter('duplicate_identity_mismatches');
 export const partialShardResults = new Counter('partial_shard_results');
 export const healthyShardSuccess = new Counter('healthy_shard_success');
 export const requestDuration = new Trend('shard_request_duration', true);
+export const bookingSuccessDuration = new Trend('booking_success_duration', true);
 export const shardADuration = new Trend('shard_a_duration', true);
 export const shardBDuration = new Trend('shard_b_duration', true);
 export const legacyDuration = new Trend('legacy_shard_duration', true);
@@ -44,7 +45,7 @@ export function list(name, minimum = 1) {
 export function boundedOptions(scenarios, extraThresholds = {}) {
   return {
     scenarios,
-    summaryTrendStats: ['avg', 'min', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
+    summaryTrendStats: ['count', 'avg', 'min', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
     thresholds: {
       checks: ['rate>0.95'],
       unexpected_5xx: ['count==0'],
@@ -151,7 +152,10 @@ export function createHold(url, trainRunID, customer, key, options = {}) {
     },
   );
   recordResponse(response, options);
-  if (response.status === 201) routingSuccess.add(1);
+  if (response.status === 201) {
+    routingSuccess.add(1);
+    bookingSuccessDuration.add(response.timings.duration);
+  }
   return response;
 }
 

@@ -1,6 +1,6 @@
 # Milestone 4: Train-Run Sharding and Single-Writer Ownership
 
-Status: Proposed; implementation and validation pending
+Status: Implementation present in this work-in-progress branch; final controlled runtime, CI, independent review, and release acceptance remain pending.
 
 Target: Milestone 4
 
@@ -232,7 +232,8 @@ perform the same assignment/fence validation before mutation.
 
 1. The operator chooses an allowlisted, bounded scope.
 2. The command enumerates a fixed workset with per-shard and global deadlines,
-   bounded concurrency, stable ordering, and bounded memory.
+   deterministic serial traversal, effective concurrency `1`, stable ordering,
+   and bounded memory.
 3. Results are explicitly `complete`, `partial`, or `unavailable`; an opaque
    cursor may continue a page without encoding schema names or credentials.
 4. Reconciliation is detect-only by default. Cleanup and other mutations
@@ -329,8 +330,10 @@ perform the same assignment/fence validation before mutation.
     schema names, generations, migration IDs, SQL, payloads, and secrets.
 45. As a security reviewer, I want metrics limited to bounded operation,
     result, reason, phase, and configured shard labels.
-46. As a reviewer, I want real PostgreSQL concurrency evidence that three stale
-    replicas and 100 concurrent requests cannot create split-brain writes.
+46. As a reviewer, I want real PostgreSQL evidence for three stale replicas,
+    100 concurrent routed-transaction/fencing attempts, and a separate 100-call
+    end-to-end `CreateHold` gate proving one target writer, no source mutation,
+    no duplicate reservation, and no overlapping allocation.
 47. As a reviewer, I want real Redis tests proving admission and cache behavior
     across migration without making Redis authoritative.
 48. As a reviewer, I want all Milestone 1–3 behavior and race tests to remain
@@ -499,7 +502,8 @@ explicit and invalid transitions fail closed.
   documented bounded policy while target remains fenced.
 - **Quiesce:** lock assignment, disable source writes, and wait with a bounded
   database timeout for in-flight work. Arbitrary sleeps are prohibited.
-- **Copy:** process deterministic primary-key order in configured batches and
+- **Copy:** process deterministic primary-key order in bounded batches selected
+  per private operator invocation and
   persist a resumable cursor and row counts. Copy inventory, reservations,
   reservation seats, associated orders/tickets, local idempotency,
   fence/reconciliation state, and any other classified local authority. Global
@@ -516,7 +520,8 @@ explicit and invalid transitions fail closed.
 - **Resume:** permit writes only after the target assignment/fence pair is
   committed. Record durable target-write evidence with every first and later
   mutation under that target generation.
-- **Complete:** retain source data for the configured window. Cleanup is an
+- **Complete:** retain source data for the window persisted by the migration
+  plan. Cleanup is an
   explicit later operation and never an automatic state transition.
 
 Raw SQL errors, DSNs, credentials, payloads, stack traces, or PII are never
@@ -577,8 +582,9 @@ stored in migration state; only bounded error categories are durable.
 - Meaningful operations support dry-run; mutations require an explicit
   confirmation flag, honor cancellation, bound output, and return nonzero on
   failure.
-- Cross-shard queries enforce per-shard/global timeouts, bounded concurrency,
-  deterministic aggregation, bounded memory, and explicit partial status.
+- Cross-shard queries enforce per-shard/global timeouts, deterministic serial
+  traversal with effective concurrency `1`, bounded memory, and explicit
+  partial status.
 
 ## Failure and Degradation Policy
 
@@ -613,11 +619,12 @@ stored in migration state; only bounded error categories are durable.
 - `booking_route_cache_ttl_seconds`
 - `booking_route_cache_max_entries`
 - `booking_shard_query_timeout`
-- `booking_shard_fanout_concurrency`
-- `booking_shard_fanout_timeout`
-- `booking_migration_batch_size`
-- `booking_migration_quiesce_timeout`
-- `booking_migration_rollback_window_seconds`
+
+Worker traversal is serial and bounded by the configured subset of the three
+fixed storage IDs. Migration controls belong to the private operator command:
+each invocation accepts a bounded `--timeout`, copy accepts bounded
+`--batch-size`, and planning accepts bounded `--rollback-window`. These are not
+application runtime environment settings.
 
 Startup rejects duplicate/unknown shard IDs, unsafe schema identifiers,
 invalid limits, and a disabled required/default storage. Schema mode requires
@@ -718,6 +725,10 @@ cutover, and rollback; real Redis is required for waiting-room and cache
 interaction. Concurrency tests use deterministic barriers, advisory locks,
 channels, and test clocks rather than arbitrary sleeps.
 
+This section separates bounded implemented coverage from final acceptance.
+The presence of a test or runner does not imply controlled runtime, CI,
+independent review, or release acceptance.
+
 - Routing tests cover explicit legacy bootstrap, shard-0/shard-1, unknown or
   disabled shards, bounded cache/expiry, one stale refresh, and identifier
   rejection.
@@ -735,20 +746,29 @@ channels, and test clocks rather than arbitrary sleeps.
   deterministic resumable copy, exact state validation, failed copy, failed
   cutover, pre-cutover rollback, post-cutover rollback before writes, durable
   target-write restriction, and reverse migration.
-- Lifecycle tests cover post-cutover get, confirm, cancel, expire, ticket reads,
-  idempotent replay, read-model reload, and reconciliation on the target.
+- Migration fixtures cover copied held, confirmed, cancelled, and expired
+  state. The post-cutover probe covers create, get, replay, confirm, cancel, and
+  ticket reads.
+- The runner also creates a target-side hold, arms expiry only in the target
+  schema, waits for the shard-aware hold-expirer, and confirms `expired` through
+  the locator read. Final read-model reconciliation remains indirect.
 - Admission/cache tests cover tokens issued before cutover, draining/fenced
   submissions, retry without duplicate or lease/quota leak, availability
   generation rotation, and rejection of old cache envelopes.
-- Worker/fanout tests cover fair bounded batches, per-shard timeout, continued
-  healthy-shard progress, cancellation, deterministic aggregation, bounded
-  memory, and explicit partial status.
+- Current operator reconciliation traverses the fixed storage set serially,
+  with effective concurrency `1`, deterministic order, bounded pages/time, and
+  explicit complete, partial, or unavailable status.
 - SQL security tests prove only allowlisted identifiers are used, no input
   reaches identifiers, `search_path` cannot leak across pooled transactions,
   and retained-public guards reject old or bypassing writers after cutover.
-- Multi-replica tests use three API replicas with divergent cached generations
-  and 100 concurrent writes around cutover to prove one writer, no duplicate
-  reservation, no overlapping seat allocation, and no source write afterward.
+- The deterministic PostgreSQL suite keeps its routed-transaction/fencing test
+  and a separate 100-call full `CreateHold` barrier test. The full gate uses
+  distinct users across three stale caches and requires exactly one target
+  reservation for a one-seat fixture, no source mutation, no duplicate ID, no
+  overlap, exact per-replica refresh counts, and clean reconciliation.
+- The bounded runtime runner separately exercises three API replicas with stale
+  caches and checks target writes plus post-run integrity. These observations
+  must not be merged into a throughput or production-capacity claim.
 - Failure tests cover crashes before/after booking commit, catalog/lock/schema
   outages, copy/validation/cutover failure, worker/admin interruption, Redis and
   projection delays, and cleanup interruption without authority ambiguity,
@@ -758,10 +778,15 @@ channels, and test clocks rather than arbitrary sleeps.
   migration version.
 - Full Milestone 1–3 regression, race, static analysis, vulnerability, secret,
   filesystem/image, Compose, and multi-replica gates remain required.
-- Load tests report route/cache overhead, legacy versus schema-shard latency,
-  stale refresh, cutover interruption, copy/validation throughput, outage
-  isolation, bounded fanout, connections, relevant Redis latency,
-  reconciliation, and unexpected errors without fabricated capacity claims.
+- The bounded runner records route/cache observations, strict k6 checks,
+  request/sample/iteration counts and achieved rates, stale refresh, both
+  cutovers' generation rotation, pre-baseline read-model catch-up, exact
+  `shard_cutover` event receipts, retained-source fingerprints,
+  catalog-disabled-route behavior, serial admin fanout, aggregate migration
+  timing, reconciliation, connection samples, and Redis PING latency.
+- A sustained benchmark still requires repeated request-rate measurements,
+  per-copy-group throughput, independent warm-up, host limits, and complete
+  PostgreSQL/Redis telemetry without fabricated capacity claims.
 
 ## Acceptance Criteria
 

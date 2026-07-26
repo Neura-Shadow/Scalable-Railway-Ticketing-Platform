@@ -94,26 +94,28 @@ func (counts DatasetCounts) total() int64 {
 }
 
 type MigrationSummary struct {
-	Found                 bool          `json:"found"`
-	State                 string        `json:"state,omitempty"`
-	SourceShardID         string        `json:"source_shard_id,omitempty"`
-	TargetShardID         string        `json:"target_shard_id,omitempty"`
-	SourceGeneration      int64         `json:"source_generation,omitempty"`
-	TargetGeneration      int64         `json:"target_generation,omitempty"`
-	CopyComplete          bool          `json:"copy_complete"`
-	CopiedRows            int64         `json:"copied_rows"`
-	AuditedCopiedRows     int64         `json:"audited_copied_rows"`
-	ValidationStatus      string        `json:"validation_status,omitempty"`
-	SourceCounts          DatasetCounts `json:"source_counts"`
-	TargetCounts          DatasetCounts `json:"target_counts"`
-	QuotaClaims           int64         `json:"quota_claims"`
-	IdempotencyClaims     int64         `json:"idempotency_claims"`
-	ReservationLocators   int64         `json:"reservation_locators"`
-	TicketOrderLocators   int64         `json:"ticket_order_locators"`
-	TicketLocators        int64         `json:"ticket_locators"`
-	OutboxEvents          int64         `json:"outbox_events"`
-	MigrationsForTrainRun int64         `json:"migrations_for_train_run"`
-	GenerationWriteRows   int64         `json:"generation_write_rows"`
+	Found                 bool           `json:"found"`
+	State                 string         `json:"state,omitempty"`
+	SourceShardID         string         `json:"source_shard_id,omitempty"`
+	TargetShardID         string         `json:"target_shard_id,omitempty"`
+	SourceGeneration      int64          `json:"source_generation,omitempty"`
+	TargetGeneration      int64          `json:"target_generation,omitempty"`
+	CopyComplete          bool           `json:"copy_complete"`
+	CopiedRows            int64          `json:"copied_rows"`
+	AuditedCopiedRows     int64          `json:"audited_copied_rows"`
+	ValidationStatus      string         `json:"validation_status,omitempty"`
+	SourceCounts          DatasetCounts  `json:"source_counts"`
+	TargetCounts          DatasetCounts  `json:"target_counts"`
+	CutoverSourceCounts   *DatasetCounts `json:"cutover_source_counts,omitempty"`
+	CutoverTargetCounts   *DatasetCounts `json:"cutover_target_counts,omitempty"`
+	QuotaClaims           int64          `json:"quota_claims"`
+	IdempotencyClaims     int64          `json:"idempotency_claims"`
+	ReservationLocators   int64          `json:"reservation_locators"`
+	TicketOrderLocators   int64          `json:"ticket_order_locators"`
+	TicketLocators        int64          `json:"ticket_locators"`
+	OutboxEvents          int64          `json:"outbox_events"`
+	MigrationsForTrainRun int64          `json:"migrations_for_train_run"`
+	GenerationWriteRows   int64          `json:"generation_write_rows"`
 }
 
 type Report struct {

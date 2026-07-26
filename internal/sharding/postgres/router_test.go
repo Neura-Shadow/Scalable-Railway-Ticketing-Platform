@@ -622,6 +622,81 @@ func TestBeginTrainRunWriteRejectsStaleAssignmentBeforeFenceAccess(t *testing.T)
 	}
 }
 
+func TestBeginTrainRunWriteCancellationRollsBackAndAllowsSafeRetry(t *testing.T) {
+	trainRunID := uuid.New()
+	route := mustRoute(t, trainRunID, sharding.ShardLegacy, 1)
+	firstQuery := make(chan string, 1)
+	firstTx := &fakeTx{
+		exec: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("SET"), nil
+		},
+		queryRow: func(ctx context.Context, sql string, _ ...any) pgx.Row {
+			firstQuery <- sql
+			if !strings.Contains(sql, "public.train_run_shard_assignments") {
+				return fakeRow{err: errors.New("unexpected query before assignment authority")}
+			}
+			<-ctx.Done()
+			return fakeRow{err: ctx.Err()}
+		},
+	}
+	secondTx := fakeAuthorityTx("legacy", 1, true, "active", "stable", false, 1, true)
+	beginCount := 0
+	db := &fakeDB{beginTx: func(context.Context, pgx.TxOptions) (pgx.Tx, error) {
+		beginCount++
+		if beginCount == 1 {
+			return firstTx, nil
+		}
+		if beginCount == 2 {
+			return secondTx, nil
+		}
+		return nil, errors.New("unexpected extra BeginTx call")
+	}}
+	router, err := NewRouter(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	requestContext, cancel := context.WithCancel(context.Background())
+	firstResult := make(chan error, 1)
+	go func() {
+		transaction, beginErr := router.BeginTrainRunWrite(requestContext, route)
+		if transaction != nil {
+			_ = transaction.Rollback(context.Background())
+		}
+		firstResult <- beginErr
+	}()
+	observedQuery := <-firstQuery
+	cancel()
+	firstErr := <-firstResult
+	if !strings.Contains(observedQuery, "public.train_run_shard_assignments") {
+		t.Fatalf("canceled attempt queried %q before assignment authority", observedQuery)
+	}
+	if !errors.Is(firstErr, sharding.ErrShardUnavailable) {
+		t.Fatalf("canceled attempt error = %v, want %v", firstErr, sharding.ErrShardUnavailable)
+	}
+	if firstTx.commits != 0 || firstTx.rollbacks != 1 {
+		t.Fatalf("canceled attempt commits=%d rollbacks=%d, want 0/1", firstTx.commits, firstTx.rollbacks)
+	}
+
+	retry, err := router.BeginTrainRunWrite(context.Background(), route)
+	if err != nil {
+		t.Fatalf("retry after cancellation error = %v", err)
+	}
+	if retry.Route() != route {
+		_ = retry.Rollback(context.Background())
+		t.Fatalf("retry route = %+v, want unchanged legacy generation 1", retry.Route())
+	}
+	if err := retry.Rollback(context.Background()); err != nil {
+		t.Fatalf("rollback successful retry: %v", err)
+	}
+	if secondTx.commits != 0 || secondTx.rollbacks != 1 {
+		t.Fatalf("retry commits=%d rollbacks=%d, want 0/1", secondTx.commits, secondTx.rollbacks)
+	}
+	if beginCount != 2 {
+		t.Fatalf("BeginTx calls = %d, want exactly two bounded attempts", beginCount)
+	}
+}
+
 func TestBeginTrainRunWriteTreatsUnknownCatalogShardAsUnavailable(t *testing.T) {
 	trainRunID := uuid.New()
 	route := mustRoute(t, trainRunID, sharding.ShardZero, 7)

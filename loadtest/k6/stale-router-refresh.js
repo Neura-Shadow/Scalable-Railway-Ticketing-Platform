@@ -1,34 +1,51 @@
-import { check, sleep } from 'k6';
+import { check, fail } from 'k6';
+import { Counter } from 'k6/metrics';
 
 import {
-  bookingStatusAllowed,
   boundedOptions,
   createHold,
-  customerForVU,
-  iterationKey,
   list,
-  positiveInteger,
   required,
 } from './lib/milestone4.js';
 
+export const staleRefreshSuccess = new Counter('stale_refresh_success');
+
 export const options = boundedOptions({
-  stale_refresh: {
-    executor: 'shared-iterations',
-    vus: positiveInteger('VUS', 9),
-    iterations: positiveInteger('ITERATIONS', 36),
-    maxDuration: (__ENV.MAX_DURATION || '90s').trim(),
-  },
+  replica_1: { executor: 'per-vu-iterations', exec: 'replica1', vus: 1, iterations: 1, maxDuration: '30s' },
+  replica_2: { executor: 'per-vu-iterations', exec: 'replica2', vus: 1, iterations: 1, maxDuration: '30s' },
+  replica_3: { executor: 'per-vu-iterations', exec: 'replica3', vus: 1, iterations: 1, maxDuration: '30s' },
+}, {
+  checks: ['rate==1'],
+  stale_refresh_success: ['count==3'],
+  shard_routing_success: ['count==3'],
+  booking_success_duration: ['p(95)<2000', 'p(99)<5000'],
 });
 
-export default function () {
+function exerciseReplica(index) {
   const urls = list('API_URLS', 3).map((value) => value.replace(/\/$/, ''));
-  const url = urls[(__VU - 1) % urls.length];
-  const response = createHold(url, required('TRAIN_RUN_ID'), customerForVU(), iterationKey('m4-stale'), {
-    operation: 'stale_router_refresh',
+  const tokens = list('CUSTOMER_TOKENS', 3);
+  const passengers = list('PASSENGER_IDS', 3);
+  const response = createHold(urls[index], required('TRAIN_RUN_ID'), {
+    token: tokens[index],
+    passengerID: passengers[index],
+  }, `m4-stale-replica-${index + 1}`, {
+    operation: `stale_router_refresh_replica_${index + 1}`,
   });
-  check(response, {
-    'stale router refresh is transparent to the customer': (value) => bookingStatusAllowed(value, false),
-    'stale router refresh does not leak a rebalancing 503': (value) => value.status !== 503,
+  const passed = check(response, {
+    [`replica ${index + 1} transparently refreshes and commits on target`]: (value) => value.status === 201,
+    [`replica ${index + 1} returns a reservation identity`]: (value) => {
+      try {
+        const id = value.json('id');
+        return typeof id === 'string' && id.length > 0;
+      } catch (_) {
+        return false;
+      }
+    },
   });
-  sleep(0.1);
+  if (!passed) fail(`replica ${index + 1} stale-route refresh did not commit exactly once`);
+  staleRefreshSuccess.add(1);
 }
+
+export function replica1() { exerciseReplica(0); }
+export function replica2() { exerciseReplica(1); }
+export function replica3() { exerciseReplica(2); }

@@ -93,20 +93,21 @@ re-plan rather than accept a partial switch.
 
 In one PostgreSQL transaction, cutover:
 
-1. locks the migration, assignment, source fence, and target fence in the fixed
-   order shared with normal mutations and rollback;
-2. revalidates source generation, target health, completed copy/validation,
-   locator count, and the cutover deadline;
-3. creates and locks the target-generation write-evidence row at zero;
-4. installs the reserved target generation and enabled target fence while
+1. locks the migration, assignment, and target shard-catalog row;
+2. revalidates source generation, target write eligibility and fencing-
+   protocol compatibility, completed copy/validation, locator count, and the
+   cutover deadline;
+3. locks bounded locator rows, the source fence, and then the target fence;
+4. creates and locks the target-generation write-evidence row at zero;
+5. installs the reserved target generation and enabled target fence while
    retaining the disabled source fence;
-5. updates reservation, ticket-order, and ticket locators through their
+6. updates reservation, ticket-order, and ticket locators through their
    train-run indexes;
-6. switches the assignment to target and enters `rollback_window`;
-7. records central cutover/invalidation outbox intent; the committed assignment
+7. switches the assignment to target and enters `rollback_window`;
+8. records central cutover/invalidation outbox intent; the committed assignment
    generation immediately invalidates old availability envelopes and the
    worker rotates the disposable Redis namespace after commit; and
-8. commits all routing, fencing, locator, and invalidation effects together.
+9. commits all routing, fencing, locator, and invalidation effects together.
 
 The target accepts writes only after this commit. A stale replica remains
 unable to write because its source fence is disabled and its expected
@@ -123,10 +124,11 @@ generation, and records the outcome. No routing switch or data loss occurs.
 Cutover pre-creates a target-generation evidence row. Every successful
 non-replay target mutation locks and increments it in the same booking
 transaction. A direct post-cutover rollback is permitted only in one
-transaction that locks migration, assignment, both fences, the zero-valued
-evidence row, and the indexed bounded locator set. It installs a newer source
-generation, switches locators, enables source, disables target, and records the
-audit outcome atomically.
+transaction that locks migration, assignment, the destination shard-catalog
+row, the indexed bounded locator set, both fences, and the zero-valued evidence
+row in that order. It atomically revalidates destination protocol compatibility
+and write eligibility, installs a newer source generation, switches locators,
+enables source, disables target, and records the audit outcome.
 
 If target-write evidence is positive, direct mapping reversal is forbidden.
 Recovery requires a new reverse migration from target to source or another

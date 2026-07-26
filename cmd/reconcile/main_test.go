@@ -263,6 +263,12 @@ func TestShardScopesRejectInvalidBoundsBeforeDatabaseAccess(t *testing.T) {
 			},
 		},
 		{
+			name: "assignments timeout upper bound",
+			run: func() (resultEnvelope, error) {
+				return runShardAssignments(context.Background(), "postgres://do-not-connect", []string{"--timeout", "5m1ns"})
+			},
+		},
+		{
 			name: "locators page size",
 			run: func() (resultEnvelope, error) {
 				return runShardLocators(context.Background(), "postgres://do-not-connect", []string{"--page-size", "1001"})
@@ -288,6 +294,27 @@ func TestShardScopesRejectInvalidBoundsBeforeDatabaseAccess(t *testing.T) {
 			envelope, err := testCase.run()
 			if err == nil || envelope.Command != "" {
 				t.Fatalf("envelope=%+v error=%v, want pre-connection rejection", envelope, err)
+			}
+		})
+	}
+}
+
+func TestShardReconciliationTimeoutBounds(t *testing.T) {
+	tests := []struct {
+		name    string
+		timeout time.Duration
+		valid   bool
+	}{
+		{name: "default", timeout: defaultTimeout, valid: true},
+		{name: "maximum", timeout: maximumShardReconciliationTimeout, valid: true},
+		{name: "zero", timeout: 0, valid: false},
+		{name: "negative", timeout: -time.Nanosecond, valid: false},
+		{name: "above maximum", timeout: maximumShardReconciliationTimeout + time.Nanosecond, valid: false},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := validShardReconciliationTimeout(testCase.timeout); got != testCase.valid {
+				t.Fatalf("validShardReconciliationTimeout(%s) = %t, want %t", testCase.timeout, got, testCase.valid)
 			}
 		})
 	}

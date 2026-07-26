@@ -133,8 +133,8 @@ bounded statement timeout; cap or timeout failure rolls back the entire switch.
   requires schema-aware migrations, backups, reconciliation, legacy guards,
   and a mixed-version deployment gate.
 - Both logical shards share connections, storage engine, primary availability,
-  and physical failure domain. Logical-shard outage injection is not evidence
-  of independent PostgreSQL shard isolation.
+  and physical failure domain. The bounded harness disables a catalog route;
+  it is not schema, process, host, disk, network, or physical-shard isolation.
 - Cross-schema foreign keys, global key/locator/quota/outbox atomicity, relay
   discovery, and control-plane availability must be redesigned or coordinated
   before extracting separate databases.

@@ -148,7 +148,7 @@ Migration 8 must also install database guards on retained `public` booking table
 | waiting-room join/status | train-run/request or queue token | global policy plus Redis | shard-neutral; route only at booking use |
 | seat reconciliation | train-run ID | current assignment | exactly one current shard unless explicit migration comparison |
 | migration/admin inspection | train-run or migration ID | catalog plus explicit source/target | at most the recorded pair |
-| cross-shard admin summary | operator command | allowlisted enabled workset | bounded concurrency, per-shard/global deadlines, explicit partial result |
+| cross-shard admin summary | operator command | allowlisted enabled workset | deterministic serial traversal (effective concurrency 1), deadlines, explicit partial result |
 
 ## Worker routing map
 

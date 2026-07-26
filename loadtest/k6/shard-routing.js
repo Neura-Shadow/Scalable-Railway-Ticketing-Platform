@@ -21,6 +21,9 @@ export const options = boundedOptions({
     iterations: positiveInteger('ITERATIONS', 48),
     maxDuration: (__ENV.MAX_DURATION || '2m').trim(),
   },
+}, {
+  shard_routing_success: ['count>0'],
+  booking_success_duration: ['p(95)<2000', 'p(99)<5000'],
 });
 
 export default function () {

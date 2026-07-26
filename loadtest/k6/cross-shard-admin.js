@@ -8,6 +8,7 @@ import {
   enabled,
   list,
   partialShardResults,
+  publicErrorCode,
   recordResponse,
   required,
 } from './lib/milestone4.js';
@@ -21,7 +22,10 @@ export const options = boundedOptions({
     duration: (__ENV.DURATION || '10s').trim(),
     gracefulStop: '5s',
   },
-}, expectPartialRun ? { partial_shard_results: ['count>0'] } : {});
+}, {
+  checks: ['rate==1'],
+  ...(expectPartialRun ? { partial_shard_results: ['count>0'] } : {}),
+});
 
 export default function () {
   const url = baseURL();
@@ -38,12 +42,15 @@ export default function () {
   const expectPartial = expectPartialRun;
   const firstHealthy = responses[0].status === 200;
   const secondHealthy = responses[1].status === 200;
+  const firstUnavailable = responses[0].status === 503 && publicErrorCode(responses[0]) === 'unavailable';
+  const secondUnavailable = responses[1].status === 503 && publicErrorCode(responses[1]) === 'unavailable';
+  const exactPartial = (firstHealthy && secondUnavailable) || (secondHealthy && firstUnavailable);
   recordResponse(responses[0], { allowOutage: expectPartial });
   recordResponse(responses[1], { allowOutage: expectPartial });
-  if (firstHealthy !== secondHealthy) partialShardResults.add(1);
+  if (exactPartial) partialShardResults.add(1);
   check(responses, {
     'bounded cross-shard probe is complete or explicitly partial': () => expectPartial
-      ? firstHealthy !== secondHealthy
+      ? exactPartial
       : firstHealthy && secondHealthy,
   });
   sleep(0.1);

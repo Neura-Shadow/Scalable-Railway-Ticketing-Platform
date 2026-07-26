@@ -407,7 +407,8 @@ jobs:
           for script in \
             shard-routing.js shard-route-cache.js two-hot-train-shards.js \
             shard-cutover.js stale-router-refresh.js shard-outage-isolation.js \
-            cross-shard-admin.js legacy-vs-schema-shard.js
+            cross-shard-admin.js legacy-vs-schema-shard.js \
+            shard-route-prewarm.js shard-post-cutover-lifecycle.js
           do
             docker run --rm -v "$PWD/loadtest/k6:/scripts:ro" grafana/k6:0.54.0 \
               inspect "/scripts/$script" >/dev/null
@@ -417,19 +418,54 @@ jobs:
         run: |
           $evidence = Join-Path $env:RUNNER_TEMP 'milestone-4-evidence'
           ./scripts/run-milestone-4-multi-replica-evidence.ps1 `
-            -CustomerCount 12 `
+            -CustomerCount 20 `
             -LoadDuration 15s `
             -EvidenceDirectory $evidence
           Get-Content -Raw (Join-Path $evidence 'milestone-4-summary.json')
+      - name: Upload sanitized Milestone 4 evidence bundle
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: milestone-4-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/milestone-4-evidence
+          if-no-files-found: error
+          retention-days: 14
       - name: Print bounded shard-evidence failure diagnostics
         if: failure()
         shell: pwsh
         run: |
           $evidence = Join-Path $env:RUNNER_TEMP 'milestone-4-evidence'
+          $sanitizationPath = Join-Path $evidence 'artifact-sanitization.json'
+          $safeToPrint = $false
+          if (Test-Path -LiteralPath $sanitizationPath) {
+            try {
+              $sanitization = Get-Content -Raw -LiteralPath $sanitizationPath | ConvertFrom-Json
+              $safeToPrint = [string]$sanitization.status -eq 'passed'
+            } catch {
+              $safeToPrint = $false
+            }
+          }
+          if (-not $safeToPrint) {
+            Write-Warning 'Raw evidence diagnostics suppressed because final post-teardown sanitization did not pass.'
+            if (Test-Path -LiteralPath $evidence) {
+              Get-ChildItem -LiteralPath $evidence -File |
+                Select-Object Name, Length | Format-Table -AutoSize
+            }
+            return
+          }
           foreach ($name in @(
             'evidence-status.json', 'compose-up.log', 'shard-admin-build.log',
+            'reconcile-build.log',
             'operator-health-baseline.json', 'operator-health-partial.json',
+            'operator-health-recovered.json',
+            'admin-fanout-complete-before.json', 'admin-fanout-partial.json',
+            'admin-fanout-complete-after.json',
             'train-a-reconcile.json', 'train-b-reconcile.json',
+            'reconcile-shard-assignments.json', 'reconcile-shard-locators.json',
+            'reconcile-train-a-migration.json', 'reconcile-train-b-migration.json',
+            'reconcile-admission-state.json',
+            'reconcile-train-a-read-model.json', 'reconcile-train-b-read-model.json',
+            'reconcile-train-a-cache-versions.json', 'reconcile-train-b-cache-versions.json',
             'integrity-evidence.json', 'compose-failure-ps.log'
           )) {
             $path = Join-Path $evidence $name

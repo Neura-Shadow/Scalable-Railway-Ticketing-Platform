@@ -1,14 +1,29 @@
 # Production Deployment
 
-This guide describes a conservative single-region deployment. It does not turn Milestone 3 into a multi-region or nationally sized platform.
+This guide describes a conservative single-region deployment. It does not turn
+Milestone 4's same-cluster logical schemas into independent physical shards, a
+multi-region system, or a nationally sized platform.
 
-Deploying these artifacts adds disposable read projections/caches and a hot-train waiting-room control plane, but not payment, a complete anti-bot platform, multi-region active-active writes, national-scale capacity evidence, or real passenger identity verification. Cached availability is a hint and admission permits an attempt, not a seat.
+Deploying these artifacts adds explicit train-run routing, monotonic database
+fencing, bounded quiesced migration controls, disposable read projections/
+caches, and a hot-train waiting-room control plane. It does not add payment, a
+complete anti-bot platform, physical shard isolation, zero-downtime
+rebalancing, multi-region active-active writes, national-scale capacity
+evidence, or real passenger identity verification. Cached availability is a
+hint and admission permits an attempt, not a seat.
 
 ## Authority and topology
 
 - One regional PostgreSQL primary is authoritative for train-run status, seat occupancy, reservations, tickets, durable idempotency, and outbox rows.
+- The fixed `legacy`, `shard-0`, and `shard-1` booking storages are schemas in
+  that same database. Exactly one storage owns a train run's writes in stable
+  state; assignment generation and a local fence are checked in the mutation
+  transaction. The schemas share one physical failure domain.
 - Redis provides rate-limit state, event transport, ephemeral waiting-room/token control state, and versioned station/search/availability read caches. Cache loss degrades read performance but cannot move booking authority out of PostgreSQL.
-- The PostgreSQL journey projection is disposable and rebuildable. API, admission-worker, read-model-worker, hold-expirer, and outbox-worker processes use the same schema and documented lock ordering.
+- The PostgreSQL journey projection is disposable and rebuildable. API,
+  admission-worker, read-model-worker, hold-expirer, and outbox-worker processes
+  use the same database and the documented global/routed schema boundaries and
+  lock ordering.
 - Run migrations as an explicit release step before deploying compatible application processes. Do not run automatic schema mutation on application startup.
 
 The manifests under `deploy/kubernetes/base` are a security-conscious baseline, not a complete cloud platform. A production overlay must supply an immutable image digest, secret references, ingress/TLS, database and Redis endpoints, topology-specific network policy, resource sizing, autoscaling policy, and observability integration.
@@ -33,6 +48,11 @@ ingress, APM, trace, and error-report logs.
 
 The database migration principal should be separate from the runtime principal. The runtime principal must not own the database or create arbitrary schemas in production. Integration tests use separate ephemeral infrastructure because they require isolated schema creation.
 
+`shard-admin` should use a distinct, private, audited operator role with only
+the reviewed catalog, fence, migration, copy, validation, and cleanup grants it
+needs. It requires no JWT or admission-token keyring. Do not place database
+credentials on its command line or include them in its output.
+
 ## Configuration
 
 Set `APP_ENV=production` and validate process-owned settings:
@@ -45,6 +65,17 @@ Set `APP_ENV=production` and validate process-owned settings:
 - Redis Streams outbox-worker: the log-worker settings plus only its Redis publisher address/credential;
 - trusted proxy CIDRs and explicit CORS origins; and
 - request, dependency, and shutdown timeouts.
+
+Milestone 4 additionally validates the fixed logical shard IDs, booking mode,
+bounded route cache, and routed query timeout. Worker traversal is a serial,
+fail-isolated pass over at most the configured subset of the three fixed
+storages. Migration operation duration, copy size, and retained-source duration
+are bounded per `shard-admin` invocation by `--timeout`, `--batch-size`, and
+`plan-migration --rollback-window`; they are not application runtime settings.
+`BOOKING_SHARD_MODE` defaults to `legacy`. Production `schema_poc` mode also requires
+`BOOKING_SHARD_SCHEMA_POC_PRODUCTION_ENABLED=true`; that acknowledgement does
+not replace Migration 8, writer-version drain, reconciliation, or operator
+approval. Never configure schema names where logical shard IDs are expected.
 
 Production configuration validation rejects the committed local Compose database password, the development JWT default, and universal trusted-proxy CIDRs. Terminate TLS at a trusted ingress/load balancer, use TLS to managed dependencies where supported, replace the baseline loopback-only proxy trust with only the exact ingress addresses or narrow topology-specific CIDRs, and keep CORS disabled unless explicit origins are required.
 
@@ -67,6 +98,15 @@ An enabled production outbox worker must use `OUTBOX_PUBLISHER=redis_stream` by 
 13. Run sanitized read, hot/non-hot booking, cache-loss, and source-fallback smokes plus seat, quota, admission, read-model, and cache-version reconciliation.
 14. Observe cache/fallback/projection lag, queue/inflight bounds, lock waits, connections, outbox backlog, DLQ, and worker failures through rollback.
 
+For Milestone 4, keep the general release in `legacy` mode while applying and
+validating Migration 8. Drain every incompatible pre-fencing writer, deploy
+generation-aware binaries, and prove the legacy path before explicitly opting
+into `schema_poc`. Move selected synthetic or approved train runs only through
+the private bounded workflow in
+[Migration 8 production rollout](migrations/migration-8-production-rollout.md).
+Each move has its own maintenance window, backup/reconciliation evidence,
+bounded zero-writer interval, source-retention window, and rollback decision.
+
 The release artifact contains the detect-only `reconcile` binary. Run the
 following checks with a read-only operational PostgreSQL role where the query
 contract permits it and with exact network access to the authoritative Redis
@@ -78,6 +118,9 @@ reconcile reservation-quotas
 reconcile admission-state
 reconcile read-model
 reconcile cache-versions
+reconcile shard-assignments
+reconcile shard-locators
+reconcile shard-migration --migration-id <canonical-uuid>
 ```
 
 Each command emits a bounded JSON summary and exits non-zero on a detected
@@ -116,10 +159,23 @@ reconciliation gate in [the release checklist](release-checklist.md).
 Do not down-migrate automatically: version 6 down deletes durable policy outbox
 events because the older constraints cannot represent them.
 
+Migration 8 expands the database with two fixed schema-isolated booking
+storages, explicit legacy assignments/fences, catalog and migration control,
+global resource locators/claims, and retained-public guards. It does not move
+bookings automatically. Its down migration is blocked unless every run is
+stable on `legacy`, all migrations are terminal, and both logical schemas are
+empty. Follow the dedicated runbook; do not use a down migration as the first
+incident response.
+
 ## Health and rollout behavior
 
 - The API `/livez` is process-only and must not depend on PostgreSQL or Redis.
 - The API `/readyz` uses short checks for PostgreSQL, Redis, migrations, and required configuration without exposing credentials.
+- In schema mode, API readiness also requires catalog/control access, Migration
+  8, a valid fixed topology, and a compatible fencing-protocol version.
+  Catalog loss makes the API unready. One optional logical storage may leave
+  the API ready but explicitly degraded while requests assigned there fail
+  boundedly; this is logical degradation, not physical isolation.
 - Each worker exposes a private `WORKER_HTTP_ADDRESS` (default `:9090`) with process-only `/livez`, dependency/config `/readyz`, and its own `/metrics`. Admission-worker readiness checks PostgreSQL, Redis, migrations, and its process-owned keyring/config; queue backlog does not fail readiness. Hold-expirer `/readyz` checks PostgreSQL; a Redis Streams outbox-worker checks both PostgreSQL and Redis; a log outbox-worker checks PostgreSQL only. Each pass is bounded by `WORKER_PASS_TIMEOUT`.
 - Outbox backlog, pending consumer work, or a dead-letter item is alertable but is not by itself a readiness failure.
 - The source stream is intentionally not blind-`MAXLEN` trimmed. Alert on
@@ -150,6 +206,15 @@ Never use Redis `KEYS` in production. Read-cache request paths use only exact
 generation/data keys; bounded operator reconciliation reads only known version
 keys. Never treat a cache hit as proof that a seat can be sold.
 
+Never treat route-cache or Redis state as a shard assignment. Every booking
+mutation must lock and validate the public assignment and selected storage
+fence in PostgreSQL. The routed transaction uses only fixed transaction-local
+paths: `pg_catalog, public, pg_temp` for legacy,
+`pg_catalog, booking_shard_0, public, pg_temp` for `shard-0`, and
+`pg_catalog, booking_shard_1, public, pg_temp` for `shard-1`. Keeping
+`pg_catalog` first and `pg_temp` explicit and last prevents temporary-object
+shadowing.
+
 ## Monitoring and alerts
 
 At minimum monitor:
@@ -165,6 +230,10 @@ At minimum monitor:
 - read-model events/duplicates/rebuild duration/rows/lag/reconciliation and cache hit/miss/fill/invalidation/fallback metrics;
 - worker loop success/failure and last successful pass; and
 - reconciliation failures as correctness incidents.
+- shard route/cache/refresh results, stale/fence rejections, logical-storage
+  unavailability, bounded fanout/partial results, migration phase/duration/copy
+  counts, validation failures, cutover/rollback results, and shard
+  reconciliation mismatches.
 
 Do not use user, passenger, reservation, ticket, train-run, seat, event, idempotency key, station input, or raw path values as metric labels.
 
@@ -173,6 +242,14 @@ Do not use user, passenger, reservation, ticket, train-run, seat, event, idempot
 Application rollback is safe only while the migrated schema remains compatible with the previous image. Do not automatically migrate down during an incident: a down migration may destroy data needed by the current or previous binary.
 
 If reconciliation fails, stop new reservation writes for the affected train run, preserve database evidence, identify the transaction/invariant failure, and repair only through a reviewed operator procedure. Redis cache deletion is not an inventory repair.
+
+For a train run in migration, preserve source authority until atomic cutover
+commits. Before cutover, a failed copy or validation remains resumable and the
+partial target is unroutable. After cutover, direct rollback is allowed only
+when target-generation write evidence is still zero under the same locks; any
+successful target mutation requires a full reverse migration with a newer
+generation. Source cleanup is never automatic and cannot run before the
+rollback window expires and current authority is revalidated.
 
 If Redis is unavailable, keep browsing fallbacks bounded, fail authentication
 and passenger-profile creation closed, and fail enabled hot-run admission
@@ -184,4 +261,8 @@ reservation writes must fail; do not queue speculative bookings elsewhere.
 
 ## Capacity statement
 
-No sustained Milestone 3 benchmark is recorded in the repository. Replica counts in local Compose and baseline resource requests are evidence fixtures, not a capacity claim. Production sizing requires [Milestone 3 load testing](milestone-3-load-testing.md) and a completed [benchmark report](benchmark-report-milestone-3.md).
+No accepted Milestone 4 runtime benchmark is recorded in the repository.
+Replica counts, fixed schemas, local Compose, and baseline resource requests
+are evidence fixtures, not capacity or physical-shard claims. Production
+sizing requires [Milestone 4 load testing](milestone-4-load-testing.md) and a
+completed [benchmark report](benchmark-report-milestone-4.md).

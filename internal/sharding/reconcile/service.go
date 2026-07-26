@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"time"
 
@@ -283,6 +284,7 @@ func (service *service) Assignments(ctx context.Context, limits Limits) (Report,
 		return finishReport(report, work, true, false)
 	}
 	catalogByID := make(map[string]catalogObservation, len(catalog))
+	failedStorage := make(map[fixedStorage]bool)
 	var catalogViolations int64
 	for _, row := range catalog {
 		storage, valid := parseStorage(row.ShardID)
@@ -295,6 +297,13 @@ func (service *service) Assignments(ctx context.Context, limits Limits) (Report,
 			continue
 		}
 		catalogByID[row.ShardID] = row
+		if !row.Enabled {
+			index := slices.Index(fixedStorages[:], storage)
+			if index >= 0 {
+				markShardFailure(&report.Shards[index], "catalog_disabled")
+				failedStorage[storage] = true
+			}
+		}
 	}
 	for _, storage := range fixedStorages {
 		if _, exists := catalogByID[storage.shardID()]; !exists {
@@ -303,7 +312,6 @@ func (service *service) Assignments(ctx context.Context, limits Limits) (Report,
 	}
 	report.addCheck("fixed_catalog", int64(len(fixedStorages)), 0, catalogViolations)
 
-	failedStorage := make(map[fixedStorage]bool)
 	after := uuid.Nil
 	for {
 		pageSize := work.pageSize()
@@ -325,16 +333,13 @@ func (service *service) Assignments(ctx context.Context, limits Limits) (Report,
 			ids = append(ids, assignment.TrainRunID)
 		}
 		fences := make(map[fixedStorage]map[uuid.UUID]fenceObservation, len(fixedStorages))
-		completeFencePage := true
 		for index, storage := range fixedStorages {
 			if failedStorage[storage] {
-				completeFencePage = false
 				continue
 			}
 			if !work.canQuery() {
 				markShardFailure(&report.Shards[index], "limit_reached")
 				failedStorage[storage] = true
-				completeFencePage = false
 				continue
 			}
 			rows, fenceErr := service.source.Fences(ctx, storage, ids)
@@ -342,13 +347,11 @@ func (service *service) Assignments(ctx context.Context, limits Limits) (Report,
 			if fenceErr != nil {
 				markShardFailure(&report.Shards[index], failureCategory(fenceErr))
 				failedStorage[storage] = true
-				completeFencePage = false
 				continue
 			}
 			if !work.addRows(int64(len(rows))) {
 				markShardFailure(&report.Shards[index], "row_limit")
 				failedStorage[storage] = true
-				completeFencePage = false
 				continue
 			}
 			report.Shards[index].Rows += int64(len(rows))
@@ -359,7 +362,7 @@ func (service *service) Assignments(ctx context.Context, limits Limits) (Report,
 			fences[storage] = byRun
 		}
 		for _, assignment := range assignments {
-			service.checkAssignment(&report, assignment, catalogByID, fences, completeFencePage)
+			service.checkAssignment(&report, assignment, catalogByID, fences, failedStorage)
 		}
 		after = assignments[len(assignments)-1].TrainRunID
 		if !more {
@@ -375,7 +378,7 @@ func (service *service) checkAssignment(
 	assignment assignmentObservation,
 	catalog map[string]catalogObservation,
 	fences map[fixedStorage]map[uuid.UUID]fenceObservation,
-	completeFencePage bool,
+	failedStorage map[fixedStorage]bool,
 ) {
 	missing := int64(0)
 	if !assignment.AssignmentPresent {
@@ -410,10 +413,7 @@ func (service *service) checkAssignment(
 		stateViolation = 1
 	}
 	report.addCheck("assignment_state", 1, 0, stateViolation)
-	if !completeFencePage {
-		return
-	}
-
+	assignedStorage, assignedStorageValid := parseStorage(assignment.ShardID)
 	writers := int64(0)
 	activeFenceViolation := int64(0)
 	for storage, byRun := range fences {
@@ -433,11 +433,37 @@ func (service *service) checkAssignment(
 		expectedWriters = 0
 	}
 	writerViolation := int64(0)
-	if writers != expectedWriters || (writers == 1 && (!catalogRow.WriteEnabled || !assignment.CatalogWriteEnabled)) {
-		writerViolation = 1
+	completeFencePage := len(failedStorage) == 0
+	if completeFencePage {
+		if writers != expectedWriters || (writers == 1 && (!catalogRow.WriteEnabled || !assignment.CatalogWriteEnabled)) {
+			writerViolation = 1
+		}
+	} else {
+		assignedStorageAvailable := assignedStorageValid && !failedStorage[assignedStorage]
+		assignedFence, assignedFenceExists := fences[assignedStorage][assignment.TrainRunID]
+		if assignedStorageAvailable {
+			assignedWriterExpected := expectedWriters == 1 && catalogRow.WriteEnabled && assignment.CatalogWriteEnabled
+			assignedWriterObserved := assignedFenceExists && assignedFence.Enabled &&
+				assignedFence.Generation == assignment.Generation
+			if assignedWriterObserved != assignedWriterExpected {
+				writerViolation = 1
+			}
+		}
+		for storage, byRun := range fences {
+			if storage == assignedStorage {
+				continue
+			}
+			if fence, exists := byRun[assignment.TrainRunID]; exists && fence.Enabled {
+				writerViolation = 1
+			}
+		}
 	}
 	report.addCheck("active_fence_generation", 1, 0, activeFenceViolation)
-	report.addCheck("exact_writer_count", 1, writers, writerViolation)
+	writerCheckName := "exact_writer_count"
+	if !completeFencePage {
+		writerCheckName = "available_writer_consistency"
+	}
+	report.addCheck(writerCheckName, 1, writers, writerViolation)
 	bothWritable := int64(0)
 	if writers > 1 {
 		bothWritable = 1
@@ -674,7 +700,8 @@ func (service *service) Migration(
 	report.addCheck("migration_copy_counts", 1, 0, counterViolation)
 	assignmentViolation := validateMigrationAssignment(record)
 	report.addCheck("migration_assignment", 1, 0, assignmentViolation)
-	validationViolation := validateLastValidation(record)
+	validationEvidence, validValidation := validatedMigrationEvidence(record)
+	validationViolation := validateLastValidation(record, validValidation)
 	report.addCheck("migration_validation", 1, 0, validationViolation)
 
 	failedStorage := make(map[fixedStorage]bool)
@@ -714,16 +741,41 @@ func (service *service) Migration(
 	}
 	if sourceValid && targetValid && sourceStorage != targetStorage &&
 		!failedStorage[sourceStorage] && !failedStorage[targetStorage] {
-		countsViolation := int64(0)
-		if requiresEqualCopy(record.State, record.CopyComplete) && summary.SourceCounts != summary.TargetCounts {
-			countsViolation = 1
+		if usesCutoverValidationEvidence(record.State) {
+			if validValidation {
+				cutoverSourceCounts := validationEvidence.sourceCounts
+				cutoverTargetCounts := validationEvidence.targetCounts
+				summary.CutoverSourceCounts = &cutoverSourceCounts
+				summary.CutoverTargetCounts = &cutoverTargetCounts
+				report.addCheck("cutover_validation_exact_copy", validationEvidence.tables,
+					validationEvidence.targetRows, 0)
+				auditViolation := int64(0)
+				if record.auditedRows() != validationEvidence.targetRows {
+					auditViolation = 1
+				}
+				report.addCheck("migration_audit_vs_cutover_counts", validationEvidence.tables,
+					validationEvidence.targetRows, auditViolation)
+				if record.State == "rollback_window" {
+					retainedSourceViolation := int64(0)
+					if summary.SourceCounts != validationEvidence.sourceCounts {
+						retainedSourceViolation = 1
+					}
+					report.addCheck("rollback_source_retained_counts", validationEvidence.tables,
+						summary.SourceCounts.total(), retainedSourceViolation)
+				}
+			}
+		} else {
+			countsViolation := int64(0)
+			if requiresEqualCopy(record.State, record.CopyComplete) && summary.SourceCounts != summary.TargetCounts {
+				countsViolation = 1
+			}
+			report.addCheck("source_target_dataset_counts", 6, 0, countsViolation)
+			auditViolation := int64(0)
+			if record.CopyComplete && record.auditedRows() != summary.TargetCounts.total() {
+				auditViolation = 1
+			}
+			report.addCheck("migration_audit_vs_target_counts", 6, 0, auditViolation)
 		}
-		report.addCheck("source_target_dataset_counts", 6, 0, countsViolation)
-		auditViolation := int64(0)
-		if record.CopyComplete && record.auditedRows() != summary.TargetCounts.total() {
-			auditViolation = 1
-		}
-		report.addCheck("migration_audit_vs_target_counts", 6, 0, auditViolation)
 	}
 
 	remaining := work.limits.MaxRows - work.rows
@@ -756,7 +808,12 @@ func (service *service) Migration(
 				report.addCheck("outbox_provenance", central.OutboxEvents, 0, central.OutboxProvenanceViolations)
 				report.addCheck("migration_cardinality", central.MigrationsForTrainRun, central.ActiveMigrations,
 					boolViolation(central.ActiveMigrations > 1))
-				report.addCheck("generation_write_evidence", central.GenerationWriteRows, 0, central.GenerationWriteViolations)
+				generationWriteViolations := central.GenerationWriteViolations
+				if usesCutoverValidationEvidence(record.State) && central.GenerationWriteRows == 0 {
+					generationWriteViolations++
+				}
+				report.addCheck("generation_write_evidence", central.GenerationWriteRows, 0,
+					generationWriteViolations)
 			}
 		}
 	}
@@ -865,8 +922,15 @@ func validateMigrationAssignment(record migrationObservation) int64 {
 	if !record.AssignmentPresent || record.AssignmentGeneration <= 0 {
 		return 1
 	}
-	terminal := record.State == "completed" || record.State == "failed" || record.State == "rolled_back"
-	if terminal {
+	if record.State == "completed" {
+		if record.ActiveMigrationID != nil || record.AssignmentState != "stable" ||
+			record.AssignmentShardID != record.TargetShardID ||
+			record.AssignmentGeneration != record.TargetGeneration {
+			return 1
+		}
+		return 0
+	}
+	if record.State == "failed" || record.State == "rolled_back" {
 		if record.ActiveMigrationID != nil || record.AssignmentState != "stable" {
 			return 1
 		}
@@ -897,7 +961,14 @@ func validateMigrationAssignment(record migrationObservation) int64 {
 	return 0
 }
 
-func validateLastValidation(record migrationObservation) int64 {
+type migrationValidationEvidence struct {
+	sourceCounts DatasetCounts
+	targetCounts DatasetCounts
+	targetRows   int64
+	tables       int64
+}
+
+func validateLastValidation(record migrationObservation, validPassedValidation bool) int64 {
 	if record.ValidationStatus != "passed" {
 		if record.State == "cutover_ready" || record.State == "cutting_over" ||
 			record.State == "rollback_window" || record.State == "completed" {
@@ -905,12 +976,80 @@ func validateLastValidation(record migrationObservation) int64 {
 		}
 		return 0
 	}
+	return boolViolation(!validPassedValidation)
+}
+
+func validatedMigrationEvidence(record migrationObservation) (migrationValidationEvidence, bool) {
+	if record.ValidationStatus != "passed" {
+		return migrationValidationEvidence{}, false
+	}
 	var outcome control.ValidationOutcome
 	if len(record.LastValidation) == 0 || json.Unmarshal(record.LastValidation, &outcome) != nil ||
 		!outcome.Passed || outcome.Snapshot.Truncated {
-		return 1
+		return migrationValidationEvidence{}, false
 	}
-	return 0
+	snapshot := outcome.Snapshot
+	if snapshot.RowsExamined < 0 || snapshot.InvariantViolations != 0 ||
+		snapshot.MissingReservationLocators != 0 || snapshot.MissingTicketOrderLocators != 0 ||
+		snapshot.MissingTicketLocators != 0 {
+		return migrationValidationEvidence{}, false
+	}
+	sourceCounts, sourceTables, sourceRows, sourceValid := validatedDigest(snapshot.Source)
+	targetCounts, targetTables, targetRows, targetValid := validatedDigest(snapshot.Target)
+	if !sourceValid || !targetValid || sourceRows > math.MaxInt64-targetRows ||
+		snapshot.RowsExamined != sourceRows+targetRows {
+		return migrationValidationEvidence{}, false
+	}
+	for name, sourceTable := range sourceTables {
+		if targetTable, exists := targetTables[name]; !exists || targetTable != sourceTable {
+			return migrationValidationEvidence{}, false
+		}
+	}
+	return migrationValidationEvidence{
+		sourceCounts: sourceCounts,
+		targetCounts: targetCounts,
+		targetRows:   targetRows,
+		tables:       int64(len(sourceTables)),
+	}, true
+}
+
+func validatedDigest(
+	digest control.DatasetDigest,
+) (DatasetCounts, map[string]control.TableDigest, int64, bool) {
+	const expectedTables = 6
+	if len(digest.Tables) != expectedTables {
+		return DatasetCounts{}, nil, 0, false
+	}
+	counts := DatasetCounts{}
+	tables := make(map[string]control.TableDigest, expectedTables)
+	var total int64
+	for _, table := range digest.Tables {
+		if table.Rows < 0 || table.Rows > math.MaxInt64-total || table.Checksum == "" {
+			return DatasetCounts{}, nil, 0, false
+		}
+		if _, duplicate := tables[table.Name]; duplicate {
+			return DatasetCounts{}, nil, 0, false
+		}
+		switch table.Name {
+		case "seat_inventory":
+			counts.Inventory = table.Rows
+		case "reservations":
+			counts.Reservations = table.Rows
+		case "reservation_seats":
+			counts.ReservationSeats = table.Rows
+		case "ticket_orders":
+			counts.TicketOrders = table.Rows
+		case "tickets":
+			counts.Tickets = table.Rows
+		case "idempotency_records":
+			counts.IdempotencyRecords = table.Rows
+		default:
+			return DatasetCounts{}, nil, 0, false
+		}
+		tables[table.Name] = table
+		total += table.Rows
+	}
+	return counts, tables, total, true
 }
 
 func knownMigrationState(state string) bool {
@@ -933,6 +1072,10 @@ func requiresEqualCopy(state string, copyComplete bool) bool {
 	default:
 		return false
 	}
+}
+
+func usesCutoverValidationEvidence(state string) bool {
+	return state == "rollback_window" || state == "completed"
 }
 
 func stateAtOrAfterCutover(state string) bool {

@@ -18,6 +18,9 @@ export const options = boundedOptions({
     duration: (__ENV.DURATION || '15s').trim(),
     gracefulStop: '5s',
   },
+}, {
+  shard_routing_success: ['count>0'],
+  booking_success_duration: ['p(95)<2000', 'p(99)<5000'],
 });
 
 let observedID = '';

@@ -206,9 +206,9 @@ INSERT INTO public.outbox_events (
     aggregate_type, aggregate_id, event_type, payload,
     train_run_id, shard_id, assignment_generation
 ) VALUES (
-    'train_run', $1, 'trainrun.updated',
-    jsonb_build_object('trainRunId', $1::text, 'reason', $2::text),
-    $1, $3, $4
+    'train_run', $1::uuid, 'trainrun.updated',
+    jsonb_build_object('trainRunId', $1::uuid::text, 'reason', $2::text),
+    $1::uuid, $3, $4
 )`, next.TrainRunID(), reason, next.ShardID().String(), next.Generation().Int64())
 	if err != nil || commandTag.RowsAffected() != 1 {
 		return ErrPersistence

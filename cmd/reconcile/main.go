@@ -25,9 +25,10 @@ import (
 )
 
 const (
-	defaultTimeout      = 30 * time.Second
-	defaultPageSize     = 100
-	defaultMaximumPages = 10_000
+	defaultTimeout                    = 30 * time.Second
+	maximumShardReconciliationTimeout = 5 * time.Minute
+	defaultPageSize                   = 100
+	defaultMaximumPages               = 10_000
 )
 
 var errReconciliationViolations = errors.New("reconciliation violations detected")
@@ -55,6 +56,10 @@ type admissionStateResult struct {
 	DisabledPolicies                int64 `json:"disabled_policies"`
 	LiveRedisGenerations            int64 `json:"live_redis_generations"`
 	PreviousOrDisabledGenerations   int64 `json:"previous_or_disabled_generations"`
+}
+
+func validShardReconciliationTimeout(timeout time.Duration) bool {
+	return timeout > 0 && timeout <= maximumShardReconciliationTimeout
 }
 
 func (result admissionStateResult) violations() int64 {
@@ -160,7 +165,7 @@ func runShardAssignments(
 	timeout := flags.Duration("timeout", defaultTimeout, "maximum reconciliation duration")
 	limits := shardreconcile.Limits{}
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 ||
-		*timeout <= 0 {
+		!validShardReconciliationTimeout(*timeout) {
 		return resultEnvelope{}, errors.New(
 			"usage: reconcile shard-assignments [--page-size 100] [--max-pages 10000] [--max-rows 100000] [--timeout 30s]",
 		)
@@ -188,7 +193,7 @@ func runShardLocators(
 	maximumRows := flags.Int64("max-rows", shardreconcile.DefaultMaxRows, "maximum examined rows")
 	timeout := flags.Duration("timeout", defaultTimeout, "maximum reconciliation duration")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 ||
-		*timeout <= 0 {
+		!validShardReconciliationTimeout(*timeout) {
 		return resultEnvelope{}, errors.New(
 			"usage: reconcile shard-locators [--train-run-id UUID] [bounded flags] [--timeout 30s]",
 		)
@@ -224,7 +229,7 @@ func runShardMigration(
 	maximumRows := flags.Int64("max-rows", shardreconcile.DefaultMaxRows, "maximum examined rows")
 	timeout := flags.Duration("timeout", defaultTimeout, "maximum reconciliation duration")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 ||
-		*timeout <= 0 {
+		!validShardReconciliationTimeout(*timeout) {
 		return resultEnvelope{}, errors.New(
 			"usage: reconcile shard-migration --migration-id UUID [bounded flags] [--timeout 30s]",
 		)

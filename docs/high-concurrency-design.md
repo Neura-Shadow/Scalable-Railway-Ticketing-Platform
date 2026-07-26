@@ -108,3 +108,66 @@ multiple worker replicas idempotent; pending claims, attempts, impact size, and
 DLQ length are bounded. These mechanisms are correctness and amplification
 bounds, not sustained capacity evidence. No accepted Milestone 3 benchmark is
 recorded.
+
+## Milestone 4 routed-write concurrency
+
+Milestone 4 adds an outer serialization boundary without changing the VARBIT
+allocation predicate. Before any idempotency completion, quota transition,
+inventory mutation, locator write, or central outbox append, a routed booking
+transaction locks the public train-run assignment and the selected storage's
+local fence. It verifies the fixed shard ID, positive expected generation,
+catalog write policy, migration state, and enabled matching fence under those
+locks.
+
+An ownership operation uses this global order:
+
+1. migration/control row;
+2. train-run assignment;
+3. destination shard-catalog row, including atomic write-eligibility and
+   fencing-protocol compatibility revalidation;
+4. bounded locator rows in fixed table and primary-key order;
+5. current-owner fence, then destination fence in the shared fixed role order;
+6. target-generation write-evidence row when applicable.
+
+A normal booking transaction instead locks assignment, the active local fence,
+global idempotency-key/per-user quota serialization, and then the established
+train-run, passenger, reservation, and inventory rows. It never locks migration
+or locator control rows or an inactive fence. Customer writes therefore cannot
+create a reverse cycle with cutover or rollback.
+
+Normal mutations hold assignment and fence locks through commit. Quiescence
+takes the same locks and disables the source, so it waits for preceding writers
+through PostgreSQL serialization instead of sleep-based observation. A stable
+state has one writer; the bounded copy/cutover interval may have zero writers;
+no valid state has two.
+
+A stale replica may refresh once and retry once after
+`shard_assignment_stale`. It never probes multiple storages. Cutover creates a
+zero-valued target-generation evidence row, and every successful non-replay
+target mutation increments it in the same transaction. Direct rollback locks
+that row together with assignment and both fences; a racing first target write
+either commits evidence first and blocks rollback or observes the newer fenced
+route and fails.
+
+Required deterministic evidence extends the earlier suite with:
+
+1. three replicas caching an old generation while cutover commits;
+2. 100 concurrent routed-transaction/fencing attempts reject stale authority;
+3. a separate full-booking barrier drives 100 concurrent `CreateHold` commands
+   from distinct users through that assignment change, requires 100 stale-route
+   refreshes, exactly one target reservation for one seat, no cross-storage
+   duplicate or overlap, and no source booking mutation;
+4. source/target fences never simultaneously enabled;
+5. commit and rollback of routed transactions never leak `search_path` through
+   the pool;
+6. copy failure and retry preserve one source authority and an unroutable
+   partial target;
+7. locator cap/timeout or cutover failure exposes no partial switch;
+8. direct rollback racing the first target mutation preserves committed state;
+   and
+9. logical-shard worker failure does not starve bounded healthy work.
+
+The added assignment/fence locks and routing queries have measurable overhead,
+and quiesced cutover has a measurable retryable interruption. Both remain
+pending until controlled Milestone 4 runtime evidence is accepted. Logical
+schema results are not physical-shard or production-capacity evidence.
