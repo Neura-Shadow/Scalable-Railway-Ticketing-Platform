@@ -1007,7 +1007,7 @@ SELECT service_date::text FROM public.train_runs WHERE id='$fixtureTrainA'::uuid
     $stationPrewarm = Invoke-API -Method GET -Path '/api/v1/stations?page=1&limit=100&sort=code'
     $searchPrewarm = Invoke-API -Method GET -Path (
         "/api/v1/train-runs/search?origin_station_code=$origin&destination_station_code=$destination" +
-        "&service_date=$($serviceDate.Trim())&page=1&limit=100&sort=departure_at"
+        "&service_date=$($serviceDate.Trim())&seat_class=standard&page=1&limit=100&sort=departure_at"
     )
     if ($stationPrewarm.StatusCode -ne 200 -or $searchPrewarm.StatusCode -ne 200) {
         throw 'global station or train-search cache prewarm failed'

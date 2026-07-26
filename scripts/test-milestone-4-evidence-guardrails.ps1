@@ -369,6 +369,7 @@ try {
         "'api-1', 'api-2', 'api-3'",
         "'admission-worker-1', 'admission-worker-2'",
         "'read-model-worker-1', 'read-model-worker-2', 'hold-expirer', 'outbox-worker'",
+        '&service_date=$($serviceDate.Trim())&seat_class=standard&page=1&limit=100&sort=departure_at',
         'operation="write",shard_id="legacy"',
         'operation="refresh",result="success",shard_id="shard-0"',
         'operation="write",result="success",reason="none",shard_id="shard-0"',
