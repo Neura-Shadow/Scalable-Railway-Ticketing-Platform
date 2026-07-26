@@ -1007,7 +1007,7 @@ SELECT service_date::text FROM public.train_runs WHERE id='$fixtureTrainA'::uuid
     $stationPrewarm = Invoke-API -Method GET -Path '/api/v1/stations?page=1&limit=100&sort=code'
     $searchPrewarm = Invoke-API -Method GET -Path (
         "/api/v1/train-runs/search?origin_station_code=$origin&destination_station_code=$destination" +
-        "&service_date=$($serviceDate.Trim())&seat_class=standard&page=1&limit=100&sort=departure_at"
+        "&service_date=$($serviceDate.Trim())&seat_class=$seatClass&page=1&limit=100&sort=departure_at"
     )
     if ($stationPrewarm.StatusCode -ne 200 -or $searchPrewarm.StatusCode -ne 200) {
         throw 'global station or train-search cache prewarm failed'
@@ -1110,11 +1110,21 @@ SELECT service_date::text FROM public.train_runs WHERE id='$fixtureTrainA'::uuid
         }
     }
     $expiryIDs = ($expiredReservations.ID | ForEach-Object { "'$($_)'::uuid" }) -join ','
-    Invoke-PSQL -Artifact 'migration-fixture-expiry-arm.log' -SQL @"
-UPDATE public.reservations
-SET expires_at = clock_timestamp() - interval '1 minute'
-WHERE id IN ($expiryIDs);
-"@ | Out-Null
+    $fixtureExpiryArm = Invoke-PSQL -Artifact 'migration-fixture-expiry-arm.log' -SQL @"
+WITH armed AS (
+    UPDATE public.reservations AS reservation
+    SET expires_at = GREATEST(reservation.created_at + interval '1 second', clock_timestamp() + interval '1 second')
+    WHERE reservation.id IN ($expiryIDs)
+    RETURNING reservation.id
+)
+SELECT count(*) FROM armed;
+"@
+    $fixtureExpiryArmCount = [string](@($fixtureExpiryArm.Output | Where-Object {
+        ([string]$_).Trim() -match '^[0-9]+$'
+    }) | Select-Object -Last 1)
+    if ($fixtureExpiryArm.ExitCode -ne 0 -or $fixtureExpiryArmCount.Trim() -ne '2') {
+        throw 'deterministic migration expiry fixtures were not armed exactly once'
+    }
     foreach ($expired in $expiredReservations) {
         Wait-ReservationStatus -ReservationID $expired.ID -Token $expired.Token -ExpectedStatus 'expired'
     }
@@ -1310,11 +1320,23 @@ WHERE id IN ($expiryIDs);
         -not [guid]::TryParse($postCutoverExpiryID, [ref]$parsedPostCutoverExpiryID)) {
         throw 'post-cutover expiration fixture creation failed'
     }
-    Invoke-PSQL -Artifact 'post-cutover-expiry-arm.log' -SQL @"
-UPDATE booking_shard_0.reservations
-SET expires_at=clock_timestamp() - interval '1 minute'
-WHERE id='$postCutoverExpiryID'::uuid AND train_run_id='$fixtureTrainA'::uuid AND status='held';
-"@ | Out-Null
+    $postCutoverExpiryArm = Invoke-PSQL -Artifact 'post-cutover-expiry-arm.log' -SQL @"
+WITH armed AS (
+    UPDATE booking_shard_0.reservations AS reservation
+    SET expires_at = GREATEST(reservation.created_at + interval '1 second', clock_timestamp() + interval '1 second')
+    WHERE reservation.id='$postCutoverExpiryID'::uuid
+      AND reservation.train_run_id='$fixtureTrainA'::uuid
+      AND reservation.status='held'
+    RETURNING reservation.id
+)
+SELECT count(*) FROM armed;
+"@
+    $postCutoverExpiryArmCount = [string](@($postCutoverExpiryArm.Output | Where-Object {
+        ([string]$_).Trim() -match '^[0-9]+$'
+    }) | Select-Object -Last 1)
+    if ($postCutoverExpiryArm.ExitCode -ne 0 -or $postCutoverExpiryArmCount.Trim() -ne '1') {
+        throw 'post-cutover expiration fixture was not armed exactly once'
+    }
     Wait-ReservationStatus -ReservationID $postCutoverExpiryID `
         -Token $postCutoverExpiryCustomer.Token -ExpectedStatus 'expired'
     $fixtureLifecycleEvidence['post_cutover'] = [ordered]@{

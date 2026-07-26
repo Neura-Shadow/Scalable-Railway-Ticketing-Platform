@@ -369,7 +369,10 @@ try {
         "'api-1', 'api-2', 'api-3'",
         "'admission-worker-1', 'admission-worker-2'",
         "'read-model-worker-1', 'read-model-worker-2', 'hold-expirer', 'outbox-worker'",
-        '&service_date=$($serviceDate.Trim())&seat_class=standard&page=1&limit=100&sort=departure_at',
+        '&service_date=$($serviceDate.Trim())&seat_class=$seatClass&page=1&limit=100&sort=departure_at',
+        "GREATEST(reservation.created_at + interval '1 second', clock_timestamp() + interval '1 second')",
+        "`$fixtureExpiryArmCount.Trim() -ne '2'",
+        "`$postCutoverExpiryArmCount.Trim() -ne '1'",
         'operation="write",shard_id="legacy"',
         'operation="refresh",result="success",shard_id="shard-0"',
         'operation="write",result="success",reason="none",shard_id="shard-0"',
@@ -399,7 +402,9 @@ try {
         }
     }
     foreach ($forbiddenRunnerContract in @(
-        '$staleAfter', '$staleBefore', "-Name 'cross-shard-healthy'", "-Name 'cross-shard-partial'"
+        '$staleAfter', '$staleBefore', "-Name 'cross-shard-healthy'", "-Name 'cross-shard-partial'",
+        "SET expires_at = clock_timestamp() - interval '1 minute'",
+        "SET expires_at=clock_timestamp() - interval '1 minute'"
     )) {
         if ($runner.Contains($forbiddenRunnerContract)) {
             throw "runner retained a stale or misleading evidence contract: $forbiddenRunnerContract"
