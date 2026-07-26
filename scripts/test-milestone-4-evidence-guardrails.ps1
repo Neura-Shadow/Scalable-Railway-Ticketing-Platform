@@ -373,6 +373,7 @@ try {
         "GREATEST(reservation.created_at + interval '1 second', clock_timestamp() + interval '1 second')",
         "`$fixtureExpiryArmCount.Trim() -ne '2'",
         "`$postCutoverExpiryArmCount.Trim() -ne '1'",
+        '$prewarmCustomer = $overlapCustomers[$index]',
         'operation="write",shard_id="legacy"',
         'operation="refresh",result="success",shard_id="shard-0"',
         'operation="write",result="success",reason="none",shard_id="shard-0"',
@@ -403,6 +404,7 @@ try {
     }
     foreach ($forbiddenRunnerContract in @(
         '$staleAfter', '$staleBefore', "-Name 'cross-shard-healthy'", "-Name 'cross-shard-partial'",
+        '$prewarmCustomer = $staleCustomers[$index]',
         "SET expires_at = clock_timestamp() - interval '1 minute'",
         "SET expires_at=clock_timestamp() - interval '1 minute'"
     )) {

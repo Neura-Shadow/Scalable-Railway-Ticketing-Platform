@@ -1185,7 +1185,11 @@ SELECT count(*) FROM armed;
     $apis = @('api-1', 'api-2', 'api-3')
     for ($index = 0; $index -lt $apis.Count; $index++) {
         $api = $apis[$index]
-        $prewarmCustomer = $staleCustomers[$index]
+        # Prewarm with identities that are used later on the other train run.
+        # Reusing the stale-refresh passengers here would leave active holds on
+        # train A and turn the post-cutover fencing probe into a passenger-level
+        # allocation conflict before the stale route can be exercised.
+        $prewarmCustomer = $overlapCustomers[$index]
         $prewarmEnvironment = $commonK6.Clone()
         $prewarmEnvironment['BASE_URL'] = "http://${api}:8080"
         $prewarmEnvironment['CUSTOMER_TOKENS'] = $prewarmCustomer.Token
