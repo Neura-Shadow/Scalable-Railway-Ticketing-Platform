@@ -277,15 +277,18 @@ jobs:
       - name: Verify clean migration version
         run: go run ./cmd/migrate -path migrations version
       - name: Run integration and constraint tests
-        run: go test ./... -count=1 -timeout 420s
+        # Migration 8 owns fixed public schemas/catalog rows in this one CI
+        # database. Serialize package binaries while preserving each package's
+        # internal concurrency and race probes.
+        run: go test -p 1 ./... -count=1 -timeout 420s
       - name: Run focused admission, token, quota, and concurrency tests
-        run: go test ./internal/admission/... ./internal/booking/postgres ./internal/app -count=3 -timeout 300s
+        run: go test -p 1 ./internal/admission/... ./internal/booking/postgres ./internal/app -count=3 -timeout 300s
       - name: Run focused projection, cache, fallback, and reconciliation tests repeatedly
-        run: go test ./internal/query/cache ./internal/query/readmodel ./internal/query/postgres ./internal/app -count=3 -timeout 420s
+        run: go test -p 1 ./internal/query/cache ./internal/query/readmodel ./internal/query/postgres ./internal/app -count=3 -timeout 420s
       - name: Run focused shard routing, fencing, migration, locator, and reconciliation tests repeatedly
-        run: go test ./internal/sharding/... ./internal/booking/postgres ./cmd/shard-admin ./cmd/reconcile -count=3 -timeout 420s
+        run: go test -p 1 ./internal/sharding/... ./internal/booking/postgres ./cmd/shard-admin ./cmd/reconcile -count=3 -timeout 420s
       - name: Run race-enabled persistence and concurrency tests
-        run: go test -race ./internal/accounts/postgres ./internal/admission/... ./internal/booking/postgres ./internal/offering/postgres ./internal/eventrelay/postgres ./internal/query/cache ./internal/query/readmodel ./internal/query/postgres -count=1 -timeout 540s
+        run: go test -p 1 -race ./internal/accounts/postgres ./internal/admission/... ./internal/booking/postgres ./internal/offering/postgres ./internal/eventrelay/postgres ./internal/query/cache ./internal/query/readmodel ./internal/query/postgres -count=1 -timeout 540s
 
   multi-replica-evidence:
     name: Multi-replica admission evidence
