@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/domain"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -34,6 +35,7 @@ var (
 type Store struct {
 	pool                   *pgxpool.Pool
 	reservationQuotaLimits ReservationQuotaLimits
+	shards                 bookingShardRouter
 }
 
 func New(pool *pgxpool.Pool) *Store {
@@ -53,7 +55,9 @@ func isRetryableTransactionError(err error) bool {
 }
 
 type Tx struct {
-	tx pgx.Tx
+	tx     pgx.Tx
+	route  sharding.ShardRoute
+	routed bookingRoutedTx
 }
 
 func (s *Store) Begin(ctx context.Context) (*Tx, error) {
@@ -71,6 +75,9 @@ func (tx *Tx) Commit(ctx context.Context) error {
 	if tx == nil || tx.tx == nil {
 		return ErrInvalidArgument
 	}
+	if tx.routed != nil {
+		return tx.routed.Commit(ctx)
+	}
 	if err := tx.tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit booking transaction: %w", err)
 	}
@@ -81,6 +88,9 @@ func (tx *Tx) Rollback(ctx context.Context) error {
 	if tx == nil || tx.tx == nil {
 		return ErrInvalidArgument
 	}
+	if tx.routed != nil {
+		return tx.routed.Rollback(ctx)
+	}
 	err := tx.tx.Rollback(ctx)
 	if err != nil && !errors.Is(err, pgx.ErrTxClosed) {
 		return fmt.Errorf("rollback booking transaction: %w", err)
@@ -89,7 +99,15 @@ func (tx *Tx) Rollback(ctx context.Context) error {
 }
 
 func (s *Store) InitializeInventory(ctx context.Context, trainRunID uuid.UUID) (int64, error) {
-	tx, err := s.Begin(ctx)
+	var (
+		tx  *Tx
+		err error
+	)
+	if s != nil && s.shards != nil {
+		tx, err = s.beginTrainRunWrite(ctx, trainRunID)
+	} else {
+		tx, err = s.Begin(ctx)
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -98,6 +116,11 @@ func (s *Store) InitializeInventory(ctx context.Context, trainRunID uuid.UUID) (
 	inserted, err := tx.InitializeInventory(ctx, trainRunID)
 	if err != nil {
 		return 0, err
+	}
+	if inserted > 0 {
+		if err := tx.recordSuccessfulGenerationWrite(ctx); err != nil {
+			return 0, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err

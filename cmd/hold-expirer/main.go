@@ -17,9 +17,14 @@ import (
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
 	platformmetrics "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/metrics"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/workerhttp"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
+	shardingpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/postgres"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/routecache"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 )
+
+const holdExpirerSchemaVersion = 8
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -43,7 +48,9 @@ func main() {
 		logger.Error("hold expirer metrics initialization failed")
 		os.Exit(1)
 	}
-	healthServer, err := workerhttp.New(cfg.WorkerHTTPAddress, registry, pool.Ping, cfg.DatabaseTimeout)
+	healthServer, err := workerhttp.New(
+		cfg.WorkerHTTPAddress, registry, holdExpirerReadiness(pool, cfg), cfg.DatabaseTimeout,
+	)
 	if err != nil {
 		logger.Error("hold expirer health server invalid")
 		os.Exit(1)
@@ -56,7 +63,39 @@ func main() {
 	serverErrors := make(chan error, 1)
 	go func() { serverErrors <- healthServer.Serve(listener) }()
 	defer shutdownWorkerHTTP(healthServer, cfg.ShutdownTimeout)
-	expirer, err := application.NewHoldExpirer(bookingpostgres.New(pool), clock.RealClock{}, metrics, cfg.HoldExpirerBatchSize)
+	bookingStore := bookingpostgres.New(pool)
+	if cfg.BookingShardMode == config.BookingShardModeSchemaPOC {
+		allowedShards, parseErr := sharding.ParseShardIDs(cfg.BookingShardIDs)
+		if parseErr != nil {
+			logger.Error("hold expirer shard allowlist initialization failed")
+			os.Exit(1)
+		}
+		cache, cacheErr := routecache.New(routecache.Config{
+			Enabled: cfg.BookingRouteCacheEnabled, TTL: cfg.BookingRouteCacheTTL,
+			MaxEntries: cfg.BookingRouteCacheMaxEntries,
+		})
+		if cacheErr != nil {
+			logger.Error("hold expirer route cache initialization failed")
+			os.Exit(1)
+		}
+		router, routerErr := shardingpostgres.NewRouter(
+			pool,
+			cache,
+			shardingpostgres.WithMetrics(metrics),
+			shardingpostgres.WithQueryTimeout(cfg.BookingShardQueryTimeout),
+			shardingpostgres.WithAllowedShards(allowedShards...),
+		)
+		if routerErr != nil {
+			logger.Error("hold expirer shard router initialization failed")
+			os.Exit(1)
+		}
+		bookingStore, err = bookingpostgres.NewSharded(pool, router)
+		if err != nil {
+			logger.Error("hold expirer sharded store initialization failed")
+			os.Exit(1)
+		}
+	}
+	expirer, err := application.NewHoldExpirer(bookingStore, clock.RealClock{}, metrics, cfg.HoldExpirerBatchSize)
 	if err != nil {
 		logger.Error("hold expirer initialization failed")
 		os.Exit(1)
@@ -94,6 +133,41 @@ func main() {
 		case <-ticker.C():
 			run()
 		}
+	}
+}
+
+func holdExpirerReadiness(pool *pgxpool.Pool, cfg config.Config) workerhttp.ReadinessCheck {
+	return func(ctx context.Context) error {
+		if pool == nil || cfg.ValidateFor(config.ProcessHoldExpirer) != nil {
+			return errors.New("hold expirer dependency unavailable")
+		}
+		if err := pool.Ping(ctx); err != nil {
+			return errors.New("hold expirer dependency unavailable")
+		}
+		var version int
+		var dirty bool
+		if err := pool.QueryRow(ctx, `SELECT version, dirty FROM schema_migrations LIMIT 1`).Scan(
+			&version, &dirty,
+		); err != nil || version != holdExpirerSchemaVersion || dirty {
+			return errors.New("hold expirer migration unavailable")
+		}
+		if cfg.BookingShardMode == config.BookingShardModeSchemaPOC {
+			var serving int
+			var incompatible int
+			if err := pool.QueryRow(ctx, `
+SELECT
+    count(*) FILTER (WHERE enabled AND state IN ('active', 'draining')),
+    count(*) FILTER (WHERE enabled AND state IN ('active', 'draining')
+        AND minimum_fencing_protocol_version > $1)
+FROM public.booking_shards
+WHERE shard_id IN ('legacy', 'shard-0', 'shard-1')`, sharding.SupportedFencingProtocolVersion).Scan(
+				&serving,
+				&incompatible,
+			); err != nil || serving < 1 || incompatible != 0 {
+				return errors.New("hold expirer shard catalog unavailable")
+			}
+		}
+		return nil
 	}
 }
 

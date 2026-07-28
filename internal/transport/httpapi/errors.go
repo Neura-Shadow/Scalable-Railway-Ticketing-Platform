@@ -11,20 +11,21 @@ import (
 // Application-facing sentinel errors may be wrapped by injected ports. The
 // transport maps them to a fixed public contract and never serializes err.
 var (
-	ErrInvalidInput             = errors.New("invalid input")
-	ErrUnauthenticated          = errors.New("unauthenticated")
-	ErrForbidden                = errors.New("forbidden")
-	ErrNotFound                 = errors.New("not found")
-	ErrConflict                 = errors.New("conflict")
-	ErrTooManyRequests          = errors.New("too many requests")
-	ErrUnavailable              = errors.New("unavailable")
-	ErrAdmissionRequired        = errors.New("admission required")
-	ErrAdmissionInvalid         = errors.New("admission invalid")
-	ErrAdmissionExpired         = errors.New("admission expired")
-	ErrAdmissionInProgress      = errors.New("admission in progress")
-	ErrQueueFull                = errors.New("waiting room full")
-	ErrReservationQuotaExceeded = errors.New("reservation quota exceeded")
-	ErrReservationBackpressure  = errors.New("reservation backpressure")
+	ErrInvalidInput                  = errors.New("invalid input")
+	ErrUnauthenticated               = errors.New("unauthenticated")
+	ErrForbidden                     = errors.New("forbidden")
+	ErrNotFound                      = errors.New("not found")
+	ErrConflict                      = errors.New("conflict")
+	ErrTooManyRequests               = errors.New("too many requests")
+	ErrUnavailable                   = errors.New("unavailable")
+	ErrAdmissionRequired             = errors.New("admission required")
+	ErrAdmissionInvalid              = errors.New("admission invalid")
+	ErrAdmissionExpired              = errors.New("admission expired")
+	ErrAdmissionInProgress           = errors.New("admission in progress")
+	ErrQueueFull                     = errors.New("waiting room full")
+	ErrReservationQuotaExceeded      = errors.New("reservation quota exceeded")
+	ErrReservationBackpressure       = errors.New("reservation backpressure")
+	ErrServiceTemporarilyRebalancing = errors.New("service temporarily rebalancing")
 )
 
 type retryAfterError struct {
@@ -100,6 +101,8 @@ func classifyError(err error) (int, string, string) {
 		return http.StatusTooManyRequests, "rate_limited", "too many requests"
 	case errors.Is(err, ErrUnavailable):
 		return http.StatusServiceUnavailable, "unavailable", "service is temporarily unavailable"
+	case errors.Is(err, ErrServiceTemporarilyRebalancing):
+		return http.StatusServiceUnavailable, "service_temporarily_rebalancing", "booking is temporarily rebalancing"
 	case errors.Is(err, ErrReservationBackpressure):
 		return http.StatusServiceUnavailable, "reservation_backpressure", "reservation capacity is temporarily full"
 	default:

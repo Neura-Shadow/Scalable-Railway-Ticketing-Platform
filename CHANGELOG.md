@@ -1,10 +1,28 @@
 # Changelog
 
-All notable changes to this project will be documented in this file. The project has not published a Milestone 3 release or version tag.
+All notable changes to this project will be documented in this file. The project has not published a Milestone 4 release or version tag.
 
 ## Unreleased
 
 ### Added
+
+- Milestone 4 fixed `legacy`, `shard-0`, and `shard-1` booking storages inside
+  one PostgreSQL database, with explicit train-run assignments, monotonic
+  writer generations, database fences, and retained-public guards.
+- Global reservation/order/ticket locators, bounded route caching, same-
+  transaction cross-shard quota/idempotency integrity, and a central outbox
+  that preserve existing booking atomicity without Redis routing authority.
+- Durable bounded train-run migration, deterministic resumable copy,
+  validation, quiesced atomic cutover, retained-source rollback window,
+  target-write evidence, reverse-migration rules, and detect-only shard
+  reconciliation.
+- Private bounded shard administration, shard-aware lifecycle work, explicit
+  partial-result policy, Migration 8 rollout guidance, bounded measurement and
+  failure scenarios, prewarm/lifecycle probes, and an evidence-pending report.
+
+- The historically named `cross-shard-admin.js` is a customer cross-route batch
+  read. Admin fanout is the private serial reconciliation CLI, with effective
+  concurrency `1` and explicit complete/partial/recovered results.
 
 - Milestone 3 disposable PostgreSQL journey projection with atomic per-run rebuild, durable event receipts, current-state event handling, bounded backfill, lag inspection, and detect-only reconciliation.
 - Versioned station, normalized train-search, and short-lived availability-hint Redis caches with CSPRNG generations, TTL jitter, exact-key invalidation, local singleflight, PostgreSQL fallback, and multi-replica sharing.
@@ -28,6 +46,17 @@ All notable changes to this project will be documented in this file. The project
 
 ### Security
 
+- Fixed shard-to-schema mappings and transaction-local `search_path` prevent
+  public, Redis, configuration, or corrupted metadata from introducing an SQL
+  identifier; database fencing rejects stale routes inside the mutation
+  transaction.
+- Public errors and telemetry hide topology, generations, migration IDs, SQL,
+  DSNs, identifiers, and PII. Destructive migration/rollback/cleanup remains a
+  private explicitly confirmed operator workflow.
+- Source and target are never dual writable. A successful target mutation is
+  recorded durably and forbids a direct mapping rollback that could discard
+  committed state.
+
 - Read caches remain outside booking interfaces; stale availability cannot bypass PostgreSQL segment-overlap, status, admission, quota, or idempotency checks.
 - Cache generations and query hashes are bounded, version loss creates a fresh random namespace, production paths never enumerate cache keys, and cache/event payloads are excluded from logs and labels.
 - Read-model workers receive PostgreSQL/Redis settings only, admin rebuilds default to dry-run, and reconciliation remains detect-only.
@@ -42,6 +71,15 @@ All notable changes to this project will be documented in this file. The project
 - Runtime containers run non-root with a read-only root filesystem, dropped capabilities, and no privilege escalation in the deployment baseline.
 
 ### Known limitations
+
+- Milestone 4 uses logical schemas in one PostgreSQL cluster and does not prove
+  independent physical shard failure isolation, distributed transactions,
+  zero-downtime rebalancing, or production capacity.
+- Quiesced cutover may reject selected train-run writes, retained source data
+  amplifies disk/backup scope, and post-cutover target writes require a reverse
+  migration rather than a simple rollback.
+- Milestone 4 load and benchmark evidence remains pending until controlled
+  runtime results and complete reconciliation are accepted.
 
 - Admission permits an attempt and does not guarantee a seat. Redis AOF does not guarantee queue continuity, token delivery is at-most-once, and account-level quota does not prevent Sybil identities.
 - Projection/cache state can lag or disappear; availability is hint-only and cold generations can amplify PostgreSQL read load across replicas.

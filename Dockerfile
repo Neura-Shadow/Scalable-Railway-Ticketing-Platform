@@ -18,6 +18,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/outbox-worker ./cmd/outbox-worker && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/read-model-worker ./cmd/read-model-worker && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/read-model-admin ./cmd/read-model-admin && \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/shard-admin ./cmd/shard-admin && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/reconcile ./cmd/reconcile && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/migrate ./cmd/migrate
 
@@ -31,6 +32,7 @@ COPY --from=build --chown=railway:railway /out/hold-expirer /usr/local/bin/hold-
 COPY --from=build --chown=railway:railway /out/outbox-worker /usr/local/bin/outbox-worker
 COPY --from=build --chown=railway:railway /out/read-model-worker /usr/local/bin/read-model-worker
 COPY --from=build --chown=railway:railway /out/read-model-admin /usr/local/bin/read-model-admin
+COPY --from=build --chown=railway:railway /out/shard-admin /usr/local/bin/shard-admin
 COPY --from=build --chown=railway:railway /out/reconcile /usr/local/bin/reconcile
 
 USER railway:railway
@@ -75,5 +77,8 @@ ENTRYPOINT ["/usr/local/bin/reconcile"]
 
 FROM runtime AS read-model-admin
 ENTRYPOINT ["/usr/local/bin/read-model-admin"]
+
+FROM runtime AS shard-admin
+ENTRYPOINT ["/usr/local/bin/shard-admin"]
 
 FROM api AS final

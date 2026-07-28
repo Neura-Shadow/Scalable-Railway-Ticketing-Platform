@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	admissionredis "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/admission/redis"
 	bookingpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/postgres"
 	querypostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/postgres"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/transport/httpapi"
 	"github.com/google/uuid"
 )
@@ -309,6 +311,337 @@ func (f *countingReservationCommandsFake) calls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.createCalls
+}
+
+type rebalancingReservationCommandsFake struct {
+	mu               sync.Mutex
+	result           bookingpostgres.CreateHoldResult
+	rejection        error
+	targetServing    bool
+	committed        bool
+	createAttempts   int
+	committedCreates int
+	firstInput       bookingpostgres.CreateHoldParams
+}
+
+func (f *rebalancingReservationCommandsFake) CreateHold(
+	_ context.Context,
+	input bookingpostgres.CreateHoldParams,
+) (bookingpostgres.CreateHoldResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createAttempts++
+	if f.createAttempts == 1 {
+		f.firstInput = input
+	} else if !sameCreateHoldIdentity(f.firstInput, input) {
+		return bookingpostgres.CreateHoldResult{}, bookingpostgres.ErrIdempotencyConflict
+	}
+	if !f.targetServing {
+		return bookingpostgres.CreateHoldResult{}, f.rejection
+	}
+	if !f.committed {
+		f.committed = true
+		f.committedCreates++
+	}
+	return f.result, nil
+}
+
+func (f *rebalancingReservationCommandsFake) LookupCompletedCreateHold(
+	_ context.Context,
+	lookup bookingpostgres.CompletedCreateHoldLookupParams,
+) (bookingpostgres.CreateHoldResult, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.createAttempts > 0 && !sameCompletedCreateHoldIdentity(f.firstInput, lookup) {
+		return bookingpostgres.CreateHoldResult{}, false, bookingpostgres.ErrIdempotencyConflict
+	}
+	if !f.committed {
+		return bookingpostgres.CreateHoldResult{}, false, nil
+	}
+	result := f.result
+	result.Replayed = true
+	return result, true, nil
+}
+
+func (*rebalancingReservationCommandsFake) ConfirmReservation(
+	context.Context,
+	bookingpostgres.ReservationCommandParams,
+) (bookingpostgres.ConfirmReservationResult, error) {
+	return bookingpostgres.ConfirmReservationResult{}, nil
+}
+
+func (*rebalancingReservationCommandsFake) CancelReservation(
+	context.Context,
+	bookingpostgres.ReservationCommandParams,
+) (bookingpostgres.CancelReservationResult, error) {
+	return bookingpostgres.CancelReservationResult{}, nil
+}
+
+func (f *rebalancingReservationCommandsFake) activateTarget() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.targetServing = true
+}
+
+func (f *rebalancingReservationCommandsFake) counts() (attempts, committed int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.createAttempts, f.committedCreates
+}
+
+func sameCreateHoldIdentity(first, next bookingpostgres.CreateHoldParams) bool {
+	return first.UserID == next.UserID &&
+		first.TrainRunID == next.TrainRunID &&
+		bytes.Equal(first.IdempotencyKeyHash, next.IdempotencyKeyHash) &&
+		bytes.Equal(first.RequestFingerprint, next.RequestFingerprint)
+}
+
+func sameCompletedCreateHoldIdentity(
+	created bookingpostgres.CreateHoldParams,
+	lookup bookingpostgres.CompletedCreateHoldLookupParams,
+) bool {
+	return created.UserID == lookup.UserID &&
+		created.TrainRunID == lookup.TrainRunID &&
+		bytes.Equal(created.IdempotencyKeyHash, lookup.IdempotencyKeyHash) &&
+		bytes.Equal(created.RequestFingerprint, lookup.RequestFingerprint)
+}
+
+type admissionLeaseState string
+
+const (
+	admissionLeaseAvailable admissionLeaseState = "available"
+	admissionLeaseAcquired  admissionLeaseState = "acquired"
+	admissionLeaseConsumed  admissionLeaseState = "consumed"
+)
+
+type rebalancingAdmissionFake struct {
+	mu                    sync.Mutex
+	state                 admissionLeaseState
+	generation            int64
+	inflight              int
+	inspectCalls          int
+	acquireCalls          int
+	releaseCalls          int
+	finalizeCalls         int
+	permanentReleaseCalls int
+	tokenHash             [sha256.Size]byte
+	currentAcquire        admissionredis.AcquireRequest
+}
+
+func (f *rebalancingAdmissionFake) InspectToken(
+	_ context.Context,
+	_ admissionredis.PolicyScope,
+	tokenHash [sha256.Size]byte,
+) (admissiondomain.TokenDeliveryFields, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.inspectCalls++
+	if f.inspectCalls == 1 {
+		f.tokenHash = tokenHash
+	} else if f.tokenHash != tokenHash {
+		return admissiondomain.TokenDeliveryFields{}, admissionredis.ErrTokenMismatch
+	}
+	return admissiondomain.TokenDeliveryFields{}, nil
+}
+
+func (f *rebalancingAdmissionFake) Acquire(
+	_ context.Context,
+	request admissionredis.AcquireRequest,
+) (admissionredis.AcquireResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.acquireCalls++
+	if uuid.Validate(request.LeaseOwner) != nil || request.TokenHash != f.tokenHash {
+		return admissionredis.AcquireResult{}, admissionredis.ErrInvalidInput
+	}
+	if f.acquireCalls > 1 && !sameAdmissionAcquireBinding(f.currentAcquire, request) {
+		return admissionredis.AcquireResult{}, admissionredis.ErrTokenMismatch
+	}
+	if f.state != admissionLeaseAvailable {
+		return admissionredis.AcquireResult{}, errors.New("test admission token is not reusable")
+	}
+	f.state = admissionLeaseAcquired
+	f.generation++
+	f.currentAcquire = request
+	return admissionredis.AcquireResult{
+		Decision:        admissiondomain.DecisionAcquired,
+		LeaseOwner:      request.LeaseOwner,
+		LeaseGeneration: f.generation,
+	}, nil
+}
+
+func (f *rebalancingAdmissionFake) Release(
+	_ context.Context,
+	mutation admissionredis.LeaseMutation,
+	permanent bool,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.releaseCalls++
+	if f.state != admissionLeaseAcquired {
+		return errors.New("test admission lease was not acquired")
+	}
+	if !sameAdmissionLeaseMutation(f.currentAcquire, f.generation, mutation) {
+		return admissionredis.ErrTokenMismatch
+	}
+	if f.inflight != 1 {
+		return errors.New("test admission inflight is inconsistent")
+	}
+	if permanent {
+		f.inflight--
+		f.permanentReleaseCalls++
+		f.state = admissionLeaseConsumed
+		return nil
+	}
+	f.state = admissionLeaseAvailable
+	return nil
+}
+
+func (f *rebalancingAdmissionFake) Finalize(
+	_ context.Context,
+	mutation admissionredis.LeaseMutation,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.finalizeCalls++
+	if f.state != admissionLeaseAcquired {
+		return errors.New("test admission lease was not acquired")
+	}
+	if !sameAdmissionLeaseMutation(f.currentAcquire, f.generation, mutation) {
+		return admissionredis.ErrTokenMismatch
+	}
+	if f.inflight != 1 {
+		return errors.New("test admission inflight is inconsistent")
+	}
+	f.inflight--
+	f.state = admissionLeaseConsumed
+	return nil
+}
+
+func sameAdmissionAcquireBinding(first, next admissionredis.AcquireRequest) bool {
+	return first.Scope == next.Scope &&
+		first.TokenHash == next.TokenHash &&
+		first.OwnerHash == next.OwnerHash &&
+		first.AdmissionFingerprint == next.AdmissionFingerprint &&
+		first.BookingFingerprint == next.BookingFingerprint &&
+		first.IdempotencyKeyHash == next.IdempotencyKeyHash &&
+		first.FromStopIndex == next.FromStopIndex &&
+		first.ToStopIndex == next.ToStopIndex &&
+		first.PassengerCount == next.PassengerCount &&
+		first.ProcessingLease == next.ProcessingLease
+}
+
+func sameAdmissionLeaseMutation(
+	acquire admissionredis.AcquireRequest,
+	generation int64,
+	mutation admissionredis.LeaseMutation,
+) bool {
+	return acquire.Scope == mutation.Scope &&
+		acquire.TokenHash == mutation.TokenHash &&
+		acquire.OwnerHash == mutation.OwnerHash &&
+		acquire.BookingFingerprint == mutation.BookingFingerprint &&
+		acquire.IdempotencyKeyHash == mutation.IdempotencyKeyHash &&
+		acquire.LeaseOwner == mutation.LeaseOwner &&
+		generation == mutation.LeaseGeneration
+}
+
+func (f *rebalancingAdmissionFake) snapshot() (
+	state admissionLeaseState,
+	inflight, inspect, acquire, release, finalize, permanent int,
+) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.state, f.inflight, f.inspectCalls, f.acquireCalls, f.releaseCalls, f.finalizeCalls, f.permanentReleaseCalls
+}
+
+func TestHotReservationRebalancingRetryReleasesTokenAndInflightThenCreatesOnce(t *testing.T) {
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name      string
+		rejection error
+	}{
+		{name: "assignment stale", rejection: sharding.ErrAssignmentStale},
+		{name: "write fenced", rejection: sharding.ErrWriteFenced},
+		{name: "train run migrating", rejection: sharding.ErrTrainRunMigrating},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			policy := testHotTrainPolicy(t)
+			command := protectedReservationCommand(policy)
+			command.AdmissionToken = "same-rebalancing-token"
+			reservationID := uuid.New()
+			commands := &rebalancingReservationCommandsFake{
+				result:    bookingpostgres.CreateHoldResult{ReservationID: reservationID},
+				rejection: test.rejection,
+			}
+			admission := &rebalancingAdmissionFake{state: admissionLeaseAvailable, inflight: 1}
+			slots, err := NewExecutionSlots(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			service := NewAdmissionProtectedReservationService(
+				commands, commands,
+				&journeyResolverFake{journey: querypostgres.Journey{FromStopIndex: 0, ToStopIndex: 2}},
+				&reservationReaderFake{detail: ReservationDetail{ID: reservationID.String(), Status: "held"}},
+				&reservationPolicyFake{policy: policy}, admission, &admissionVerifierFake{},
+				slots, fixedClock{now}, time.Minute, 6,
+			)
+
+			if _, err := service.CreateHold(context.Background(), command); !errors.Is(err, httpapi.ErrServiceTemporarilyRebalancing) {
+				t.Fatalf("pre-cutover rejection = %v, want %v", err, httpapi.ErrServiceTemporarilyRebalancing)
+			} else if err == httpapi.ErrServiceTemporarilyRebalancing {
+				t.Fatal("pre-cutover rejection omitted its bounded Retry-After wrapper")
+			}
+			attempts, committed := commands.counts()
+			state, admissionInflight, inspect, acquire, release, finalize, permanent := admission.snapshot()
+			if attempts != 1 || committed != 0 {
+				t.Fatalf("pre-cutover creates = attempts:%d committed:%d, want 1/0", attempts, committed)
+			}
+			if state != admissionLeaseAvailable || admissionInflight != 1 || inspect != 1 || acquire != 1 || release != 1 || finalize != 0 || permanent != 0 {
+				t.Fatalf("pre-cutover token = state:%s inflight:%d inspect:%d acquire:%d release:%d finalize:%d permanent:%d",
+					state, admissionInflight, inspect, acquire, release, finalize, permanent)
+			}
+			if inflight := slots.Inflight(); inflight != 0 {
+				t.Fatalf("pre-cutover inflight = %d, want 0", inflight)
+			}
+
+			commands.activateTarget()
+			created, err := service.CreateHold(context.Background(), command)
+			if err != nil || created.ID != reservationID.String() {
+				t.Fatalf("post-cutover retry = (%+v, %v)", created, err)
+			}
+			attempts, committed = commands.counts()
+			state, admissionInflight, inspect, acquire, release, finalize, permanent = admission.snapshot()
+			if attempts != 2 || committed != 1 {
+				t.Fatalf("post-cutover creates = attempts:%d committed:%d, want 2/1", attempts, committed)
+			}
+			if state != admissionLeaseConsumed || admissionInflight != 0 || inspect != 2 || acquire != 2 || release != 1 || finalize != 1 || permanent != 0 {
+				t.Fatalf("post-cutover token = state:%s inflight:%d inspect:%d acquire:%d release:%d finalize:%d permanent:%d",
+					state, admissionInflight, inspect, acquire, release, finalize, permanent)
+			}
+			if inflight := slots.Inflight(); inflight != 0 {
+				t.Fatalf("post-cutover inflight = %d, want 0", inflight)
+			}
+
+			replayed, err := service.CreateHold(context.Background(), command)
+			if err != nil || replayed.ID != reservationID.String() {
+				t.Fatalf("durable replay = (%+v, %v)", replayed, err)
+			}
+			attempts, committed = commands.counts()
+			state, admissionInflight, inspect, acquire, release, finalize, permanent = admission.snapshot()
+			if attempts != 2 || committed != 1 {
+				t.Fatalf("durable replay creates = attempts:%d committed:%d, want 2/1", attempts, committed)
+			}
+			if state != admissionLeaseConsumed || admissionInflight != 0 || inspect != 2 || acquire != 2 || release != 1 || finalize != 1 || permanent != 0 {
+				t.Fatalf("durable replay token = state:%s inflight:%d inspect:%d acquire:%d release:%d finalize:%d permanent:%d",
+					state, admissionInflight, inspect, acquire, release, finalize, permanent)
+			}
+			if inflight := slots.Inflight(); inflight != 0 {
+				t.Fatalf("durable replay inflight = %d, want 0", inflight)
+			}
+		})
+	}
 }
 
 func TestConcurrentSameAdmissionTokenAndIdempotencyConvergeOnDurableReplay(t *testing.T) {

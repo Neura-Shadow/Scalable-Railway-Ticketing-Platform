@@ -25,6 +25,8 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+const outboxSchemaVersion = 8
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	cfg, err := config.LoadFor(config.ProcessOutboxWorker)
@@ -49,7 +51,23 @@ func main() {
 
 	var eventPublisher application.Publisher
 	var redisClient *redis.Client
-	readiness := workerhttp.ReadinessCheck(pool.Ping)
+	databaseReadiness := func(checkContext context.Context) error {
+		if pool == nil || cfg.ValidateFor(config.ProcessOutboxWorker) != nil {
+			return errors.New("worker dependency unavailable")
+		}
+		if err := pool.Ping(checkContext); err != nil {
+			return errors.New("worker dependency unavailable")
+		}
+		var version int
+		var dirty bool
+		if err := pool.QueryRow(checkContext, `SELECT version, dirty FROM schema_migrations LIMIT 1`).Scan(
+			&version, &dirty,
+		); err != nil || version != outboxSchemaVersion || dirty {
+			return errors.New("worker migration unavailable")
+		}
+		return nil
+	}
+	readiness := workerhttp.ReadinessCheck(databaseReadiness)
 	if cfg.OutboxPublisherEnabled {
 		switch cfg.OutboxPublisher {
 		case "redis_stream":
@@ -70,7 +88,7 @@ func main() {
 				os.Exit(1)
 			}
 			eventPublisher, err = publisher.NewRedisStream(redisClient, "railway:outbox:v1")
-			readiness = allReady(pool.Ping, redisReady)
+			readiness = allReady(databaseReadiness, redisReady)
 		case "log":
 			if cfg.Environment == config.EnvironmentProduction {
 				logger.Warn("production log publisher override enabled", "category", "production_log_publisher_override")

@@ -2,25 +2,26 @@
 
 ## Executive summary
 
-Milestone 3 adds public cacheable read paths and an event-maintained PostgreSQL
-projection to the existing Milestone 2 admission system. Its highest new risks
-are cache-key or namespace manipulation, cold-cache amplification against the
-PostgreSQL primary, stale availability accidentally crossing into booking
-authority, duplicate/out-of-order event corruption, exposed rebuild tooling,
-and identifier leakage through cache metrics or logs. PostgreSQL remains the
-only inventory and durable-booking authority; Redis compromise can poison or
-deny read hints and admission but must never allocate a seat. Existing
-admission-token, Sybil, quota, Redis continuity, and supply-chain risks remain.
+Milestone 4 adds fixed schema-isolated logical booking shards, explicit routing,
+monotonic PostgreSQL fencing, resource locators, and privileged migration/
+rollback operations to the Milestone 3 system. Its highest new risks are stale-
+writer split brain, schema-identifier or temporary-object shadowing, locator
+tampering, unsafe cutover/rollback/cleanup, and unbounded administrative
+fanout. PostgreSQL remains the only inventory and durable-booking authority;
+Redis and route caches cannot authorize a write. Existing admission, cache,
+projection, Sybil, quota, continuity, and supply-chain risks remain. The full
+Milestone 4 analysis is in
+[the focused threat model](security/Scalable-Railway-Ticketing-Platform-threat-model.md).
 
 ## Scope and assumptions
 
 In scope: `cmd/`, `internal/`, `migrations/`, `.github/workflows/`, `Dockerfile`,
-`docker-compose*.yml`, and deployment/configuration documentation. Milestone 3
-design evidence is `docs/prd/milestone-3-read-model-cache.md` and ADRs 019-026.
-Milestone 3 implementation evidence now includes migration 7, cache/projection
-packages, worker/admin commands, process-scoped manifests, and focused
-PostgreSQL/Redis tests. Independent security review and CI scans remain release
-gates. Existing Milestone 1/1.1/2 controls retain their evidence.
+`docker-compose*.yml`, and deployment/configuration documentation. Milestone 4
+design evidence is `docs/prd/milestone-4-train-run-sharding.md`, the dependency
+map, and ADRs 027-035. Planned controls are not credited as runtime evidence
+until migration, implementation, focused PostgreSQL/Redis/concurrency tests,
+independent review, and CI scans pass. Earlier milestone controls retain their
+own evidence.
 
 Assumptions validated from the project contract:
 
@@ -45,14 +46,21 @@ Open deployment questions that affect final ranking: TLS/load-balancer
 ownership, derivation-key rotation and previous-key retention, Redis backup
 encryption/restore objectives, monitoring-plane access control, production
 dependency network policy, edge-level Sybil/abuse controls, read-cache memory
-limits/eviction policy, and production projection backfill size/lock budget.
+limits/eviction policy, production projection backfill size/lock budget,
+separate API/worker/shard-admin database roles, operator identity/audit, and
+revocation of runtime schema-creation privileges.
 
 ## System model
 
 ### Primary components
 
 - Three stateless Gin API replicas behind one non-sticky HTTP load balancer for public/customer/admin/operator REST endpoints.
-- PostgreSQL primary as policy, quota, seat, reservation, ticket, idempotency, and outbox authority.
+- PostgreSQL primary with public catalog/control/global state, guarded legacy
+  booking tables, and the fixed `booking_shard_0`/`booking_shard_1` schemas as
+  policy, routing, quota, seat, reservation, ticket, idempotency, and central
+  outbox authority.
+- A deep router/routed-transaction module resolves fixed handles and validates
+  assignment generation plus local fence before exposing booking repositories.
 - Redis for waiting-room/token control-plane state, rate limits, and optional Streams publication; it is never inventory authority.
 - Redis also holds bounded station/search/availability-hint entries and their
   collision-resistant version namespaces; those values are optional read
@@ -63,6 +71,8 @@ limits/eviction policy, and production projection backfill size/lock budget.
   read-model workers using shared internal modules.
 - A private read-model admin command performs bounded rebuild, lag inspection,
   and detect-only reconciliation.
+- A private `shard-admin` command owns bounded inspect, plan, copy, validation,
+  cutover, rollback, reconciliation, health, and explicitly confirmed cleanup.
 - Prometheus/health surfaces for operations.
 - GitHub Actions and Docker build producing the runtime image.
 
@@ -73,6 +83,10 @@ limits/eviction policy, and production projection backfill size/lock budget.
 - Operator/admin -> policy module -> PostgreSQL: bounded hot-train settings and enable/version changes over authenticated HTTP and parameterized transactions; enforce RBAC, constraints, soft disable, and transactional outbox.
 - API/admission worker -> Redis: queue entries, one-time delivery nonce, token hashes/bindings, policy generation, leases, rate windows, and inflight indexes over a private authenticated channel; use exact hash-tagged keys, atomic Lua, Redis `TIME`, bounded TTLs/timeouts, and fail-closed hot-run behavior.
 - API/workers -> PostgreSQL: authority-critical policy, quotas, masks, state, PII, and outbox payloads over a pooled TLS-capable database channel; parameterized SQL, least privilege, explicit transactions, deterministic locks, and per-user quota serialization.
+- API/worker -> public catalog/locator -> routed transaction: a domain ID yields
+  only a fixed handle and observed generation; the transaction-local safe path,
+  assignment lock, active-fence lock, and authoritative owner check prevent a
+  stale or poisoned route from granting authority.
 - API/admission worker -> secret provider: token-derivation key enters process-owned configuration; require least privilege, rotation/versioning, and no logging or persistence in Redis/PostgreSQL.
 - PostgreSQL outbox -> publisher -> log/Redis Stream: minimized typed envelopes; enforce type/size/schema allowlists, bounded retries, poison isolation, and no payload logging.
 - Public read query -> API -> Redis cache: normalized station/search/
@@ -90,6 +104,10 @@ limits/eviction policy, and production projection backfill size/lock budget.
   bounds, dry-run, and cursors cross a privileged local process boundary;
   enforce no public HTTP route, least privilege, safe bounded output, and
   detect-only defaults.
+- Operator shell -> shard-admin -> public/source/target schemas: migration IDs,
+  train-run IDs, fixed target IDs, bounds, dry-run, and explicit confirmation
+  cross a privileged process boundary; enforce least privilege, state/
+  generation checks, cancellation, sanitized audit, and no public route.
 - Monitoring client -> health/metrics: operational status and bounded labels; restrict network exposure and omit identifiers/secrets.
 - Contributor/dependency -> CI -> image: untrusted code and third-party tooling enter the delivery pipeline; immutable pins, read-only permissions, no PR secrets, scanning, and protected release gates.
 - Admin/operator token -> privileged routes: topology/fare/run/inventory mutations; explicit role groups, fresh token version, safe audit metadata, and no customer impersonation.
@@ -100,19 +118,24 @@ limits/eviction policy, and production projection backfill size/lock budget.
 flowchart LR
     U["Internet clients"] --> L["Load balancer"]
     L --> A["Gin API replicas"]
-    A --> P["PostgreSQL authority"]
+    A --> Ctl["PostgreSQL catalog, global claims, locators, and central outbox"]
+    A --> P["Routed PostgreSQL booking storage"]
     A --> R["Redis admission and read cache"]
     K["Secret provider"] --> A
     K --> W["Admission workers"]
-    W --> P
+    W --> Ctl
     W --> R
-    X["Lifecycle workers"] --> P
-    P --> O["Outbox publisher"]
+    X["Lifecycle workers"] --> Ctl
+    X --> P
+    Ctl --> O["Outbox publisher"]
     O --> R
     R --> Q["Read model workers"]
+    Q --> Ctl
     Q --> P
     Q --> R
-    D["Read model admin"] --> P
+    D["Read model admin"] --> Ctl
+    S["Shard admin CLI"] --> Ctl
+    S --> P
     A --> M["Private health and metrics"]
     C["Pull requests and dependencies"] --> CI["GitHub Actions"]
     CI --> I["Container artifact"]
@@ -126,6 +149,9 @@ flowchart LR
 | Waiting-room order and inflight/rate state | Corruption creates unfair admission, double issue, or dependency overload | I, A |
 | Raw admission tokens and derivation key | Disclosure permits unauthorized booking attempts under a customer's admission | C, I |
 | Token hashes, delivery nonces, and bindings | Mutation can deny service or attempt request rebinding; disclosure must not reveal the raw token | C, I, A |
+| Shard catalog, assignments, and fixed handle mapping | Corruption or unsafe identifier handling can route across trust boundaries | I, A |
+| Monotonic generations, local fences, and retained-public guards | These prevent stale or bypassing writers from creating split brain | I, A |
+| Resource locators, migration state, and target-write evidence | Tampering can cause IDOR, partial cutover, or loss of committed target work | C, I, A |
 | Seat inventory, reservations, run status, durable quotas | Overselling, stale release, or hold hoarding defeats the core platform | I, A |
 | Tickets and ticket orders | Represent travel entitlement and customer travel data | C, I |
 | JWT keys, refresh state, password hashes | Compromise permits account/role takeover | C, I |
@@ -157,7 +183,8 @@ flowchart LR
 - No assumed direct PostgreSQL/Redis host access, server filesystem access, JWT or admission-derivation key, admin/operator credential, or trusted CI environment control. Redis active-write compromise is modeled separately as a privileged dependency breach.
 - No payment or national identity system exists to attack.
 - Cross-region partitions, active-active writes, regional cache replication,
-  payment, and Milestone 4 behavior are outside scope.
+  payment, and physical-database sharding are outside scope. Milestone 4's
+  same-cluster logical-sharding behavior is covered by the extension below.
 
 ## Entry points and attack surfaces
 
@@ -237,6 +264,32 @@ flowchart LR
 | TM-023 | Public clients or cache outage | Popular key cold/rotated across several replicas | Coordinate identical misses to amplify projection/source work and consume DB pools | Search denial that can contend with authoritative booking | PostgreSQL connections, API/read availability | Exact-key local singleflight, second cache read, TTL jitter, shared Redis, batch availability, and bounded request/database settings | Concurrency tests prove one local fill, independent keys, retry after failure, and cross-replica warm reuse | Measure cross-replica cold amplification before considering a distributed lease | Source/fallback/singleflight counters, DB pool saturation, cold-cache load scenario | medium | medium | medium |
 | TM-024 | Compromised operator/process or network misconfiguration | Access to read-model worker health/admin process or over-mounted secrets | Trigger unbounded/destructive rebuild, exfiltrate config, or mutate source tables | Operational denial, secret exposure, source integrity loss | Projection, PostgreSQL, Redis credentials, operational metadata | Worker HTTP exposes private health/metrics only; admin is CLI-only, bounded/cancellable and dry-run by default; manifests mount only DB/Redis settings | Command/config/lifecycle tests and Kustomize/Compose renders cover process scope and bounds | Production overlay must add least-privilege roles, private network policy, and operator audit | Rebuild actor/change audit and deployment/private-surface scans | low | high | medium |
 
+## Milestone 4 logical-sharding extension
+
+The focused Milestone 4 threat model owns detailed abuse paths, evidence
+anchors, and residual risks. The release gate must cover at least these
+controls; design text alone is not implementation evidence:
+
+| Threat | Required control and evidence |
+|---|---|
+| Stale-router split brain | Lock assignment and selected fence inside every mutation transaction; prove three stale replicas refresh correctly and 100 concurrent routed-transaction/fencing attempts reject stale authority. A separate 100-call full `CreateHold` barrier must prove exact stale refresh, one target reservation, zero source mutation, no duplicate, and no overlap |
+| Schema/temporary-object shadowing | Fixed handle mapping only; transaction-local paths are `pg_catalog, public, pg_temp`, `pg_catalog, booking_shard_0, public, pg_temp`, or `pg_catalog, booking_shard_1, public, pg_temp`; reject arbitrary IDs and prove pool reset on commit/rollback |
+| Retained-public bypass | Database DML guards plus a minimum fencing-protocol rollout gate and complete drain of incompatible writers before schema mode |
+| Malicious or corrupted shard metadata | Catalog IDs cannot extend the compile-time allowlist; unknown/disabled storage fails closed without fallback or probing |
+| Locator poisoning and IDOR | Atomic resource/locator creation, current-assignment revalidation, and authoritative local owner check; missing/corrupt locator never triggers a scan |
+| Wrong-shard idempotency effects | Route/fence first, then atomic global uniqueness claim and local completion with synchronized database expiry; rejection leaves no stranded claim/result |
+| Migration/cutover misuse | Private least-privilege CLI, bounded input/output/time/cursor/row cap, dry-run, explicit confirmation, state/generation checks, atomic locator/fence/assignment switch, and non-zero failures |
+| Unsafe rollback/cleanup | Target-write evidence locked with assignment and both fences; positive evidence forces reverse migration; source cleanup waits for window expiry and revalidates current authority |
+| Fanout denial | Fixed workset, deterministic serial traversal (effective concurrency 1), bounded pages/memory/deadlines, cancellation, stable scheduling, and explicit complete/partial/unavailable status |
+| Topology or customer-data leakage | Safe public error, metadata-only audit/logging, fixed low-cardinality labels, private health/metrics, and sentinel leakage tests covering DSNs, SQL, IDs, schemas, tokens, keys, and PII |
+| Redis route manipulation | Redis may deny admission or poison disposable hints but never selects assignment, generation, fence, locator, quota, idempotency result, or outbox authority |
+| Stale JWT role | Continue current-database authentication-state and role/token-version checks before privileged HTTP work; migration remains private CLI-only |
+
+The logical schemas share one PostgreSQL authority and failure domain. Schema
+fault injection is not evidence of physical database isolation, and none of
+these controls supports a multi-region, zero-downtime, or production-capacity
+claim.
+
 ## Criticality calibration
 
 - **Critical**: unauthenticated remote code execution in the API/image; direct auth bypass to admin/operator; deterministic widespread overselling from a public request.
@@ -255,6 +308,7 @@ flowchart LR
 | `internal/accounts/**` | Password, JWT, refresh rotation, roles, registration enumeration, passenger ownership | TM-001, TM-002, TM-011 |
 | `internal/admission/**` | Policy, queue, key builder, Lua, issuance MAC, token binding, worker and reconciliation | TM-004, TM-005, TM-012, TM-013, TM-014, TM-015, TM-017, TM-018 |
 | `internal/booking/**` | Allocation, quota serialization, releases, lifecycle, idempotency, ownership | TM-002, TM-003, TM-004, TM-008, TM-016, TM-017 |
+| `internal/sharding/**` | Fixed-handle routing, transaction-local schema selection, assignment/fence locks, migration state, cutover, rollback, and bounded fanout | Milestone 4 focused threat model |
 | `internal/app/reservation.go` | Replay-first orchestration, policy gate, local backpressure, commit/finalize classification | TM-012, TM-013, TM-016, TM-017 |
 | `internal/transport/httpapi/**` | Header-only token transport, ownership, policy RBAC, Retry-After and safe errors | TM-002, TM-012, TM-013, TM-017, TM-018 |
 | `internal/offering/**` | Train-run commissioning/status and safe query inputs | TM-007, TM-008 |
@@ -267,16 +321,19 @@ flowchart LR
 | `cmd/admission-worker/**` | Root-context lifecycle, private health, key readiness, bounded passes | TM-014, TM-015, TM-017 |
 | `cmd/read-model-worker/**` | Stream parsing, pending recovery, retries, DLQ, secret scope, readiness, and shutdown | TM-022, TM-024 |
 | `cmd/read-model-admin/**` and `cmd/reconcile/**` | Bounded operator input/output and detect-only default | TM-020, TM-022, TM-024 |
-| `migrations/**` | Policy/quota constraints, outbox types, indexes, least privilege | TM-002, TM-003, TM-008, TM-009, TM-013, TM-016 |
+| `cmd/shard-admin/**` | Private operator authorization boundary, confirmation, cancellation, bounds, sanitized audit, and cleanup safety | Milestone 4 focused threat model |
+| `migrations/**` | Policy/quota/shard constraints, retained-public guards, locator indexes, fixed schemas, and least privilege | TM-002, TM-003, TM-008, TM-009, TM-013, TM-016 and Milestone 4 focused threat model |
 | `docker-compose.multi-replica.yml` | Shared Redis persistence and non-sticky multi-replica topology | TM-005, TM-014, TM-015 |
 | `.github/workflows/**` | Permissions, immutable actions, untrusted PR execution | TM-010 |
 | `Dockerfile` and Compose manifests | Base/tool pins, runtime identities, dependency topology, and artifact hardening | TM-005, TM-010, TM-014 |
 
 ## Notes on use
 
-- This model was re-evaluated against Milestone 3 code, migration, tests, and
-  deployment artifacts. Independent review and green CI remain mandatory
-  before PR approval; production overlay/RBAC assumptions remain residual risk.
+- The earlier entries were re-evaluated against Milestone 3 code, migration,
+  tests, and deployment artifacts. The Milestone 4 extension is design-gated
+  and requires current implementation/runtime evidence before a control is
+  credited. Independent review and green CI remain mandatory before PR
+  approval; production overlay/RBAC assumptions remain residual risk.
 - Every entry point and trust boundary above must have at least one implementation test or review anchor.
 - Runtime, CI/dev, and test-only controls must remain clearly separated.
 - The explicit non-goals do not erase residual risk. TM-004 remains after Milestone 2 because waiting-room admission and per-user quotas do not prove real identity or Sybil resistance.

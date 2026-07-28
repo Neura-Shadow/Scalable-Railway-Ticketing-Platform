@@ -33,6 +33,12 @@ x-api-common: &api-common
     AVAILABILITY_CACHE_TTL_SECONDS: 10
     AVAILABILITY_CACHE_JITTER_SECONDS: 2
     AVAILABILITY_CACHE_MAX_STALE_SECONDS: 10
+    BOOKING_SHARD_MODE: schema_poc
+    BOOKING_SHARD_IDS: legacy,shard-0,shard-1
+    BOOKING_ROUTE_CACHE_ENABLED: "true"
+    BOOKING_ROUTE_CACHE_TTL_SECONDS: 30
+    BOOKING_ROUTE_CACHE_MAX_ENTRIES: 1000
+    BOOKING_SHARD_QUERY_TIMEOUT: 2s
   depends_on:
     migrate:
       condition: service_completed_successfully
@@ -190,6 +196,12 @@ services:
       HOLD_EXPIRER_ENABLED: "true"
       HOLD_EXPIRER_BATCH_SIZE: 50
       HOLD_EXPIRER_INTERVAL_SECONDS: 30
+      BOOKING_SHARD_MODE: schema_poc
+      BOOKING_SHARD_IDS: legacy,shard-0,shard-1
+      BOOKING_ROUTE_CACHE_ENABLED: "true"
+      BOOKING_ROUTE_CACHE_TTL_SECONDS: 30
+      BOOKING_ROUTE_CACHE_MAX_ENTRIES: 1000
+      BOOKING_SHARD_QUERY_TIMEOUT: 2s
       WORKER_HTTP_ADDRESS: :9090
       WORKER_PASS_TIMEOUT: 60s
     depends_on:
@@ -234,7 +246,7 @@ services:
     build:
       context: .
       dockerfile: deploy/nginx/Dockerfile
-    image: scalable-railway-ticketing-proxy:milestone-3
+    image: scalable-railway-ticketing-proxy:milestone-4
     user: "101:101"
     depends_on:
       - api-1
@@ -291,6 +303,25 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    restart: "no"
+
+  shard-admin:
+    build:
+      context: .
+      target: shard-admin
+    profiles:
+      - tools
+    environment:
+      DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     read_only: true
     security_opt:
       - no-new-privileges:true

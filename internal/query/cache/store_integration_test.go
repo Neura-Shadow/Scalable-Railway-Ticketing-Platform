@@ -181,6 +181,33 @@ func TestAvailabilityHintIsSharedAcrossReplicasAndRotationReobservesPostgres(t *
 	}
 }
 
+func TestAvailabilityHintRejectsPreviousAssignmentGeneration(t *testing.T) {
+	client := openCacheRedis(t)
+	trainRunID := uuid.NewString()
+	source := &assignmentGenerationSource{trainRunID: trainRunID}
+	source.generation.Store(1)
+	source.seats.Store(7)
+	store := newCacheStore(t, source, source, client)
+	request := querypostgres.AvailabilityRequest{
+		TrainRunID: trainRunID, OriginCode: "TPE", DestinationCode: "KHH", SeatClass: "standard",
+	}
+
+	first, err := store.Availability(context.Background(), request)
+	if err != nil || first.AvailableSeats != 7 {
+		t.Fatalf("Availability(generation 1) = %+v, %v", first, err)
+	}
+
+	source.generation.Store(2)
+	source.seats.Store(2)
+	second, err := store.Availability(context.Background(), request)
+	if err != nil || second.AvailableSeats != 2 {
+		t.Fatalf("Availability(generation 2) = %+v, %v", second, err)
+	}
+	if calls := source.availabilityCalls.Load(); calls != 2 {
+		t.Fatalf("availability source calls = %d, want 2 after generation change", calls)
+	}
+}
+
 func TestAvailabilityHintCanonicalizesUppercaseTrainRunIDForWarmHit(t *testing.T) {
 	client := openCacheRedis(t)
 	canonicalTrainRunID := uuid.NewString()
@@ -512,6 +539,41 @@ type rotationRaceSource struct {
 	entered    chan struct{}
 	release    chan struct{}
 	calls      atomic.Int64
+}
+
+type assignmentGenerationSource struct {
+	trainRunID        string
+	generation        atomic.Int64
+	seats             atomic.Int64
+	availabilityCalls atomic.Int64
+}
+
+func (source *assignmentGenerationSource) ListStations(context.Context) ([]querypostgres.Station, error) {
+	return nil, nil
+}
+
+func (source *assignmentGenerationSource) SearchTrainRuns(
+	context.Context,
+	querypostgres.SearchRequest,
+) ([]querypostgres.SearchResult, error) {
+	return nil, nil
+}
+
+func (source *assignmentGenerationSource) Availability(
+	context.Context,
+	querypostgres.AvailabilityRequest,
+) (querypostgres.Availability, error) {
+	source.availabilityCalls.Add(1)
+	value := availabilityFixture(source.trainRunID, source.seats.Load())
+	value.AssignmentGeneration = source.generation.Load()
+	return value, nil
+}
+
+func (source *assignmentGenerationSource) AvailabilityAssignmentGeneration(
+	context.Context,
+	string,
+) (int64, error) {
+	return source.generation.Load(), nil
 }
 
 func (source *rotationRaceSource) ListStations(context.Context) ([]querypostgres.Station, error) {

@@ -49,8 +49,156 @@ func TestDefaultsProvideSafeOperationalValues(t *testing.T) {
 	if cfg.WorkerBatchSize != 100 {
 		t.Fatalf("WorkerBatchSize = %d, want 100", cfg.WorkerBatchSize)
 	}
+	if cfg.BookingShardMode != config.BookingShardModeLegacy || !reflect.DeepEqual(cfg.BookingShardIDs, []string{"legacy"}) {
+		t.Fatalf("booking shard defaults = mode %q ids %v, want legacy-only", cfg.BookingShardMode, cfg.BookingShardIDs)
+	}
 	if cfg.DatabaseURL != "" || cfg.RedisAddress != "" || cfg.JWTSecret != "" {
 		t.Fatal("connection settings and secrets must not have built-in defaults")
+	}
+}
+
+func TestLoadFromForParsesSchemaPOCBookingShardControls(t *testing.T) {
+	t.Parallel()
+
+	env := map[string]string{
+		"APP_ENV":                         "test",
+		"DATABASE_URL":                    "postgres://api@db.example/railway",
+		"REDIS_ADDRESS":                   "redis.example:6379",
+		"JWT_SECRET":                      "test-secret",
+		"ADMISSION_TOKEN_KEYRING":         testAdmissionKeyring,
+		"ADMISSION_TOKEN_ISSUE_KEY_ID":    "current",
+		"ADMISSION_TOKEN_ACCEPT_KEY_IDS":  "current",
+		"BOOKING_SHARD_MODE":              "schema_poc",
+		"BOOKING_SHARD_IDS":               "legacy, shard-0, shard-1",
+		"BOOKING_ROUTE_CACHE_ENABLED":     "false",
+		"BOOKING_ROUTE_CACHE_TTL_SECONDS": "25",
+		"BOOKING_ROUTE_CACHE_MAX_ENTRIES": "200",
+		"BOOKING_SHARD_QUERY_TIMEOUT":     "750ms",
+	}
+
+	cfg, err := config.LoadFromFor(func(key string) (string, bool) {
+		value, ok := env[key]
+		return value, ok
+	}, config.ProcessAPI)
+	if err != nil {
+		t.Fatalf("LoadFromFor(api) error = %v", err)
+	}
+	if cfg.BookingShardMode != config.BookingShardModeSchemaPOC ||
+		!reflect.DeepEqual(cfg.BookingShardIDs, []string{"legacy", "shard-0", "shard-1"}) ||
+		cfg.BookingRouteCacheEnabled || cfg.BookingRouteCacheTTL != 25*time.Second ||
+		cfg.BookingRouteCacheMaxEntries != 200 || cfg.BookingShardQueryTimeout != 750*time.Millisecond {
+		t.Fatalf("booking shard controls = %+v", cfg)
+	}
+}
+
+func TestLoadFromForSchemaPOCUsesKnownLogicalShardDefaults(t *testing.T) {
+	t.Parallel()
+
+	env := validBookingShardAPIEnvironment()
+	env["BOOKING_SHARD_MODE"] = "schema_poc"
+	cfg, err := config.LoadFromFor(mapLookup(env), config.ProcessAPI)
+	if err != nil {
+		t.Fatalf("LoadFromFor(api) error = %v", err)
+	}
+	if !reflect.DeepEqual(cfg.BookingShardIDs, []string{"legacy", "shard-0", "shard-1"}) {
+		t.Fatalf("BookingShardIDs = %v, want known schema_poc defaults", cfg.BookingShardIDs)
+	}
+}
+
+func TestLoadFromForRejectsUnsafeBookingShardControls(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		set  map[string]string
+		want string
+	}{
+		{
+			name: "unknown mode",
+			set:  map[string]string{"BOOKING_SHARD_MODE": "physical"},
+			want: "BOOKING_SHARD_MODE",
+		},
+		{
+			name: "duplicate logical ID",
+			set: map[string]string{
+				"BOOKING_SHARD_MODE": "schema_poc",
+				"BOOKING_SHARD_IDS":  "legacy,shard-0,shard-0",
+			},
+			want: "BOOKING_SHARD_IDS",
+		},
+		{
+			name: "database schema identifier",
+			set: map[string]string{
+				"BOOKING_SHARD_MODE": "schema_poc",
+				"BOOKING_SHARD_IDS":  "legacy,booking_shard_0",
+			},
+			want: "BOOKING_SHARD_IDS",
+		},
+		{
+			name: "legacy mode extra shard",
+			set: map[string]string{
+				"BOOKING_SHARD_IDS": "legacy,shard-0",
+			},
+			want: "BOOKING_SHARD_IDS",
+		},
+		{
+			name: "route cache entries beyond bounded maximum",
+			set:  map[string]string{"BOOKING_ROUTE_CACHE_MAX_ENTRIES": "100001"},
+			want: "BOOKING_ROUTE_CACHE_MAX_ENTRIES",
+		},
+		{
+			name: "query timeout not positive",
+			set:  map[string]string{"BOOKING_SHARD_QUERY_TIMEOUT": "0s"},
+			want: "BOOKING_SHARD_QUERY_TIMEOUT",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			env := validBookingShardAPIEnvironment()
+			for key, value := range tt.set {
+				env[key] = value
+			}
+			if _, err := config.LoadFromFor(mapLookup(env), config.ProcessAPI); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("LoadFromFor(api) error = %v, want %s", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestSchemaPOCRequiresExplicitProductionOptIn(t *testing.T) {
+	t.Parallel()
+
+	env := validBookingShardAPIEnvironment()
+	env["APP_ENV"] = "production"
+	env["JWT_SECRET"] = strings.Repeat("s", 32)
+	env["BOOKING_SHARD_MODE"] = "schema_poc"
+	if _, err := config.LoadFromFor(mapLookup(env), config.ProcessAPI); err == nil || !strings.Contains(err.Error(), "BOOKING_SHARD_SCHEMA_POC_PRODUCTION_ENABLED") {
+		t.Fatalf("LoadFromFor(api) error = %v, want explicit production opt-in error", err)
+	}
+	env["BOOKING_SHARD_SCHEMA_POC_PRODUCTION_ENABLED"] = "true"
+	if _, err := config.LoadFromFor(mapLookup(env), config.ProcessAPI); err != nil {
+		t.Fatalf("LoadFromFor(api) with production opt-in error = %v", err)
+	}
+}
+
+func validBookingShardAPIEnvironment() map[string]string {
+	return map[string]string{
+		"APP_ENV":                        "test",
+		"DATABASE_URL":                   "postgres://api@db.example/railway",
+		"REDIS_ADDRESS":                  "redis.example:6379",
+		"JWT_SECRET":                     "test-secret",
+		"ADMISSION_TOKEN_KEYRING":        testAdmissionKeyring,
+		"ADMISSION_TOKEN_ISSUE_KEY_ID":   "current",
+		"ADMISSION_TOKEN_ACCEPT_KEY_IDS": "current",
+	}
+}
+
+func mapLookup(values map[string]string) config.LookupFunc {
+	return func(key string) (string, bool) {
+		value, ok := values[key]
+		return value, ok
 	}
 }
 

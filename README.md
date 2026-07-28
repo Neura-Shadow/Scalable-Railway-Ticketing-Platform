@@ -1,8 +1,18 @@
 # Scalable Railway Ticketing Platform
 
-A production-minded, single-region Go backend for railway booking with a disposable PostgreSQL journey read model, versioned Redis read caches, Redis-backed hot-train admission, and PostgreSQL-authoritative route-segment seat allocation under concurrency.
+A production-minded, single-region Go backend for railway booking with explicit
+train-run routing, monotonic PostgreSQL writer fencing, schema-isolated logical
+booking shards, a disposable journey read model, versioned Redis read caches,
+Redis-backed hot-train admission, and authoritative route-segment allocation
+under concurrency.
 
-Milestone 3 is intentionally bounded. Projection/cache state can lag or disappear, availability is hint-only, and admission permits an attempt rather than a seat. This is not a national-scale capacity claim and does not implement payment, a search microservice, train-run sharding, or multi-region active-active writes. See [Milestone 3 limitations](docs/milestone-3-limitations.md).
+Milestone 4 is intentionally bounded. `legacy`, `shard-0`, and `shard-1` are
+logical schemas in one PostgreSQL database, not independent physical shards.
+Migration uses a bounded quiesced cutover, may reject writes for the selected
+train run, never dual writes, and retains the source for a rollback window.
+This is not a zero-downtime, multi-region, production-capacity, or national-
+scale claim and does not implement payment. See
+[Milestone 4 limitations](docs/milestone-4-limitations.md).
 
 ## Architecture
 
@@ -15,7 +25,13 @@ HTTP transport
             -> PostgreSQL, Redis, Prometheus, and publisher adapters
 ```
 
-PostgreSQL source tables are authoritative for policies, train-run status, seat inventory, reservation lifecycle, durable quotas, tickets, idempotency, and outbox state. A PostgreSQL journey projection and versioned Redis station/search/availability caches accelerate public reads but remain disposable. Redis also provides rate controls, event transport, and ephemeral waiting-room/token state. Redis never allocates a seat; booking always rechecks PostgreSQL.
+PostgreSQL public/control tables and the currently assigned routed booking
+storage are authoritative for policies, train-run status, seat inventory,
+reservation lifecycle, durable quotas, tickets, idempotency, and outbox state.
+A PostgreSQL journey projection and versioned Redis station/search/availability
+caches accelerate public reads but remain disposable. Redis also provides rate
+controls, event transport, and ephemeral waiting-room/token state. Redis never
+allocates a seat or selects a write owner; booking always rechecks PostgreSQL.
 
 ### Module boundaries
 
@@ -25,6 +41,7 @@ PostgreSQL source tables are authoritative for policies, train-run status, seat 
 | Railway Offering | Stations, ordered routes/stops, trains/coaches/seats, fares, and dated train runs |
 | Admission | Durable hot policy resolution, bounded waiting-room control, token lifecycle, and global admission limits |
 | Booking | Segment masks, atomic allocation, holds, lifecycle transitions, tickets, idempotency, and reconciliation |
+| Sharding | Fixed catalog, locator routing, fenced transactions, bounded migration, cutover, and rollback controls |
 | Query | Journey projection, source fallback, versioned station/search caches, and short-lived availability hints |
 | Event Relay | Outbox claim, publish, retry, stale-lease recovery, and finalize |
 | Platform | Configuration, pools, metrics, clock, middleware, and process lifecycle |
@@ -32,6 +49,16 @@ PostgreSQL source tables are authoritative for policies, train-run status, seat 
 Booking owns each reservation transaction. Event Relay delivers already committed events and never decides booking state. Domain packages do not depend on Gin, pgx, Redis, Prometheus, Docker, or HTTP status codes.
 
 For an enabled hot policy, the API requires one short-lived, owner/request-bound admission token before attempting the existing booking transaction. Redis Lua scripts atomically enforce duplicate joins, monotonic policy-local FIFO ordering, queue capacity, worker-global issue rate, inflight capacity, token leases, and single-use transitions. Hot-run Redis failure fails closed rather than bypassing admission. Complete Redis loss may lose queue continuity, but it cannot corrupt PostgreSQL inventory. See [waiting-room-design.md](docs/waiting-room-design.md) and [hot-train-protection.md](docs/hot-train-protection.md).
+
+Milestone 4 routes each train run to exactly one of the fixed logical storages
+`legacy`, `shard-0`, or `shard-1`. Every booking mutation locks and validates
+the public assignment generation and the selected storage's write fence in the
+same PostgreSQL transaction as inventory, lifecycle, idempotency, quota,
+locator, and central outbox changes. Route caches are bounded hints; Redis is
+never ownership authority. See
+[train-run-sharding-design.md](docs/train-run-sharding-design.md),
+[shard-routing.md](docs/shard-routing.md), and
+[single-writer-fencing.md](docs/single-writer-fencing.md).
 
 The detailed model is in [domain-model.md](docs/domain-model.md); design decisions are under [docs/adr](docs/adr).
 
@@ -76,7 +103,7 @@ See [reservation-state-machine.md](docs/reservation-state-machine.md) and [consi
 
 ## Durable idempotency and outbox
 
-Reservation create, confirm, and cancel commands bind a SHA-256 key hash and canonical request fingerprint to one owner/operation in PostgreSQL. The raw client key is never persisted or logged. The idempotency record, domain mutation, and outbox event commit in the same transaction; a retry with the same fingerprint returns the resource, while a changed fingerprint conflicts.
+Reservation create, confirm, and cancel commands bind a SHA-256 key hash and canonical request fingerprint to one owner/operation in PostgreSQL. The raw client key is never persisted or logged. A minimal global key claim preserves uniqueness across logical storages, while the authoritative completion stays with routed booking state. Claim, completion, domain mutation, quota transition, locator, and central outbox event commit in the same transaction; a retry with the same fingerprint returns the resource, while a changed fingerprint conflicts.
 
 Outbox publication is at least once. Workers claim and finalize in short transactions, publish outside a transaction, retry with bounded backoff, reclaim stale leases, and move exhausted events to a dead letter state. Consumers must deduplicate by event ID. See [outbox-events.md](docs/outbox-events.md).
 
@@ -135,6 +162,15 @@ Migration 5 requires the production procedure in [migration-5-production-rollout
 
 Migration 6 adds the durable hot-train policy, safe bound/uniqueness constraints, policy outbox event types, and indexes for derived held-reservation quota checks. Follow [migration-6-production-rollout.md](docs/migrations/migration-6-production-rollout.md); its down migration removes policy audit events and is not an automatic production rollback.
 
+Migration 8 adds the fixed logical-shard schemas, catalog, explicit legacy
+assignments, monotonic fences, migration control state, global locators/claims,
+and retained-public guards. It does not move train runs automatically. Keep
+`BOOKING_SHARD_MODE=legacy` through expansion and follow
+[migration-8-production-rollout.md](docs/migrations/migration-8-production-rollout.md)
+before any explicit `schema_poc` opt-in. The down migration is blocked while a
+run is non-legacy, a migration is active, or a logical shard retains booking
+data.
+
 ## Read-only reconciliation
 
 `cmd/reconcile` provides detect-only correctness checks. It never repairs
@@ -145,7 +181,20 @@ and emits bounded JSON summaries without customer or token identifiers.
 go run ./cmd/reconcile seat-inventory --train-run-id <canonical-uuid>
 go run ./cmd/reconcile reservation-quotas
 go run ./cmd/reconcile admission-state
+go run ./cmd/reconcile read-model --train-run-id <canonical-uuid>
+go run ./cmd/reconcile cache-versions --train-run-id <canonical-uuid>
+go run ./cmd/reconcile shard-assignments
+go run ./cmd/reconcile shard-locators
+go run ./cmd/reconcile shard-migration --migration-id <canonical-uuid>
 ```
+
+The standalone seat-inventory and reservation-quota commands predate shard
+routing and are not sufficient by themselves as Milestone 4 shard-wide proof.
+`shard-admin reconcile` is a bounded locator/resource scope, not every scope.
+
+See [shard-reconciliation.md](docs/shard-reconciliation.md) for the scope and
+shard-awareness matrix. Final acceptance combines all applicable scopes and
+the bounded integrity evidence; no single command is a complete verdict.
 
 All commands require `DATABASE_URL`; `admission-state` also requires
 `REDIS_ADDRESS` or `REDIS_ADDR`. Quota checks use the same bounded
@@ -204,6 +253,10 @@ credentials are explicit local-development defaults only. There is no
 committed production secret, default production database, or production-ready
 customer bootstrap token.
 
+Logical schema routing remains disabled by default. `schema_poc` requires the
+fixed allowlisted topology, Migration 8, compatible fenced writers, an explicit
+production acknowledgement, and the operator gates in the rollout runbook.
+
 ## Tests and validation
 
 Unit tests do not require dependencies. PostgreSQL integration tests run when `DATABASE_URL` is present and otherwise skip.
@@ -211,8 +264,8 @@ Unit tests do not require dependencies. PostgreSQL integration tests run when `D
 ```powershell
 go mod tidy
 go vet ./...
-go test ./... -count=1 -timeout 300s
-go test -race ./...
+go test ./... -count=1 -timeout 480s
+go test -race ./... -count=1 -timeout 600s
 staticcheck ./...
 govulncheck ./...
 ```
@@ -225,19 +278,35 @@ make migrate-up
 make migrate-status
 docker compose config
 docker compose -f docker-compose.multi-replica.yml config
-docker build -t scalable-railway-ticketing-platform:milestone-3 .
+docker build -t scalable-railway-ticketing-platform:milestone-4 .
 ```
 
 CI also verifies tidy/gofmt, action syntax, secret scanning,
-filesystem/image vulnerabilities, populated version-6-to-7 and one-step
-down/reapply rehearsals, read-model/cache integration tests, the Docker build,
-and the bounded three-API/two-admission/two-read-worker topology.
+filesystem/image vulnerabilities, populated migration rehearsals, routing and
+fencing safety, migration/cutover/rollback restrictions, read-model/cache
+regressions, the Docker build, and the bounded multi-replica topology.
 
 ## Load tests
 
-The original and Milestone 2 scenarios remain. Nine Milestone 3 scenarios cover station/search/availability caches, honest cold/warm search, mixed booking, invalidation, Redis/worker failure windows, and multi-replica shared cache behavior. They accept configuration only through environment variables and contain no credentials or tokens.
+The original Milestone 4 measurement/failure scenarios remain. The bounded
+runner also uses a per-replica prewarm helper, drains all earlier train-run
+events to durable read-model receipts before taking its cache-version baseline,
+and requires the exact `shard_cutover` event receipt before attributing a
+namespace rotation to cutover. A separate probe covers post-cutover lifecycle
+correctness.
 
-See [Milestone 3 load testing](docs/milestone-3-load-testing.md) for setup and correctness gates. [benchmark-report-milestone-3.md](docs/benchmark-report-milestone-3.md) intentionally records no sustained capacity numbers until a controlled run is accepted. A smoke run is not production or national-scale evidence.
+Despite its filename, `cross-shard-admin.js` is a customer cross-route batch
+read. Private admin fanout uses `reconcile shard-assignments` and currently
+traverses the three fixed storages serially, with effective concurrency `1`.
+
+The outage smoke disables one logical catalog route; it is not a schema,
+PostgreSQL-process, host, disk, or network failure. All scripts use environment
+configuration and contain no embedded credentials or tokens.
+
+See [Milestone 4 load testing](docs/milestone-4-load-testing.md) for setup and
+correctness gates. [benchmark-report-milestone-4.md](docs/benchmark-report-milestone-4.md)
+records every Milestone 4 result as pending until a controlled run is accepted.
+A smoke run is not physical-shard, production, or national-scale evidence.
 
 ## Deployment
 
@@ -245,7 +314,14 @@ See [Milestone 3 load testing](docs/milestone-3-load-testing.md) for setup and c
 
 ## Current limitations
 
-- Single-region PostgreSQL primary for all authoritative writes.
+- Single-region PostgreSQL primary for all authoritative writes; logical
+  schemas share one physical failure domain.
+- Quiesced train-run migration may reject writes and does not claim zero
+  downtime. Source and target are never dual writable.
+- Source retention increases disk/backup scope. After any target write, direct
+  rollback is forbidden and a reverse migration is required.
+- Fixed global locators, quota/idempotency claims, central outbox, and cross-
+  schema foreign keys are not a physical-database protocol.
 - Redis AOF reduces loss risk but does not guarantee waiting-room continuity; hot-run Redis loss fails closed.
 - Admission does not guarantee a seat and token delivery is at-most-once.
 - Projection lag and cache staleness are possible; availability remains hint-only and cache loss increases PostgreSQL read load.
@@ -255,7 +331,11 @@ See [Milestone 3 load testing](docs/milestone-3-load-testing.md) for setup and c
 - No accepted sustained benchmark or national-scale capacity claim.
 - No government-ID or real passenger identity verification.
 
-The complete list is in [milestone-3-limitations.md](docs/milestone-3-limitations.md). Future multi-region ideas are design direction only in [future-multi-region-design.md](docs/future-multi-region-design.md); none are implemented in Milestone 3.
+The complete list is in
+[milestone-4-limitations.md](docs/milestone-4-limitations.md). Future physical-
+shard and multi-region ideas are design direction only in
+[future-multi-region-design.md](docs/future-multi-region-design.md); none are
+implemented in Milestone 4.
 
 ## License
 

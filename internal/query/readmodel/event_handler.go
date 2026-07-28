@@ -285,9 +285,9 @@ func impactQuery(aggregateType string) (string, bool) {
 	case "seat":
 		return `SELECT tr.id AS train_run_id FROM seats s JOIN coaches c ON c.id = s.coach_id JOIN train_runs tr ON tr.train_id = c.train_id WHERE s.id = $1`, true
 	case "reservation":
-		return `SELECT tr.id AS train_run_id FROM reservations r JOIN train_runs tr ON tr.id = r.train_run_id WHERE r.id = $1`, true
+		return `SELECT locator.train_run_id FROM public.reservation_shard_locators AS locator WHERE locator.reservation_id = $1`, true
 	case "ticket":
-		return `SELECT tr.id AS train_run_id FROM tickets t JOIN reservation_seats rs ON rs.id = t.reservation_seat_id JOIN reservations r ON r.id = rs.reservation_id JOIN train_runs tr ON tr.id = r.train_run_id WHERE t.id = $1`, true
+		return `SELECT locator.train_run_id FROM public.ticket_shard_locators AS locator WHERE locator.ticket_id = $1`, true
 	default:
 		return "", false
 	}

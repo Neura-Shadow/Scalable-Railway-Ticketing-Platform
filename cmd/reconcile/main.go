@@ -18,15 +18,17 @@ import (
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/clock"
 	querycache "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/cache"
 	queryreadmodel "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/readmodel"
+	shardreconcile "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/reconcile"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
 
 const (
-	defaultTimeout      = 30 * time.Second
-	defaultPageSize     = 100
-	defaultMaximumPages = 10_000
+	defaultTimeout                    = 30 * time.Second
+	maximumShardReconciliationTimeout = 5 * time.Minute
+	defaultPageSize                   = 100
+	defaultMaximumPages               = 10_000
 )
 
 var errReconciliationViolations = errors.New("reconciliation violations detected")
@@ -54,6 +56,10 @@ type admissionStateResult struct {
 	DisabledPolicies                int64 `json:"disabled_policies"`
 	LiveRedisGenerations            int64 `json:"live_redis_generations"`
 	PreviousOrDisabledGenerations   int64 `json:"previous_or_disabled_generations"`
+}
+
+func validShardReconciliationTimeout(timeout time.Duration) bool {
+	return timeout > 0 && timeout <= maximumShardReconciliationTimeout
 }
 
 func (result admissionStateResult) violations() int64 {
@@ -107,6 +113,12 @@ func run(
 		envelope, err = runReadModel(parent, databaseURL, args[1:])
 	case "cache-versions":
 		envelope, err = runCacheVersions(parent, lookup, args[1:])
+	case shardreconcile.ScopeAssignments:
+		envelope, err = runShardAssignments(parent, databaseURL, args[1:])
+	case shardreconcile.ScopeLocators:
+		envelope, err = runShardLocators(parent, databaseURL, args[1:])
+	case shardreconcile.ScopeMigration:
+		envelope, err = runShardMigration(parent, databaseURL, args[1:])
 	default:
 		writeUsage(stderr)
 		return 2
@@ -115,8 +127,15 @@ func run(
 	if err != nil {
 		if envelope.Command != "" {
 			envelope.Status = "failed"
-			if errors.Is(err, bookingpostgres.ErrPersistenceInvariant) ||
-				errors.Is(err, errReconciliationViolations) {
+			switch {
+			case errors.Is(err, shardreconcile.ErrPartial):
+				envelope.Status = "partial"
+			case errors.Is(err, shardreconcile.ErrUnavailable):
+				envelope.Status = "unavailable"
+			case errors.Is(err, bookingpostgres.ErrPersistenceInvariant) ||
+				errors.Is(err, errReconciliationViolations):
+				envelope.Status = "violations"
+			case errors.Is(err, shardreconcile.ErrViolations):
 				envelope.Status = "violations"
 			}
 			if encodeErr := json.NewEncoder(stdout).Encode(envelope); encodeErr != nil {
@@ -131,6 +150,134 @@ func run(
 		return 1
 	}
 	return 0
+}
+
+func runShardAssignments(
+	parent context.Context,
+	databaseURL string,
+	args []string,
+) (resultEnvelope, error) {
+	flags := flag.NewFlagSet(shardreconcile.ScopeAssignments, flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	pageSize := flags.Int("page-size", shardreconcile.DefaultPageSize, "bounded database page size")
+	maximumPages := flags.Int("max-pages", shardreconcile.DefaultMaxPages, "maximum query pages")
+	maximumRows := flags.Int64("max-rows", shardreconcile.DefaultMaxRows, "maximum examined rows")
+	timeout := flags.Duration("timeout", defaultTimeout, "maximum reconciliation duration")
+	limits := shardreconcile.Limits{}
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 ||
+		!validShardReconciliationTimeout(*timeout) {
+		return resultEnvelope{}, errors.New(
+			"usage: reconcile shard-assignments [--page-size 100] [--max-pages 10000] [--max-rows 100000] [--timeout 30s]",
+		)
+	}
+	limits = shardreconcile.Limits{PageSize: *pageSize, MaxPages: *maximumPages, MaxRows: *maximumRows}
+	if !limits.Valid() {
+		return resultEnvelope{}, errors.New("shard reconciliation limits are invalid")
+	}
+	return runShardInspection(parent, databaseURL, shardreconcile.ScopeAssignments, *timeout,
+		func(ctx context.Context, inspector *shardreconcile.Inspector) (shardreconcile.Report, error) {
+			return inspector.Assignments(ctx, limits)
+		})
+}
+
+func runShardLocators(
+	parent context.Context,
+	databaseURL string,
+	args []string,
+) (resultEnvelope, error) {
+	flags := flag.NewFlagSet(shardreconcile.ScopeLocators, flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	trainRunText := flags.String("train-run-id", "", "optional canonical train-run UUID")
+	pageSize := flags.Int("page-size", shardreconcile.DefaultPageSize, "bounded database page size")
+	maximumPages := flags.Int("max-pages", shardreconcile.DefaultMaxPages, "maximum query pages")
+	maximumRows := flags.Int64("max-rows", shardreconcile.DefaultMaxRows, "maximum examined rows")
+	timeout := flags.Duration("timeout", defaultTimeout, "maximum reconciliation duration")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 ||
+		!validShardReconciliationTimeout(*timeout) {
+		return resultEnvelope{}, errors.New(
+			"usage: reconcile shard-locators [--train-run-id UUID] [bounded flags] [--timeout 30s]",
+		)
+	}
+	limits := shardreconcile.Limits{PageSize: *pageSize, MaxPages: *maximumPages, MaxRows: *maximumRows}
+	if !limits.Valid() {
+		return resultEnvelope{}, errors.New("shard reconciliation limits are invalid")
+	}
+	filter := shardreconcile.LocatorFilter{}
+	if raw := strings.TrimSpace(*trainRunText); raw != "" {
+		trainRunID, err := uuid.Parse(raw)
+		if err != nil || trainRunID == uuid.Nil || trainRunID.String() != raw {
+			return resultEnvelope{}, errors.New("train-run-id must be a canonical UUID")
+		}
+		filter.TrainRunID = &trainRunID
+	}
+	return runShardInspection(parent, databaseURL, shardreconcile.ScopeLocators, *timeout,
+		func(ctx context.Context, inspector *shardreconcile.Inspector) (shardreconcile.Report, error) {
+			return inspector.Locators(ctx, filter, limits)
+		})
+}
+
+func runShardMigration(
+	parent context.Context,
+	databaseURL string,
+	args []string,
+) (resultEnvelope, error) {
+	flags := flag.NewFlagSet(shardreconcile.ScopeMigration, flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	migrationText := flags.String("migration-id", "", "canonical migration UUID")
+	pageSize := flags.Int("page-size", shardreconcile.DefaultPageSize, "bounded database page size")
+	maximumPages := flags.Int("max-pages", shardreconcile.DefaultMaxPages, "maximum query pages")
+	maximumRows := flags.Int64("max-rows", shardreconcile.DefaultMaxRows, "maximum examined rows")
+	timeout := flags.Duration("timeout", defaultTimeout, "maximum reconciliation duration")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 ||
+		!validShardReconciliationTimeout(*timeout) {
+		return resultEnvelope{}, errors.New(
+			"usage: reconcile shard-migration --migration-id UUID [bounded flags] [--timeout 30s]",
+		)
+	}
+	limits := shardreconcile.Limits{PageSize: *pageSize, MaxPages: *maximumPages, MaxRows: *maximumRows}
+	if !limits.Valid() {
+		return resultEnvelope{}, errors.New("shard reconciliation limits are invalid")
+	}
+	migrationID, err := uuid.Parse(strings.TrimSpace(*migrationText))
+	if err != nil || migrationID == uuid.Nil || migrationID.String() != strings.TrimSpace(*migrationText) {
+		return resultEnvelope{}, errors.New("migration-id must be a canonical UUID")
+	}
+	return runShardInspection(parent, databaseURL, shardreconcile.ScopeMigration, *timeout,
+		func(ctx context.Context, inspector *shardreconcile.Inspector) (shardreconcile.Report, error) {
+			return inspector.Migration(ctx, migrationID, limits)
+		})
+}
+
+func runShardInspection(
+	parent context.Context,
+	databaseURL string,
+	command string,
+	timeout time.Duration,
+	inspect func(context.Context, *shardreconcile.Inspector) (shardreconcile.Report, error),
+) (resultEnvelope, error) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		return resultEnvelope{}, errors.New("postgres configuration invalid")
+	}
+	defer pool.Close()
+	inspector, err := shardreconcile.New(pool)
+	if err != nil {
+		return resultEnvelope{}, errors.New("shard reconciliation initialization failed")
+	}
+	report, inspectErr := inspect(ctx, inspector)
+	envelope := resultEnvelope{Command: command, Status: "healthy", ReadOnly: true, Result: report}
+	switch report.Completeness {
+	case shardreconcile.CompletenessPartial:
+		envelope.Status = "partial"
+	case shardreconcile.CompletenessUnavailable:
+		envelope.Status = "unavailable"
+	}
+	if report.Violations > 0 && envelope.Status == "healthy" {
+		envelope.Status = "violations"
+	}
+	return envelope, inspectErr
 }
 
 func runReadModel(parent context.Context, databaseURL string, args []string) (resultEnvelope, error) {
@@ -554,5 +701,5 @@ func publicError(err error) string {
 }
 
 func writeUsage(output io.Writer) {
-	fmt.Fprintln(output, "usage: reconcile {seat-inventory|reservation-quotas|admission-state|read-model|cache-versions} [options]")
+	fmt.Fprintln(output, "usage: reconcile {seat-inventory|reservation-quotas|admission-state|read-model|cache-versions|shard-assignments|shard-locators|shard-migration} [options]")
 }

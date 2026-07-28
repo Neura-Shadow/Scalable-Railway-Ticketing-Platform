@@ -25,6 +25,7 @@ func TestAdmissionErrorsUseSafeStatusAndBoundedRetryAfter(t *testing.T) {
 		{name: "queue full", err: WithRetryAfter(ErrQueueFull, 8), wantStatus: http.StatusTooManyRequests, wantCode: "queue_full", wantRetry: 8},
 		{name: "quota", err: WithRetryAfter(ErrReservationQuotaExceeded, 12), wantStatus: http.StatusTooManyRequests, wantCode: "reservation_quota_exceeded", wantRetry: 12},
 		{name: "backpressure bounded", err: WithRetryAfter(ErrReservationBackpressure, 600), wantStatus: http.StatusServiceUnavailable, wantCode: "reservation_backpressure", wantRetry: 60},
+		{name: "rebalancing", err: WithRetryAfter(ErrServiceTemporarilyRebalancing, 2), wantStatus: http.StatusServiceUnavailable, wantCode: "service_temporarily_rebalancing", wantRetry: 2},
 	}
 
 	for _, test := range tests {

@@ -24,6 +24,16 @@ const (
 	EnvironmentProduction  Environment = "production"
 )
 
+// BookingShardMode selects the booking storage-routing policy.
+type BookingShardMode string
+
+const (
+	// BookingShardModeLegacy preserves the pre-Milestone 4 single-schema path.
+	BookingShardModeLegacy BookingShardMode = "legacy"
+	// BookingShardModeSchemaPOC enables the reversible same-cluster schema POC.
+	BookingShardModeSchemaPOC BookingShardMode = "schema_poc"
+)
+
 // Process identifies the executable whose configuration contract is being
 // loaded and validated.
 type Process string
@@ -42,12 +52,25 @@ const (
 	// admissionredis.MaxAdmissionBatch. Config deliberately does not import an
 	// infrastructure adapter solely to share a constant.
 	maxAdmissionWorkerBatchSize = 1_000
+	maxBookingRouteCacheEntries = 100_000
+	maxBookingShardQueryTimeout = 30 * time.Second
 )
 
 // Config contains the typed runtime settings used by the application and its
 // background workers. Secret values are intentionally never assigned defaults.
 type Config struct {
 	Environment Environment
+
+	BookingShardMode BookingShardMode
+	BookingShardIDs  []string
+	// BookingShardSchemaPOCProductionEnabled is an explicit acknowledgement
+	// that the same-cluster schema sharding proof of concept is being enabled
+	// outside development and test environments.
+	BookingShardSchemaPOCProductionEnabled bool
+	BookingRouteCacheEnabled               bool
+	BookingRouteCacheTTL                   time.Duration
+	BookingRouteCacheMaxEntries            int
+	BookingShardQueryTimeout               time.Duration
 
 	HTTPAddress   string
 	DatabaseURL   string
@@ -128,6 +151,12 @@ type LookupFunc func(key string) (string, bool)
 func Defaults() Config {
 	return Config{
 		Environment:                      EnvironmentDevelopment,
+		BookingShardMode:                 BookingShardModeLegacy,
+		BookingShardIDs:                  []string{"legacy"},
+		BookingRouteCacheEnabled:         true,
+		BookingRouteCacheTTL:             30 * time.Second,
+		BookingRouteCacheMaxEntries:      1_000,
+		BookingShardQueryTimeout:         2 * time.Second,
 		HTTPAddress:                      ":8080",
 		JWTIssuer:                        "scalable-railway-ticketing-platform",
 		JWTAudience:                      "railway-api",
@@ -222,7 +251,13 @@ func (c Config) ValidateFor(process Process) error {
 	validatePositive(
 		validationCheck{"SHUTDOWN_TIMEOUT", c.ShutdownTimeout > 0},
 		validationCheck{"DATABASE_TIMEOUT", c.DatabaseTimeout > 0},
+		validationCheck{"BOOKING_ROUTE_CACHE_TTL_SECONDS", c.BookingRouteCacheTTL > 0 && c.BookingRouteCacheTTL <= 24*time.Hour},
+		validationCheck{"BOOKING_ROUTE_CACHE_MAX_ENTRIES", positiveBounded(c.BookingRouteCacheMaxEntries, maxBookingRouteCacheEntries)},
+		validationCheck{"BOOKING_SHARD_QUERY_TIMEOUT", c.BookingShardQueryTimeout > 0 && c.BookingShardQueryTimeout <= maxBookingShardQueryTimeout},
 	)
+	if err := validateBookingShardConfig(c); err != nil {
+		problems = append(problems, err)
+	}
 
 	switch process {
 	case ProcessAPI:
@@ -598,6 +633,9 @@ func LoadFromFor(lookup LookupFunc, process Process) (Config, error) {
 			return Config{}, err
 		}
 	}
+	if err := loadBookingShardSettings(lookup, &cfg); err != nil {
+		return Config{}, err
+	}
 	var err error
 	switch process {
 	case ProcessAPI:
@@ -620,6 +658,76 @@ func LoadFromFor(lookup LookupFunc, process Process) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func loadBookingShardSettings(lookup LookupFunc, cfg *Config) error {
+	if value, ok := lookup("BOOKING_SHARD_MODE"); ok {
+		cfg.BookingShardMode = BookingShardMode(strings.ToLower(strings.TrimSpace(value)))
+	}
+	if value, ok := lookup("BOOKING_SHARD_IDS"); ok {
+		cfg.BookingShardIDs = splitList(value)
+	} else if cfg.BookingShardMode == BookingShardModeSchemaPOC {
+		cfg.BookingShardIDs = []string{"legacy", "shard-0", "shard-1"}
+	}
+	for _, item := range []struct {
+		name   string
+		target *bool
+	}{
+		{"BOOKING_SHARD_SCHEMA_POC_PRODUCTION_ENABLED", &cfg.BookingShardSchemaPOCProductionEnabled},
+		{"BOOKING_ROUTE_CACHE_ENABLED", &cfg.BookingRouteCacheEnabled},
+	} {
+		if err := setBool(lookup, item.name, item.target); err != nil {
+			return err
+		}
+	}
+	for _, item := range []struct {
+		name   string
+		target *int
+	}{
+		{"BOOKING_ROUTE_CACHE_MAX_ENTRIES", &cfg.BookingRouteCacheMaxEntries},
+	} {
+		if err := setInt(lookup, item.name, item.target); err != nil {
+			return err
+		}
+	}
+	if err := setSeconds(lookup, "BOOKING_ROUTE_CACHE_TTL_SECONDS", &cfg.BookingRouteCacheTTL); err != nil {
+		return err
+	}
+	return setDuration(lookup, "BOOKING_SHARD_QUERY_TIMEOUT", &cfg.BookingShardQueryTimeout)
+}
+
+func validateBookingShardConfig(c Config) error {
+	if c.BookingShardMode != BookingShardModeLegacy && c.BookingShardMode != BookingShardModeSchemaPOC {
+		return errors.New("BOOKING_SHARD_MODE must be legacy or schema_poc")
+	}
+	if c.BookingShardMode == BookingShardModeSchemaPOC && c.Environment == EnvironmentProduction && !c.BookingShardSchemaPOCProductionEnabled {
+		return errors.New("BOOKING_SHARD_SCHEMA_POC_PRODUCTION_ENABLED must be true when BOOKING_SHARD_MODE=schema_poc in production")
+	}
+
+	known := map[string]struct{}{"legacy": {}, "shard-0": {}, "shard-1": {}}
+	seen := make(map[string]struct{}, len(c.BookingShardIDs))
+	for _, shardID := range c.BookingShardIDs {
+		if _, ok := known[shardID]; !ok {
+			return errors.New("BOOKING_SHARD_IDS must contain only known logical shard IDs, not database schema identifiers")
+		}
+		if _, duplicate := seen[shardID]; duplicate {
+			return errors.New("BOOKING_SHARD_IDS must not contain duplicates")
+		}
+		seen[shardID] = struct{}{}
+	}
+	if c.BookingShardMode == BookingShardModeLegacy {
+		if len(c.BookingShardIDs) != 1 || c.BookingShardIDs[0] != "legacy" {
+			return errors.New("BOOKING_SHARD_IDS must be legacy when BOOKING_SHARD_MODE=legacy")
+		}
+		return nil
+	}
+	if len(c.BookingShardIDs) < 2 {
+		return errors.New("BOOKING_SHARD_IDS must include legacy and at least one schema_poc target")
+	}
+	if _, ok := seen["legacy"]; !ok {
+		return errors.New("BOOKING_SHARD_IDS must include legacy")
+	}
+	return nil
 }
 
 func loadAPISettings(lookup LookupFunc, cfg *Config) error {

@@ -25,7 +25,7 @@ func (s *Store) ReconcileReservationQuotas(
 		return ReservationQuotaReconciliation{}, ErrInvalidArgument
 	}
 	var result ReservationQuotaReconciliation
-	err := s.pool.QueryRow(ctx, `
+	query := `
 WITH held AS (
     SELECT r.id, r.user_id, r.train_run_id,
            count(rs.id)::bigint AS passenger_count
@@ -46,7 +46,29 @@ WITH held AS (
 SELECT
     (SELECT count(*) FROM per_user WHERE holds > $1),
     (SELECT count(*) FROM per_user_run WHERE holds > $2),
-    (SELECT count(*) FROM per_user WHERE passengers > $3)`,
+	(SELECT count(*) FROM per_user WHERE passengers > $3)`
+	if s.shards != nil {
+		query = `
+WITH held AS (
+    SELECT reservation_id AS id, user_id, train_run_id, passenger_count
+    FROM public.reservation_quota_claims
+    WHERE active
+), per_user AS (
+    SELECT user_id, count(*)::bigint AS holds,
+           coalesce(sum(passenger_count), 0)::bigint AS passengers
+    FROM held
+    GROUP BY user_id
+), per_user_run AS (
+    SELECT user_id, train_run_id, count(*)::bigint AS holds
+    FROM held
+    GROUP BY user_id, train_run_id
+)
+SELECT
+    (SELECT count(*) FROM per_user WHERE holds > $1),
+    (SELECT count(*) FROM per_user_run WHERE holds > $2),
+    (SELECT count(*) FROM per_user WHERE passengers > $3)`
+	}
+	err := s.pool.QueryRow(ctx, query,
 		limits.MaxActiveHoldsPerUser,
 		limits.MaxActiveHoldsPerUserPerTrainRun,
 		limits.MaxActivePassengersPerUser,
