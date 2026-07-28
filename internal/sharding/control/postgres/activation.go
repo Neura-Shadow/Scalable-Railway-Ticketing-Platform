@@ -133,9 +133,6 @@ SELECT EXISTS (
     UNION ALL
     SELECT 1 FROM public.ticket_shard_locators
     WHERE train_run_id = $1 AND (shard_id <> $2 OR assignment_generation <> $3)
-    UNION ALL
-    SELECT 1 FROM public.booking_idempotency_key_claims
-    WHERE train_run_id = $1 AND (shard_id <> $2 OR assignment_generation <> $3)
 )`, expected.TrainRunID(), expected.ShardID().String(), expected.Generation().Int64()).Scan(&stale)
 	if err != nil {
 		return ErrPersistence
@@ -155,17 +152,6 @@ WHERE train_run_id = $1 AND shard_id = $2 AND assignment_generation = $3`
 			return ErrPersistence
 		}
 	}
-	if _, err := tx.tx.Exec(ctx, `
-UPDATE public.booking_idempotency_key_claims
-SET shard_id = $4,
-    assignment_generation = $5,
-    updated_at = clock_timestamp()
-WHERE train_run_id = $1 AND shard_id = $2 AND assignment_generation = $3`,
-		expected.TrainRunID(), expected.ShardID().String(), expected.Generation().Int64(),
-		next.ShardID().String(), next.Generation().Int64()); err != nil {
-		return ErrPersistence
-	}
-
 	commandTag, err := tx.tx.Exec(ctx, `
 UPDATE public.train_run_shard_assignments
 SET shard_id = $4,

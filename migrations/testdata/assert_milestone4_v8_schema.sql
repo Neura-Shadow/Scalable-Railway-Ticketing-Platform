@@ -102,13 +102,17 @@ BEGIN
         RAISE EXCEPTION 'durable migration replay fields are incomplete';
     END IF;
 
-    IF NOT EXISTS (
+    IF EXISTS (
         SELECT 1
-        FROM pg_constraint
-        WHERE conrelid = 'public.booking_idempotency_key_claims'::regclass
-          AND conname = 'booking_idempotency_key_claims_train_run_compatibility_check'
-    ) THEN
-        RAISE EXCEPTION 'version-7 unresolved-key compatibility constraint is missing';
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'booking_idempotency_key_claims'
+          AND column_name IN ('shard_id', 'assignment_generation', 'local_record_id')
+    ) OR (SELECT is_nullable FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'booking_idempotency_key_claims'
+            AND column_name = 'train_run_id') <> 'YES' THEN
+        RAISE EXCEPTION 'global idempotency claim contains routing or completion authority';
     END IF;
 
     IF to_regclass('public.reservation_shard_locators_train_run_idx') IS NULL

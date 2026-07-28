@@ -312,58 +312,20 @@ CREATE TABLE IF NOT EXISTS public.booking_idempotency_key_claims (
         CHECK (octet_length(request_fingerprint) = 32),
     train_run_id uuid
         REFERENCES public.train_runs(id) ON DELETE RESTRICT,
-    shard_id text NOT NULL
-        REFERENCES public.booking_shards(shard_id) ON DELETE RESTRICT,
-    assignment_generation bigint NOT NULL CHECK (assignment_generation > 0),
-    local_record_id uuid,
     expires_at timestamptz NOT NULL,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     UNIQUE (user_id, operation, key_hash),
-    CHECK (expires_at > created_at),
-    CONSTRAINT booking_idempotency_key_claims_train_run_compatibility_check CHECK (
-        train_run_id IS NOT NULL
-        OR (
-            shard_id = 'legacy'
-            AND assignment_generation = 1
-            AND local_record_id IS NOT NULL
-        )
-    )
+    CHECK (expires_at > created_at)
 );
 
 -- A committed version-7 in-progress record has no resource from which to
 -- derive train_run_id. This tightly constrained nullable form preserves the
 -- global key conflict until completion/expiry; routed version-8 acquisition
--- always supplies a train run.
+-- always supplies a train run. The claim deliberately carries no storage
+-- route, generation, local record identity, or replay result authority.
 ALTER TABLE public.booking_idempotency_key_claims
     ALTER COLUMN train_run_id DROP NOT NULL;
-
-DO $m4_constraint$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1
-        FROM pg_constraint
-        WHERE conrelid = 'public.booking_idempotency_key_claims'::regclass
-          AND conname = 'booking_idempotency_key_claims_train_run_compatibility_check'
-    ) THEN
-        ALTER TABLE public.booking_idempotency_key_claims
-            ADD CONSTRAINT booking_idempotency_key_claims_train_run_compatibility_check
-            CHECK (
-                train_run_id IS NOT NULL
-                OR (
-                    shard_id = 'legacy'
-                    AND assignment_generation = 1
-                    AND local_record_id IS NOT NULL
-                )
-            );
-    END IF;
-END
-$m4_constraint$;
-
-COMMENT ON COLUMN public.booking_idempotency_key_claims.shard_id IS
-    'Bounded integrity provenance only; routing authority remains train_run_shard_assignments.';
-COMMENT ON COLUMN public.booking_idempotency_key_claims.assignment_generation IS
-    'Observed integrity provenance only; this row cannot authorize or replay a booking command.';
 
 CREATE INDEX IF NOT EXISTS booking_idempotency_key_claims_expiry_idx
     ON public.booking_idempotency_key_claims (expires_at, id);
@@ -905,8 +867,7 @@ WHERE record.train_run_id IS NULL
   AND record.resource_id = reservation.id;
 
 INSERT INTO public.booking_idempotency_key_claims (
-    user_id, operation, key_hash, request_fingerprint, train_run_id,
-    shard_id, assignment_generation, local_record_id, expires_at,
+    user_id, operation, key_hash, request_fingerprint, train_run_id, expires_at,
     created_at, updated_at
 )
 SELECT record.user_id,
@@ -914,22 +875,15 @@ SELECT record.user_id,
        record.key_hash,
        record.request_fingerprint,
        record.train_run_id,
-       'legacy',
-       assignment.assignment_generation,
-       record.id,
        record.expires_at,
        record.created_at,
        record.updated_at
 FROM public.idempotency_records AS record
-JOIN public.train_run_shard_assignments AS assignment
-  ON assignment.train_run_id = record.train_run_id
- AND assignment.shard_id = 'legacy'
 WHERE record.train_run_id IS NOT NULL
 ON CONFLICT (user_id, operation, key_hash) DO NOTHING;
 
 INSERT INTO public.booking_idempotency_key_claims (
-    user_id, operation, key_hash, request_fingerprint, train_run_id,
-    shard_id, assignment_generation, local_record_id, expires_at,
+    user_id, operation, key_hash, request_fingerprint, train_run_id, expires_at,
     created_at, updated_at
 )
 SELECT record.user_id,
@@ -937,9 +891,6 @@ SELECT record.user_id,
        record.key_hash,
        record.request_fingerprint,
        NULL,
-       'legacy',
-       1,
-       record.id,
        record.expires_at,
        record.created_at,
        record.updated_at
@@ -1755,44 +1706,36 @@ BEGIN
     END IF;
 
     INSERT INTO public.booking_idempotency_key_claims (
-        user_id, operation, key_hash, request_fingerprint, train_run_id,
-        shard_id, assignment_generation, local_record_id, expires_at,
+        user_id, operation, key_hash, request_fingerprint, train_run_id, expires_at,
         created_at, updated_at
     ) VALUES (
         NEW.user_id, NEW.operation, NEW.key_hash, NEW.request_fingerprint,
-        NEW.train_run_id, 'legacy', current_generation, NEW.id,
-        NEW.expires_at, NEW.created_at, NEW.updated_at
+        NEW.train_run_id, NEW.expires_at, NEW.created_at, NEW.updated_at
     )
     ON CONFLICT (user_id, operation, key_hash) DO UPDATE
     SET request_fingerprint = EXCLUDED.request_fingerprint,
         train_run_id = EXCLUDED.train_run_id,
-        shard_id = EXCLUDED.shard_id,
-        assignment_generation = EXCLUDED.assignment_generation,
-        local_record_id = EXCLUDED.local_record_id,
         expires_at = EXCLUDED.expires_at,
         created_at = EXCLUDED.created_at,
         updated_at = EXCLUDED.updated_at
     WHERE public.booking_idempotency_key_claims.expires_at <= clock_timestamp()
        OR (
-            public.booking_idempotency_key_claims.local_record_id = EXCLUDED.local_record_id
-            AND public.booking_idempotency_key_claims.request_fingerprint
-                = EXCLUDED.request_fingerprint
-       )
-       OR (
-            -- A routed legacy writer acquires and locks the global claim
-            -- before inserting its local record. Permit only that exact
-            -- unbound placeholder to be completed by this compatibility
-            -- trigger; a different route, generation, or fingerprint remains
-            -- a conflict.
-            public.booking_idempotency_key_claims.local_record_id IS NULL
-            AND public.booking_idempotency_key_claims.request_fingerprint
+            public.booking_idempotency_key_claims.request_fingerprint
                 = EXCLUDED.request_fingerprint
             AND public.booking_idempotency_key_claims.train_run_id
-                = EXCLUDED.train_run_id
-            AND public.booking_idempotency_key_claims.shard_id
-                = EXCLUDED.shard_id
-            AND public.booking_idempotency_key_claims.assignment_generation
-                = EXCLUDED.assignment_generation
+                IS NOT DISTINCT FROM EXCLUDED.train_run_id
+            AND public.booking_idempotency_key_claims.expires_at
+                = EXCLUDED.expires_at
+       )
+       OR (
+            -- A version-7 in-progress row receives its train-run integrity
+            -- reference only when completion resolves its reservation.
+            public.booking_idempotency_key_claims.request_fingerprint
+                = EXCLUDED.request_fingerprint
+            AND public.booking_idempotency_key_claims.train_run_id IS NULL
+            AND EXCLUDED.train_run_id IS NOT NULL
+            AND public.booking_idempotency_key_claims.expires_at
+                = EXCLUDED.expires_at
        )
     RETURNING id INTO synchronized_claim_id;
 

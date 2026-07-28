@@ -21,6 +21,504 @@ import (
 
 const concurrentBookingCutoverAttempts = 100
 
+func TestExpiredIdempotencyCleanupDefersMigrationAndRetiresRetainedCopiesIntegration(t *testing.T) {
+	pool := openShardedBookingIntegrationPool(t)
+	fixture := seedShardedBookingCutoverFixture(t, pool)
+	ctx := context.Background()
+	recordID := seedExpiredIdempotencyCopies(t, pool, fixture)
+	store := New(pool)
+
+	if _, err := pool.Exec(ctx, `
+UPDATE public.train_run_shard_assignments
+SET assignment_state = 'draining'
+WHERE train_run_id = $1`, fixture.trainRunID); err != nil {
+		t.Fatalf("mark assignment draining: %v", err)
+	}
+	if err := store.cleanupExpiredIdempotencyAcrossShards(ctx, 10); err != nil {
+		t.Fatalf("cleanup while migration is active: %v", err)
+	}
+	assertExpiredIdempotencyCopyCounts(t, pool, fixture, recordID, 1, 1, 1)
+
+	if _, err := pool.Exec(ctx, `
+UPDATE public.train_run_shard_assignments
+SET assignment_state = 'stable', active_migration_id = NULL
+WHERE train_run_id = $1`, fixture.trainRunID); err != nil {
+		t.Fatalf("restore stable assignment: %v", err)
+	}
+	if err := store.cleanupExpiredIdempotencyAcrossShards(ctx, 10); err != nil {
+		t.Fatalf("cleanup retained copies after rollback: %v", err)
+	}
+	assertExpiredIdempotencyCopyCounts(t, pool, fixture, recordID, 0, 0, 0)
+}
+
+func TestExpiredIdempotencyReacquisitionRetiresRetainedCopiesIntegration(t *testing.T) {
+	pool := openShardedBookingIntegrationPool(t)
+	fixture := seedShardedBookingCutoverFixture(t, pool)
+	ctx := context.Background()
+	oldRecordID := seedExpiredIdempotencyCopies(t, pool, fixture)
+	router, err := shardingpostgres.NewRouter(pool, nil)
+	if err != nil {
+		t.Fatalf("create router: %v", err)
+	}
+	store, err := NewShardedWithReservationQuotaLimits(pool, router, cutoverQuotaLimits())
+	if err != nil {
+		t.Fatalf("create sharded store: %v", err)
+	}
+	tx, err := store.beginTrainRunWrite(ctx, fixture.trainRunID)
+	if err != nil {
+		t.Fatalf("begin routed reacquisition: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	acquisition, err := tx.AcquireIdempotency(ctx, IdempotencyInput{
+		UserID: fixture.userIDs[0], Operation: OperationReservationCreate,
+		KeyHash: bookingCutoverDigest("expired-key", 0), RequestFingerprint: bookingCutoverDigest("new-request", 0),
+		ExpiresAt: time.Unix(1, 0).UTC(), // deliberately skewed; the database derives the real expiry
+	})
+	if err != nil {
+		t.Fatalf("reacquire expired routed key: %v", err)
+	}
+	if !acquisition.Owned || acquisition.RecordID == uuid.Nil || acquisition.RecordID == oldRecordID {
+		t.Fatalf("reacquisition = %#v, old record = %s", acquisition, oldRecordID)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit routed reacquisition: %v", err)
+	}
+	assertExpiredIdempotencyCopyCounts(t, pool, fixture, oldRecordID, 0, 0, 1)
+	var claimLocalRecordID uuid.UUID
+	var claimExpiry, localExpiry, databaseNow time.Time
+	if err := pool.QueryRow(ctx, `
+SELECT record.id, claim.expires_at, record.expires_at, clock_timestamp()
+FROM public.booking_idempotency_key_claims AS claim
+JOIN public.idempotency_records AS record
+  ON record.user_id = claim.user_id
+ AND record.operation = claim.operation
+ AND record.key_hash = claim.key_hash
+ AND record.request_fingerprint = claim.request_fingerprint
+ AND record.train_run_id = claim.train_run_id
+ AND record.expires_at = claim.expires_at
+WHERE claim.user_id = $1 AND claim.operation = 'reservation.create' AND claim.key_hash = $2`,
+		fixture.userIDs[0], bookingCutoverDigest("expired-key", 0)).Scan(
+		&claimLocalRecordID, &claimExpiry, &localExpiry, &databaseNow,
+	); err != nil {
+		t.Fatalf("read reacquired claim: %v", err)
+	}
+	if claimLocalRecordID != acquisition.RecordID {
+		t.Fatalf("reacquired claim local record = %s, want %s", claimLocalRecordID, acquisition.RecordID)
+	}
+	if !claimExpiry.Equal(localExpiry) || claimExpiry.Before(databaseNow.Add(23*time.Hour)) ||
+		claimExpiry.After(databaseNow.Add(25*time.Hour)) {
+		t.Fatalf("database-derived expiry claim/local/now = %s/%s/%s", claimExpiry, localExpiry, databaseNow)
+	}
+}
+
+func TestRoutedIdempotencyRetryReusesCanonicalClaimExpiryIntegration(t *testing.T) {
+	pool := openShardedBookingIntegrationPool(t)
+	fixture := seedShardedBookingCutoverFixture(t, pool)
+	ctx := context.Background()
+	router, err := shardingpostgres.NewRouter(pool, nil)
+	if err != nil {
+		t.Fatalf("create router: %v", err)
+	}
+	store, err := NewShardedWithReservationQuotaLimits(pool, router, cutoverQuotaLimits())
+	if err != nil {
+		t.Fatalf("create sharded store: %v", err)
+	}
+	keyHash := bookingCutoverDigest("routed-replay-key", 0)
+	fingerprint := bookingCutoverDigest("routed-replay-request", 0)
+	resourceID := uuid.New()
+
+	first, err := store.beginTrainRunWrite(ctx, fixture.trainRunID)
+	if err != nil {
+		t.Fatalf("begin first routed acquisition: %v", err)
+	}
+	acquisition, err := first.AcquireIdempotency(ctx, IdempotencyInput{
+		UserID: fixture.userIDs[0], Operation: OperationReservationCreate,
+		KeyHash: keyHash, RequestFingerprint: fingerprint,
+		ExpiresAt: time.Unix(1, 0).UTC(),
+	})
+	if err != nil {
+		_ = first.Rollback(context.Background())
+		t.Fatalf("acquire first routed key: %v", err)
+	}
+	if err := first.CompleteIdempotency(ctx, acquisition.RecordID, resourceID); err != nil {
+		_ = first.Rollback(context.Background())
+		t.Fatalf("complete first routed key: %v", err)
+	}
+	if err := first.Commit(ctx); err != nil {
+		t.Fatalf("commit first routed acquisition: %v", err)
+	}
+
+	var originalClaimExpiry time.Time
+	if err := pool.QueryRow(ctx, `
+SELECT expires_at
+FROM public.booking_idempotency_key_claims
+WHERE user_id = $1 AND operation = 'reservation.create' AND key_hash = $2`,
+		fixture.userIDs[0], keyHash).Scan(&originalClaimExpiry); err != nil {
+		t.Fatalf("read original claim expiry: %v", err)
+	}
+
+	retry, err := store.beginTrainRunWrite(ctx, fixture.trainRunID)
+	if err != nil {
+		t.Fatalf("begin routed retry: %v", err)
+	}
+	defer func() { _ = retry.Rollback(context.Background()) }()
+	replay, err := retry.AcquireIdempotency(ctx, IdempotencyInput{
+		UserID: fixture.userIDs[0], Operation: OperationReservationCreate,
+		KeyHash: keyHash, RequestFingerprint: fingerprint,
+		ExpiresAt: time.Unix(4102444800, 0).UTC(), // caller skew must not replace canonical DB expiry
+	})
+	if err != nil {
+		t.Fatalf("retry routed key: %v", err)
+	}
+	if !replay.Replayed || replay.Owned || replay.RecordID != acquisition.RecordID || replay.ResourceID != resourceID {
+		t.Fatalf("routed replay = %#v, first = %#v resource = %s", replay, acquisition, resourceID)
+	}
+	if err := retry.Commit(ctx); err != nil {
+		t.Fatalf("commit routed replay: %v", err)
+	}
+
+	var claimExpiry, localExpiry time.Time
+	if err := pool.QueryRow(ctx, `
+SELECT claim.expires_at, record.expires_at
+FROM public.booking_idempotency_key_claims AS claim
+JOIN public.idempotency_records AS record
+  ON record.user_id = claim.user_id
+ AND record.operation = claim.operation
+ AND record.key_hash = claim.key_hash
+WHERE claim.user_id = $1 AND claim.operation = 'reservation.create' AND claim.key_hash = $2`,
+		fixture.userIDs[0], keyHash).Scan(&claimExpiry, &localExpiry); err != nil {
+		t.Fatalf("read replayed claim/local expiry: %v", err)
+	}
+	if !claimExpiry.Equal(originalClaimExpiry) || !localExpiry.Equal(originalClaimExpiry) {
+		t.Fatalf("retry changed canonical expiry: original=%s claim=%s local=%s", originalClaimExpiry, claimExpiry, localExpiry)
+	}
+}
+
+func TestRoutedInProgressRetryDoesNotConflictOnCanonicalExpiryIntegration(t *testing.T) {
+	pool := openShardedBookingIntegrationPool(t)
+	fixture := seedShardedBookingCutoverFixture(t, pool)
+	ctx := context.Background()
+	router, err := shardingpostgres.NewRouter(pool, nil)
+	if err != nil {
+		t.Fatalf("create router: %v", err)
+	}
+	store, err := NewShardedWithReservationQuotaLimits(pool, router, cutoverQuotaLimits())
+	if err != nil {
+		t.Fatalf("create sharded store: %v", err)
+	}
+	input := IdempotencyInput{
+		UserID: fixture.userIDs[0], Operation: OperationReservationCreate,
+		KeyHash:            bookingCutoverDigest("routed-in-progress-key", 0),
+		RequestFingerprint: bookingCutoverDigest("routed-in-progress-request", 0),
+		ExpiresAt:          time.Unix(1, 0).UTC(),
+	}
+
+	first, err := store.beginTrainRunWrite(ctx, fixture.trainRunID)
+	if err != nil {
+		t.Fatalf("begin first routed acquisition: %v", err)
+	}
+	if _, err := first.AcquireIdempotency(ctx, input); err != nil {
+		_ = first.Rollback(context.Background())
+		t.Fatalf("acquire in-progress routed key: %v", err)
+	}
+	if err := first.Commit(ctx); err != nil {
+		t.Fatalf("commit in-progress routed key: %v", err)
+	}
+
+	retry, err := store.beginTrainRunWrite(ctx, fixture.trainRunID)
+	if err != nil {
+		t.Fatalf("begin in-progress retry: %v", err)
+	}
+	defer func() { _ = retry.Rollback(context.Background()) }()
+	input.ExpiresAt = time.Unix(4102444800, 0).UTC()
+	if _, err := retry.AcquireIdempotency(ctx, input); !errors.Is(err, ErrIdempotencyInProgress) {
+		t.Fatalf("in-progress retry error = %v, want %v", err, ErrIdempotencyInProgress)
+	}
+}
+
+func TestRoutedRetryLinearizesExpiryBeforeClaimLockWaitIntegration(t *testing.T) {
+	pool := openShardedBookingIntegrationPool(t)
+	fixture := seedShardedBookingCutoverFixture(t, pool)
+	ctx := context.Background()
+	keyHash := bookingCutoverDigest("expiry-boundary-key", 0)
+	fingerprint := bookingCutoverDigest("expiry-boundary-request", 0)
+	recordID := uuid.New()
+	var originalExpiry time.Time
+	if err := pool.QueryRow(ctx, `
+INSERT INTO public.idempotency_records (
+    id, user_id, operation, key_hash, request_fingerprint, train_run_id, expires_at
+)
+VALUES ($1, $2, 'reservation.create', $3, $4, $5, clock_timestamp() + interval '3 seconds')
+RETURNING expires_at`, recordID, fixture.userIDs[0], keyHash, fingerprint, fixture.trainRunID).Scan(&originalExpiry); err != nil {
+		t.Fatalf("seed boundary idempotency record: %v", err)
+	}
+	for _, schema := range []string{"booking_shard_0", "booking_shard_1"} {
+		if _, err := pool.Exec(ctx, fmt.Sprintf(`
+INSERT INTO %s.idempotency_records (
+    id, user_id, operation, key_hash, request_fingerprint, train_run_id, expires_at
+)
+VALUES ($1, $2, 'reservation.create', $3, $4, $5, $6)`, schema),
+			recordID, fixture.userIDs[0], keyHash, fingerprint, fixture.trainRunID, originalExpiry); err != nil {
+			t.Fatalf("seed boundary idempotency record in %s: %v", schema, err)
+		}
+	}
+
+	claimLock, err := pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		t.Fatalf("begin claim blocker: %v", err)
+	}
+	defer func() { _ = claimLock.Rollback(context.Background()) }()
+	if _, err := claimLock.Exec(ctx, `
+SELECT id
+FROM public.booking_idempotency_key_claims
+WHERE user_id = $1 AND operation = 'reservation.create' AND key_hash = $2
+FOR UPDATE`, fixture.userIDs[0], keyHash); err != nil {
+		t.Fatalf("lock boundary claim: %v", err)
+	}
+
+	router, err := shardingpostgres.NewRouter(pool, nil)
+	if err != nil {
+		t.Fatalf("create router: %v", err)
+	}
+	store, err := NewShardedWithReservationQuotaLimits(pool, router, cutoverQuotaLimits())
+	if err != nil {
+		t.Fatalf("create sharded store: %v", err)
+	}
+	backendPID := make(chan int32, 1)
+	result := make(chan error, 1)
+	go func() {
+		tx, beginErr := store.beginTrainRunWrite(context.Background(), fixture.trainRunID)
+		if beginErr != nil {
+			result <- beginErr
+			return
+		}
+		defer func() { _ = tx.Rollback(context.Background()) }()
+		var pid int32
+		if pidErr := tx.tx.QueryRow(context.Background(), `SELECT pg_backend_pid()`).Scan(&pid); pidErr != nil {
+			result <- pidErr
+			return
+		}
+		backendPID <- pid
+		_, acquireErr := tx.AcquireIdempotency(context.Background(), IdempotencyInput{
+			UserID: fixture.userIDs[0], Operation: OperationReservationCreate,
+			KeyHash: keyHash, RequestFingerprint: fingerprint,
+			ExpiresAt: time.Unix(1, 0).UTC(),
+		})
+		result <- acquireErr
+	}()
+
+	var pid int32
+	select {
+	case pid = <-backendPID:
+	case acquireErr := <-result:
+		t.Fatalf("start boundary retry: %v", acquireErr)
+	case <-time.After(5 * time.Second):
+		t.Fatal("boundary retry did not start")
+	}
+	waitDeadline := time.Now().Add(5 * time.Second)
+	for {
+		var waitingOnLock bool
+		if err := pool.QueryRow(ctx, `
+SELECT COALESCE((
+    SELECT wait_event_type = 'Lock'
+    FROM pg_stat_activity
+    WHERE pid = $1
+), false)`, pid).Scan(&waitingOnLock); err != nil {
+			t.Fatalf("observe boundary claim lock wait: %v", err)
+		}
+		if waitingOnLock {
+			break
+		}
+		if time.Now().After(waitDeadline) {
+			t.Fatal("routed retry did not reach the boundary claim lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Acquisition time is captured before the observed claim-lock wait. Release
+	// the lock only after database expiry; the retry must still use that one
+	// earlier decision for both claim and local record.
+	for {
+		var expired bool
+		if err := pool.QueryRow(ctx, `SELECT clock_timestamp() >= $1`, originalExpiry).Scan(&expired); err != nil {
+			t.Fatalf("observe boundary expiry: %v", err)
+		}
+		if expired {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := claimLock.Commit(ctx); err != nil {
+		t.Fatalf("release boundary claim lock: %v", err)
+	}
+	select {
+	case acquireErr := <-result:
+		if !errors.Is(acquireErr, ErrIdempotencyInProgress) {
+			t.Fatalf("boundary retry error = %v, want %v", acquireErr, ErrIdempotencyInProgress)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("boundary retry did not finish after claim lock release")
+	}
+
+	var persistedID uuid.UUID
+	var claimExpiry, localExpiry time.Time
+	if err := pool.QueryRow(ctx, `
+SELECT record.id, claim.expires_at, record.expires_at
+FROM public.booking_idempotency_key_claims AS claim
+JOIN public.idempotency_records AS record
+  ON record.user_id = claim.user_id
+ AND record.operation = claim.operation
+ AND record.key_hash = claim.key_hash
+WHERE claim.user_id = $1 AND claim.operation = 'reservation.create' AND claim.key_hash = $2`,
+		fixture.userIDs[0], keyHash).Scan(&persistedID, &claimExpiry, &localExpiry); err != nil {
+		t.Fatalf("read boundary claim/local record: %v", err)
+	}
+	if persistedID != recordID || !claimExpiry.Equal(originalExpiry) || !localExpiry.Equal(originalExpiry) {
+		t.Fatalf("boundary retry rewrote identity/expiry: id=%s want=%s claim=%s local=%s want=%s",
+			persistedID, recordID, claimExpiry, localExpiry, originalExpiry)
+	}
+}
+
+func TestForeignExpiredIdempotencyReacquisitionCannotRaceMigrationCopyIntegration(t *testing.T) {
+	pool := openShardedBookingIntegrationPool(t)
+	oldFixture := seedShardedBookingCutoverFixture(t, pool)
+	newFixture := seedShardedBookingCutoverFixture(t, pool)
+	ctx := context.Background()
+	oldRecordID := seedExpiredIdempotencyCopies(t, pool, oldFixture)
+	if _, err := pool.Exec(ctx, `
+UPDATE public.train_run_shard_assignments
+SET assignment_state = 'draining'
+WHERE train_run_id = $1`, oldFixture.trainRunID); err != nil {
+		t.Fatalf("mark old assignment draining: %v", err)
+	}
+
+	copyTx, err := pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		t.Fatalf("begin simulated migration copy: %v", err)
+	}
+	defer func() { _ = copyTx.Rollback(context.Background()) }()
+	if _, err := copyTx.Exec(ctx, `
+INSERT INTO booking_shard_1.idempotency_records (
+    id, user_id, operation, key_hash, request_fingerprint, status,
+    resource_type, resource_id, expires_at, created_at, updated_at, train_run_id
+)
+SELECT id, user_id, operation, key_hash, request_fingerprint, status,
+       resource_type, resource_id, expires_at, created_at, updated_at, train_run_id
+FROM public.idempotency_records
+WHERE id = $1`, oldRecordID); err != nil {
+		t.Fatalf("materialize simulated target copy: %v", err)
+	}
+
+	router, err := shardingpostgres.NewRouter(pool, nil)
+	if err != nil {
+		t.Fatalf("create router: %v", err)
+	}
+	store, err := NewShardedWithReservationQuotaLimits(pool, router, cutoverQuotaLimits())
+	if err != nil {
+		t.Fatalf("create sharded store: %v", err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		tx, beginErr := store.beginTrainRunWrite(context.Background(), newFixture.trainRunID)
+		if beginErr != nil {
+			result <- beginErr
+			return
+		}
+		defer func() { _ = tx.Rollback(context.Background()) }()
+		_, acquireErr := tx.AcquireIdempotency(context.Background(), IdempotencyInput{
+			UserID: oldFixture.userIDs[0], Operation: OperationReservationCreate,
+			KeyHash:            bookingCutoverDigest("expired-key", 0),
+			RequestFingerprint: bookingCutoverDigest("foreign-new-request", 0),
+			ExpiresAt:          time.Unix(1, 0).UTC(),
+		})
+		result <- acquireErr
+	}()
+
+	// Let the routed request reach the claim while the migration target insert
+	// remains uncommitted. It must fail closed without waiting to delete it.
+	select {
+	case acquireErr := <-result:
+		if !errors.Is(acquireErr, sharding.ErrShardUnavailable) {
+			t.Fatalf("foreign expired-key reacquisition error = %v, want %v", acquireErr, sharding.ErrShardUnavailable)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("foreign expired-key reacquisition blocked on migration target copy")
+	}
+	if err := copyTx.Commit(ctx); err != nil {
+		t.Fatalf("commit simulated migration copy: %v", err)
+	}
+
+	var legacy, shardZero, shardOne, claim int
+	if err := pool.QueryRow(ctx, `
+SELECT (SELECT count(*)::integer FROM public.idempotency_records WHERE id = $1),
+       (SELECT count(*)::integer FROM booking_shard_0.idempotency_records WHERE id = $1),
+       (SELECT count(*)::integer FROM booking_shard_1.idempotency_records WHERE id = $1),
+       (SELECT count(*)::integer FROM public.booking_idempotency_key_claims
+        WHERE user_id = $2 AND operation = 'reservation.create' AND key_hash = $3)`,
+		oldRecordID, oldFixture.userIDs[0], bookingCutoverDigest("expired-key", 0)).Scan(
+		&legacy, &shardZero, &shardOne, &claim,
+	); err != nil {
+		t.Fatalf("read post-race idempotency copies: %v", err)
+	}
+	if legacy != 1 || shardZero != 1 || shardOne != 1 || claim != 1 {
+		t.Fatalf("post-race copies legacy/shard0/shard1/claim = %d/%d/%d/%d, want 1/1/1/1",
+			legacy, shardZero, shardOne, claim)
+	}
+}
+
+func seedExpiredIdempotencyCopies(t *testing.T, pool *pgxpool.Pool, fixture shardedBookingCutoverFixture) uuid.UUID {
+	t.Helper()
+	recordID := uuid.New()
+	createdAt := time.Now().UTC().Add(-2 * time.Hour)
+	expiresAt := createdAt.Add(time.Hour)
+	for _, item := range []struct {
+		name  string
+		query string
+	}{
+		{"booking_shard_0", `
+INSERT INTO booking_shard_0.idempotency_records (
+    id, user_id, operation, key_hash, request_fingerprint, train_run_id,
+    expires_at, created_at
+) VALUES ($1, $2, 'reservation.create', $3, $4, $5,
+	          $6, $7)`},
+		{"public", `
+INSERT INTO public.idempotency_records (
+    id, user_id, operation, key_hash, request_fingerprint, train_run_id,
+    expires_at, created_at
+) VALUES ($1, $2, 'reservation.create', $3, $4, $5,
+	          $6, $7)`},
+	} {
+		if _, err := pool.Exec(context.Background(), item.query,
+			recordID, fixture.userIDs[0], bookingCutoverDigest("expired-key", 0),
+			bookingCutoverDigest("old-request", 0), fixture.trainRunID, expiresAt, createdAt); err != nil {
+			t.Fatalf("seed expired idempotency copy in %s: %v", item.name, err)
+		}
+	}
+	return recordID
+}
+
+func assertExpiredIdempotencyCopyCounts(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	fixture shardedBookingCutoverFixture,
+	recordID uuid.UUID,
+	wantLegacy, wantTarget, wantClaim int,
+) {
+	t.Helper()
+	var legacy, target, claim int
+	if err := pool.QueryRow(context.Background(), `
+SELECT (SELECT count(*)::integer FROM public.idempotency_records WHERE id = $1),
+       (SELECT count(*)::integer FROM booking_shard_0.idempotency_records WHERE id = $1),
+       (SELECT count(*)::integer FROM public.booking_idempotency_key_claims
+        WHERE user_id = $2 AND operation = 'reservation.create' AND key_hash = $3)`,
+		recordID, fixture.userIDs[0], bookingCutoverDigest("expired-key", 0)).Scan(&legacy, &target, &claim); err != nil {
+		t.Fatalf("read expired idempotency copy counts: %v", err)
+	}
+	if legacy != wantLegacy || target != wantTarget || claim != wantClaim {
+		t.Fatalf("expired idempotency copies legacy/target/claim = %d/%d/%d, want %d/%d/%d",
+			legacy, target, claim, wantLegacy, wantTarget, wantClaim)
+	}
+}
+
 func TestConcurrentCreateHoldAcrossCutoverUsesOnlyTargetWriterIntegration(t *testing.T) {
 	pool := openShardedBookingIntegrationPool(t)
 	fixture := seedShardedBookingCutoverFixture(t, pool)

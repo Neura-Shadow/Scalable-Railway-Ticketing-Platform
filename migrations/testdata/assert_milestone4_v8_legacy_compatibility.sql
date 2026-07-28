@@ -16,17 +16,16 @@ VALUES (
 );
 
 -- A schema-aware legacy writer acquires the global key claim before its
--- shard-local insert. The compatibility trigger must bind only the exact
--- placeholder owned by that routed transaction.
+-- shard-local insert. The compatibility trigger must accept only the same
+-- fingerprint, train-run integrity reference, and database expiry.
 INSERT INTO public.booking_idempotency_key_claims (
-    user_id, operation, key_hash, request_fingerprint, train_run_id,
-    shard_id, assignment_generation, local_record_id, expires_at
+    user_id, operation, key_hash, request_fingerprint, train_run_id, expires_at
 ) VALUES (
     '11111111-1111-4111-8111-111111111111',
     'reservation.create', decode(repeat('b0', 32), 'hex'),
     decode(repeat('a0', 32), 'hex'),
     '66666666-6666-4666-8666-666666666666',
-    'legacy', 1, NULL, '2099-01-01 00:00:00+00'
+    '2099-01-01 00:00:00+00'
 );
 
 INSERT INTO public.idempotency_records (
@@ -49,10 +48,8 @@ BEGIN
         WHERE user_id = '11111111-1111-4111-8111-111111111111'
           AND operation = 'reservation.create'
           AND key_hash = decode(repeat('b0', 32), 'hex')
-          AND local_record_id = 'e4000000-0000-4000-8000-000000000001'
           AND train_run_id = '66666666-6666-4666-8666-666666666666'
-          AND shard_id = 'legacy'
-          AND assignment_generation = 1
+          AND expires_at = '2099-01-01 00:00:00+00'
     ) THEN
         RAISE EXCEPTION 'routed legacy key placeholder was not bound';
     END IF;
@@ -83,10 +80,10 @@ BEGIN
     IF NOT EXISTS (
         SELECT 1
         FROM public.booking_idempotency_key_claims
-        WHERE local_record_id = 'e4000000-0000-4000-8000-000000000010'
+        WHERE user_id = '11111111-1111-4111-8111-111111111111'
+          AND operation = 'reservation.create'
+          AND key_hash = decode(repeat('c1', 32), 'hex')
           AND train_run_id IS NULL
-          AND shard_id = 'legacy'
-          AND assignment_generation = 1
     ) THEN
         RAISE EXCEPTION 'unresolved legacy in-progress key claim was not preserved';
     END IF;
@@ -142,9 +139,10 @@ BEGIN
           AND passenger_count = 1 AND active
     ) OR NOT EXISTS (
         SELECT 1 FROM public.booking_idempotency_key_claims
-        WHERE local_record_id = 'e4000000-0000-4000-8000-000000000010'
+        WHERE user_id = '11111111-1111-4111-8111-111111111111'
+          AND operation = 'reservation.create'
+          AND key_hash = decode(repeat('c1', 32), 'hex')
           AND train_run_id = '66666666-6666-4666-8666-666666666666'
-          AND shard_id = 'legacy' AND assignment_generation = 1
     ) OR NOT EXISTS (
         SELECT 1 FROM public.outbox_events
         WHERE id = 'f4000000-0000-4000-8000-000000000010'
@@ -241,7 +239,10 @@ BEGIN
         SELECT 1
         FROM public.idempotency_records AS record
         JOIN public.booking_idempotency_key_claims AS claim
-          ON claim.local_record_id = record.id
+          ON claim.user_id = record.user_id
+         AND claim.operation = record.operation
+         AND claim.key_hash = record.key_hash
+         AND claim.request_fingerprint = record.request_fingerprint
         WHERE record.id = 'e4000000-0000-4000-8000-000000000021'
           AND record.request_fingerprint = decode(repeat('d3', 32), 'hex')
           AND record.train_run_id IS NULL
@@ -251,21 +252,6 @@ BEGIN
         RAISE EXCEPTION 'expired unresolved key was not atomically reacquired';
     END IF;
 
-    BEGIN
-        INSERT INTO public.booking_idempotency_key_claims (
-            user_id, operation, key_hash, request_fingerprint, train_run_id,
-            shard_id, assignment_generation, local_record_id, expires_at
-        ) VALUES (
-            '11111111-1111-4111-8111-111111111111',
-            'reservation.cancel', decode(repeat('c3', 32), 'hex'),
-            decode(repeat('d4', 32), 'hex'), NULL,
-            'shard-0', 1, 'e4000000-0000-4000-8000-000000000022',
-            '2099-01-01 00:00:00+00'
-        );
-        RAISE EXCEPTION 'illegal routed NULL train-run claim unexpectedly succeeded';
-    EXCEPTION WHEN check_violation THEN
-        NULL;
-    END;
 END
 $assert$;
 

@@ -119,7 +119,7 @@ ORDER BY `+orderBy+` LIMIT $2 OFFSET $3`, owner, l, (p-1)*l)
 			return TicketOrderRecords{}, err
 		}
 		record.CreatedAt = record.CreatedAt.UTC()
-		record.Tickets, err = r.loadTickets(ctx, owner, record.ID)
+		record.Tickets, err = r.loadTickets(ctx, owner, record)
 		if err != nil {
 			return TicketOrderRecords{}, err
 		}
@@ -147,17 +147,20 @@ func (r *PostgresReads) GetTicketOrderRecord(ctx context.Context, owner, id uuid
 		return TicketOrderRecord{}, err
 	}
 	record.CreatedAt = record.CreatedAt.UTC()
-	record.Tickets, err = r.loadTickets(ctx, owner, record.ID)
-	return record, err
+	record.Tickets, err = r.loadTickets(ctx, owner, record)
+	if err != nil {
+		return TicketOrderRecord{}, err
+	}
+	return record, nil
 }
-func (r *PostgresReads) loadTickets(ctx context.Context, owner uuid.UUID, orderID string) ([]TicketRecord, error) {
+func (r *PostgresReads) loadTickets(ctx context.Context, owner uuid.UUID, record TicketOrderRecord) ([]TicketRecord, error) {
 	var (
 		rows pgx.Rows
 		tx   readRoutedTx
 		err  error
 	)
 	if r.shards != nil {
-		parsed, parseErr := uuid.Parse(orderID)
+		parsed, parseErr := uuid.Parse(record.ID)
 		if parseErr != nil {
 			return nil, ErrReadNotFound
 		}
@@ -169,19 +172,40 @@ func (r *PostgresReads) loadTickets(ctx context.Context, owner uuid.UUID, orderI
 			return nil, err
 		}
 		defer func() { _ = tx.Rollback(context.Background()) }()
+		var authoritative TicketOrderRecord
+		err = tx.PGXTx().QueryRow(ctx, `
+SELECT id::text, reservation_id::text, status, total_amount_minor, currency, created_at
+FROM ticket_orders
+WHERE id = $1 AND user_id = $2`, parsed, owner).Scan(
+			&authoritative.ID,
+			&authoritative.ReservationID,
+			&authoritative.Status,
+			&authoritative.TotalAmountMinor,
+			&authoritative.Currency,
+			&authoritative.CreatedAt,
+		)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrReadNotFound
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !sameTicketOrderSummary(record, authoritative) {
+			return nil, ErrReadNotFound
+		}
 		rows, err = tx.PGXTx().Query(ctx, `
 SELECT t.id::text,t.ticket_code,rs.passenger_id::text,rs.seat_id::text,t.status
 FROM tickets t
 JOIN ticket_orders o ON o.id=t.ticket_order_id
 JOIN reservation_seats rs ON rs.id=t.reservation_seat_id
-WHERE t.ticket_order_id=$1 AND o.user_id=$2 ORDER BY t.id`, orderID, owner)
+WHERE t.ticket_order_id=$1 AND o.user_id=$2 ORDER BY t.id`, record.ID, owner)
 	} else {
 		rows, err = r.pool.Query(ctx, `
 SELECT t.id::text,t.ticket_code,rs.passenger_id::text,rs.seat_id::text,t.status
 FROM tickets t
 JOIN ticket_orders o ON o.id=t.ticket_order_id
 JOIN reservation_seats rs ON rs.id=t.reservation_seat_id
-WHERE t.ticket_order_id=$1 AND o.user_id=$2 ORDER BY t.id`, orderID, owner)
+WHERE t.ticket_order_id=$1 AND o.user_id=$2 ORDER BY t.id`, record.ID, owner)
 	}
 	if err != nil {
 		return nil, err
@@ -204,6 +228,15 @@ WHERE t.ticket_order_id=$1 AND o.user_id=$2 ORDER BY t.id`, orderID, owner)
 		}
 	}
 	return items, nil
+}
+
+func sameTicketOrderSummary(locator, authoritative TicketOrderRecord) bool {
+	return locator.ID == authoritative.ID &&
+		locator.ReservationID == authoritative.ReservationID &&
+		locator.Status == authoritative.Status &&
+		locator.TotalAmountMinor == authoritative.TotalAmountMinor &&
+		locator.Currency == authoritative.Currency &&
+		locator.CreatedAt.Equal(authoritative.CreatedAt)
 }
 
 func ticketOrderBy(raw string) (string, bool) {

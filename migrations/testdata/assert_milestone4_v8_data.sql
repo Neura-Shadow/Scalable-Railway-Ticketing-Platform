@@ -52,13 +52,7 @@ BEGIN
         )
           AND train_run_id = '66666666-6666-4666-8666-666666666666') <> 2
        OR (SELECT count(*) FROM public.booking_idempotency_key_claims
-        WHERE local_record_id IN (
-            'e0000000-0000-4000-8000-000000000001',
-            'e0000000-0000-4000-8000-000000000002'
-        )
-          AND train_run_id = '66666666-6666-4666-8666-666666666666'
-          AND shard_id = 'legacy'
-          AND assignment_generation = 1) <> 2 THEN
+        WHERE train_run_id = '66666666-6666-4666-8666-666666666666') <> 2 THEN
         RAISE EXCEPTION 'legacy idempotency completion or key-claim bootstrap is incomplete';
     END IF;
 
@@ -66,13 +60,15 @@ BEGIN
         SELECT 1
         FROM public.idempotency_records AS record
         JOIN public.booking_idempotency_key_claims AS claim
-          ON claim.local_record_id = record.id
+          ON claim.user_id = record.user_id
+         AND claim.operation = record.operation
+         AND claim.key_hash = record.key_hash
+         AND claim.request_fingerprint = record.request_fingerprint
+         AND claim.expires_at = record.expires_at
         WHERE record.id = 'e0000000-0000-4000-8000-000000000003'
           AND record.status = 'in_progress'
           AND record.train_run_id IS NULL
           AND claim.train_run_id IS NULL
-          AND claim.shard_id = 'legacy'
-          AND claim.assignment_generation = 1
     ) THEN
         RAISE EXCEPTION 'unresolved version-7 idempotency conflict was not preserved';
     END IF;

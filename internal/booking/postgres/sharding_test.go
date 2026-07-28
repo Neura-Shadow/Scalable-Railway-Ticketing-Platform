@@ -319,27 +319,26 @@ func TestRecordSuccessfulGenerationWriteRejectsRollbackWindowWithoutMigration(t 
 	}
 }
 
-func TestExpiredIdempotencyCleanupOnlyMutatesStableAuthoritativeShard(t *testing.T) {
+func TestExpiredIdempotencyCleanupLocksStableAuthorityAndAllFixedCopies(t *testing.T) {
 	t.Parallel()
 
-	for _, shardID := range []sharding.ShardID{
-		sharding.ShardLegacy,
-		sharding.ShardZero,
-		sharding.ShardOne,
+	for _, required := range []string{
+		"assignment.assignment_state = 'stable'",
+		"assignment.active_migration_id IS NULL",
+		"FOR UPDATE OF assignment SKIP LOCKED",
 	} {
-		query, ok := expiredIdempotencyCleanupQuery(shardID)
-		if !ok {
-			t.Fatalf("expiredIdempotencyCleanupQuery(%s) unavailable", shardID)
+		if !strings.Contains(expiredIdempotencyRouteSelectionQuery, required) {
+			t.Fatalf("route selection lacks cleanup authority guard %q: %s", required, expiredIdempotencyRouteSelectionQuery)
 		}
-		for _, required := range []string{
-			"public.train_run_shard_assignments",
-			"assignment.assignment_state = 'stable'",
-			"assignment.active_migration_id IS NULL",
-			"assignment.shard_id = '",
-		} {
-			if !strings.Contains(query, required) {
-				t.Fatalf("cleanup query for %s lacks rollback-safe authority guard %q: %s", shardID, required, query)
-			}
+	}
+	if !strings.Contains(expiredIdempotencyRoutedClaimSelectionQuery, "FOR UPDATE OF claim SKIP LOCKED") {
+		t.Fatalf("routed claim selection does not lock claims: %s", expiredIdempotencyRoutedClaimSelectionQuery)
+	}
+	for index, schema := range []string{"public", "booking_shard_0", "booking_shard_1"} {
+		query := expiredIdempotencyRecordDeleteQueries[index]
+		if !strings.Contains(query, "DELETE FROM "+schema+".idempotency_records") ||
+			!strings.Contains(query, "record.train_run_id IS NOT DISTINCT FROM claim.train_run_id") {
+			t.Fatalf("cleanup query for %s does not delete an exact claim copy: %s", schema, query)
 		}
 	}
 }

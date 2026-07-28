@@ -818,7 +818,6 @@ inventory_violations AS (
      AND claim.key_hash = local.key_hash
      AND claim.request_fingerprint = local.request_fingerprint
      AND claim.train_run_id = local.train_run_id
-     AND claim.local_record_id = local.id
      AND claim.expires_at = local.expires_at
     LEFT JOIN reservation AS resource
       ON local.status = 'completed'
@@ -930,8 +929,6 @@ locator_route_violations AS (
     FROM claim
     LEFT JOIN public.train_run_shard_assignments AS assignment ON assignment.train_run_id = claim.train_run_id
     WHERE assignment.train_run_id IS NULL
-       OR claim.shard_id <> assignment.shard_id
-       OR claim.assignment_generation <> assignment.assignment_generation
 ), invalid_outbox AS (
     SELECT event.id
     FROM outbox AS event

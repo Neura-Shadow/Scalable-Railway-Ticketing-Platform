@@ -329,7 +329,64 @@ func TestValidateStreamsCanonicalRowsWithinOneTotalCap(t *testing.T) {
 	}
 }
 
-func TestActivateRouteUpdatesProvenanceAndAppendsCutoverEvent(t *testing.T) {
+func TestValidationInvariantSQLCoversGlobalLifecycleAndMetadata(t *testing.T) {
+	sql := validationInvariantSQL("booking_shard_0")
+	for _, required := range []string{
+		"quota.active <> (reservation.status = 'held')",
+		"reservation_locator_violations",
+		"locator.owner_user_id <> reservation.user_id",
+		"order_locator_violations",
+		"locator.reservation_id <> ticket_order.reservation_id",
+		"locator.owner_user_id <> ticket_order.user_id",
+		"locator.status <> ticket_order.status",
+		"locator.total_amount_minor <> ticket_order.total_amount_minor",
+		"locator.currency <> ticket_order.currency",
+		"locator.created_at <> ticket_order.created_at",
+		"ticket_locator_violations",
+		"locator.ticket_order_id <> ticket.ticket_order_id",
+		"outbox_violations",
+		"event.shard_id NOT IN ('legacy', 'shard-0', 'shard-1')",
+		"missing_outbox_intent",
+		"event.event_type = 'reservation.held'",
+		"event.event_type = 'reservation.' || reservation.status",
+		"event.event_type = 'reservation.confirmed'",
+		"event.event_type = 'ticket.created'",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Fatalf("validation SQL does not enforce %q: %s", required, sql)
+		}
+	}
+	if strings.Contains(sql, "%!") {
+		t.Fatalf("validation SQL contains an unresolved format directive: %s", sql)
+	}
+}
+
+func TestValidationInvariantSQLTreatsGlobalClaimAsRouteNeutral(t *testing.T) {
+	sql := validationInvariantSQL("booking_shard_1")
+	start := strings.Index(sql, "claim_violations AS")
+	end := strings.Index(sql, "quota_violations AS")
+	if start < 0 || end <= start {
+		t.Fatalf("claim validation CTE was not found: %s", sql)
+	}
+	claimSQL := sql[start:end]
+	for _, required := range []string{
+		"claim.user_id = local.user_id",
+		"claim.request_fingerprint = local.request_fingerprint",
+		"claim.train_run_id = local.train_run_id",
+		"claim.expires_at = local.expires_at",
+	} {
+		if !strings.Contains(claimSQL, required) {
+			t.Fatalf("claim validation does not enforce %q: %s", required, claimSQL)
+		}
+	}
+	for _, forbidden := range []string{"claim.shard_id", "claim.assignment_generation", "claim.local_record_id"} {
+		if strings.Contains(claimSQL, forbidden) {
+			t.Fatalf("route-neutral claim validation contains %q: %s", forbidden, claimSQL)
+		}
+	}
+}
+
+func TestActivateRouteUpdatesLocatorsWithoutMutatingClaimsAndAppendsCutoverEvent(t *testing.T) {
 	migrationID, trainRunID := uuid.New(), uuid.New()
 	expected, _ := sharding.NewShardRoute(trainRunID, sharding.ShardLegacy, mustGeneration(t, 1))
 	next, _ := sharding.NewShardRoute(trainRunID, sharding.ShardZero, mustGeneration(t, 2))
@@ -341,7 +398,7 @@ func TestActivateRouteUpdatesProvenanceAndAppendsCutoverEvent(t *testing.T) {
 			if queryRows == 1 {
 				return fakeRow{values: []any{migrationID, "legacy", "shard-0", int64(1), int64(2)}}
 			}
-			if !strings.Contains(sql, "booking_idempotency_key_claims") {
+			if strings.Contains(sql, "booking_idempotency_key_claims") || !strings.Contains(sql, "ticket_shard_locators") {
 				t.Fatalf("stale query = %q", sql)
 			}
 			return fakeRow{values: []any{false}}
@@ -366,10 +423,13 @@ func TestActivateRouteUpdatesProvenanceAndAppendsCutoverEvent(t *testing.T) {
 		t.Fatalf("ActivateRoute() error = %v", err)
 	}
 	joined := strings.Join(statements, "\n")
-	for _, required := range []string{"reservation_shard_locators", "ticket_order_shard_locators", "ticket_shard_locators", "booking_idempotency_key_claims", "train_run_shard_assignments", "train_run_generation_writes", "outbox_events"} {
+	for _, required := range []string{"reservation_shard_locators", "ticket_order_shard_locators", "ticket_shard_locators", "train_run_shard_assignments", "train_run_generation_writes", "outbox_events"} {
 		if !strings.Contains(joined, required) {
 			t.Fatalf("missing %s in statements", required)
 		}
+	}
+	if strings.Contains(joined, "booking_idempotency_key_claims") {
+		t.Fatalf("route activation mutated route-neutral idempotency claims: %s", joined)
 	}
 }
 

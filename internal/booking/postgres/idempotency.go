@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type Operation string
@@ -90,6 +91,9 @@ JOIN public.booking_idempotency_key_claims AS claim
   ON claim.user_id = ir.user_id
  AND claim.operation = ir.operation
  AND claim.key_hash = ir.key_hash
+ AND claim.request_fingerprint = ir.request_fingerprint
+ AND claim.train_run_id = ir.train_run_id
+ AND claim.expires_at = ir.expires_at
 LEFT JOIN reservations AS r
   ON r.id = ir.resource_id
  AND r.user_id = ir.user_id
@@ -97,14 +101,10 @@ WHERE ir.user_id = $1
   AND ir.operation = 'reservation.create'
   AND ir.key_hash = $2
   AND ir.expires_at > clock_timestamp()
-  AND claim.train_run_id = $3
-  AND claim.shard_id = $4
-  AND claim.assignment_generation = $5`,
+  AND claim.train_run_id = $3`,
 			params.UserID,
 			params.IdempotencyKeyHash,
 			params.TrainRunID,
-			tx.route.ShardID().String(),
-			tx.route.Generation().Int64(),
 		)
 	} else {
 		row = s.pool.QueryRow(ctx, `
@@ -159,18 +159,36 @@ func (tx *Tx) AcquireIdempotency(ctx context.Context, input IdempotencyInput) (I
 		len(input.KeyHash) != 32 || len(input.RequestFingerprint) != 32 || input.ExpiresAt.IsZero() {
 		return IdempotencyAcquisition{}, ErrInvalidArgument
 	}
+	var acquiredAt time.Time
 	if tx.routed != nil {
-		if err := tx.acquireGlobalIdempotencyClaim(ctx, input); err != nil {
+		claimExpiry, claimAcquiredAt, err := tx.acquireGlobalIdempotencyClaim(ctx, input)
+		if err != nil {
 			return IdempotencyAcquisition{}, err
 		}
+		// The claim is the canonical source for the shared database-derived
+		// expiry. Exact retries reuse its original value instead of deriving a
+		// new timestamp and spuriously conflicting with the local record.
+		input.ExpiresAt = claimExpiry
+		acquiredAt = claimAcquiredAt
+	} else {
+		if err := tx.tx.QueryRow(ctx, `
+WITH acquisition AS MATERIALIZED (
+    SELECT clock_timestamp() AS acquired_at
+)
+SELECT acquired_at, acquired_at + interval '24 hours'
+FROM acquisition`).Scan(&acquiredAt, &input.ExpiresAt); err != nil {
+			return IdempotencyAcquisition{}, fmt.Errorf("derive idempotency expiry: %w", err)
+		}
 	}
+	acquiredAt = acquiredAt.UTC()
+	input.ExpiresAt = input.ExpiresAt.UTC()
 
 	var insertedID uuid.UUID
 	insertQuery := `
 INSERT INTO idempotency_records (
-    user_id, operation, key_hash, request_fingerprint, expires_at
+    user_id, operation, key_hash, request_fingerprint, expires_at, created_at, updated_at
 )
-VALUES ($1, $2, $3, $4, $5)
+VALUES ($1, $2, $3, $4, $5, $6, $6)
 ON CONFLICT (user_id, operation, key_hash) DO UPDATE
 SET id = gen_random_uuid(),
     request_fingerprint = EXCLUDED.request_fingerprint,
@@ -180,15 +198,16 @@ SET id = gen_random_uuid(),
     expires_at = EXCLUDED.expires_at,
     created_at = clock_timestamp(),
     updated_at = clock_timestamp()
-WHERE idempotency_records.expires_at <= clock_timestamp()
+WHERE idempotency_records.expires_at <= $6
 RETURNING id`
 	insertArgs := []any{input.UserID, input.Operation, input.KeyHash, input.RequestFingerprint, input.ExpiresAt.UTC()}
 	if tx.routed != nil {
 		insertQuery = `
 INSERT INTO idempotency_records (
-    user_id, operation, key_hash, request_fingerprint, expires_at, train_run_id
+    user_id, operation, key_hash, request_fingerprint, expires_at, train_run_id,
+    created_at, updated_at
 )
-VALUES ($1, $2, $3, $4, $5, $6)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
 ON CONFLICT (user_id, operation, key_hash) DO UPDATE
 SET id = gen_random_uuid(),
     request_fingerprint = EXCLUDED.request_fingerprint,
@@ -199,9 +218,11 @@ SET id = gen_random_uuid(),
     expires_at = EXCLUDED.expires_at,
     created_at = clock_timestamp(),
     updated_at = clock_timestamp()
-WHERE idempotency_records.expires_at <= clock_timestamp()
+WHERE idempotency_records.expires_at <= $7
 RETURNING id`
-		insertArgs = append(insertArgs, tx.route.TrainRunID())
+		insertArgs = append(insertArgs, tx.route.TrainRunID(), acquiredAt)
+	} else {
+		insertArgs = append(insertArgs, acquiredAt)
 	}
 	err := tx.tx.QueryRow(ctx, insertQuery, insertArgs...).Scan(&insertedID)
 	inserted := err == nil
@@ -210,30 +231,46 @@ RETURNING id`
 	}
 
 	var (
-		recordID    uuid.UUID
-		fingerprint []byte
-		status      string
-		resourceID  *uuid.UUID
+		recordID     uuid.UUID
+		fingerprint  []byte
+		status       string
+		resourceID   *uuid.UUID
+		recordExpiry time.Time
+		recordRun    pgtype.UUID
 	)
-	err = tx.tx.QueryRow(ctx, `
-SELECT id, request_fingerprint, status, resource_id
+	selectQuery := `
+SELECT id, request_fingerprint, status, resource_id, expires_at
 FROM idempotency_records
 WHERE user_id = $1
   AND operation = $2
   AND key_hash = $3
-FOR UPDATE`, input.UserID, input.Operation, input.KeyHash).Scan(&recordID, &fingerprint, &status, &resourceID)
+FOR UPDATE`
+	if tx.routed != nil {
+		selectQuery = `
+SELECT id, request_fingerprint, status, resource_id, expires_at, train_run_id
+FROM idempotency_records
+WHERE user_id = $1
+  AND operation = $2
+  AND key_hash = $3
+FOR UPDATE`
+		err = tx.tx.QueryRow(ctx, selectQuery, input.UserID, input.Operation, input.KeyHash).Scan(
+			&recordID, &fingerprint, &status, &resourceID, &recordExpiry, &recordRun,
+		)
+	} else {
+		err = tx.tx.QueryRow(ctx, selectQuery, input.UserID, input.Operation, input.KeyHash).Scan(
+			&recordID, &fingerprint, &status, &resourceID, &recordExpiry,
+		)
+	}
 	if err != nil {
 		return IdempotencyAcquisition{}, fmt.Errorf("lock idempotency record: %w", err)
 	}
 	if !bytes.Equal(fingerprint, input.RequestFingerprint) {
 		return IdempotencyAcquisition{}, ErrIdempotencyConflict
 	}
-	if tx.routed != nil {
-		if err := tx.bindGlobalIdempotencyClaim(ctx, input, recordID); err != nil {
-			return IdempotencyAcquisition{}, err
-		}
+	if tx.routed != nil && (!recordRun.Valid || recordRun.Bytes != tx.route.TrainRunID() ||
+		!recordExpiry.Equal(input.ExpiresAt)) {
+		return IdempotencyAcquisition{}, ErrPersistenceInvariant
 	}
-
 	switch status {
 	case "in_progress":
 		if !inserted || insertedID != recordID {

@@ -149,43 +149,210 @@ func (s *Store) cleanupExpiredIdempotencyAcrossShards(ctx context.Context, limit
 	if limit <= 0 {
 		return ErrInvalidArgument
 	}
-	shards, err := s.shards.ListEnabledShards(ctx)
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
+		return sharding.ErrShardUnavailable
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	// Lock routing authority before key claims, matching the routed-write and
+	// migration lock order. Stable assignments are the only safe cleanup
+	// boundary; a migration may retain copies on both source and target.
+	rows, err := tx.Query(ctx, expiredIdempotencyRouteSelectionQuery, limit)
+	if err != nil {
+		return sharding.ErrShardUnavailable
+	}
+	trainRunIDs := make([]uuid.UUID, 0, limit)
+	for rows.Next() {
+		var trainRunID uuid.UUID
+		if err := rows.Scan(&trainRunID); err != nil {
+			rows.Close()
+			return sharding.ErrShardUnavailable
+		}
+		trainRunIDs = append(trainRunIDs, trainRunID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return sharding.ErrShardUnavailable
+	}
+	rows.Close()
+
+	claimIDs := make([]uuid.UUID, 0, limit)
+	if len(trainRunIDs) > 0 {
+		rows, err = tx.Query(ctx, expiredIdempotencyRoutedClaimSelectionQuery, trainRunIDs, limit)
+		if err != nil {
+			return sharding.ErrShardUnavailable
+		}
+		for rows.Next() {
+			var claimID uuid.UUID
+			if err := rows.Scan(&claimID); err != nil {
+				rows.Close()
+				return sharding.ErrShardUnavailable
+			}
+			claimIDs = append(claimIDs, claimID)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return sharding.ErrShardUnavailable
+		}
+		rows.Close()
+	}
+
+	remaining := limit - len(claimIDs)
+	if remaining > 0 {
+		rows, err = tx.Query(ctx, expiredIdempotencyLegacyClaimSelectionQuery, remaining)
+		if err != nil {
+			return sharding.ErrShardUnavailable
+		}
+		for rows.Next() {
+			var claimID uuid.UUID
+			if err := rows.Scan(&claimID); err != nil {
+				rows.Close()
+				return sharding.ErrShardUnavailable
+			}
+			claimIDs = append(claimIDs, claimID)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return sharding.ErrShardUnavailable
+		}
+		rows.Close()
+	}
+	if len(claimIDs) == 0 {
+		return tx.Commit(ctx)
+	}
+
+	if err := retireExpiredIdempotencyClaims(ctx, tx, claimIDs); err != nil {
 		return err
 	}
-	perShard := limit / len(shards)
-	if perShard < 1 {
-		perShard = 1
+	if err := tx.Commit(ctx); err != nil {
+		return sharding.ErrShardUnavailable
 	}
-	var failures []error
-	for _, shardID := range shards {
-		query, ok := expiredIdempotencyCleanupQuery(shardID)
-		if !ok {
-			failures = append(failures, sharding.ErrShardUnavailable)
-			continue
-		}
-		if _, err := s.pool.Exec(ctx, query, perShard); err != nil {
-			failures = append(failures, sharding.ErrShardUnavailable)
-		}
-	}
-	if _, err := s.pool.Exec(ctx, `
-WITH expired AS (
-    SELECT user_id, operation, key_hash
-    FROM public.booking_idempotency_key_claims
-    WHERE expires_at <= clock_timestamp()
-    ORDER BY expires_at, user_id, operation, key_hash
-    FOR UPDATE SKIP LOCKED
-    LIMIT $1
-)
-DELETE FROM public.booking_idempotency_key_claims AS claim
-USING expired
-WHERE claim.user_id = expired.user_id
-  AND claim.operation = expired.operation
-  AND claim.key_hash = expired.key_hash`, limit); err != nil {
-		failures = append(failures, sharding.ErrShardUnavailable)
-	}
-	return errors.Join(failures...)
+	return nil
 }
+
+// retireExpiredIdempotencyClaims deletes every exact shard-local copy before
+// releasing its global uniqueness claim. The caller must already hold the
+// applicable assignment locks followed by the claim locks.
+func retireExpiredIdempotencyClaims(ctx context.Context, tx pgx.Tx, claimIDs []uuid.UUID) error {
+	if len(claimIDs) == 0 {
+		return nil
+	}
+	// A pre-cutover rollback intentionally retains the target copy, so cleanup
+	// must cover the complete fixed topology rather than only current authority.
+	for _, query := range expiredIdempotencyRecordDeleteQueries {
+		if _, err := tx.Exec(ctx, query, claimIDs); err != nil {
+			return sharding.ErrShardUnavailable
+		}
+	}
+	var localRecordRemains bool
+	if err := tx.QueryRow(ctx, expiredIdempotencyRecordVerificationQuery, claimIDs).Scan(&localRecordRemains); err != nil {
+		return sharding.ErrShardUnavailable
+	}
+	if localRecordRemains {
+		return ErrPersistenceInvariant
+	}
+	result, err := tx.Exec(ctx, `
+DELETE FROM public.booking_idempotency_key_claims
+WHERE id = ANY($1::uuid[])`, claimIDs)
+	if err != nil {
+		return sharding.ErrShardUnavailable
+	}
+	if result.RowsAffected() != int64(len(claimIDs)) {
+		return ErrPersistenceInvariant
+	}
+	return nil
+}
+
+const expiredIdempotencyRouteSelectionQuery = `
+SELECT assignment.train_run_id
+FROM public.train_run_shard_assignments AS assignment
+WHERE assignment.assignment_state = 'stable'
+  AND assignment.active_migration_id IS NULL
+  AND EXISTS (
+      SELECT 1
+      FROM public.booking_idempotency_key_claims AS claim
+      WHERE claim.train_run_id = assignment.train_run_id
+        AND claim.expires_at <= clock_timestamp()
+  )
+ORDER BY assignment.train_run_id
+FOR UPDATE OF assignment SKIP LOCKED
+LIMIT $1`
+
+const expiredIdempotencyRoutedClaimSelectionQuery = `
+SELECT claim.id
+FROM public.booking_idempotency_key_claims AS claim
+WHERE claim.train_run_id = ANY($1::uuid[])
+  AND claim.expires_at <= clock_timestamp()
+ORDER BY claim.expires_at, claim.id
+FOR UPDATE OF claim SKIP LOCKED
+LIMIT $2`
+
+const expiredIdempotencyLegacyClaimSelectionQuery = `
+SELECT claim.id
+FROM public.booking_idempotency_key_claims AS claim
+WHERE claim.train_run_id IS NULL
+  AND claim.expires_at <= clock_timestamp()
+ORDER BY claim.expires_at, claim.id
+FOR UPDATE OF claim SKIP LOCKED
+LIMIT $1`
+
+var expiredIdempotencyRecordDeleteQueries = [...]string{
+	`DELETE FROM public.idempotency_records AS record
+USING public.booking_idempotency_key_claims AS claim
+WHERE claim.id = ANY($1::uuid[])
+  AND record.user_id = claim.user_id
+  AND record.operation = claim.operation
+  AND record.key_hash = claim.key_hash
+  AND record.request_fingerprint = claim.request_fingerprint
+  AND record.train_run_id IS NOT DISTINCT FROM claim.train_run_id
+  AND record.expires_at = claim.expires_at`,
+	`DELETE FROM booking_shard_0.idempotency_records AS record
+USING public.booking_idempotency_key_claims AS claim
+WHERE claim.id = ANY($1::uuid[])
+  AND record.user_id = claim.user_id
+  AND record.operation = claim.operation
+  AND record.key_hash = claim.key_hash
+  AND record.request_fingerprint = claim.request_fingerprint
+  AND record.train_run_id IS NOT DISTINCT FROM claim.train_run_id
+  AND record.expires_at = claim.expires_at`,
+	`DELETE FROM booking_shard_1.idempotency_records AS record
+USING public.booking_idempotency_key_claims AS claim
+WHERE claim.id = ANY($1::uuid[])
+  AND record.user_id = claim.user_id
+  AND record.operation = claim.operation
+  AND record.key_hash = claim.key_hash
+  AND record.request_fingerprint = claim.request_fingerprint
+  AND record.train_run_id IS NOT DISTINCT FROM claim.train_run_id
+  AND record.expires_at = claim.expires_at`,
+}
+
+const expiredIdempotencyRecordVerificationQuery = `
+SELECT EXISTS (
+    SELECT 1
+    FROM public.booking_idempotency_key_claims AS claim
+    JOIN public.idempotency_records AS record
+      ON record.user_id = claim.user_id
+     AND record.operation = claim.operation
+     AND record.key_hash = claim.key_hash
+    WHERE claim.id = ANY($1::uuid[])
+    UNION ALL
+    SELECT 1
+    FROM public.booking_idempotency_key_claims AS claim
+    JOIN booking_shard_0.idempotency_records AS record
+      ON record.user_id = claim.user_id
+     AND record.operation = claim.operation
+     AND record.key_hash = claim.key_hash
+    WHERE claim.id = ANY($1::uuid[])
+    UNION ALL
+    SELECT 1
+    FROM public.booking_idempotency_key_claims AS claim
+    JOIN booking_shard_1.idempotency_records AS record
+      ON record.user_id = claim.user_id
+     AND record.operation = claim.operation
+     AND record.key_hash = claim.key_hash
+    WHERE claim.id = ANY($1::uuid[])
+)`
 
 func dueReservationQuery(shardID sharding.ShardID) (string, bool) {
 	const suffix = `
@@ -217,67 +384,6 @@ LIMIT 1`
 		return "SELECT reservation.id FROM booking_shard_0.reservations AS reservation" + suffix + "'shard-0'" + order, true
 	case sharding.ShardOne:
 		return "SELECT reservation.id FROM booking_shard_1.reservations AS reservation" + suffix + "'shard-1'" + order, true
-	default:
-		return "", false
-	}
-}
-
-func expiredIdempotencyCleanupQuery(shardID sharding.ShardID) (string, bool) {
-	const legacy = `
-WITH expired AS (
-    SELECT record.id FROM public.idempotency_records AS record
-    WHERE record.expires_at <= clock_timestamp()
-      AND EXISTS (
-          SELECT 1
-          FROM public.train_run_shard_assignments AS assignment
-          WHERE assignment.train_run_id = record.train_run_id
-            AND assignment.shard_id = 'legacy'
-            AND assignment.assignment_state = 'stable'
-            AND assignment.active_migration_id IS NULL
-      )
-    ORDER BY record.expires_at, record.id FOR UPDATE OF record SKIP LOCKED LIMIT $1
-)
-DELETE FROM public.idempotency_records AS record
-USING expired WHERE record.id = expired.id`
-	const shardZero = `
-WITH expired AS (
-    SELECT record.id FROM booking_shard_0.idempotency_records AS record
-    WHERE record.expires_at <= clock_timestamp()
-      AND EXISTS (
-          SELECT 1
-          FROM public.train_run_shard_assignments AS assignment
-          WHERE assignment.train_run_id = record.train_run_id
-            AND assignment.shard_id = 'shard-0'
-            AND assignment.assignment_state = 'stable'
-            AND assignment.active_migration_id IS NULL
-      )
-    ORDER BY record.expires_at, record.id FOR UPDATE OF record SKIP LOCKED LIMIT $1
-)
-DELETE FROM booking_shard_0.idempotency_records AS record
-USING expired WHERE record.id = expired.id`
-	const shardOne = `
-WITH expired AS (
-    SELECT record.id FROM booking_shard_1.idempotency_records AS record
-    WHERE record.expires_at <= clock_timestamp()
-      AND EXISTS (
-          SELECT 1
-          FROM public.train_run_shard_assignments AS assignment
-          WHERE assignment.train_run_id = record.train_run_id
-            AND assignment.shard_id = 'shard-1'
-            AND assignment.assignment_state = 'stable'
-            AND assignment.active_migration_id IS NULL
-      )
-    ORDER BY record.expires_at, record.id FOR UPDATE OF record SKIP LOCKED LIMIT $1
-)
-DELETE FROM booking_shard_1.idempotency_records AS record
-USING expired WHERE record.id = expired.id`
-	switch shardID {
-	case sharding.ShardLegacy:
-		return legacy, true
-	case sharding.ShardZero:
-		return shardZero, true
-	case sharding.ShardOne:
-		return shardOne, true
 	default:
 		return "", false
 	}
