@@ -582,11 +582,12 @@ function Start-Milestone5DriverJob {
         RepositoryPath=[string]$Context.RepositoryPath; RawDirectory=[string]$Context.RawDirectory; ProjectName=[string]$Context.ProjectName
         ComposeFile=[string]$Context.ComposeFile; ComposeArguments=[string[]]@($Context.ComposeArguments)
     }
+    $measurePauseEnabled = $MeasurePause.IsPresent
     $job = Start-Job -ScriptBlock {
-        param($DriverPath,$JobContext,$Scenario,$MigrationID,$Target,$DelayMilliseconds,$MeasurePause)
+        param($DriverPath,$JobContext,$Scenario,$MigrationID,$Target,$DelayMilliseconds,[bool]$MeasurePauseEnabled)
         . $DriverPath
         Start-Sleep -Milliseconds $DelayMilliseconds
-        if ($MeasurePause) {
+        if ($MeasurePauseEnabled) {
             Move-Milestone5Migration -Context $JobContext -MigrationID $MigrationID -Target draining -Prefix "$Scenario-job"
             $started = [DateTimeOffset]::UtcNow
             Move-Milestone5Migration -Context $JobContext -MigrationID $MigrationID -Target rollback_window -Prefix "$Scenario-job-cutover"
@@ -594,7 +595,7 @@ function Start-Milestone5DriverJob {
         }
         Move-Milestone5Migration -Context $JobContext -MigrationID $MigrationID -Target $Target -Prefix "$Scenario-job"
         return [pscustomobject]@{ state=$Target }
-    } -ArgumentList $driverPath,$jobContext,$Scenario,$MigrationID,$Target,$DelayMilliseconds,[bool]$MeasurePause
+    } -ArgumentList $driverPath,$jobContext,$Scenario,$MigrationID,$Target,$DelayMilliseconds,$measurePauseEnabled
     $State.Jobs[$Scenario] = $job
 }
 
