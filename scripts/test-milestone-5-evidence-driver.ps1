@@ -60,7 +60,8 @@ foreach ($required in @(
     'Stop-Milestone5DriverJob', 'target_write_observed_before_reverse',
     'target_write_preserved_after_reverse', 'M5EvidenceDriverPath',
     'stale-prewarm-$index.log', 'Complete-Milestone5MigrationAfterRollbackWindow',
-    'rollback_deadline_at<=clock_timestamp()', '$Prefix-complete.log'
+    'rollback_deadline_at<=clock_timestamp()', '$Prefix-complete.log',
+    'LEGACY_TRAIN_RUN_ID=$script:M5TrainF'
 )) {
     Assert-True -Condition $driver.Contains($required) `
         -Message "driver omitted trusted evidence token $required"

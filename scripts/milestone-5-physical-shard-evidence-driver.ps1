@@ -574,7 +574,7 @@ function New-Milestone5EnvironmentMap {
         IDEMPOTENCY_KEY="m5-target-era-$($State.Suffix)"; TARGET_ERA_RESERVATION_ID='pending'
     }
     $map['legacy-vs-physical'] = [ordered]@{
-        BASE_URL=$common.BASE_URL; ORIGIN_CODE='M2A'; DESTINATION_CODE='M2B'; SEAT_CLASS='standard'; LEGACY_TRAIN_RUN_ID=$script:M5TrainD; PHYSICAL_TRAIN_RUN_ID=$script:M5TrainC
+        BASE_URL=$common.BASE_URL; ORIGIN_CODE='M2A'; DESTINATION_CODE='M2B'; SEAT_CLASS='standard'; LEGACY_TRAIN_RUN_ID=$script:M5TrainF; PHYSICAL_TRAIN_RUN_ID=$script:M5TrainC
         LEGACY_CUSTOMER_TOKENS=($State.Customers[22].Token,$State.Customers[23].Token -join ','); LEGACY_PASSENGER_IDS=($State.Customers[22].PassengerIDs[0],$State.Customers[23].PassengerIDs[0] -join ',')
         PHYSICAL_CUSTOMER_TOKENS=($State.Customers[22].Token,$State.Customers[23].Token -join ','); PHYSICAL_PASSENGER_IDS=($State.Customers[22].PassengerIDs[2],$State.Customers[23].PassengerIDs[2] -join ','); VUS_PER_PATH='2'; ITERATIONS_PER_VU='2'
     }
