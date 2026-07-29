@@ -74,19 +74,27 @@ type Config struct {
 	PhysicalShardingProductionEnabled      bool
 	// PhysicalShardConnections contains secret DSNs keyed only by fixed
 	// connection references. Catalog rows never populate this map.
-	PhysicalShardConnections     map[string]string
-	PhysicalShardMaxCount        int
-	PhysicalShardMaxOpenConns    int
-	PhysicalShardMaxIdleConns    int
-	PhysicalShardConnMaxLifetime time.Duration
-	PhysicalShardConnMaxIdleTime time.Duration
-	PhysicalShardConnectTimeout  time.Duration
-	PhysicalShardQueryTimeout    time.Duration
-	PhysicalShardTotalPoolBudget int
-	BookingRouteCacheEnabled     bool
-	BookingRouteCacheTTL         time.Duration
-	BookingRouteCacheMaxEntries  int
-	BookingShardQueryTimeout     time.Duration
+	PhysicalShardConnections        map[string]string
+	PhysicalShardMaxCount           int
+	PhysicalShardMaxOpenConns       int
+	PhysicalShardMaxIdleConns       int
+	PhysicalShardConnMaxLifetime    time.Duration
+	PhysicalShardConnMaxIdleTime    time.Duration
+	PhysicalShardConnectTimeout     time.Duration
+	PhysicalShardQueryTimeout       time.Duration
+	PhysicalShardTotalPoolBudget    int
+	ControlDatabaseMaxOpenConns     int
+	ControlDatabasePoolCount        int
+	PhysicalShardAPIReplicaCount    int
+	PhysicalShardWorkerReplicas     int
+	WorkerShardConcurrency          int
+	PhysicalShardMigrationReserve   int
+	PhysicalShardOperationalReserve int
+	PostgresMaxConnectionsLimit     int
+	BookingRouteCacheEnabled        bool
+	BookingRouteCacheTTL            time.Duration
+	BookingRouteCacheMaxEntries     int
+	BookingShardQueryTimeout        time.Duration
 
 	HTTPAddress   string
 	DatabaseURL   string
@@ -189,6 +197,13 @@ func Defaults() Config {
 		PhysicalShardConnectTimeout:                 3 * time.Second,
 		PhysicalShardQueryTimeout:                   2 * time.Second,
 		PhysicalShardTotalPoolBudget:                32,
+		ControlDatabaseMaxOpenConns:                 16,
+		ControlDatabasePoolCount:                    1,
+		PhysicalShardAPIReplicaCount:                1,
+		PhysicalShardWorkerReplicas:                 0,
+		WorkerShardConcurrency:                      1,
+		PhysicalShardMigrationReserve:               4,
+		PhysicalShardOperationalReserve:             4,
 		BookingRouteCacheEnabled:                    true,
 		BookingRouteCacheTTL:                        30 * time.Second,
 		BookingRouteCacheMaxEntries:                 1_000,
@@ -728,6 +743,14 @@ func loadBookingShardSettings(lookup LookupFunc, cfg *Config) error {
 		{"PHYSICAL_SHARD_MAX_OPEN_CONNS", &cfg.PhysicalShardMaxOpenConns},
 		{"PHYSICAL_SHARD_MAX_IDLE_CONNS", &cfg.PhysicalShardMaxIdleConns},
 		{"PHYSICAL_SHARD_TOTAL_POOL_BUDGET", &cfg.PhysicalShardTotalPoolBudget},
+		{"CONTROL_DATABASE_MAX_OPEN_CONNS", &cfg.ControlDatabaseMaxOpenConns},
+		{"CONTROL_DATABASE_POOL_COUNT", &cfg.ControlDatabasePoolCount},
+		{"PHYSICAL_SHARD_API_REPLICA_COUNT", &cfg.PhysicalShardAPIReplicaCount},
+		{"PHYSICAL_SHARD_WORKER_REPLICA_COUNT", &cfg.PhysicalShardWorkerReplicas},
+		{"WORKER_SHARD_CONCURRENCY", &cfg.WorkerShardConcurrency},
+		{"PHYSICAL_SHARD_MIGRATION_ADMIN_RESERVE", &cfg.PhysicalShardMigrationReserve},
+		{"PHYSICAL_SHARD_OPERATIONAL_RESERVE", &cfg.PhysicalShardOperationalReserve},
+		{"POSTGRES_MAX_CONNECTIONS_LIMIT", &cfg.PostgresMaxConnectionsLimit},
 	} {
 		if err := setInt(lookup, item.name, item.target); err != nil {
 			return err
@@ -840,6 +863,13 @@ func validateBookingShardConfig(c Config) error {
 		if c.PhysicalShardTotalPoolBudget < len(c.BookingShardIDs)*c.PhysicalShardMaxOpenConns {
 			return errors.New("PHYSICAL_SHARD_TOTAL_POOL_BUDGET is smaller than the configured per-shard maximum")
 		}
+		budget, err := c.PhysicalShardConnectionBudget()
+		if err != nil {
+			return err
+		}
+		if c.PostgresMaxConnectionsLimit > 0 && budget > c.PostgresMaxConnectionsLimit {
+			return errors.New("POSTGRES_MAX_CONNECTIONS_LIMIT is smaller than the configured deployment connection budget")
+		}
 		return nil
 	}
 	if len(c.BookingShardIDs) < 2 {
@@ -849,6 +879,36 @@ func validateBookingShardConfig(c Config) error {
 		return errors.New("BOOKING_SHARD_IDS must include legacy")
 	}
 	return nil
+}
+
+// PhysicalShardConnectionBudget returns the configured deployment-wide upper
+// bound. It is a capacity guard, not an observed connection count. Control
+// pools, API shard pools, bounded worker concurrency, and both reserves are
+// included explicitly so a catalog row can never create unbudgeted pools.
+func (c Config) PhysicalShardConnectionBudget() (int, error) {
+	values := []int{
+		c.ControlDatabaseMaxOpenConns, c.ControlDatabasePoolCount,
+		c.PhysicalShardAPIReplicaCount, c.PhysicalShardWorkerReplicas,
+		c.WorkerShardConcurrency, c.PhysicalShardMigrationReserve,
+		c.PhysicalShardOperationalReserve, c.PostgresMaxConnectionsLimit,
+	}
+	for _, value := range values {
+		if value < 0 || value > 10_000 {
+			return 0, errors.New("physical shard deployment connection budget values must be bounded")
+		}
+	}
+	if c.ControlDatabaseMaxOpenConns < 1 || c.ControlDatabasePoolCount < 1 ||
+		c.PhysicalShardAPIReplicaCount < 1 || c.WorkerShardConcurrency < 1 {
+		return 0, errors.New("physical shard deployment connection budget requires positive pool and concurrency values")
+	}
+	control := int64(c.ControlDatabaseMaxOpenConns) * int64(c.ControlDatabasePoolCount)
+	api := int64(c.PhysicalShardAPIReplicaCount) * int64(len(c.BookingShardIDs)) * int64(c.PhysicalShardMaxOpenConns)
+	workers := int64(c.PhysicalShardWorkerReplicas) * int64(c.WorkerShardConcurrency)
+	total := control + api + workers + int64(c.PhysicalShardMigrationReserve) + int64(c.PhysicalShardOperationalReserve)
+	if total <= 0 || total > int64(math.MaxInt) {
+		return 0, errors.New("physical shard deployment connection budget overflows")
+	}
+	return int(total), nil
 }
 
 func loadAPISettings(lookup LookupFunc, cfg *Config) error {

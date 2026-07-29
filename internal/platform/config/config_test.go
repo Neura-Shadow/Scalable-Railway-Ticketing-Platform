@@ -122,6 +122,14 @@ func TestLoadFromForParsesBoundedPhysicalShardControls(t *testing.T) {
 	env["PHYSICAL_SHARD_CONNECT_TIMEOUT"] = "2s"
 	env["PHYSICAL_SHARD_QUERY_TIMEOUT"] = "1500ms"
 	env["PHYSICAL_SHARD_TOTAL_POOL_BUDGET"] = "16"
+	env["CONTROL_DATABASE_MAX_OPEN_CONNS"] = "6"
+	env["CONTROL_DATABASE_POOL_COUNT"] = "3"
+	env["PHYSICAL_SHARD_API_REPLICA_COUNT"] = "3"
+	env["PHYSICAL_SHARD_WORKER_REPLICA_COUNT"] = "2"
+	env["WORKER_SHARD_CONCURRENCY"] = "2"
+	env["PHYSICAL_SHARD_MIGRATION_ADMIN_RESERVE"] = "4"
+	env["PHYSICAL_SHARD_OPERATIONAL_RESERVE"] = "6"
+	env["POSTGRES_MAX_CONNECTIONS_LIMIT"] = "80"
 
 	cfg, err := config.LoadFromFor(mapLookup(env), config.ProcessAPI)
 	if err != nil {
@@ -143,6 +151,9 @@ func TestLoadFromForParsesBoundedPhysicalShardControls(t *testing.T) {
 		cfg.PhysicalShardConnMaxIdleTime != time.Minute || cfg.PhysicalShardConnectTimeout != 2*time.Second ||
 		cfg.PhysicalShardQueryTimeout != 1500*time.Millisecond || cfg.PhysicalShardTotalPoolBudget != 16 {
 		t.Fatalf("physical shard bounds = %+v", cfg)
+	}
+	if got, err := cfg.PhysicalShardConnectionBudget(); err != nil || got != 80 {
+		t.Fatalf("PhysicalShardConnectionBudget() = %d, %v, want 80", got, err)
 	}
 }
 
@@ -193,6 +204,20 @@ func TestLoadFromForRejectsUnsafePhysicalShardControls(t *testing.T) {
 				env["PHYSICAL_SHARD_TOTAL_POOL_BUDGET"] = "15"
 			},
 			want: "PHYSICAL_SHARD_TOTAL_POOL_BUDGET",
+		},
+		{
+			name: "unsafe deployment connection limit",
+			mutate: func(env map[string]string) {
+				env["CONTROL_DATABASE_MAX_OPEN_CONNS"] = "4"
+				env["CONTROL_DATABASE_POOL_COUNT"] = "3"
+				env["PHYSICAL_SHARD_API_REPLICA_COUNT"] = "3"
+				env["PHYSICAL_SHARD_WORKER_REPLICA_COUNT"] = "2"
+				env["WORKER_SHARD_CONCURRENCY"] = "2"
+				env["PHYSICAL_SHARD_MIGRATION_ADMIN_RESERVE"] = "4"
+				env["PHYSICAL_SHARD_OPERATIONAL_RESERVE"] = "4"
+				env["POSTGRES_MAX_CONNECTIONS_LIMIT"] = "71"
+			},
+			want: "POSTGRES_MAX_CONNECTIONS_LIMIT",
 		},
 	}
 	for _, test := range tests {
