@@ -141,6 +141,8 @@ foreach ($scriptName in @('physical-shard-outage.js', 'legacy-vs-physical.js')) 
 $outageSource = Get-Content -Raw -LiteralPath (Join-Path $root 'loadtest/k6/physical-shard-outage.js')
 Assert-True -Condition $outageSource.Contains("executor: 'per-vu-iterations'") `
     -Message 'physical shard outage evidence must not turn a correctness probe into an unbounded rate-limit load loop'
+Assert-True -Condition $outageSource.Contains("shard_request_duration: ['p(95)<3000', 'p(99)<5000']") `
+    -Message 'physical shard outage latency must be bounded above the configured 2.5 second failure timeout'
 foreach ($scriptName in @('online-base-copy.js', 'physical-cutover.js', 'legacy-vs-physical.js')) {
     $scriptSource = Get-Content -Raw -LiteralPath (Join-Path $root "loadtest/k6/$scriptName")
     Assert-True -Condition $scriptSource.Contains("executor: 'per-vu-iterations'") `

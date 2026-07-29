@@ -34,6 +34,7 @@ export const options = boundedOptions({
   expected_outage_503: ['count>0'],
   healthy_shard_success: ['count>=2'],
   outage_fallback_writer_observations: ['count==0'],
+  shard_request_duration: ['p(95)<3000', 'p(99)<5000'],
 });
 
 export function unavailableShard() {
