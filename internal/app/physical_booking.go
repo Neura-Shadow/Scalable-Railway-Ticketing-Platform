@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	bookingcommand "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command"
+	commandphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command/physical"
 	commandpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command/postgres"
 	bookingpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/postgres"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
@@ -14,6 +15,7 @@ import (
 
 type physicalCreateCoordinator interface {
 	Execute(context.Context, bookingcommand.ReserveRequest) (bookingcommand.Result, error)
+	ExecuteLifecycle(context.Context, bookingcommand.LifecycleRequest) (bookingcommand.Result, error)
 }
 
 type controlRouteReader interface {
@@ -100,10 +102,22 @@ func (commands *HybridReservationCommands) ConfirmReservation(
 		return bookingpostgres.ConfirmReservationResult{}, err
 	}
 	if physical {
-		// A physical lifecycle mutation must use its own command receipt saga.
-		// Failing closed here prevents a legacy fallback from mutating the wrong
-		// database while that operation is implemented.
-		return bookingpostgres.ConfirmReservationResult{}, sharding.ErrShardUnavailable
+		keyHash, fingerprint, ok := commandHashes(params.IdempotencyKeyHash, params.RequestFingerprint)
+		if !ok {
+			return bookingpostgres.ConfirmReservationResult{}, bookingpostgres.ErrInvalidArgument
+		}
+		result, executeErr := commands.physical.ExecuteLifecycle(ctx, bookingcommand.LifecycleRequest{
+			OwnerUserID: params.UserID, ReservationID: params.ReservationID,
+			Operation:          bookingcommand.OperationConfirmReservation,
+			IdempotencyKeyHash: keyHash, RequestFingerprint: fingerprint,
+		})
+		if executeErr != nil {
+			return bookingpostgres.ConfirmReservationResult{}, mapPhysicalCommandError(executeErr)
+		}
+		return bookingpostgres.ConfirmReservationResult{
+			ReservationID: result.ReservationID, TicketOrderID: result.TicketOrderID,
+			TicketCount: result.TicketCount, Replayed: result.Replayed,
+		}, nil
 	}
 	return commands.legacy.ConfirmReservation(ctx, params)
 }
@@ -117,7 +131,22 @@ func (commands *HybridReservationCommands) CancelReservation(
 		return bookingpostgres.CancelReservationResult{}, err
 	}
 	if physical {
-		return bookingpostgres.CancelReservationResult{}, sharding.ErrShardUnavailable
+		keyHash, fingerprint, ok := commandHashes(params.IdempotencyKeyHash, params.RequestFingerprint)
+		if !ok {
+			return bookingpostgres.CancelReservationResult{}, bookingpostgres.ErrInvalidArgument
+		}
+		result, executeErr := commands.physical.ExecuteLifecycle(ctx, bookingcommand.LifecycleRequest{
+			OwnerUserID: params.UserID, ReservationID: params.ReservationID,
+			Operation:          bookingcommand.OperationCancelReservation,
+			IdempotencyKeyHash: keyHash, RequestFingerprint: fingerprint,
+		})
+		if executeErr != nil {
+			return bookingpostgres.CancelReservationResult{}, mapPhysicalCommandError(executeErr)
+		}
+		return bookingpostgres.CancelReservationResult{
+			ReservationID: result.ReservationID, ReleasedSeatCount: result.ReleasedSeats,
+			Replayed: result.Replayed,
+		}, nil
 	}
 	return commands.legacy.CancelReservation(ctx, params)
 }
@@ -247,6 +276,8 @@ func mapPhysicalCommandError(err error) error {
 		return bookingpostgres.ErrNotFound
 	case errors.Is(err, bookingcommand.ErrInvalidCommand):
 		return bookingpostgres.ErrInvalidArgument
+	case errors.Is(err, commandphysical.ErrInvalidPayload):
+		return bookingpostgres.ErrInvalidState
 	case errors.Is(err, sharding.ErrAssignmentStale), errors.Is(err, sharding.ErrWriteFenced):
 		return err
 	default:

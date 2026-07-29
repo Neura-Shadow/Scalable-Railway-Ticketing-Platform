@@ -64,21 +64,47 @@ func TestHybridReservationCommandsPreservesLegacyCreatePath(t *testing.T) {
 	}
 }
 
-func TestHybridReservationCommandsNeverFallsBackPhysicalLifecycleToLegacy(t *testing.T) {
+func TestHybridReservationCommandsRoutesPhysicalLifecycleWithoutLegacyFallback(t *testing.T) {
 	t.Parallel()
 	legacy := &hybridLegacy{}
 	commands, err := NewHybridReservationCommands(
 		&hybridControl{rows: []pgx.Row{hybridRow{values: []any{"postgres"}}}},
 		legacy,
-		&hybridSaga{},
+		&hybridSaga{result: bookingcommand.Result{ReservationID: uuid.New(), ReleasedSeats: 2}},
 		&hybridPhysicalRouter{},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = commands.CancelReservation(context.Background(), bookingpostgres.ReservationCommandParams{ReservationID: uuid.New()})
-	if !errors.Is(err, sharding.ErrShardUnavailable) || legacy.cancelCalls != 0 {
-		t.Fatalf("CancelReservation() error=%v legacy calls=%d", err, legacy.cancelCalls)
+	result, err := commands.CancelReservation(context.Background(), bookingpostgres.ReservationCommandParams{
+		UserID: uuid.New(), ReservationID: uuid.New(), IdempotencyKeyHash: makeHash(4), RequestFingerprint: makeHash(5),
+	})
+	if err != nil || legacy.cancelCalls != 0 || result.ReleasedSeatCount != 2 {
+		t.Fatalf("CancelReservation() result=%+v error=%v legacy calls=%d", result, err, legacy.cancelCalls)
+	}
+}
+
+func TestPhysicalTrainRunCancellationPreservesLegacyAndEnforcesPhysical(t *testing.T) {
+	t.Parallel()
+	runID := uuid.New()
+	executor := &hybridTrainRunCancellation{}
+	legacy, err := NewPhysicalTrainRunCancellation(
+		&hybridControl{rows: []pgx.Row{hybridRow{values: []any{"legacy_schema", "stable"}}}}, executor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.CancelTrainRun(context.Background(), runID); err != nil || executor.calls != 0 {
+		t.Fatalf("legacy cancellation err=%v calls=%d", err, executor.calls)
+	}
+	physical, _ := NewPhysicalTrainRunCancellation(
+		&hybridControl{rows: []pgx.Row{hybridRow{values: []any{"postgres", "stable"}}}}, executor)
+	if err := physical.CancelTrainRun(context.Background(), runID); err != nil || executor.calls != 1 || executor.runID != runID {
+		t.Fatalf("physical cancellation err=%v calls=%d run=%v", err, executor.calls, executor.runID)
+	}
+	draining, _ := NewPhysicalTrainRunCancellation(
+		&hybridControl{rows: []pgx.Row{hybridRow{values: []any{"postgres", "draining"}}}}, executor)
+	if err := draining.CancelTrainRun(context.Background(), runID); !errors.Is(err, sharding.ErrWriteFenced) || executor.calls != 1 {
+		t.Fatalf("draining cancellation err=%v calls=%d", err, executor.calls)
 	}
 }
 
@@ -134,9 +160,25 @@ func (saga *hybridSaga) Execute(_ context.Context, request bookingcommand.Reserv
 	return saga.result, saga.err
 }
 
+func (saga *hybridSaga) ExecuteLifecycle(_ context.Context, request bookingcommand.LifecycleRequest) (bookingcommand.Result, error) {
+	saga.calls++
+	return saga.result, saga.err
+}
+
 type hybridLegacy struct {
 	createResult                           bookingpostgres.CreateHoldResult
 	createCalls, confirmCalls, cancelCalls int
+}
+
+type hybridTrainRunCancellation struct {
+	calls int
+	runID uuid.UUID
+}
+
+func (executor *hybridTrainRunCancellation) CancelTrainRun(_ context.Context, runID uuid.UUID) error {
+	executor.calls++
+	executor.runID = runID
+	return nil
 }
 
 func (legacy *hybridLegacy) CreateHold(context.Context, bookingpostgres.CreateHoldParams) (bookingpostgres.CreateHoldResult, error) {

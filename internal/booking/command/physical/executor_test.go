@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -55,6 +56,22 @@ func TestExecutorCommitsReservationReceiptOutboxAndWriteEvidenceTogether(t *test
 	}
 }
 
+func TestExecutorCancellationRollsBackPartialSeatRelease(t *testing.T) {
+	t.Parallel()
+	cmd, resolution := commandFixture(t)
+	cmd.Operation, cmd.Payload = command.OperationCancelReservation, command.CreateReservationPayload{}
+	tx := &scriptedTx{rows: []scriptedRow{
+		{err: pgx.ErrNoRows}, {values: []any{int64(7), true, "active", "scheduled"}}, {err: pgx.ErrNoRows},
+		{values: []any{"held", int64(1200), "TWD"}}, {values: []any{2}},
+	}}
+	resolution.Handle = handleForTx(t, tx, true)
+	executor, _ := commandphysical.NewExecutor(&routeResolver{resolution: resolution}, commandphysical.Options{MaxHoldTTL: time.Hour})
+	_, err := executor.Execute(context.Background(), cmd)
+	if !errors.Is(err, commandphysical.ErrShardPersistence) || tx.commits != 0 || tx.rollbacks == 0 {
+		t.Fatalf("err=%v commits=%d rollbacks=%d", err, tx.commits, tx.rollbacks)
+	}
+}
+
 func TestExecutorReturnsCommittedReceiptWithoutReapplyingMutation(t *testing.T) {
 	t.Parallel()
 
@@ -97,6 +114,91 @@ func TestExecutorRefreshesOnceAndRejectsChangedControlAssignment(t *testing.T) {
 	}
 	if !reflect.DeepEqual(router.force, []bool{false, true}) {
 		t.Fatalf("force refresh calls = %v", router.force)
+	}
+}
+
+func TestExecutorCancellationCommitsReceiptMutationOutboxAndEvidenceTogether(t *testing.T) {
+	t.Parallel()
+	cmd, resolution := commandFixture(t)
+	cmd.Operation, cmd.Payload = command.OperationCancelReservation, command.CreateReservationPayload{}
+	tx := &scriptedTx{rows: []scriptedRow{
+		{err: pgx.ErrNoRows},
+		{values: []any{int64(7), true, "active", "scheduled"}},
+		{err: pgx.ErrNoRows},
+		{values: []any{"held", int64(1200), "TWD"}},
+		{values: []any{2}},
+	}, affectedByContains: map[string]int64{"UPDATE seat_inventory": 2}}
+	resolution.Handle = handleForTx(t, tx, true)
+	executor, err := commandphysical.NewExecutor(&routeResolver{resolution: resolution}, commandphysical.Options{MaxHoldTTL: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := executor.Execute(context.Background(), cmd)
+	if err != nil {
+		t.Fatalf("Execute() error=%v", err)
+	}
+	if receipt.ReleasedSeatCount != 2 || tx.commits != 1 || tx.rollbacks != 0 {
+		t.Fatalf("receipt=%+v commits=%d rollbacks=%d", receipt, tx.commits, tx.rollbacks)
+	}
+	joined := strings.Join(tx.execs, "\n")
+	for _, fragment := range []string{"booking_command_receipts", "UPDATE reservations", "seat_inventory", "outbox_events", "train_run_target_write_evidence"} {
+		if !strings.Contains(joined, fragment) {
+			t.Fatalf("missing %q in SQL: %s", fragment, joined)
+		}
+	}
+}
+
+func TestExecutorLifecycleDuplicateReturnsReceiptWithoutMutation(t *testing.T) {
+	t.Parallel()
+	cmd, resolution := commandFixture(t)
+	cmd.Operation, cmd.Payload = command.OperationCancelReservation, command.CreateReservationPayload{}
+	tx := &scriptedTx{rows: []scriptedRow{
+		{values: []any{cmd.RequestFingerprint[:], cmd.ReservationID, "succeeded"}},
+		{values: []any{2}},
+	}}
+	resolution.Handle = handleForTx(t, tx, false)
+	executor, _ := commandphysical.NewExecutor(&routeResolver{resolution: resolution}, commandphysical.Options{MaxHoldTTL: time.Hour})
+	receipt, err := executor.Execute(context.Background(), cmd)
+	if err != nil || receipt.ReleasedSeatCount != 2 || len(tx.execs) != 0 || tx.commits != 1 {
+		t.Fatalf("receipt=%+v err=%v execs=%d commits=%d", receipt, err, len(tx.execs), tx.commits)
+	}
+}
+
+func TestExecutorLifecycleRejectsGenerationRaceBeforeMutation(t *testing.T) {
+	t.Parallel()
+	cmd, resolution := commandFixture(t)
+	cmd.Operation, cmd.Payload = command.OperationConfirmReservation, command.CreateReservationPayload{}
+	tx := &scriptedTx{rows: []scriptedRow{
+		{err: pgx.ErrNoRows}, {values: []any{int64(8), true, "active", "scheduled"}},
+		{err: pgx.ErrNoRows}, {values: []any{int64(8), true, "active", "scheduled"}},
+	}}
+	resolution.Handle = handleForTx(t, tx, true)
+	executor, _ := commandphysical.NewExecutor(&routeResolver{resolution: resolution}, commandphysical.Options{MaxHoldTTL: time.Hour})
+	_, err := executor.Execute(context.Background(), cmd)
+	if !errors.Is(err, sharding.ErrAssignmentStale) || len(tx.execs) != 0 || tx.commits != 0 {
+		t.Fatalf("err=%v execs=%d commits=%d", err, len(tx.execs), tx.commits)
+	}
+}
+
+func TestTrainRunCancellationCommitsLocalSnapshotBeforeControlAndKeepsRelayFenceActive(t *testing.T) {
+	t.Parallel()
+	cmd, resolution := commandFixture(t)
+	tx := &scriptedTx{rows: []scriptedRow{
+		{err: pgx.ErrNoRows}, {values: []any{int64(7), true, "active", "scheduled"}},
+	}}
+	resolution.Handle = handleForTx(t, tx, true)
+	executor, _ := commandphysical.NewExecutor(&routeResolver{resolution: resolution}, commandphysical.Options{MaxHoldTTL: time.Hour})
+	if err := executor.CancelTrainRun(context.Background(), cmd.TrainRunID); err != nil {
+		t.Fatalf("CancelTrainRun() error=%v", err)
+	}
+	joined := strings.Join(tx.execs, "\n")
+	for _, fragment := range []string{"booking_command_receipts", "UPDATE train_run_booking_snapshots", "outbox_events", "train_run_target_write_evidence"} {
+		if !strings.Contains(joined, fragment) {
+			t.Fatalf("missing %q in SQL: %s", fragment, joined)
+		}
+	}
+	if strings.Contains(joined, "UPDATE train_run_write_fences") {
+		t.Fatalf("cancellation disabled relay/lifecycle fence: %s", joined)
 	}
 }
 
@@ -164,11 +266,12 @@ func (*executorPool) Close() {}
 
 type scriptedTx struct {
 	pgx.Tx
-	rows      []scriptedRow
-	rowIndex  int
-	execs     []string
-	commits   int
-	rollbacks int
+	rows               []scriptedRow
+	rowIndex           int
+	execs              []string
+	commits            int
+	rollbacks          int
+	affectedByContains map[string]int64
 }
 
 func (tx *scriptedTx) QueryRow(_ context.Context, _ string, _ ...any) pgx.Row {
@@ -178,6 +281,11 @@ func (tx *scriptedTx) QueryRow(_ context.Context, _ string, _ ...any) pgx.Row {
 }
 func (tx *scriptedTx) Exec(_ context.Context, query string, _ ...any) (pgconn.CommandTag, error) {
 	tx.execs = append(tx.execs, query)
+	for fragment, count := range tx.affectedByContains {
+		if strings.Contains(query, fragment) {
+			return pgconn.NewCommandTag("UPDATE " + strconv.FormatInt(count, 10)), nil
+		}
+	}
 	return pgconn.NewCommandTag("INSERT 0 1"), nil
 }
 func (tx *scriptedTx) Commit(context.Context) error   { tx.commits++; return nil }

@@ -122,11 +122,24 @@ type inventoryInitializer interface {
 	InitializeInventory(context.Context, uuid.UUID) (int64, error)
 }
 type OperatorCommands struct {
-	offering  managementOffering
-	inventory inventoryInitializer
-	metrics   interface {
+	offering             managementOffering
+	inventory            inventoryInitializer
+	physicalCancellation interface {
+		CancelTrainRun(context.Context, uuid.UUID) error
+	}
+	metrics interface {
 		RecordOutbox(operation, eventType, result, reason string)
 	}
+}
+
+func NewPhysicalOperatorCommands(offering managementOffering, inventory inventoryInitializer, cancellation interface {
+	CancelTrainRun(context.Context, uuid.UUID) error
+}, metrics ...interface {
+	RecordOutbox(operation, eventType, result, reason string)
+}) *OperatorCommands {
+	commands := NewOperatorCommands(offering, inventory, metrics...)
+	commands.physicalCancellation = cancellation
+	return commands
 }
 
 func NewOperatorCommands(offering managementOffering, inventory inventoryInitializer, metrics ...interface {
@@ -178,6 +191,15 @@ func (o *OperatorCommands) ExecuteOperator(ctx context.Context, c httpapi.Operat
 		status, err := offeringdomain.ParseTrainRunStatus(c.Status.Status)
 		if err != nil {
 			return httpapi.ResourceView{}, httpapi.ErrInvalidInput
+		}
+		if status == offeringdomain.TrainRunStatusCancelled && o.physicalCancellation != nil {
+			trainRunID, parseErr := uuid.Parse(c.TrainRunID)
+			if parseErr != nil {
+				return httpapi.ResourceView{}, httpapi.ErrInvalidInput
+			}
+			if cancelErr := o.physicalCancellation.CancelTrainRun(ctx, trainRunID); cancelErr != nil {
+				return httpapi.ResourceView{}, mapBookingError(cancelErr)
+			}
 		}
 		v, err := o.offering.UpdateTrainRunStatus(ctx, c.TrainRunID, status)
 		if err != nil {

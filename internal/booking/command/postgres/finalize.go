@@ -20,6 +20,10 @@ func (repository *Repository) Finalize(
 		receipt.RequestFingerprint != bookingCommand.RequestFingerprint {
 		return ErrControlWrite
 	}
+	if bookingCommand.Operation == command.OperationConfirmReservation ||
+		bookingCommand.Operation == command.OperationCancelReservation {
+		return repository.finalizeLifecycle(ctx, bookingCommand, receipt)
+	}
 	tx, err := repository.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return ErrControlWrite
@@ -88,6 +92,65 @@ INSERT INTO public.outbox_events (
     id, aggregate_type, aggregate_id, event_type, event_version, payload
 ) VALUES ($1, 'booking_command', $2, 'booking_command.finalized', 1, $3)
 ON CONFLICT (id) DO NOTHING`, eventID, bookingCommand.ID, payload); err != nil {
+		return ErrControlWrite
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ErrControlWrite
+	}
+	return nil
+}
+
+func (repository *Repository) finalizeLifecycle(ctx context.Context, bookingCommand command.Command, receipt command.Receipt) error {
+	tx, err := repository.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return ErrControlWrite
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	var state string
+	var fingerprint []byte
+	var reservationID uuid.UUID
+	if err := tx.QueryRow(ctx, `
+SELECT state, request_fingerprint, reservation_id
+FROM public.booking_commands WHERE command_id=$1 FOR UPDATE`, bookingCommand.ID).Scan(
+		&state, &fingerprint, &reservationID); err != nil || len(fingerprint) != 32 ||
+		!bytes.Equal(fingerprint, receipt.RequestFingerprint[:]) || reservationID != receipt.ResultResourceID ||
+		state == string(command.StateFailed) || state == string(command.StateExpired) {
+		return ErrControlWrite
+	}
+	if _, err := tx.Exec(ctx, `
+UPDATE public.booking_commands
+SET state='finalized', result_resource_id=$2,
+    finalized_at=COALESCE(finalized_at,clock_timestamp()),
+    lease_owner=NULL, lease_until=NULL, bounded_error_category=NULL
+WHERE command_id=$1`, bookingCommand.ID, receipt.ResultResourceID); err != nil {
+		return ErrControlWrite
+	}
+	// The directory remains a locator, not a lifecycle state store. Release the
+	// create command's global quota only after the shard receipt has committed.
+	if _, err := tx.Exec(ctx, `
+UPDATE public.booking_quota_leases AS quota
+SET state='released', released_at=COALESCE(released_at,clock_timestamp())
+FROM public.reservation_directory AS directory
+WHERE directory.reservation_id=$1
+  AND quota.command_id=directory.command_id
+  AND quota.state IN ('pending','active_hold','repair_required','released')`,
+		bookingCommand.ReservationID); err != nil {
+		return ErrControlWrite
+	}
+	payload, err := json.Marshal(struct {
+		CommandID     uuid.UUID         `json:"command_id"`
+		ReservationID uuid.UUID         `json:"reservation_id"`
+		Operation     command.Operation `json:"operation"`
+	}{bookingCommand.ID, bookingCommand.ReservationID, bookingCommand.Operation})
+	if err != nil {
+		return ErrControlWrite
+	}
+	if _, err := tx.Exec(ctx, `
+INSERT INTO public.outbox_events(id,aggregate_type,aggregate_id,event_type,event_version,payload)
+VALUES($1,'booking_command',$2,'booking_command.finalized',1,$3)
+ON CONFLICT(id) DO NOTHING`,
+		uuid.NewSHA1(uuid.NameSpaceOID, []byte("booking-command.finalized:"+bookingCommand.ID.String())),
+		bookingCommand.ID, payload); err != nil {
 		return ErrControlWrite
 	}
 	if err := tx.Commit(ctx); err != nil {

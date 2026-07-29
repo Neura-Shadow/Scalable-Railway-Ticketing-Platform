@@ -197,6 +197,13 @@ func run(logger *slog.Logger) error {
 			return errors.New("sharded query store initialization failed")
 		}
 	}
+	var querySource querycache.SourceStore = queryStore
+	if physicalRouter != nil {
+		querySource, err = querypostgres.NewPhysicalStore(queryStore, physicalRouter)
+		if err != nil {
+			return errors.New("physical availability store initialization failed")
+		}
+	}
 	projectionStore, err := queryreadmodel.NewStore(pool, clock.RealClock{})
 	if err != nil {
 		return errors.New("read-model store initialization failed")
@@ -222,7 +229,7 @@ func run(logger *slog.Logger) error {
 		return errors.New("availability cache TTL configuration invalid")
 	}
 	cachedQueryStore, err := querycache.NewStore(
-		queryStore,
+		querySource,
 		projectionStore,
 		redisClient,
 		versionManager,
@@ -335,6 +342,18 @@ func run(logger *slog.Logger) error {
 		readiness = app.NewReadinessChecker(pool, redisClient, cfg, physicalRegistry)
 	}
 
+	operatorCommands := app.NewOperatorCommands(offeringStore, bookingStore, metrics)
+	if physicalRouter != nil {
+		operatorExecutor, operatorErr := commandphysical.NewExecutor(physicalRouter, commandphysical.Options{MaxHoldTTL: cfg.HoldTTL})
+		if operatorErr != nil {
+			return errors.New("physical operator command initialization failed")
+		}
+		cancellation, cancellationErr := app.NewPhysicalTrainRunCancellation(pool, operatorExecutor)
+		if cancellationErr != nil {
+			return errors.New("physical operator routing initialization failed")
+		}
+		operatorCommands = app.NewPhysicalOperatorCommands(offeringStore, bookingStore, cancellation, metrics)
+	}
 	router := httpapi.New(httpapi.Dependencies{
 		Readiness:           readiness,
 		ReadinessTimeout:    readinessTimeout(cfg),
@@ -352,7 +371,7 @@ func run(logger *slog.Logger) error {
 		Passengers:          passengers,
 		Tickets:             app.NewTicketQueries(reads),
 		Admin:               app.NewAdminCommands(offeringStore),
-		Operator:            app.NewOperatorCommands(offeringStore, bookingStore, metrics),
+		Operator:            operatorCommands,
 	})
 	if err := router.SetTrustedProxies(cfg.TrustedProxies); err != nil {
 		return errors.New("trusted proxy configuration invalid")

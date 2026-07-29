@@ -25,7 +25,11 @@ var (
 
 type Operation string
 
-const OperationCreateReservation Operation = "reservation.create"
+const (
+	OperationCreateReservation  Operation = "reservation.create"
+	OperationConfirmReservation Operation = "reservation.confirm"
+	OperationCancelReservation  Operation = "reservation.cancel"
+)
 
 type ReceiptStatus string
 
@@ -54,6 +58,17 @@ type ReserveRequest struct {
 	RequestFingerprint [32]byte
 	PassengerCount     int
 	Payload            CreateReservationPayload
+}
+
+// LifecycleRequest binds a confirm or cancel command to the owner-visible
+// reservation identity. The control repository resolves the immutable target
+// route from reservation_directory; callers never supply a shard.
+type LifecycleRequest struct {
+	OwnerUserID        uuid.UUID
+	ReservationID      uuid.UUID
+	Operation          Operation
+	IdempotencyKeyHash [32]byte
+	RequestFingerprint [32]byte
 }
 
 // CreateReservationPayload is the immutable, fingerprint-bound input needed
@@ -86,11 +101,18 @@ type Receipt struct {
 	RequestFingerprint [32]byte
 	ResultResourceID   uuid.UUID
 	Status             ReceiptStatus
+	TicketOrderID      uuid.UUID
+	TicketCount        int
+	ReleasedSeatCount  int
 }
 
 type Result struct {
 	CommandID     uuid.UUID
 	ReservationID uuid.UUID
+	TicketOrderID uuid.UUID
+	TicketCount   int
+	ReleasedSeats int
+	Replayed      bool
 }
 
 // ControlRepository makes reservation of command identity, quota lease, and
@@ -98,6 +120,7 @@ type Result struct {
 // transaction after the shard receipt exists.
 type ControlRepository interface {
 	Reserve(context.Context, ReserveRequest) (Command, error)
+	ReserveLifecycle(context.Context, LifecycleRequest) (Command, error)
 	Finalize(context.Context, Command, Receipt) error
 }
 
@@ -105,6 +128,59 @@ type ControlRepository interface {
 // Re-executing one command and fingerprint returns the same receipt.
 type ShardExecutor interface {
 	Execute(context.Context, Command) (Receipt, error)
+}
+
+// ExecuteLifecycle runs a confirm/cancel saga. Even a finalized control
+// command is re-read from the shard receipt so the HTTP result can be rebuilt
+// without making the control database authoritative for shard-local details.
+func (coordinator *Coordinator) ExecuteLifecycle(ctx context.Context, request LifecycleRequest) (Result, error) {
+	if coordinator == nil || ctx == nil || !validLifecycleRequest(request) {
+		return Result{}, ErrInvalidCommand
+	}
+	bookingCommand, err := coordinator.control.ReserveLifecycle(ctx, request)
+	if err != nil {
+		return Result{}, fmt.Errorf("%w: %w", ErrControlUnavailable, err)
+	}
+	if !validLifecycleCommand(bookingCommand, request) {
+		return Result{}, ErrInvalidCommand
+	}
+	if bookingCommand.State == StateFailed || bookingCommand.State == StateExpired {
+		return Result{}, ErrShardExecution
+	}
+	replayed := bookingCommand.State == StateFinalized
+	receipt, err := coordinator.shard.Execute(ctx, bookingCommand)
+	if err != nil {
+		return Result{}, fmt.Errorf("%w: %w", ErrShardExecution, err)
+	}
+	if receipt.Status != ReceiptCommitted || receipt.CommandID != bookingCommand.ID ||
+		receipt.RequestFingerprint != bookingCommand.RequestFingerprint ||
+		receipt.ResultResourceID != bookingCommand.ReservationID {
+		return Result{}, ErrReceiptMismatch
+	}
+	if err := coordinator.control.Finalize(ctx, bookingCommand, receipt); err != nil {
+		return Result{}, fmt.Errorf("%w: %w", ErrFinalizationDeferred, err)
+	}
+	return Result{
+		CommandID: bookingCommand.ID, ReservationID: receipt.ResultResourceID,
+		TicketOrderID: receipt.TicketOrderID, TicketCount: receipt.TicketCount,
+		ReleasedSeats: receipt.ReleasedSeatCount, Replayed: replayed,
+	}, nil
+}
+
+func validLifecycleRequest(request LifecycleRequest) bool {
+	return request.OwnerUserID != uuid.Nil && request.ReservationID != uuid.Nil &&
+		(request.Operation == OperationConfirmReservation || request.Operation == OperationCancelReservation) &&
+		request.IdempotencyKeyHash != [32]byte{} && request.RequestFingerprint != [32]byte{}
+}
+
+func validLifecycleCommand(bookingCommand Command, request LifecycleRequest) bool {
+	return bookingCommand.ID != uuid.Nil && bookingCommand.OwnerUserID == request.OwnerUserID &&
+		bookingCommand.ReservationID == request.ReservationID && bookingCommand.TrainRunID != uuid.Nil &&
+		bookingCommand.Operation == request.Operation && bookingCommand.RequestFingerprint == request.RequestFingerprint &&
+		bookingCommand.Route.TrainRunID() == bookingCommand.TrainRunID && bookingCommand.Route.Generation().Int64() > 0 &&
+		(bookingCommand.State == StateReserved || bookingCommand.State == StateExecuting ||
+			bookingCommand.State == StateCommittedOnShard || bookingCommand.State == StateFinalized ||
+			bookingCommand.State == StateNeedsRepair)
 }
 
 type Coordinator struct {

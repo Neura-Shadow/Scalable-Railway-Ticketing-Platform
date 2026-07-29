@@ -142,7 +142,7 @@ func TestOfferingSearchMapsQueryResultsAndAvailability(t *testing.T) {
 	departure := time.Date(2026, 7, 20, 8, 0, 0, 0, time.UTC)
 	backend := &offeringQueriesFake{
 		search:       []querypostgres.SearchResult{{TrainRunID: "run", TrainCode: "R100", DepartureAt: departure, ArrivalAt: departure.Add(time.Hour), SeatClass: offeringdomain.SeatClassStandard, FareAmountMinor: 1200, Currency: "TWD"}},
-		availability: querypostgres.Availability{TrainRunID: "run", AvailableSeats: 9},
+		availability: querypostgres.Availability{TrainRunID: "run", AvailableSeats: 9, FareAmountMinor: 1150, Currency: "TWD"},
 	}
 	page, err := NewOfferingQueries(backend).SearchTrainRuns(context.Background(), httpapi.TrainRunSearch{
 		OriginStationCode: "TPE", DestinationStationCode: "KHH", ServiceDate: departure, SeatClass: "standard",
@@ -151,7 +151,7 @@ func TestOfferingSearchMapsQueryResultsAndAvailability(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SearchTrainRuns() error = %v", err)
 	}
-	if backend.searchInput.Sort != "fare_desc" || len(page.Items) != 1 || page.Items[0].AvailableSeatCount != 9 || page.Items[0].OriginStationCode != "TPE" {
+	if backend.searchInput.Sort != "fare_desc" || len(page.Items) != 1 || page.Items[0].AvailableSeatCount != 9 || page.Items[0].FareMinor != 1150 || page.Items[0].OriginStationCode != "TPE" {
 		t.Fatalf("page = %#v, query = %#v", page, backend.searchInput)
 	}
 	if backend.availabilityBatches != 1 || backend.availabilityCalls != 0 {

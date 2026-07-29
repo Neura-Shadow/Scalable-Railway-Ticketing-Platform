@@ -52,6 +52,12 @@ func TestOutboxProcessorUsesDatabaseLocalLeaseAndPreservesEventID(t *testing.T) 
 	if claimCall == nil || !strings.Contains(claimCall.query, "lease_token = gen_random_uuid()") {
 		t.Fatalf("claim query did not create a database-local lease: %+v", claim.calls)
 	}
+	if !strings.Contains(claimCall.query, "JOIN train_run_write_fences") ||
+		!strings.Contains(claimCall.query, "fence.state = 'active'") ||
+		!strings.Contains(claimCall.query, "fence.write_enabled") ||
+		!strings.Contains(claimCall.query, "FOR UPDATE OF event SKIP LOCKED") {
+		t.Fatalf("claim query did not fence pre-cutover event relay: %s", claimCall.query)
+	}
 	finalizeCall := finalize.findCall("status = 'published'")
 	if finalizeCall == nil || !strings.Contains(finalizeCall.query, "lease_token = $3") {
 		t.Fatalf("finalize query did not fence lease ownership: %+v", finalize.calls)

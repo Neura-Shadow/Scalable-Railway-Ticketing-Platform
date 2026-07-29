@@ -111,12 +111,17 @@ func (processor *OutboxProcessor) claim(
 
 	rows, err := tx.Query(ctx, `
 WITH candidates AS MATERIALIZED (
-    SELECT id
-    FROM outbox_events
-    WHERE (status = 'pending' AND next_attempt_at <= $1)
-       OR (status = 'processing' AND locked_at <= $2)
-    ORDER BY created_at, id
-    FOR UPDATE SKIP LOCKED
+    SELECT event.id
+    FROM outbox_events AS event
+    JOIN train_run_write_fences AS fence
+      ON fence.train_run_id = event.train_run_id
+     AND fence.assignment_generation = event.assignment_generation
+    WHERE fence.state = 'active'
+      AND fence.write_enabled
+      AND ((event.status = 'pending' AND event.next_attempt_at <= $1)
+       OR (event.status = 'processing' AND event.locked_at <= $2))
+    ORDER BY event.created_at, event.id
+    FOR UPDATE OF event SKIP LOCKED
     LIMIT $3
 ), claimed AS (
     UPDATE outbox_events AS event

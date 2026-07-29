@@ -104,6 +104,17 @@ func (executor *Executor) executeOnce(
 		}
 		return receipt, nil
 	}
+	if bookingCommand.Operation == command.OperationConfirmReservation ||
+		bookingCommand.Operation == command.OperationCancelReservation {
+		receipt, err := executor.executeLifecycleTx(ctx, tx, bookingCommand, resolved)
+		if err != nil {
+			return rollback(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return command.Receipt{}, ErrShardPersistence
+		}
+		return receipt, nil
+	}
 	now := executor.now()
 	if !bookingCommand.Payload.HoldExpiresAt.After(now) ||
 		bookingCommand.Payload.HoldExpiresAt.Sub(now) > executor.options.MaxHoldTTL {
@@ -328,7 +339,25 @@ WHERE command_id = $1`, bookingCommand.ID).Scan(&fingerprint, &resourceID, &stat
 	if stored != bookingCommand.RequestFingerprint {
 		return command.Receipt{}, false, command.ErrReceiptMismatch
 	}
-	return committedReceipt(bookingCommand), true, nil
+	receipt := committedReceipt(bookingCommand)
+	switch bookingCommand.Operation {
+	case command.OperationConfirmReservation:
+		if err := tx.QueryRow(ctx, `
+SELECT ticket_order.id, count(ticket.id)::integer
+FROM ticket_orders AS ticket_order
+JOIN tickets AS ticket ON ticket.ticket_order_id=ticket_order.id
+WHERE ticket_order.reservation_id=$1
+GROUP BY ticket_order.id`, bookingCommand.ReservationID).Scan(&receipt.TicketOrderID, &receipt.TicketCount); err != nil ||
+			receipt.TicketOrderID == uuid.Nil || receipt.TicketCount < 1 {
+			return command.Receipt{}, false, ErrShardPersistence
+		}
+	case command.OperationCancelReservation:
+		if err := tx.QueryRow(ctx, `SELECT count(*)::integer FROM reservation_seats WHERE reservation_id=$1`,
+			bookingCommand.ReservationID).Scan(&receipt.ReleasedSeatCount); err != nil || receipt.ReleasedSeatCount < 0 {
+			return command.Receipt{}, false, ErrShardPersistence
+		}
+	}
+	return receipt, true, nil
 }
 
 func lockLocalAuthority(ctx context.Context, tx pgx.Tx, bookingCommand command.Command) (int, error) {
@@ -384,11 +413,23 @@ func execOne(ctx context.Context, tx pgx.Tx, query string, args ...any) error {
 
 func (executor *Executor) validCommand(bookingCommand command.Command) bool {
 	payload := bookingCommand.Payload
-	if bookingCommand.ID == uuid.Nil || bookingCommand.Operation != command.OperationCreateReservation ||
+	if bookingCommand.ID == uuid.Nil ||
 		bookingCommand.OwnerUserID == uuid.Nil || bookingCommand.TrainRunID == uuid.Nil ||
 		bookingCommand.ReservationID == uuid.Nil || bookingCommand.RequestFingerprint == [32]byte{} ||
 		bookingCommand.Route.TrainRunID() != bookingCommand.TrainRunID ||
-		bookingCommand.Route.Generation().Int64() <= 0 || len(payload.PassengerIDs) < 1 || len(payload.PassengerIDs) > 6 ||
+		bookingCommand.Route.Generation().Int64() <= 0 {
+		return false
+	}
+	if bookingCommand.Operation == command.OperationConfirmReservation ||
+		bookingCommand.Operation == command.OperationCancelReservation {
+		return bookingCommand.Payload.FromStopIndex == 0 && bookingCommand.Payload.ToStopIndex == 0 &&
+			bookingCommand.Payload.SeatClass == "" && len(bookingCommand.Payload.PassengerIDs) == 0 &&
+			bookingCommand.Payload.HoldExpiresAt.IsZero() && bookingCommand.Payload.ExpectedSnapshotVersion == 0
+	}
+	if bookingCommand.Operation != command.OperationCreateReservation {
+		return false
+	}
+	if len(payload.PassengerIDs) < 1 || len(payload.PassengerIDs) > 6 ||
 		payload.FromStopIndex < 0 || payload.ToStopIndex <= payload.FromStopIndex ||
 		(payload.SeatClass != "standard" && payload.SeatClass != "business" && payload.SeatClass != "first") ||
 		payload.ExpectedSnapshotVersion <= 0 {
