@@ -331,7 +331,7 @@ function Assert-Milestone5MeasuredMigrationEvidence {
 
 function Test-Milestone5CanonicalSummaryReady {
     param(
-        [Parameter(Mandatory = $true)][object[]]$Scenarios,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Scenarios,
         [Parameter(Mandatory = $true)][bool]$DatabaseInvariantsPassed,
         [Parameter(Mandatory = $true)][bool]$MigrationEvidencePassed,
         [Parameter(Mandatory = $true)][bool]$TeardownCompleted,

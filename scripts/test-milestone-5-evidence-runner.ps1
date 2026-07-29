@@ -179,6 +179,10 @@ Assert-True -Condition (Test-Milestone5CanonicalSummaryReady `
     -Scenarios $passedScenarios -DatabaseInvariantsPassed $true `
     -MigrationEvidencePassed $true -TeardownCompleted $true -SanitizationCompleted $true) `
     -Message 'complete evidence set was not publishable'
+Assert-True -Condition (-not (Test-Milestone5CanonicalSummaryReady `
+    -Scenarios @() -DatabaseInvariantsPassed $false `
+    -MigrationEvidencePassed $false -TeardownCompleted $false -SanitizationCompleted $true)) `
+    -Message 'empty scenario evidence must remain non-publishable without masking the original failure'
 foreach ($case in @(
     @{ Name = 'missing scenario'; Scenarios = $passedScenarios[0..8]; DB = $true; Migration = $true; Down = $true; Sanitized = $true },
     @{ Name = 'database failure'; Scenarios = $passedScenarios; DB = $false; Migration = $true; Down = $true; Sanitized = $true },
