@@ -7,7 +7,7 @@ import (
 )
 
 var (
-	allowedShardIDs        = set("legacy", "shard-0", "shard-1")
+	allowedShardIDs        = set("legacy", "shard-0", "shard-1", "physical-shard-0", "physical-shard-1")
 	allowedShardOperations = set(
 		"resolve", "refresh", "read", "write", "create", "confirm", "cancel",
 		"expire", "reconcile", "fanout", "copy", "validate", "cutover", "rollback",
@@ -85,7 +85,7 @@ func (m *shardingMetrics) collectors() []prometheus.Collector {
 	}
 }
 
-// NormalizeShardID allows only logical shard IDs from the fixed topology.
+// NormalizeShardID allows only shard IDs from the fixed topology.
 // Database schema names and arbitrary configuration values collapse to unknown.
 func NormalizeShardID(shardID string) string {
 	return normalize(shardID, allowedShardIDs, "unknown")

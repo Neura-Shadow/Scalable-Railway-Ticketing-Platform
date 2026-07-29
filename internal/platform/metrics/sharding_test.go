@@ -90,7 +90,7 @@ func TestShardingMetricsExposeRequiredFamiliesWithBoundedLabels(t *testing.T) {
 
 func TestNormalizeShardIDRetainsOnlyFixedLogicalIDs(t *testing.T) {
 	t.Parallel()
-	for _, id := range []string{"legacy", "shard-0", "shard-1"} {
+	for _, id := range []string{"legacy", "shard-0", "shard-1", "physical-shard-0", "physical-shard-1"} {
 		if got := metrics.NormalizeShardID(id); got != id {
 			t.Fatalf("NormalizeShardID(%q) = %q", id, got)
 		}

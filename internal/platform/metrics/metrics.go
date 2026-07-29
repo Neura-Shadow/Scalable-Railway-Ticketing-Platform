@@ -146,6 +146,7 @@ type Metrics struct {
 	outboxEvents        *prometheus.CounterVec
 	admission           *admissionMetrics
 	sharding            *shardingMetrics
+	physical            *physicalMetrics
 }
 
 // New registers the platform's bounded metric families.
@@ -156,6 +157,7 @@ func New(registerer prometheus.Registerer) (*Metrics, error) {
 
 	admission := newAdmissionMetrics()
 	sharding := newShardingMetrics()
+	physical := newPhysicalMetrics()
 	m := &Metrics{
 		httpRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "http_requests_total",
@@ -180,6 +182,7 @@ func New(registerer prometheus.Registerer) (*Metrics, error) {
 		}, []string{"operation", "event_type", "result", "reason"}),
 		admission: admission,
 		sharding:  sharding,
+		physical:  physical,
 	}
 
 	for _, collector := range []prometheus.Collector{
@@ -221,6 +224,11 @@ func New(registerer prometheus.Registerer) (*Metrics, error) {
 	for _, collector := range m.sharding.collectors() {
 		if err := registerer.Register(collector); err != nil {
 			return nil, fmt.Errorf("metrics: register sharding collector: %w", err)
+		}
+	}
+	for _, collector := range m.physical.collectors() {
+		if err := registerer.Register(collector); err != nil {
+			return nil, fmt.Errorf("metrics: register physical collector: %w", err)
 		}
 	}
 	return m, nil
