@@ -72,6 +72,10 @@ Assert-True -Condition (-not $driver.Contains('--header=''Authorization: Bearer 
     -Message 'stale prewarm must not single-quote the shell token expansion'
 Assert-True -Condition (-not $driver.Contains('wget --server-response')) `
     -Message 'stale prewarm must use BusyBox-compatible wget response diagnostics'
+Assert-True -Condition (-not $driver.Contains('--header=')) `
+    -Message 'stale prewarm must pass BusyBox long-option values as separate arguments'
+Assert-True -Condition (-not $driver.Contains('--post-data=')) `
+    -Message 'stale prewarm must pass BusyBox post data as a separate argument'
 foreach ($forbidden in @(
     'final_write_pause_ms = 1',
     'dual_writer_violations = 0',
