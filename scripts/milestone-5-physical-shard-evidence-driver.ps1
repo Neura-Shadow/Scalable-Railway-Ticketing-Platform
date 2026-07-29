@@ -508,12 +508,12 @@ function New-Milestone5EnvironmentMap {
     }
     $map['booking-command-recovery'] = [ordered]@{
         BASE_URL=$common.BASE_URL; ORIGIN_CODE='M2A'; DESTINATION_CODE='M2B'; SEAT_CLASS='standard'; TRAIN_RUN_ID=$script:M5TrainA
-        CUSTOMER_TOKENS=$State.Customers[2].Token; PASSENGER_IDS=$State.Customers[2].PassengerIDs[1]
+        CUSTOMER_TOKENS=$State.Customers[8].Token; PASSENGER_IDS=$State.Customers[8].PassengerIDs[1]
         IDEMPOTENCY_KEY="m5-recovery-$($State.Suffix)"; DEFERRED_ERROR_CODE='unavailable'; MAX_REPLAY_ATTEMPTS='20'; REPLAY_INTERVAL_SECONDS='0.25'
     }
     $map['physical-shard-outage'] = [ordered]@{
         BASE_URL=$common.BASE_URL; ORIGIN_CODE='M2A'; DESTINATION_CODE='M2B'; SEAT_CLASS='standard'; OUTAGE_TRAIN_RUN_ID=$script:M5TrainA; HEALTHY_TRAIN_RUN_ID=$script:M5TrainB
-        CUSTOMER_TOKENS=($State.Customers[3].Token,$State.Customers[4].Token -join ','); PASSENGER_IDS=($State.Customers[3].PassengerIDs[0],$State.Customers[4].PassengerIDs[0] -join ','); VUS_PER_SHARD='2'; ITERATIONS_PER_VU='2'
+        CUSTOMER_TOKENS=($State.Customers[9].Token,$State.Customers[10].Token -join ','); PASSENGER_IDS=($State.Customers[9].PassengerIDs[0],$State.Customers[10].PassengerIDs[0] -join ','); VUS_PER_SHARD='2'; ITERATIONS_PER_VU='2'
     }
     foreach ($scenarioSpec in @(
         @('online-base-copy',2), @('journal-catchup',3), @('physical-cutover',4)
@@ -528,25 +528,29 @@ function New-Milestone5EnvironmentMap {
         }
     }
     $map['online-base-copy']['ITERATIONS_PER_VU']='2'
+    $map['online-base-copy']['CUSTOMER_TOKENS']=($State.Customers[11].Token,$State.Customers[12].Token -join ',')
+    $map['online-base-copy']['PASSENGER_IDS']=($State.Customers[11].PassengerIDs[2],$State.Customers[12].PassengerIDs[2] -join ',')
     $map['journal-catchup']['VUS']='3'; $map['journal-catchup']['ITERATIONS']='3'
-    $map['physical-cutover']['CUSTOMER_TOKENS']=($State.Customers[8].Token,$State.Customers[9].Token -join ',')
-    $map['physical-cutover']['PASSENGER_IDS']=($State.Customers[8].PassengerIDs[4],$State.Customers[9].PassengerIDs[4] -join ',')
+    $map['journal-catchup']['CUSTOMER_TOKENS']=($State.Customers[13].Token,$State.Customers[14].Token,$State.Customers[15].Token -join ',')
+    $map['journal-catchup']['PASSENGER_IDS']=($State.Customers[13].PassengerIDs[3],$State.Customers[14].PassengerIDs[3],$State.Customers[15].PassengerIDs[3] -join ',')
+    $map['physical-cutover']['CUSTOMER_TOKENS']=($State.Customers[16].Token,$State.Customers[17].Token -join ',')
+    $map['physical-cutover']['PASSENGER_IDS']=($State.Customers[16].PassengerIDs[4],$State.Customers[17].PassengerIDs[4] -join ',')
     $map['physical-cutover']['ITERATIONS_PER_VU']='8'
     $map['physical-cutover']['CUTOVER_INTERVAL_SECONDS']='3'
     $map['stale-router-physical'] = [ordered]@{
         API_URLS='http://api-1:8080,http://api-2:8080,http://api-3:8080'; ORIGIN_CODE='M2A'; DESTINATION_CODE='M2B'; SEAT_CLASS='standard'; TRAIN_RUN_ID=$script:M5TrainC
-        CUSTOMER_TOKENS=($State.Customers[5].Token,$State.Customers[6].Token,$State.Customers[7].Token -join ',')
-        PASSENGER_IDS=($State.Customers[5].PassengerIDs[5],$State.Customers[6].PassengerIDs[5],$State.Customers[7].PassengerIDs[5] -join ',')
+        CUSTOMER_TOKENS=($State.Customers[18].Token,$State.Customers[19].Token,$State.Customers[20].Token -join ',')
+        PASSENGER_IDS=($State.Customers[18].PassengerIDs[5],$State.Customers[19].PassengerIDs[5],$State.Customers[20].PassengerIDs[5] -join ',')
     }
     $map['reverse-migration'] = [ordered]@{
         BASE_URL=$common.BASE_URL; ORIGIN_CODE='M2A'; DESTINATION_CODE='M2B'; SEAT_CLASS='standard'; TRAIN_RUN_ID=$script:M5TrainC
-        CUSTOMER_TOKENS=$State.Customers[7].Token; PASSENGER_IDS=$State.Customers[7].PassengerIDs[0]
+        CUSTOMER_TOKENS=$State.Customers[21].Token; PASSENGER_IDS=$State.Customers[21].PassengerIDs[0]
         IDEMPOTENCY_KEY="m5-target-era-$($State.Suffix)"; TARGET_ERA_RESERVATION_ID='pending'
     }
     $map['legacy-vs-physical'] = [ordered]@{
         BASE_URL=$common.BASE_URL; ORIGIN_CODE='M2A'; DESTINATION_CODE='M2B'; SEAT_CLASS='standard'; LEGACY_TRAIN_RUN_ID=$script:M5TrainD; PHYSICAL_TRAIN_RUN_ID=$script:M5TrainC
-        LEGACY_CUSTOMER_TOKENS=($State.Customers[5].Token,$State.Customers[6].Token -join ','); LEGACY_PASSENGER_IDS=($State.Customers[5].PassengerIDs[0],$State.Customers[6].PassengerIDs[0] -join ',')
-        PHYSICAL_CUSTOMER_TOKENS=($State.Customers[5].Token,$State.Customers[6].Token -join ','); PHYSICAL_PASSENGER_IDS=($State.Customers[5].PassengerIDs[2],$State.Customers[6].PassengerIDs[2] -join ','); VUS_PER_PATH='2'; ITERATIONS_PER_VU='2'
+        LEGACY_CUSTOMER_TOKENS=($State.Customers[22].Token,$State.Customers[23].Token -join ','); LEGACY_PASSENGER_IDS=($State.Customers[22].PassengerIDs[0],$State.Customers[23].PassengerIDs[0] -join ',')
+        PHYSICAL_CUSTOMER_TOKENS=($State.Customers[22].Token,$State.Customers[23].Token -join ','); PHYSICAL_PASSENGER_IDS=($State.Customers[22].PassengerIDs[2],$State.Customers[23].PassengerIDs[2] -join ','); VUS_PER_PATH='2'; ITERATIONS_PER_VU='2'
     }
     return $map
 }
@@ -564,7 +568,7 @@ function Initialize-Milestone5Evidence {
         OnlineCopyReservationCountBefore=-1L; OnlineCopyJournalCountBefore=-1L
         OnlineCopyMutationDelta=-1L; OnlineCopyJournalDelta=-1L
     }
-    $state.Customers = New-Milestone5DriverCustomers -State $state -Count 10
+    $state.Customers = New-Milestone5DriverCustomers -State $state -Count 24
     Add-Milestone5DriverQuotaBaseline -State $state
     New-Milestone5Migration -Context $Context -TrainRunID $script:M5TrainA -TargetShard 'physical-shard-0' -MigrationID $script:M5MigrationA -Prefix 'train-a'
     Move-Milestone5Migration -Context $Context -MigrationID $script:M5MigrationA -Target rollback_window -Prefix 'train-a'
@@ -690,7 +694,7 @@ function Start-Milestone5Scenario {
         }
         'stale-router-physical' {
             foreach ($index in 0..2) {
-                $customer = $State.Customers[$index+2]
+                $customer = $State.Customers[$index+18]
                 $body = @{train_run_id=$script:M5TrainC;origin_station_code='M2A';destination_station_code='M2B';seat_class='standard';passenger_ids=@($customer.PassengerIDs[0])} | ConvertTo-Json -Compress
                 $shell = "wget -q -O /dev/null --header='Authorization: Bearer `$M5_TOKEN' --header='Content-Type: application/json' --header='Idempotency-Key: m5-prewarm-$index' --post-data='$body' http://127.0.0.1:8080/api/v1/reservations"
                 Invoke-Milestone5DriverCompose -Context $Context -Arguments @('exec','-T','-e',"M5_TOKEN=$($customer.Token)","api-$($index+1)",'sh','-c',$shell) | Out-Null
@@ -738,8 +742,8 @@ function Stop-Milestone5Scenario {
         }
         'stale-router-physical' {
             $environment = $State.EnvironmentByScenario['reverse-migration']
-            $created = Invoke-Milestone5DriverAPI -BaseURL $State.BaseURL -Method POST -Path '/api/v1/reservations' -Token $State.Customers[7].Token -IdempotencyKey $environment.IDEMPOTENCY_KEY -Body @{
-                train_run_id=$script:M5TrainC;origin_station_code='M2A';destination_station_code='M2B';seat_class='standard';passenger_ids=@($State.Customers[7].PassengerIDs[0])
+            $created = Invoke-Milestone5DriverAPI -BaseURL $State.BaseURL -Method POST -Path '/api/v1/reservations' -Token $State.Customers[21].Token -IdempotencyKey $environment.IDEMPOTENCY_KEY -Body @{
+                train_run_id=$script:M5TrainC;origin_station_code='M2A';destination_station_code='M2B';seat_class='standard';passenger_ids=@($State.Customers[21].PassengerIDs[0])
             } -ExpectedStatus @(201)
             $State.TargetEraReservationID = [string]$created.Body.id
             if (-not $State.TargetEraReservationID) { throw 'target-era write omitted reservation identity' }

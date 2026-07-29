@@ -90,7 +90,7 @@ Assert-Throws -Label 'unknown scenario start' -Action {
         -Scenario 'unknown' -Environment @{}
 }
 
-$fakeCustomers = @(0..9 | ForEach-Object {
+$fakeCustomers = @(0..23 | ForEach-Object {
     $customerIndex = [int]$_
     [pscustomobject]@{
         Token = "synthetic-token-$customerIndex"
@@ -115,14 +115,18 @@ Assert-True -Condition ($environmentMap['physical-shard-outage']['ITERATIONS_PER
     -Message 'outage evidence must use bounded iterations below the public reservation-rate limit'
 Assert-True -Condition ($environmentMap['online-base-copy']['ITERATIONS_PER_VU'] -eq '2') `
     -Message 'online base-copy evidence must use bounded source mutations'
+Assert-True -Condition ($environmentMap['online-base-copy']['CUSTOMER_TOKENS'] -eq 'synthetic-token-11,synthetic-token-12') `
+    -Message 'online base-copy evidence must use isolated public rate-limit identities'
 Assert-True -Condition ($environmentMap['journal-catchup']['VUS'] -eq '3' -and `
     $environmentMap['journal-catchup']['ITERATIONS'] -eq '3') `
     -Message 'journal catch-up must use one bounded mutation identity per customer'
+Assert-True -Condition ($environmentMap['journal-catchup']['CUSTOMER_TOKENS'] -eq 'synthetic-token-13,synthetic-token-14,synthetic-token-15') `
+    -Message 'journal catch-up evidence must use isolated public rate-limit identities'
 Assert-True -Condition ($environmentMap['physical-cutover']['ITERATIONS_PER_VU'] -eq '8') `
     -Message 'cutover evidence must poll through the bounded pause without exceeding the public rate limit'
 Assert-True -Condition ($environmentMap['physical-cutover']['CUTOVER_INTERVAL_SECONDS'] -eq '3') `
     -Message 'cutover polling must span the full bounded state transition and observe recovery'
-Assert-True -Condition ($environmentMap['physical-cutover']['CUSTOMER_TOKENS'] -eq 'synthetic-token-8,synthetic-token-9') `
+Assert-True -Condition ($environmentMap['physical-cutover']['CUSTOMER_TOKENS'] -eq 'synthetic-token-16,synthetic-token-17') `
     -Message 'cutover evidence must use dedicated synthetic customer rate-limit windows'
 Assert-True -Condition ($environmentMap['legacy-vs-physical']['VUS_PER_PATH'] -eq '2') `
     -Message 'legacy/physical comparison requires two independent writers per path'
