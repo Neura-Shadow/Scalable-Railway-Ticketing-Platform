@@ -2,6 +2,7 @@ package physical
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"sync"
 	"time"
@@ -44,36 +45,49 @@ type CatalogRouter struct {
 	registry *Registry
 	ttl      time.Duration
 	now      func() time.Time
+	metrics  Metrics
 
 	mu    sync.RWMutex
 	cache map[uuid.UUID]cachedResolution
 }
 
-func NewCatalogRouter(db CatalogReader, registry *Registry, ttl time.Duration) (*CatalogRouter, error) {
+func NewCatalogRouter(db CatalogReader, registry *Registry, ttl time.Duration, options ...RouterOption) (*CatalogRouter, error) {
 	if nilCatalogReader(db) || registry == nil || ttl <= 0 || ttl > maxCatalogRouteTTL {
 		return nil, ErrInvalidRegistry
 	}
-	return &CatalogRouter{
+	router := &CatalogRouter{
 		db: db, registry: registry, ttl: ttl, now: time.Now,
 		cache: make(map[uuid.UUID]cachedResolution),
-	}, nil
+	}
+	for _, option := range options {
+		if option != nil {
+			option(router)
+		}
+	}
+	return router, nil
 }
 
 func (router *CatalogRouter) Resolve(ctx context.Context, trainRunID uuid.UUID, forceRefresh bool) (Resolution, error) {
 	if router == nil || ctx == nil || trainRunID == uuid.Nil {
 		return Resolution{}, sharding.ErrShardUnavailable
 	}
+	started := router.now()
 	if !forceRefresh {
 		router.mu.RLock()
 		cached, found := router.cache[trainRunID]
 		router.mu.RUnlock()
 		if found && router.now().Before(cached.expiresAt) {
+			router.observeResolve(forceRefresh, cached.value, "success", "none", started)
 			return cached.value, nil
 		}
 	}
 
-	resolved, err := router.load(ctx, trainRunID)
+	resolved, reason, err := router.load(ctx, trainRunID)
 	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			reason = "timeout"
+		}
+		router.observeResolve(forceRefresh, resolved, "unavailable", reason, started)
 		return Resolution{}, err
 	}
 	router.mu.Lock()
@@ -82,10 +96,11 @@ func (router *CatalogRouter) Resolve(ctx context.Context, trainRunID uuid.UUID, 
 	}
 	router.cache[trainRunID] = cachedResolution{value: resolved, expiresAt: router.now().Add(router.ttl)}
 	router.mu.Unlock()
+	router.observeResolve(forceRefresh, resolved, "success", "none", started)
 	return resolved, nil
 }
 
-func (router *CatalogRouter) load(ctx context.Context, trainRunID uuid.UUID) (Resolution, error) {
+func (router *CatalogRouter) load(ctx context.Context, trainRunID uuid.UUID) (Resolution, string, error) {
 	var (
 		rawShardID                    string
 		rawGeneration                 int64
@@ -129,22 +144,37 @@ WHERE assignment.train_run_id = $1
 		&minimumFencingProtocolVersion,
 	)
 	if err != nil {
-		return Resolution{}, sharding.ErrShardUnavailable
+		reason := "database"
+		if errors.Is(err, pgx.ErrNoRows) {
+			reason = "catalog"
+		}
+		return Resolution{}, reason, sharding.ErrShardUnavailable
 	}
 	shardID, err := sharding.ParseShardID(rawShardID)
 	if err != nil || (shardID != sharding.ShardPhysicalZero && shardID != sharding.ShardPhysicalOne) {
-		return Resolution{}, sharding.ErrShardUnavailable
+		return Resolution{}, "catalog", sharding.ErrShardUnavailable
+	}
+	failed := Resolution{Handle: Handle{shardID: shardID}}
+	if StorageKind(rawStorageKind) == StoragePostgres {
+		failed.Handle.storageKind = StoragePostgres
 	}
 	generation, err := sharding.NewAssignmentGeneration(rawGeneration)
 	if err != nil {
-		return Resolution{}, sharding.ErrShardUnavailable
+		return failed, "catalog", sharding.ErrShardUnavailable
 	}
 	route, err := sharding.NewShardRoute(trainRunID, shardID, generation)
 	if err != nil {
-		return Resolution{}, sharding.ErrShardUnavailable
+		return failed, "catalog", sharding.ErrShardUnavailable
 	}
+	failed.Route = route
 	if minimumFencingProtocolVersion < 1 || minimumFencingProtocolVersion > sharding.SupportedFencingProtocolVersion {
-		return Resolution{}, sharding.ErrShardUnavailable
+		return failed, "protocol", sharding.ErrShardUnavailable
+	}
+	if protocolVersion != SupportedProtocolVersion {
+		return failed, "protocol", sharding.ErrShardUnavailable
+	}
+	if schemaVersion != SupportedSchemaVersion {
+		return failed, "schema", sharding.ErrShardUnavailable
 	}
 	handle, err := router.registry.Resolve(CatalogEntry{
 		ShardID:         shardID,
@@ -158,9 +188,46 @@ WHERE assignment.train_run_id = $1
 		State:           CatalogState(rawCatalogState),
 	})
 	if err != nil {
-		return Resolution{}, sharding.ErrShardUnavailable
+		reason := "catalog"
+		if errors.Is(err, ErrUnknownConnectionReference) {
+			reason = "unknown_connection_ref"
+		}
+		return failed, reason, sharding.ErrShardUnavailable
 	}
-	return Resolution{Route: route, Handle: handle}, nil
+	return Resolution{Route: route, Handle: handle}, "none", nil
+}
+
+func (router *CatalogRouter) observeResolve(
+	forceRefresh bool,
+	resolution Resolution,
+	result, reason string,
+	started time.Time,
+) {
+	if router == nil || router.metrics == nil {
+		return
+	}
+	shardID := "unknown"
+	storageKind := "unknown"
+	if resolution.Handle.shardID == sharding.ShardPhysicalZero ||
+		resolution.Handle.shardID == sharding.ShardPhysicalOne {
+		shardID = resolution.Handle.shardID.String()
+	}
+	if resolution.Handle.storageKind == StoragePostgres {
+		storageKind = string(StoragePostgres)
+	}
+	duration := router.now().Sub(started)
+	if duration < 0 {
+		duration = 0
+	}
+	router.metrics.RecordPhysicalShardRoute(
+		"resolve", result, reason, shardID, storageKind, duration,
+	)
+	if forceRefresh {
+		router.metrics.RecordPhysicalShardRouteRefresh(result, reason, shardID)
+	}
+	if result != "success" {
+		router.metrics.RecordPhysicalShardUnavailable("resolve", reason, shardID)
+	}
 }
 
 func (router *CatalogRouter) evictOneLocked() {

@@ -10,7 +10,7 @@ var (
 	allowedPhysicalShardIDs   = set("physical-shard-0", "physical-shard-1")
 	allowedStorageKinds       = set("legacy_schema", "logical_schema", "postgres")
 	allowedPhysicalOperations = set(
-		"create", "finalize", "recover", "release", "repair", "resolve",
+		"create", "confirm", "cancel", "finalize", "recover", "release", "repair", "resolve",
 		"refresh", "read", "write", "copy", "replay", "validate",
 		"cutover", "rollback", "reverse", "reconcile", "expire", "publish",
 	)

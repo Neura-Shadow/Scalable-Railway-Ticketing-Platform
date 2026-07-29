@@ -84,3 +84,40 @@ func TestPhysicalMetricsExposeRequiredFamiliesWithoutUnboundedLabels(t *testing.
 		t.Fatal("Prometheus exposition leaked an unbounded physical label")
 	}
 }
+
+func TestPhysicalBookingCommandOperationsRemainBoundedAndDistinct(t *testing.T) {
+	t.Parallel()
+	registry := prometheus.NewRegistry()
+	recorder, err := metrics.New(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []string{"create", "confirm", "cancel"} {
+		recorder.RecordBookingCommand(operation, "success", "none")
+	}
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	operations := make(map[string]bool, 3)
+	for _, family := range families {
+		if family.GetName() != "booking_command_total" {
+			continue
+		}
+		for _, sample := range family.GetMetric() {
+			for _, label := range sample.GetLabel() {
+				if label.GetName() == "operation" {
+					operations[label.GetValue()] = true
+				}
+			}
+		}
+	}
+	for _, operation := range []string{"create", "confirm", "cancel"} {
+		if !operations[operation] {
+			t.Errorf("booking command operation %q was not preserved: %v", operation, operations)
+		}
+	}
+	if operations["unknown"] {
+		t.Fatalf("bounded booking operations collapsed to unknown: %v", operations)
+	}
+}
