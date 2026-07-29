@@ -73,7 +73,7 @@ CREATE TABLE booking_seat_catalog (
     FOREIGN KEY (train_run_id, assignment_generation, train_id)
         REFERENCES train_run_booking_snapshots(
             train_run_id, assignment_generation, train_id
-        ) ON DELETE RESTRICT
+        ) ON UPDATE CASCADE ON DELETE RESTRICT
 );
 
 CREATE INDEX booking_seat_catalog_allocation_idx
@@ -110,7 +110,7 @@ CREATE TABLE booking_fare_snapshots (
     FOREIGN KEY (train_run_id, assignment_generation, segment_count)
         REFERENCES train_run_booking_snapshots(
             train_run_id, assignment_generation, segment_count
-        ) ON DELETE RESTRICT,
+        ) ON UPDATE CASCADE ON DELETE RESTRICT,
     CHECK (from_stop_index < to_stop_index),
     CHECK (to_stop_index <= segment_count)
 );
@@ -141,12 +141,12 @@ CREATE TABLE seat_inventory (
     FOREIGN KEY (train_run_id, assignment_generation, segment_count)
         REFERENCES train_run_booking_snapshots(
             train_run_id, assignment_generation, segment_count
-        ) ON DELETE RESTRICT,
+        ) ON UPDATE CASCADE ON DELETE RESTRICT,
     FOREIGN KEY (
         train_run_id, assignment_generation, seat_id, seat_class
     ) REFERENCES booking_seat_catalog(
         train_run_id, assignment_generation, seat_id, seat_class
-    ) ON DELETE RESTRICT,
+    ) ON UPDATE CASCADE ON DELETE RESTRICT,
     CHECK (bit_length(occupied_segments) = segment_count)
 );
 
@@ -181,7 +181,7 @@ CREATE TABLE reservations (
     FOREIGN KEY (train_run_id, assignment_generation, segment_count)
         REFERENCES train_run_booking_snapshots(
             train_run_id, assignment_generation, segment_count
-        ) ON DELETE RESTRICT,
+        ) ON UPDATE CASCADE ON DELETE RESTRICT,
     CHECK (from_stop_index < to_stop_index),
     CHECK (to_stop_index <= segment_count),
     CHECK (expires_at > created_at)
@@ -224,15 +224,15 @@ CREATE TABLE reservation_seats (
         reservation_id, train_run_id, assignment_generation, segment_count
     ) REFERENCES reservations(
         id, train_run_id, assignment_generation, segment_count
-    ) ON DELETE CASCADE,
+    ) ON UPDATE CASCADE ON DELETE CASCADE,
     FOREIGN KEY (train_run_id, assignment_generation, seat_id)
         REFERENCES seat_inventory(
             train_run_id, assignment_generation, seat_id
-        ) ON DELETE RESTRICT,
+        ) ON UPDATE CASCADE ON DELETE RESTRICT,
     FOREIGN KEY (fare_snapshot_id, train_run_id, assignment_generation)
         REFERENCES booking_fare_snapshots(
             id, train_run_id, assignment_generation
-        ) ON DELETE RESTRICT,
+        ) ON UPDATE CASCADE ON DELETE RESTRICT,
     CHECK (bit_length(segment_mask) = segment_count),
     CHECK (bit_count(segment_mask) > 0)
 );
@@ -264,7 +264,7 @@ CREATE TABLE ticket_orders (
     UNIQUE (id, train_run_id, assignment_generation),
     FOREIGN KEY (reservation_id, train_run_id, assignment_generation)
         REFERENCES reservations(id, train_run_id, assignment_generation)
-        ON DELETE RESTRICT
+        ON UPDATE CASCADE ON DELETE RESTRICT
 );
 
 CREATE INDEX ticket_orders_owner_created_idx
@@ -290,10 +290,10 @@ CREATE TABLE tickets (
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     FOREIGN KEY (ticket_order_id, train_run_id, assignment_generation)
         REFERENCES ticket_orders(id, train_run_id, assignment_generation)
-        ON DELETE RESTRICT,
+        ON UPDATE CASCADE ON DELETE RESTRICT,
     FOREIGN KEY (reservation_seat_id, train_run_id, assignment_generation)
         REFERENCES reservation_seats(id, train_run_id, assignment_generation)
-        ON DELETE RESTRICT,
+        ON UPDATE CASCADE ON DELETE RESTRICT,
     CHECK (length(ticket_code) BETWEEN 16 AND 64)
 );
 
@@ -330,7 +330,7 @@ CREATE TABLE idempotency_records (
     FOREIGN KEY (train_run_id, assignment_generation)
         REFERENCES train_run_booking_snapshots(
             train_run_id, assignment_generation
-        ) ON DELETE RESTRICT,
+        ) ON UPDATE CASCADE ON DELETE RESTRICT,
     CHECK (expires_at > created_at),
     CHECK (
         (status = 'in_progress'
@@ -367,7 +367,8 @@ CREATE TABLE booking_command_receipts (
     command_type text NOT NULL CHECK (
         command_type IN (
             'reservation.create', 'reservation.confirm', 'reservation.cancel',
-            'train_run.cancel', 'fare.install', 'seat.disable'
+			'train_run.cancel', 'fare.install', 'seat.disable', 'seat.enable',
+			'booking_policy.bump'
         )
     ),
     request_fingerprint bytea NOT NULL
@@ -376,6 +377,9 @@ CREATE TABLE booking_command_receipts (
         CHECK (status IN ('started', 'succeeded', 'rejected')),
     result_type text,
     result_id uuid,
+    result_source_version bigint CHECK (result_source_version > 0),
+    result_booking_policy_version bigint
+        CHECK (result_booking_policy_version > 0),
     error_code text,
     started_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     completed_at timestamptz,
@@ -384,25 +388,42 @@ CREATE TABLE booking_command_receipts (
     FOREIGN KEY (train_run_id, assignment_generation)
         REFERENCES train_run_booking_snapshots(
             train_run_id, assignment_generation
-        ) ON DELETE RESTRICT,
+        ) ON UPDATE CASCADE ON DELETE RESTRICT,
     CHECK (error_code IS NULL OR length(error_code) BETWEEN 1 AND 64),
     CHECK (
         (status = 'started'
             AND completed_at IS NULL
             AND result_type IS NULL
             AND result_id IS NULL
+            AND result_source_version IS NULL
+            AND result_booking_policy_version IS NULL
             AND error_code IS NULL)
         OR
         (status = 'succeeded'
             AND completed_at IS NOT NULL
             AND result_type IN ('reservation', 'train_run', 'fare', 'seat')
             AND result_id IS NOT NULL
+            AND (
+                (command_type = 'booking_policy.bump'
+                    AND result_source_version IS NOT NULL
+                    AND result_booking_policy_version IS NOT NULL)
+                OR
+                (command_type IN ('fare.install', 'seat.disable', 'seat.enable')
+                    AND result_source_version IS NOT NULL
+                    AND result_booking_policy_version IS NULL)
+                OR
+                (command_type NOT IN ('fare.install', 'seat.disable', 'seat.enable', 'booking_policy.bump')
+                    AND result_source_version IS NULL
+                    AND result_booking_policy_version IS NULL)
+            )
             AND error_code IS NULL)
         OR
         (status = 'rejected'
             AND completed_at IS NOT NULL
             AND result_type IS NULL
             AND result_id IS NULL
+            AND result_source_version IS NULL
+            AND result_booking_policy_version IS NULL
             AND error_code IS NOT NULL)
     )
 );
@@ -444,7 +465,7 @@ CREATE TABLE outbox_events (
     FOREIGN KEY (train_run_id, assignment_generation)
         REFERENCES train_run_booking_snapshots(
             train_run_id, assignment_generation
-        ) ON DELETE RESTRICT,
+        ) ON UPDATE CASCADE ON DELETE RESTRICT,
     CHECK (jsonb_typeof(payload) = 'object'),
     CHECK (octet_length(payload::text) <= 65536),
     CHECK (NOT (payload ?| ARRAY[
@@ -498,7 +519,7 @@ CREATE TABLE train_run_write_fences (
     FOREIGN KEY (train_run_id, assignment_generation)
         REFERENCES train_run_booking_snapshots(
             train_run_id, assignment_generation
-        ) ON DELETE RESTRICT,
+        ) ON UPDATE CASCADE ON DELETE RESTRICT,
     CHECK (NOT write_enabled OR state = 'active')
 );
 
@@ -542,13 +563,20 @@ CREATE TABLE train_run_target_write_evidence (
     first_successful_write_at timestamptz,
     last_successful_write_at timestamptz,
     last_command_id uuid,
+    baseline_initialized boolean NOT NULL DEFAULT false,
+    baseline_reservation_count bigint NOT NULL DEFAULT 0
+        CHECK (baseline_reservation_count >= 0),
+    baseline_command_receipt_count bigint NOT NULL DEFAULT 0
+        CHECK (baseline_command_receipt_count >= 0),
+    baseline_outbox_count bigint NOT NULL DEFAULT 0
+        CHECK (baseline_outbox_count >= 0),
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     UNIQUE (train_run_id, assignment_generation),
     FOREIGN KEY (train_run_id, assignment_generation)
         REFERENCES train_run_booking_snapshots(
             train_run_id, assignment_generation
-        ) ON DELETE RESTRICT,
+        ) ON UPDATE CASCADE ON DELETE RESTRICT,
     CHECK (
         (successful_write_count = 0
             AND first_successful_write_at IS NULL
@@ -570,8 +598,18 @@ AS $$
 BEGIN
     IF NEW.id <> OLD.id
        OR NEW.train_run_id <> OLD.train_run_id
-       OR NEW.assignment_generation <> OLD.assignment_generation THEN
+       OR NEW.assignment_generation < OLD.assignment_generation THEN
         RAISE EXCEPTION 'target-write evidence identity is immutable'
+            USING ERRCODE = '23514';
+    END IF;
+
+    IF OLD.baseline_initialized AND (
+        NOT NEW.baseline_initialized
+        OR NEW.baseline_reservation_count <> OLD.baseline_reservation_count
+        OR NEW.baseline_command_receipt_count <> OLD.baseline_command_receipt_count
+        OR NEW.baseline_outbox_count <> OLD.baseline_outbox_count
+    ) THEN
+        RAISE EXCEPTION 'target-write evidence baseline is immutable'
             USING ERRCODE = '23514';
     END IF;
     IF NEW.successful_write_count < OLD.successful_write_count THEN
@@ -617,7 +655,7 @@ CREATE TABLE migration_capture_state (
     FOREIGN KEY (train_run_id, source_generation)
         REFERENCES train_run_booking_snapshots(
             train_run_id, assignment_generation
-        ) ON DELETE RESTRICT,
+        ) ON UPDATE CASCADE ON DELETE RESTRICT,
     CHECK (NOT capture_enabled OR (enabled_at IS NOT NULL AND disabled_at IS NULL))
 );
 
@@ -690,7 +728,7 @@ CREATE TABLE train_run_mutation_journal (
     FOREIGN KEY (train_run_id, source_generation)
         REFERENCES train_run_booking_snapshots(
             train_run_id, assignment_generation
-        ) ON DELETE RESTRICT,
+        ) ON UPDATE CASCADE ON DELETE RESTRICT,
     CHECK (jsonb_typeof(primary_key) = 'object'),
     CHECK (jsonb_typeof(metadata) = 'object'),
     CHECK (octet_length(primary_key::text) <= 1024),
@@ -728,7 +766,7 @@ CREATE TABLE migration_apply_receipts (
     FOREIGN KEY (train_run_id, target_generation)
         REFERENCES train_run_booking_snapshots(
             train_run_id, assignment_generation
-        ) ON DELETE RESTRICT
+        ) ON UPDATE CASCADE ON DELETE RESTRICT
 );
 
 CREATE INDEX migration_apply_receipts_train_run_idx
@@ -855,6 +893,9 @@ BEGIN
             'status', source_row -> 'status',
             'result_type', source_row -> 'result_type',
             'result_id', source_row -> 'result_id',
+            'result_source_version', source_row -> 'result_source_version',
+            'result_booking_policy_version',
+                source_row -> 'result_booking_policy_version',
             'error_code', source_row -> 'error_code'
         )
     END;
