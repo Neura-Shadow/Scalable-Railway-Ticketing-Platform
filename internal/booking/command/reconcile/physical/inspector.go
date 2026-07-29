@@ -98,16 +98,17 @@ func (inspector *Inspector) Inspect(ctx context.Context, candidate reconcile.Can
 		trainRunID  uuid.UUID
 		generation  int64
 		fingerprint []byte
+		commandType string
 		status      string
 		resultID    pgtype.UUID
 		errorCode   pgtype.Text
 	)
 	err = tx.QueryRow(ctx, `
-SELECT command_id, train_run_id, assignment_generation, request_fingerprint,
+SELECT command_id, train_run_id, assignment_generation, command_type, request_fingerprint,
        status, result_id, error_code
 FROM booking_command_receipts
 WHERE command_id = $1`, candidate.Command.ID).Scan(
-		&commandID, &trainRunID, &generation, &fingerprint, &status, &resultID, &errorCode,
+		&commandID, &trainRunID, &generation, &commandType, &fingerprint, &status, &resultID, &errorCode,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if err := tx.Commit(ctx); err != nil {
@@ -116,7 +117,7 @@ WHERE command_id = $1`, candidate.Command.ID).Scan(
 		return reconcile.Observation{Kind: reconcile.ObservationMissing}, nil
 	}
 	if err != nil || trainRunID != candidate.Command.TrainRunID ||
-		generation != candidate.Command.Route.Generation().Int64() || len(fingerprint) != 32 {
+		generation != candidate.Command.Route.Generation().Int64() || command.Operation(commandType) != candidate.Command.Operation || len(fingerprint) != 32 {
 		return reconcile.Observation{}, reconcile.ErrShardUnreachable
 	}
 	var storedFingerprint [32]byte
@@ -136,6 +137,41 @@ WHERE command_id = $1`, candidate.Command.ID).Scan(
 		observation.Receipt = command.Receipt{
 			CommandID: commandID, RequestFingerprint: storedFingerprint,
 			ResultResourceID: observation.ResultResourceID, Status: command.ReceiptCommitted,
+		}
+		if candidate.Command.Operation == command.OperationConfirmReservation {
+			if err := tx.QueryRow(ctx, `
+SELECT id,count(ticket.id)::integer,orders.total_amount_minor,orders.currency,orders.created_at
+FROM ticket_orders AS orders
+JOIN tickets AS ticket ON ticket.ticket_order_id=orders.id
+WHERE orders.reservation_id=$1 AND orders.user_id=$2
+GROUP BY orders.id`, candidate.Command.ReservationID, candidate.Command.OwnerUserID).Scan(
+				&observation.Receipt.TicketOrderID, &observation.Receipt.TicketCount,
+				&observation.Receipt.TotalAmountMinor, &observation.Receipt.Currency,
+				&observation.Receipt.OrderCreatedAt,
+			); err != nil || observation.Receipt.TicketOrderID == uuid.Nil ||
+				observation.Receipt.TicketCount < 1 || observation.Receipt.TicketCount > command.MaxReceiptTickets ||
+				len(observation.Receipt.Currency) != 3 ||
+				observation.Receipt.OrderCreatedAt.IsZero() {
+				return reconcile.Observation{}, reconcile.ErrReceiptMismatch
+			}
+			rows, queryErr := tx.Query(ctx, `SELECT id FROM tickets WHERE ticket_order_id=$1 ORDER BY id LIMIT $2`,
+				observation.Receipt.TicketOrderID, command.MaxReceiptTickets+1)
+			if queryErr != nil {
+				return reconcile.Observation{}, reconcile.ErrReceiptMismatch
+			}
+			for rows.Next() {
+				var ticketID uuid.UUID
+				if scanErr := rows.Scan(&ticketID); scanErr != nil || ticketID == uuid.Nil {
+					rows.Close()
+					return reconcile.Observation{}, reconcile.ErrReceiptMismatch
+				}
+				observation.Receipt.TicketIDs = append(observation.Receipt.TicketIDs, ticketID)
+			}
+			rowsErr := rows.Err()
+			rows.Close()
+			if rowsErr != nil || len(observation.Receipt.TicketIDs) != observation.Receipt.TicketCount {
+				return reconcile.Observation{}, reconcile.ErrReceiptMismatch
+			}
 		}
 	case "rejected":
 		if !errorCode.Valid {

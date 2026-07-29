@@ -22,7 +22,7 @@ func TestInspectReadsCommittedReceiptWithoutInventoryMutation(t *testing.T) {
 	candidate := physicalCandidate(t)
 	tx := &inspectionTx{row: inspectionRow{values: []any{
 		candidate.Command.ID, candidate.Command.TrainRunID, candidate.Command.Route.Generation().Int64(),
-		candidate.Command.RequestFingerprint[:], "succeeded",
+		string(candidate.Command.Operation), candidate.Command.RequestFingerprint[:], "succeeded",
 		pgtype.UUID{Bytes: [16]byte(candidate.Command.ReservationID), Valid: true}, pgtype.Text{},
 	}}}
 	pool := &inspectionPool{tx: tx}
@@ -53,6 +53,34 @@ func TestInspectReturnsMissingOnlyAfterReachableNoRows(t *testing.T) {
 	observation, err := inspector.Inspect(context.Background(), candidate)
 	if err != nil || observation.Kind != reconcile.ObservationMissing || !tx.committed {
 		t.Fatalf("Inspect() = (%+v, %v), committed = %v", observation, err, tx.committed)
+	}
+}
+
+func TestInspectConfirmationReturnsAuthoritativeTicketOrderSummary(t *testing.T) {
+	t.Parallel()
+	candidate := physicalCandidate(t)
+	candidate.Command.Operation = command.OperationConfirmReservation
+	orderID := uuid.New()
+	createdAt := time.Now().UTC()
+	tx := &inspectionTx{rows: []pgx.Row{
+		inspectionRow{values: []any{
+			candidate.Command.ID, candidate.Command.TrainRunID, candidate.Command.Route.Generation().Int64(),
+			string(candidate.Command.Operation), candidate.Command.RequestFingerprint[:], "succeeded",
+			pgtype.UUID{Bytes: [16]byte(candidate.Command.ReservationID), Valid: true}, pgtype.Text{},
+		}},
+		inspectionRow{values: []any{orderID, 2, int64(2400), "TWD", createdAt}},
+	}, queryRows: &inspectionRows{values: [][]any{{uuid.New()}, {uuid.New()}}}}
+	inspector := testInspector(t, candidate, &inspectionPool{tx: tx})
+
+	observation, err := inspector.Inspect(context.Background(), candidate)
+	if err != nil {
+		t.Fatalf("Inspect() error = %v", err)
+	}
+	receipt := observation.Receipt
+	if observation.Kind != reconcile.ObservationCommitted || receipt.TicketOrderID != orderID ||
+		receipt.TicketCount != 2 || len(receipt.TicketIDs) != 2 || receipt.TotalAmountMinor != 2400 || receipt.Currency != "TWD" ||
+		!receipt.OrderCreatedAt.Equal(createdAt) || tx.queryCount != 2 {
+		t.Fatalf("Inspect() = %+v, queries = %d", observation, tx.queryCount)
 	}
 }
 
@@ -121,13 +149,26 @@ func (*inspectionPool) Close() {}
 
 type inspectionTx struct {
 	pgx.Tx
-	row       pgx.Row
-	query     string
-	committed bool
+	row        pgx.Row
+	rows       []pgx.Row
+	queryRows  pgx.Rows
+	queryCount int
+	query      string
+	committed  bool
+}
+
+func (tx *inspectionTx) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return tx.queryRows, nil
 }
 
 func (tx *inspectionTx) QueryRow(_ context.Context, query string, _ ...any) pgx.Row {
 	tx.query = query
+	if tx.queryCount < len(tx.rows) {
+		row := tx.rows[tx.queryCount]
+		tx.queryCount++
+		return row
+	}
+	tx.queryCount++
 	return tx.row
 }
 func (tx *inspectionTx) Commit(context.Context) error { tx.committed = true; return nil }
@@ -140,6 +181,25 @@ type inspectionRow struct {
 	values []any
 	err    error
 }
+
+type inspectionRows struct {
+	values [][]any
+	index  int
+}
+
+func (rows *inspectionRows) Next() bool { return rows.index < len(rows.values) }
+func (rows *inspectionRows) Scan(destinations ...any) error {
+	row := inspectionRow{values: rows.values[rows.index]}
+	rows.index++
+	return row.Scan(destinations...)
+}
+func (*inspectionRows) Close()                                       {}
+func (*inspectionRows) Err() error                                   { return nil }
+func (*inspectionRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (*inspectionRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (*inspectionRows) Values() ([]any, error)                       { return nil, nil }
+func (*inspectionRows) RawValues() [][]byte                          { return nil }
+func (*inspectionRows) Conn() *pgx.Conn                              { return nil }
 
 func (row inspectionRow) Scan(destinations ...any) error {
 	if row.err != nil {
@@ -154,6 +214,10 @@ func (row inspectionRow) Scan(destinations ...any) error {
 			*pointer = row.values[index].(uuid.UUID)
 		case *int64:
 			*pointer = row.values[index].(int64)
+		case *int:
+			*pointer = row.values[index].(int)
+		case *time.Time:
+			*pointer = row.values[index].(time.Time)
 		case *[]byte:
 			*pointer = append([]byte(nil), row.values[index].([]byte)...)
 		case *string:

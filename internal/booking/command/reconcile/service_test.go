@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -52,6 +53,46 @@ func TestRepairExpiresOnlyAfterAuthoritativeMissingReceipt(t *testing.T) {
 	outcome, err = worker.Repair(context.Background(), candidate)
 	if !errors.Is(err, ErrShardUnreachable) || outcome != OutcomeDeferred || store.expired != 0 {
 		t.Fatalf("unreachable Repair() = (%q, %v), expired = %d", outcome, err, store.expired)
+	}
+}
+
+func TestRepairNeverExpiresLifecycleCommandWhenReceiptIsMissing(t *testing.T) {
+	t.Parallel()
+	for _, operation := range []command.Operation{command.OperationConfirmReservation, command.OperationCancelReservation} {
+		operation := operation
+		t.Run(string(operation), func(t *testing.T) {
+			t.Parallel()
+			candidate := testCandidate(t, command.StateNeedsRepair, time.Time{})
+			candidate.Command.Operation = operation
+			store := &fakeStore{}
+			worker := newTestService(t, store, &fakeShardInspector{observation: Observation{Kind: ObservationMissing}})
+			worker.now = func() time.Time { return time.Now().Add(24 * time.Hour) }
+
+			outcome, err := worker.Repair(context.Background(), candidate)
+			if err != nil || outcome != OutcomeDeferred || store.mutations() != 0 {
+				t.Fatalf("Repair() = (%q, %v), mutations = %d", outcome, err, store.mutations())
+			}
+		})
+	}
+}
+
+func TestRepairFinalizesLifecycleCommittedReceiptWithoutQuotaExpiry(t *testing.T) {
+	t.Parallel()
+	candidate := testCandidate(t, command.StateCommittedOnShard, time.Time{})
+	candidate.Command.Operation = command.OperationConfirmReservation
+	observation := committedObservation(candidate)
+	observation.Receipt.TicketOrderID = uuid.New()
+	observation.Receipt.TicketCount = 2
+	observation.Receipt.TotalAmountMinor = 2400
+	observation.Receipt.Currency = "TWD"
+	observation.Receipt.OrderCreatedAt = time.Now().UTC()
+	store := &fakeStore{}
+	worker := newTestService(t, store, &fakeShardInspector{observation: observation})
+
+	outcome, err := worker.Repair(context.Background(), candidate)
+	if err != nil || outcome != OutcomeFinalized || store.finalized != 1 || store.failed != 0 || store.expired != 0 {
+		t.Fatalf("Repair() = (%q, %v), mutations = finalize:%d fail:%d expire:%d",
+			outcome, err, store.finalized, store.failed, store.expired)
 	}
 }
 
@@ -128,6 +169,34 @@ func TestRunOnceUsesBoundedClaimAndPerItemInspection(t *testing.T) {
 	}
 }
 
+func TestRunOnceRecordsBoundedRecoveryAndMismatchMetrics(t *testing.T) {
+	t.Parallel()
+	candidate := testCandidate(t, command.StateNeedsRepair, time.Now().Add(time.Minute))
+	metrics := &recoveryMetrics{}
+	worker, err := New(
+		&fakeStore{claimed: []Candidate{candidate}},
+		&fakeShardInspector{observation: Observation{Kind: ObservationCommitted, Receipt: command.Receipt{
+			CommandID: candidate.Command.ID, RequestFingerprint: [32]byte{99},
+			ResultResourceID: candidate.Command.ReservationID, Status: command.ReceiptCommitted,
+		}}},
+		Options{WorkerID: "metrics-worker", BatchSize: 1, LeaseTTL: time.Minute,
+			InspectTimeout: time.Second, Metrics: metrics},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, runErr := worker.RunOnce(context.Background())
+	if !errors.Is(runErr, ErrReceiptMismatch) || result.Failures != 1 {
+		t.Fatalf("RunOnce() = (%+v, %v)", result, runErr)
+	}
+	if len(metrics.recovery) != 1 || metrics.recovery[0] != "failure:receipt" {
+		t.Fatalf("recovery metrics = %v", metrics.recovery)
+	}
+	if len(metrics.mismatches) != 1 || metrics.mismatches[0] != "receipt:physical-shard-0:1" {
+		t.Fatalf("mismatch metrics = %v", metrics.mismatches)
+	}
+}
+
 type fakeStore struct {
 	claimed      []Candidate
 	claimOptions ClaimOptions
@@ -165,6 +234,24 @@ type fakeShardInspector struct {
 	observation  Observation
 	observations map[uuid.UUID]Observation
 	err          error
+}
+
+type recoveryMetrics struct {
+	recovery   []string
+	directory  []string
+	mismatches []string
+}
+
+func (metrics *recoveryMetrics) RecordBookingCommandRecovery(result, reason string) {
+	metrics.recovery = append(metrics.recovery, result+":"+reason)
+}
+
+func (metrics *recoveryMetrics) RecordBookingDirectoryRepair(result, reason string) {
+	metrics.directory = append(metrics.directory, result+":"+reason)
+}
+
+func (metrics *recoveryMetrics) AddPhysicalReconciliationMismatches(reason, shardID string, count int) {
+	metrics.mismatches = append(metrics.mismatches, reason+":"+shardID+":"+strconv.Itoa(count))
 }
 
 func (inspector *fakeShardInspector) Inspect(_ context.Context, candidate Candidate) (Observation, error) {

@@ -32,11 +32,11 @@ func TestFinalizeRepairsControlRowsAtomicallyWithoutSeatMutation(t *testing.T) {
 	if err := store.Finalize(context.Background(), candidate, receipt); err != nil {
 		t.Fatalf("Finalize() error = %v", err)
 	}
-	if !tx.committed || len(tx.statements) != 4 {
+	if !tx.committed || len(tx.statements) != 5 {
 		t.Fatalf("committed = %v, statements = %d", tx.committed, len(tx.statements))
 	}
 	joined := strings.ToLower(strings.Join(tx.statements, "\n"))
-	for _, table := range []string{"booking_commands", "reservation_directory", "booking_quota_leases", "outbox_events"} {
+	for _, table := range []string{"booking_commands", "reservation_directory", "reservation_shard_locators", "booking_quota_leases", "outbox_events"} {
 		if !strings.Contains(joined, table) {
 			t.Fatalf("Finalize() did not repair %s", table)
 		}
@@ -63,6 +63,44 @@ func TestFinalizeRejectsFingerprintMismatchBeforeTransaction(t *testing.T) {
 	}
 	if db.begins != 0 {
 		t.Fatalf("mismatched receipt began %d transactions", db.begins)
+	}
+}
+
+func TestFinalizeConfirmationRepairsLifecycleControlStateWithoutDirectoryMutation(t *testing.T) {
+	t.Parallel()
+	candidate := controlCandidate(t)
+	candidate.Command.Operation = command.OperationConfirmReservation
+	candidate.Command.State = command.StateCommittedOnShard
+	tx := &controlTx{row: controlRow{values: []any{
+		candidate.Command.RequestFingerprint[:], candidate.Command.ReservationID, string(candidate.Command.State),
+	}}}
+	store, err := NewStore(&controlDB{tx: tx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := command.Receipt{
+		CommandID: candidate.Command.ID, RequestFingerprint: candidate.Command.RequestFingerprint,
+		ResultResourceID: candidate.Command.ReservationID, Status: command.ReceiptCommitted,
+		TicketOrderID: uuid.New(), TicketCount: 2, TicketIDs: []uuid.UUID{uuid.New(), uuid.New()}, TotalAmountMinor: 2400,
+		Currency: "TWD", OrderCreatedAt: time.Now().UTC(),
+	}
+	if err := store.Finalize(context.Background(), candidate, receipt); err != nil {
+		t.Fatalf("Finalize() error = %v", err)
+	}
+	joined := strings.ToLower(strings.Join(tx.statements, "\n"))
+	for _, table := range []string{"booking_commands", "ticket_order_shard_locators", "ticket_shard_locators", "booking_quota_leases", "outbox_events"} {
+		if !strings.Contains(joined, table) {
+			t.Fatalf("Finalize() did not repair %s", table)
+		}
+	}
+	if strings.Contains(joined, "update public.reservation_directory") || strings.Contains(joined, "seat_inventory") {
+		t.Fatalf("Finalize() attempted lifecycle-forbidden mutation: %s", joined)
+	}
+	if !tx.committed || len(tx.statements) != 6 {
+		t.Fatalf("committed = %v, statements = %d", tx.committed, len(tx.statements))
+	}
+	if count := strings.Count(joined, "insert into public.ticket_shard_locators"); count != len(receipt.TicketIDs) {
+		t.Fatalf("ticket locator writes = %d, want %d", count, len(receipt.TicketIDs))
 	}
 }
 

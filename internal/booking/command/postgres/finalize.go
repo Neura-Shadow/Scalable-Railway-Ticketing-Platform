@@ -72,6 +72,22 @@ WHERE reservation_id = $1
 	); err != nil {
 		return ErrControlWrite
 	}
+	locatorTag, err := tx.Exec(ctx, `
+INSERT INTO public.reservation_shard_locators(
+ reservation_id,train_run_id,shard_id,assignment_generation,owner_user_id
+) VALUES($1,$2,$3,$4,$5)
+ON CONFLICT(reservation_id) DO UPDATE
+SET train_run_id=EXCLUDED.train_run_id,shard_id=EXCLUDED.shard_id,
+    assignment_generation=EXCLUDED.assignment_generation,owner_user_id=EXCLUDED.owner_user_id
+WHERE reservation_shard_locators.train_run_id=EXCLUDED.train_run_id
+  AND reservation_shard_locators.shard_id=EXCLUDED.shard_id
+  AND reservation_shard_locators.assignment_generation=EXCLUDED.assignment_generation
+  AND reservation_shard_locators.owner_user_id=EXCLUDED.owner_user_id`,
+		bookingCommand.ReservationID, bookingCommand.TrainRunID, bookingCommand.Route.ShardID().String(),
+		bookingCommand.Route.Generation().Int64(), bookingCommand.OwnerUserID)
+	if err != nil || locatorTag.RowsAffected() != 1 {
+		return ErrControlWrite
+	}
 	if _, err := tx.Exec(ctx, `
 UPDATE public.booking_quota_leases
 SET state = 'active_hold'
@@ -97,6 +113,8 @@ ON CONFLICT (id) DO NOTHING`, eventID, bookingCommand.ID, payload); err != nil {
 	if err := tx.Commit(ctx); err != nil {
 		return ErrControlWrite
 	}
+	repository.recordQuota("finalize", "committed", "none")
+	repository.recordDirectory("success", "none")
 	return nil
 }
 
@@ -124,6 +142,40 @@ SET state='finalized', result_resource_id=$2,
     lease_owner=NULL, lease_until=NULL, bounded_error_category=NULL
 WHERE command_id=$1`, bookingCommand.ID, receipt.ResultResourceID); err != nil {
 		return ErrControlWrite
+	}
+	if bookingCommand.Operation == command.OperationConfirmReservation {
+		if !validConfirmationReceipt(receipt) || receipt.TotalAmountMinor < 0 ||
+			len(receipt.Currency) != 3 || receipt.OrderCreatedAt.IsZero() {
+			return ErrControlWrite
+		}
+		locatorTag, err := tx.Exec(ctx, `
+INSERT INTO public.ticket_order_shard_locators(
+ ticket_order_id,reservation_id,train_run_id,shard_id,assignment_generation,
+ owner_user_id,status,total_amount_minor,currency,created_at
+) VALUES($1,$2,$3,$4,$5,$6,'confirmed',$7,$8,$9)
+ON CONFLICT(ticket_order_id) DO UPDATE
+SET status='confirmed',total_amount_minor=EXCLUDED.total_amount_minor,
+    currency=EXCLUDED.currency,created_at=EXCLUDED.created_at
+WHERE ticket_order_shard_locators.reservation_id=EXCLUDED.reservation_id
+  AND ticket_order_shard_locators.owner_user_id=EXCLUDED.owner_user_id
+  AND ticket_order_shard_locators.train_run_id=EXCLUDED.train_run_id
+  AND ticket_order_shard_locators.shard_id=EXCLUDED.shard_id
+  AND ticket_order_shard_locators.assignment_generation=EXCLUDED.assignment_generation`,
+			receipt.TicketOrderID, bookingCommand.ReservationID, bookingCommand.TrainRunID,
+			bookingCommand.Route.ShardID().String(), bookingCommand.Route.Generation().Int64(),
+			bookingCommand.OwnerUserID, receipt.TotalAmountMinor, receipt.Currency, receipt.OrderCreatedAt.UTC())
+		if err != nil || locatorTag.RowsAffected() != 1 {
+			return ErrControlWrite
+		}
+		if err := insertTicketLocators(ctx, tx, bookingCommand, receipt); err != nil {
+			return err
+		}
+	} else if bookingCommand.Operation == command.OperationCancelReservation {
+		if _, err := tx.Exec(ctx, `
+UPDATE public.ticket_order_shard_locators SET status='cancelled'
+WHERE reservation_id=$1 AND owner_user_id=$2`, bookingCommand.ReservationID, bookingCommand.OwnerUserID); err != nil {
+			return ErrControlWrite
+		}
 	}
 	// The directory remains a locator, not a lifecycle state store. Release the
 	// create command's global quota only after the shard receipt has committed.
@@ -155,6 +207,48 @@ ON CONFLICT(id) DO NOTHING`,
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return ErrControlWrite
+	}
+	repository.recordQuota("release", "committed", "none")
+	repository.recordDirectory("success", "none")
+	return nil
+}
+
+func validConfirmationReceipt(receipt command.Receipt) bool {
+	if receipt.TicketOrderID == uuid.Nil || receipt.TicketCount < 1 ||
+		receipt.TicketCount > command.MaxReceiptTickets || len(receipt.TicketIDs) != receipt.TicketCount {
+		return false
+	}
+	seen := make(map[uuid.UUID]struct{}, len(receipt.TicketIDs))
+	for _, ticketID := range receipt.TicketIDs {
+		if ticketID == uuid.Nil {
+			return false
+		}
+		if _, duplicate := seen[ticketID]; duplicate {
+			return false
+		}
+		seen[ticketID] = struct{}{}
+	}
+	return true
+}
+
+func insertTicketLocators(ctx context.Context, tx pgx.Tx, bookingCommand command.Command, receipt command.Receipt) error {
+	for _, ticketID := range receipt.TicketIDs {
+		tag, err := tx.Exec(ctx, `
+INSERT INTO public.ticket_shard_locators(
+ ticket_id,ticket_order_id,reservation_id,train_run_id,shard_id,assignment_generation,owner_user_id
+) VALUES($1,$2,$3,$4,$5,$6,$7)
+ON CONFLICT(ticket_id) DO UPDATE SET ticket_order_id=EXCLUDED.ticket_order_id
+WHERE ticket_shard_locators.ticket_order_id=EXCLUDED.ticket_order_id
+  AND ticket_shard_locators.reservation_id=EXCLUDED.reservation_id
+  AND ticket_shard_locators.owner_user_id=EXCLUDED.owner_user_id
+  AND ticket_shard_locators.train_run_id=EXCLUDED.train_run_id
+  AND ticket_shard_locators.shard_id=EXCLUDED.shard_id
+  AND ticket_shard_locators.assignment_generation=EXCLUDED.assignment_generation`,
+			ticketID, receipt.TicketOrderID, bookingCommand.ReservationID, bookingCommand.TrainRunID,
+			bookingCommand.Route.ShardID().String(), bookingCommand.Route.Generation().Int64(), bookingCommand.OwnerUserID)
+		if err != nil || tag.RowsAffected() != 1 {
+			return ErrControlWrite
+		}
 	}
 	return nil
 }

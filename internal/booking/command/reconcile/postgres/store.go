@@ -43,7 +43,7 @@ func (store *Store) Claim(ctx context.Context, options reconcile.ClaimOptions) (
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 	rows, err := tx.Query(ctx, `
-WITH claimable AS (
+WITH eligible AS (
     SELECT command_row.command_id
     FROM public.booking_commands AS command_row
     JOIN public.booking_quota_leases AS quota
@@ -64,6 +64,16 @@ WITH claimable AS (
           command_row.lease_until IS NULL
           OR command_row.lease_until < clock_timestamp()
       )
+    UNION ALL
+    SELECT command_row.command_id
+    FROM public.booking_commands AS command_row
+    WHERE command_row.operation IN ('reservation.confirm','reservation.cancel')
+      AND command_row.state IN ('reserved','executing','committed_on_shard','needs_repair')
+      AND (command_row.lease_until IS NULL OR command_row.lease_until < clock_timestamp())
+), claimable AS (
+    SELECT command_row.command_id
+    FROM public.booking_commands AS command_row
+    JOIN eligible ON eligible.command_id=command_row.command_id
     ORDER BY command_row.updated_at, command_row.command_id
     FOR UPDATE OF command_row SKIP LOCKED
     LIMIT $1
@@ -78,9 +88,9 @@ WITH claimable AS (
 SELECT claimed.command_id, claimed.operation, claimed.owner_user_id,
        claimed.train_run_id, claimed.reservation_id, claimed.target_shard_id,
        claimed.assignment_generation, claimed.request_fingerprint,
-       claimed.state, quota.expires_at
+       claimed.state, COALESCE(quota.expires_at,clock_timestamp()+interval '100 years')
 FROM claimed
-JOIN public.booking_quota_leases AS quota
+LEFT JOIN public.booking_quota_leases AS quota
   ON quota.command_id = claimed.command_id
 ORDER BY claimed.updated_at, claimed.command_id`, options.BatchSize, options.WorkerID, options.LeaseTTL.Milliseconds())
 	if err != nil {
@@ -134,6 +144,10 @@ func (store *Store) Finalize(ctx context.Context, candidate reconcile.Candidate,
 		receipt.RequestFingerprint != candidate.Command.RequestFingerprint {
 		return ErrControlStore
 	}
+	if candidate.Command.Operation == command.OperationConfirmReservation ||
+		candidate.Command.Operation == command.OperationCancelReservation {
+		return store.finalizeLifecycle(ctx, candidate, receipt)
+	}
 	return store.mutate(ctx, candidate, func(tx pgx.Tx) error {
 		state, err := lockAndVerify(ctx, tx, candidate)
 		if err != nil || state == command.StateFailed || state == command.StateExpired {
@@ -158,6 +172,22 @@ WHERE command_id = $1
 			candidate.Command.Route.ShardID().String(), candidate.Command.Route.Generation().Int64(),
 			candidate.Command.ReservationID); err != nil {
 			return err
+		}
+		locatorTag, err := tx.Exec(ctx, `
+INSERT INTO public.reservation_shard_locators(
+ reservation_id,train_run_id,shard_id,assignment_generation,owner_user_id
+) VALUES($1,$2,$3,$4,$5)
+ON CONFLICT(reservation_id) DO UPDATE SET train_run_id=EXCLUDED.train_run_id,
+ shard_id=EXCLUDED.shard_id,assignment_generation=EXCLUDED.assignment_generation,
+ owner_user_id=EXCLUDED.owner_user_id
+WHERE reservation_shard_locators.train_run_id=EXCLUDED.train_run_id
+ AND reservation_shard_locators.shard_id=EXCLUDED.shard_id
+ AND reservation_shard_locators.assignment_generation=EXCLUDED.assignment_generation
+ AND reservation_shard_locators.owner_user_id=EXCLUDED.owner_user_id`, candidate.Command.ReservationID,
+			candidate.Command.TrainRunID, candidate.Command.Route.ShardID().String(),
+			candidate.Command.Route.Generation().Int64(), candidate.Command.OwnerUserID)
+		if err != nil || locatorTag.RowsAffected() != 1 {
+			return ErrControlStore
 		}
 		if err := execOne(ctx, tx, `
 UPDATE public.booking_quota_leases
@@ -184,6 +214,116 @@ ON CONFLICT (id) DO NOTHING`,
 		}
 		return nil
 	})
+}
+
+func (store *Store) finalizeLifecycle(ctx context.Context, candidate reconcile.Candidate, receipt command.Receipt) error {
+	return store.mutate(ctx, candidate, func(tx pgx.Tx) error {
+		state, err := lockAndVerify(ctx, tx, candidate)
+		if err != nil || state == command.StateFailed || state == command.StateExpired {
+			return ErrControlStore
+		}
+		if err := execOne(ctx, tx, `
+UPDATE public.booking_commands
+SET state='finalized',result_resource_id=$2,
+    finalized_at=COALESCE(finalized_at,clock_timestamp()),
+    lease_owner=NULL,lease_until=NULL,bounded_error_category=NULL
+WHERE command_id=$1`, candidate.Command.ID, candidate.Command.ReservationID); err != nil {
+			return err
+		}
+		if candidate.Command.Operation == command.OperationConfirmReservation {
+			if !validConfirmationReceipt(receipt) || receipt.TotalAmountMinor < 0 ||
+				len(receipt.Currency) != 3 || receipt.OrderCreatedAt.IsZero() {
+				return ErrControlStore
+			}
+			locatorTag, err := tx.Exec(ctx, `
+INSERT INTO public.ticket_order_shard_locators(
+ ticket_order_id,reservation_id,train_run_id,shard_id,assignment_generation,
+ owner_user_id,status,total_amount_minor,currency,created_at
+) VALUES($1,$2,$3,$4,$5,$6,'confirmed',$7,$8,$9)
+ON CONFLICT(ticket_order_id) DO UPDATE SET status='confirmed',
+ total_amount_minor=EXCLUDED.total_amount_minor,currency=EXCLUDED.currency,created_at=EXCLUDED.created_at
+WHERE ticket_order_shard_locators.reservation_id=EXCLUDED.reservation_id
+ AND ticket_order_shard_locators.owner_user_id=EXCLUDED.owner_user_id
+ AND ticket_order_shard_locators.train_run_id=EXCLUDED.train_run_id
+ AND ticket_order_shard_locators.shard_id=EXCLUDED.shard_id
+ AND ticket_order_shard_locators.assignment_generation=EXCLUDED.assignment_generation`,
+				receipt.TicketOrderID, candidate.Command.ReservationID, candidate.Command.TrainRunID,
+				candidate.Command.Route.ShardID().String(), candidate.Command.Route.Generation().Int64(),
+				candidate.Command.OwnerUserID, receipt.TotalAmountMinor, receipt.Currency, receipt.OrderCreatedAt.UTC())
+			if err != nil || locatorTag.RowsAffected() != 1 {
+				return ErrControlStore
+			}
+			if err := insertTicketLocators(ctx, tx, candidate, receipt); err != nil {
+				return err
+			}
+		} else if candidate.Command.Operation == command.OperationCancelReservation {
+			if _, err := tx.Exec(ctx, `UPDATE public.ticket_order_shard_locators SET status='cancelled'
+WHERE reservation_id=$1 AND owner_user_id=$2`, candidate.Command.ReservationID, candidate.Command.OwnerUserID); err != nil {
+				return ErrControlStore
+			}
+		}
+		if _, err := tx.Exec(ctx, `
+UPDATE public.booking_quota_leases AS quota
+SET state='released',released_at=COALESCE(released_at,clock_timestamp())
+FROM public.reservation_directory AS directory
+WHERE directory.reservation_id=$1 AND quota.command_id=directory.command_id
+  AND quota.state IN ('pending','active_hold','repair_required','released')`, candidate.Command.ReservationID); err != nil {
+			return ErrControlStore
+		}
+		payload, err := json.Marshal(struct {
+			CommandID     uuid.UUID         `json:"command_id"`
+			ReservationID uuid.UUID         `json:"reservation_id"`
+			Operation     command.Operation `json:"operation"`
+		}{candidate.Command.ID, candidate.Command.ReservationID, candidate.Command.Operation})
+		if err != nil {
+			return ErrControlStore
+		}
+		_, err = tx.Exec(ctx, `
+INSERT INTO public.outbox_events(id,aggregate_type,aggregate_id,event_type,event_version,payload)
+VALUES($1,'booking_command',$2,'booking_command.finalized',1,$3)
+ON CONFLICT(id) DO NOTHING`, uuid.NewSHA1(uuid.NameSpaceOID, []byte("booking-command.finalized:"+candidate.Command.ID.String())), candidate.Command.ID, payload)
+		return err
+	})
+}
+
+func validConfirmationReceipt(receipt command.Receipt) bool {
+	if receipt.TicketOrderID == uuid.Nil || receipt.TicketCount < 1 ||
+		receipt.TicketCount > command.MaxReceiptTickets || len(receipt.TicketIDs) != receipt.TicketCount {
+		return false
+	}
+	seen := make(map[uuid.UUID]struct{}, len(receipt.TicketIDs))
+	for _, ticketID := range receipt.TicketIDs {
+		if ticketID == uuid.Nil {
+			return false
+		}
+		if _, duplicate := seen[ticketID]; duplicate {
+			return false
+		}
+		seen[ticketID] = struct{}{}
+	}
+	return true
+}
+
+func insertTicketLocators(ctx context.Context, tx pgx.Tx, candidate reconcile.Candidate, receipt command.Receipt) error {
+	for _, ticketID := range receipt.TicketIDs {
+		tag, err := tx.Exec(ctx, `
+INSERT INTO public.ticket_shard_locators(
+ ticket_id,ticket_order_id,reservation_id,train_run_id,shard_id,assignment_generation,owner_user_id
+) VALUES($1,$2,$3,$4,$5,$6,$7)
+ON CONFLICT(ticket_id) DO UPDATE SET ticket_order_id=EXCLUDED.ticket_order_id
+WHERE ticket_shard_locators.ticket_order_id=EXCLUDED.ticket_order_id
+  AND ticket_shard_locators.reservation_id=EXCLUDED.reservation_id
+  AND ticket_shard_locators.owner_user_id=EXCLUDED.owner_user_id
+  AND ticket_shard_locators.train_run_id=EXCLUDED.train_run_id
+  AND ticket_shard_locators.shard_id=EXCLUDED.shard_id
+  AND ticket_shard_locators.assignment_generation=EXCLUDED.assignment_generation`,
+			ticketID, receipt.TicketOrderID, candidate.Command.ReservationID, candidate.Command.TrainRunID,
+			candidate.Command.Route.ShardID().String(), candidate.Command.Route.Generation().Int64(), candidate.Command.OwnerUserID)
+		if err != nil || tag.RowsAffected() != 1 {
+			return ErrControlStore
+		}
+	}
+	return nil
 }
 
 func (store *Store) Fail(
@@ -232,6 +372,9 @@ SET state = $2, result_resource_id = NULL, finalized_at = NULL,
     lease_owner = NULL, lease_until = NULL, bounded_error_category = $3
 WHERE command_id = $1`, candidate.Command.ID, target, category); err != nil {
 			return err
+		}
+		if candidate.Command.Operation != command.OperationCreateReservation {
+			return nil
 		}
 		if err := execOne(ctx, tx, `
 UPDATE public.reservation_directory

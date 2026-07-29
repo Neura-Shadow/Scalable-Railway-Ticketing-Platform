@@ -13,10 +13,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/app"
+	commandphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command/physical"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command/reconcile"
 	reconcilephysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command/reconcile/physical"
 	reconcilepostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command/reconcile/postgres"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/operatorcommand"
+	operatorphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/operatorcommand/physical"
+	operatorpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/operatorcommand/postgres"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/clock"
+	platformmetrics "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/metrics"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/workerhttp"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	shardphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physical"
@@ -98,17 +104,24 @@ func run(logger *slog.Logger, lookup func(string) (string, bool)) error {
 	if err != nil {
 		return errors.New("shard inspector unavailable")
 	}
+	metrics, err := newMetrics()
+	if err != nil {
+		return errors.New("metrics unavailable")
+	}
+	physicalMetrics, err := platformmetrics.New(metrics.registry)
+	if err != nil {
+		return errors.New("metrics unavailable")
+	}
 	service, err := reconcile.New(controlStore, shardInspector, reconcile.Options{
 		WorkerID: cfg.workerID, BatchSize: cfg.batchSize, LeaseTTL: cfg.leaseTTL,
-		InspectTimeout: cfg.inspectTimeout,
+		InspectTimeout: cfg.inspectTimeout, Metrics: physicalMetrics,
 	})
 	if err != nil {
 		return errors.New("reconciler unavailable")
 	}
-
-	metrics, err := newMetrics()
+	operatorService, err := newOperatorRecovery(controlPool, registry, cfg)
 	if err != nil {
-		return errors.New("metrics unavailable")
+		return errors.New("operator command reconciler unavailable")
 	}
 	readiness := reconcilerReadiness(controlPool, shardPools, cfg)
 	healthServer, err := workerhttp.New(cfg.httpAddress, metrics.registry, readiness, cfg.readinessTimeout)
@@ -127,17 +140,44 @@ func run(logger *slog.Logger, lookup func(string) (string, bool)) error {
 		ctx, cancel := context.WithTimeout(rootContext, cfg.passTimeout)
 		defer cancel()
 		started := time.Now()
-		result, runErr := service.RunOnce(ctx)
-		metrics.record(result, runErr, time.Since(started))
-		if runErr != nil {
+		type bookingOutcome struct {
+			result reconcile.Result
+			err    error
+		}
+		type operatorOutcome struct {
+			result operatorcommand.RecoveryResult
+			err    error
+		}
+		bookingResults := make(chan bookingOutcome, 1)
+		operatorResults := make(chan operatorOutcome, 1)
+		go func() {
+			result, runErr := service.RunOnce(ctx)
+			bookingResults <- bookingOutcome{result: result, err: runErr}
+		}()
+		go func() {
+			result, runErr := operatorService.RunOnce(ctx)
+			operatorResults <- operatorOutcome{result: result, err: runErr}
+		}()
+		bookingRun := <-bookingResults
+		operatorRun := <-operatorResults
+		result, runErr := bookingRun.result, bookingRun.err
+		operatorResult, operatorErr := operatorRun.result, operatorRun.err
+		combinedErr := errors.Join(runErr, operatorErr)
+		metrics.record(result, combinedErr, time.Since(started))
+		metrics.recordOperator(operatorResult)
+		if combinedErr != nil {
 			logger.Warn("booking command reconciliation pass incomplete",
 				"claimed", result.Claimed, "finalized", result.Finalized, "failed", result.Failed,
-				"expired", result.Expired, "deferred", result.Deferred, "failure_count", result.Failures)
+				"expired", result.Expired, "deferred", result.Deferred, "failure_count", result.Failures,
+				"operator_claimed", operatorResult.Claimed, "operator_finalized", operatorResult.Finalized,
+				"operator_deferred", operatorResult.Deferred, "operator_failures", operatorResult.Failures)
 			return
 		}
 		logger.Info("booking command reconciliation pass complete",
 			"claimed", result.Claimed, "finalized", result.Finalized, "failed", result.Failed,
-			"expired", result.Expired, "deferred", result.Deferred)
+			"expired", result.Expired, "deferred", result.Deferred,
+			"operator_claimed", operatorResult.Claimed, "operator_finalized", operatorResult.Finalized,
+			"operator_deferred", operatorResult.Deferred)
 	}
 	if cfg.enabled {
 		runPass()
@@ -162,6 +202,45 @@ func run(logger *slog.Logger, lookup func(string) (string, bool)) error {
 			runPass()
 		}
 	}
+}
+
+func newOperatorRecovery(controlPool *pgxpool.Pool, registry *shardphysical.Registry, cfg runtimeConfig) (*operatorcommand.RecoveryService, error) {
+	router, err := shardphysical.NewCatalogRouter(controlPool, registry, cfg.routeTTL)
+	if err != nil {
+		return nil, err
+	}
+	store, err := operatorpostgres.NewStore(controlPool)
+	if err != nil {
+		return nil, err
+	}
+	physicalExecutor, err := commandphysical.NewExecutor(router, commandphysical.Options{MaxHoldTTL: 15 * time.Minute})
+	if err != nil {
+		return nil, err
+	}
+	fareResolver, err := app.NewPostgresOperatorCommandFareResolver(controlPool)
+	if err != nil {
+		return nil, err
+	}
+	executor, err := app.NewPhysicalOperatorCommandShardExecutor(router, fareResolver, physicalExecutor)
+	if err != nil {
+		return nil, err
+	}
+	inspector, err := operatorphysical.NewInspector(router)
+	if err != nil {
+		return nil, err
+	}
+	finalizer, err := app.NewPostgresDurableOperatorCommandFinalizer(controlPool)
+	if err != nil {
+		return nil, err
+	}
+	batchSize := cfg.batchSize
+	if batchSize > operatorcommand.MaxClaimBatch {
+		batchSize = operatorcommand.MaxClaimBatch
+	}
+	return operatorcommand.NewRecoveryService(store, executor, inspector, finalizer, operatorcommand.RecoveryOptions{
+		ClaimOptions:   operatorcommand.ClaimOptions{WorkerID: cfg.workerID + ":operator", BatchSize: batchSize, LeaseTTL: cfg.leaseTTL},
+		InspectTimeout: cfg.inspectTimeout,
+	})
 }
 
 type runtimeConfig struct {
@@ -332,6 +411,15 @@ func (metrics *workerMetrics) record(result reconcile.Result, err error, duratio
 	}
 }
 
+func (metrics *workerMetrics) recordOperator(result operatorcommand.RecoveryResult) {
+	for outcome, count := range map[string]int{
+		"operator_finalized": result.Finalized, "operator_deferred": result.Deferred,
+		"operator_failure": result.Failures,
+	} {
+		metrics.outcomes.WithLabelValues(outcome).Add(float64(count))
+	}
+}
+
 func reconcilerReadiness(
 	control *pgxpool.Pool,
 	shards map[string]shardphysical.Pool,
@@ -405,6 +493,7 @@ func publicReason(err error) string {
 		"runtime unavailable", "configuration invalid", "control postgres configuration invalid",
 		"control postgres unavailable", "physical shard registry unavailable", "physical shard resolver unavailable",
 		"control store unavailable", "shard inspector unavailable", "reconciler unavailable", "metrics unavailable",
+		"operator command reconciler unavailable",
 		"health server invalid", "health listener unavailable", "health server failed",
 	} {
 		if err.Error() == allowed {

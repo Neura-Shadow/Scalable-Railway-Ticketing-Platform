@@ -39,6 +39,7 @@ FOR UPDATE`, request.OwnerUserID).Scan(&active); err != nil || !active {
 		if err := tx.Commit(ctx); err != nil {
 			return command.Command{}, ErrControlWrite
 		}
+		repository.recordQuota("create", "duplicate", "none")
 		return existing, nil
 	}
 	holdTTL := time.Until(request.Payload.HoldExpiresAt)
@@ -69,6 +70,7 @@ WHERE owner_user_id = $1
 	if activeHolds+1 > repository.options.MaxActiveHoldsPerUser ||
 		activeTrainRunHolds+1 > repository.options.MaxActiveHoldsPerTrainRun ||
 		activePassengers+request.PassengerCount > repository.options.MaxActivePassengersPerUser {
+		repository.recordQuota("create", "rejected", "quota")
 		return command.Command{}, ErrQuotaExceeded
 	}
 
@@ -132,6 +134,7 @@ INSERT INTO public.reservation_directory (
 	if err := tx.Commit(ctx); err != nil {
 		return command.Command{}, ErrControlWrite
 	}
+	repository.recordQuota("create", "committed", "none")
 	return result, nil
 }
 

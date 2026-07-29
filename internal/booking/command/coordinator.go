@@ -103,8 +103,16 @@ type Receipt struct {
 	Status             ReceiptStatus
 	TicketOrderID      uuid.UUID
 	TicketCount        int
+	TicketIDs          []uuid.UUID
 	ReleasedSeatCount  int
+	TotalAmountMinor   int64
+	Currency           string
+	OrderCreatedAt     time.Time
 }
+
+// MaxReceiptTickets bounds cross-database receipt reconstruction and control
+// locator writes. It matches the public admission passenger ceiling.
+const MaxReceiptTickets = 100
 
 type Result struct {
 	CommandID     uuid.UUID

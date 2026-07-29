@@ -92,6 +92,15 @@ type Options struct {
 	BatchSize      int
 	LeaseTTL       time.Duration
 	InspectTimeout time.Duration
+	Metrics        Metrics
+}
+
+// Metrics exposes only bounded saga recovery outcomes. Shard identity comes
+// from the validated control-plane route, never from request input or errors.
+type Metrics interface {
+	RecordBookingCommandRecovery(result, reason string)
+	RecordBookingDirectoryRepair(result, reason string)
+	AddPhysicalReconciliationMismatches(reason, shardID string, count int)
 }
 
 type Result struct {
@@ -107,6 +116,7 @@ type Service struct {
 	store     Store
 	inspector ShardInspector
 	options   Options
+	metrics   Metrics
 	now       func() time.Time
 }
 
@@ -118,7 +128,7 @@ func New(store Store, inspector ShardInspector, options Options) (*Service, erro
 		options.InspectTimeout >= options.LeaseTTL {
 		return nil, ErrInvalidOptions
 	}
-	return &Service{store: store, inspector: inspector, options: options, now: time.Now}, nil
+	return &Service{store: store, inspector: inspector, options: options, metrics: options.Metrics, now: time.Now}, nil
 }
 
 // Inspect performs one read-only, deadline-bounded receipt lookup.
@@ -164,7 +174,8 @@ func (service *Service) Repair(ctx context.Context, candidate Candidate) (Outcom
 		}
 		return OutcomeFailed, nil
 	case ObservationMissing:
-		if service.now().Before(candidate.QuotaExpiresAt) || candidate.Command.State == command.StateFinalized {
+		if candidate.Command.Operation != command.OperationCreateReservation ||
+			service.now().Before(candidate.QuotaExpiresAt) || candidate.Command.State == command.StateFinalized {
 			return OutcomeDeferred, nil
 		}
 		if err := service.store.Expire(ctx, candidate); err != nil {
@@ -195,6 +206,7 @@ func (service *Service) RunOnce(ctx context.Context) (Result, error) {
 	var failures []error
 	for _, candidate := range candidates {
 		outcome, repairErr := service.Repair(ctx, candidate)
+		service.recordRecovery(candidate, outcome, repairErr)
 		switch outcome {
 		case OutcomeFinalized:
 			result.Finalized++
@@ -213,12 +225,44 @@ func (service *Service) RunOnce(ctx context.Context) (Result, error) {
 	return result, errors.Join(failures...)
 }
 
+func (service *Service) recordRecovery(candidate Candidate, outcome Outcome, err error) {
+	if service == nil || nilInterface(service.metrics) {
+		return
+	}
+	result, reason := "deferred", "none"
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		result, reason = "unavailable", "timeout"
+	case errors.Is(err, ErrReceiptMismatch):
+		result, reason = "failure", "receipt"
+		service.metrics.AddPhysicalReconciliationMismatches(
+			"receipt", candidate.Command.Route.ShardID().String(), 1,
+		)
+	case errors.Is(err, ErrShardUnreachable):
+		result, reason = "unavailable", "database"
+	case err != nil:
+		result, reason = "failure", "database"
+	case outcome == OutcomeFinalized:
+		result, reason = "success", "none"
+		service.metrics.RecordBookingDirectoryRepair("success", "none")
+	case outcome == OutcomeExpired:
+		result, reason = "success", "lease_expired"
+		service.metrics.RecordBookingDirectoryRepair("success", "lease_expired")
+	case outcome == OutcomeFailed:
+		result, reason = "rejected", "receipt"
+	}
+	service.metrics.RecordBookingCommandRecovery(result, reason)
+}
+
 func validCandidate(candidate Candidate) bool {
 	cmd := candidate.Command
-	return cmd.ID != uuid.Nil && cmd.Operation == command.OperationCreateReservation &&
+	validOperation := cmd.Operation == command.OperationCreateReservation ||
+		cmd.Operation == command.OperationConfirmReservation || cmd.Operation == command.OperationCancelReservation
+	validExpiry := cmd.Operation != command.OperationCreateReservation || !candidate.QuotaExpiresAt.IsZero()
+	return cmd.ID != uuid.Nil && validOperation &&
 		cmd.OwnerUserID != uuid.Nil && cmd.TrainRunID != uuid.Nil && cmd.ReservationID != uuid.Nil &&
 		cmd.RequestFingerprint != [32]byte{} && cmd.Route.TrainRunID() == cmd.TrainRunID &&
-		cmd.Route.Generation().Int64() > 0 && !candidate.QuotaExpiresAt.IsZero() &&
+		cmd.Route.Generation().Int64() > 0 && validExpiry &&
 		(cmd.State == command.StateReserved || cmd.State == command.StateExecuting ||
 			cmd.State == command.StateCommittedOnShard || cmd.State == command.StateNeedsRepair ||
 			cmd.State == command.StateFinalized)

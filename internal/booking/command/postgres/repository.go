@@ -30,11 +30,21 @@ type Options struct {
 	MaxActiveHoldsPerUser      int
 	MaxActiveHoldsPerTrainRun  int
 	MaxActivePassengersPerUser int
+	Metrics                    Metrics
 }
 
 type Repository struct {
 	db      DB
 	options Options
+	metrics Metrics
+}
+
+// Metrics records only fixed booking saga outcomes after the corresponding
+// control transaction has committed. Implementations must normalize labels at
+// the exporter boundary and must not include command or user identifiers.
+type Metrics interface {
+	RecordBookingQuotaLease(operation, result, reason string)
+	RecordBookingDirectoryRepair(result, reason string)
 }
 
 func NewRepository(db DB, options Options) (*Repository, error) {
@@ -45,7 +55,19 @@ func NewRepository(db DB, options Options) (*Repository, error) {
 		options.MaxActivePassengersPerUser > 10_000 {
 		return nil, ErrInvalidOptions
 	}
-	return &Repository{db: db, options: options}, nil
+	return &Repository{db: db, options: options, metrics: options.Metrics}, nil
+}
+
+func (repository *Repository) recordQuota(operation, result, reason string) {
+	if repository != nil && !nilInterface(repository.metrics) {
+		repository.metrics.RecordBookingQuotaLease(operation, result, reason)
+	}
+}
+
+func (repository *Repository) recordDirectory(result, reason string) {
+	if repository != nil && !nilInterface(repository.metrics) {
+		repository.metrics.RecordBookingDirectoryRepair(result, reason)
+	}
 }
 
 func nilInterface(value any) bool {

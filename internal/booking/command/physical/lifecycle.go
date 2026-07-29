@@ -142,7 +142,6 @@ SELECT id FROM reservation_seats WHERE reservation_id=$1 ORDER BY id FOR SHARE`,
 	if err != nil {
 		return command.Receipt{}, false, ErrShardPersistence
 	}
-	defer rows.Close()
 	var seatIDs []uuid.UUID
 	for rows.Next() {
 		var seatID uuid.UUID
@@ -151,9 +150,11 @@ SELECT id FROM reservation_seats WHERE reservation_id=$1 ORDER BY id FOR SHARE`,
 		}
 		seatIDs = append(seatIDs, seatID)
 	}
-	if rows.Err() != nil || len(seatIDs) == 0 {
+	if rows.Err() != nil || len(seatIDs) == 0 || len(seatIDs) > command.MaxReceiptTickets {
+		rows.Close()
 		return command.Receipt{}, false, ErrShardPersistence
 	}
+	rows.Close()
 	for _, reservationSeatID := range seatIDs {
 		ticketID := uuid.NewSHA1(bookingCommand.ID, reservationSeatID[:])
 		ticketCode := "TKT" + ticketID.String()
@@ -163,6 +164,24 @@ VALUES($1,$2,$3,$4,$5,$6,'active')
 ON CONFLICT(reservation_seat_id) DO NOTHING`, ticketID, orderID, reservationSeatID,
 			bookingCommand.TrainRunID, bookingCommand.Route.Generation().Int64(), ticketCode); err != nil {
 			return command.Receipt{}, false, ErrShardPersistence
+		}
+		if status == "held" {
+			ticketPayload, marshalErr := json.Marshal(map[string]any{
+				"command_id": bookingCommand.ID, "ticket_id": ticketID,
+				"ticket_order_id": orderID, "reservation_id": bookingCommand.ReservationID,
+				"train_run_id":          bookingCommand.TrainRunID,
+				"assignment_generation": bookingCommand.Route.Generation().Int64(),
+			})
+			if marshalErr != nil {
+				return command.Receipt{}, false, ErrShardPersistence
+			}
+			if err := execOne(ctx, tx, `
+INSERT INTO outbox_events(id,train_run_id,assignment_generation,aggregate_type,aggregate_id,event_type,payload)
+VALUES($1,$2,$3,'ticket',$4,'ticket.created',$5::jsonb)`,
+				uuid.NewSHA1(ticketID, []byte("ticket.created")), bookingCommand.TrainRunID,
+				bookingCommand.Route.Generation().Int64(), ticketID, string(ticketPayload)); err != nil {
+				return command.Receipt{}, false, err
+			}
 		}
 	}
 	changed := status == "held"
@@ -175,7 +194,39 @@ ON CONFLICT(reservation_seat_id) DO NOTHING`, ticketID, orderID, reservationSeat
 	}
 	receipt := committedReceipt(bookingCommand)
 	receipt.TicketOrderID, receipt.TicketCount = orderID, len(seatIDs)
+	receipt.TicketIDs, err = loadOrderTicketIDs(ctx, tx, orderID, len(seatIDs))
+	if err != nil {
+		return command.Receipt{}, false, err
+	}
+	receipt.TotalAmountMinor, receipt.Currency = total, currency
+	if err := tx.QueryRow(ctx, `SELECT created_at FROM ticket_orders WHERE id=$1`, orderID).Scan(&receipt.OrderCreatedAt); err != nil {
+		return command.Receipt{}, false, ErrShardPersistence
+	}
 	return receipt, changed, nil
+}
+
+func loadOrderTicketIDs(ctx context.Context, tx pgx.Tx, orderID uuid.UUID, expected int) ([]uuid.UUID, error) {
+	if orderID == uuid.Nil || expected < 1 || expected > command.MaxReceiptTickets {
+		return nil, ErrShardPersistence
+	}
+	rows, err := tx.Query(ctx, `SELECT id FROM tickets WHERE ticket_order_id=$1 ORDER BY id LIMIT $2`,
+		orderID, command.MaxReceiptTickets+1)
+	if err != nil {
+		return nil, ErrShardPersistence
+	}
+	defer rows.Close()
+	ticketIDs := make([]uuid.UUID, 0, expected)
+	for rows.Next() {
+		var ticketID uuid.UUID
+		if err := rows.Scan(&ticketID); err != nil || ticketID == uuid.Nil {
+			return nil, ErrShardPersistence
+		}
+		ticketIDs = append(ticketIDs, ticketID)
+	}
+	if rows.Err() != nil || len(ticketIDs) != expected || len(ticketIDs) > command.MaxReceiptTickets {
+		return nil, ErrShardPersistence
+	}
+	return ticketIDs, nil
 }
 
 func cancelReservation(ctx context.Context, tx pgx.Tx, bookingCommand command.Command) (command.Receipt, bool, error) {

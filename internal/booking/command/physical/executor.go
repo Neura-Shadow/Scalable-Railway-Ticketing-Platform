@@ -343,13 +343,21 @@ WHERE command_id = $1`, bookingCommand.ID).Scan(&fingerprint, &resourceID, &stat
 	switch bookingCommand.Operation {
 	case command.OperationConfirmReservation:
 		if err := tx.QueryRow(ctx, `
-SELECT ticket_order.id, count(ticket.id)::integer
+SELECT ticket_order.id, count(ticket.id)::integer,
+       ticket_order.total_amount_minor,ticket_order.currency,ticket_order.created_at
 FROM ticket_orders AS ticket_order
 JOIN tickets AS ticket ON ticket.ticket_order_id=ticket_order.id
 WHERE ticket_order.reservation_id=$1
-GROUP BY ticket_order.id`, bookingCommand.ReservationID).Scan(&receipt.TicketOrderID, &receipt.TicketCount); err != nil ||
-			receipt.TicketOrderID == uuid.Nil || receipt.TicketCount < 1 {
+GROUP BY ticket_order.id`, bookingCommand.ReservationID).Scan(
+			&receipt.TicketOrderID, &receipt.TicketCount, &receipt.TotalAmountMinor,
+			&receipt.Currency, &receipt.OrderCreatedAt); err != nil ||
+			receipt.TicketOrderID == uuid.Nil || receipt.TicketCount < 1 || receipt.TotalAmountMinor < 0 ||
+			receipt.TicketCount > command.MaxReceiptTickets || len(receipt.Currency) != 3 || receipt.OrderCreatedAt.IsZero() {
 			return command.Receipt{}, false, ErrShardPersistence
+		}
+		receipt.TicketIDs, err = loadOrderTicketIDs(ctx, tx, receipt.TicketOrderID, receipt.TicketCount)
+		if err != nil {
+			return command.Receipt{}, false, err
 		}
 	case command.OperationCancelReservation:
 		if err := tx.QueryRow(ctx, `SELECT count(*)::integer FROM reservation_seats WHERE reservation_id=$1`,
