@@ -103,6 +103,8 @@ Assert-True -Condition ($environmentMap.Count -eq 10) `
     -Message 'driver did not construct all ten scenario environments'
 Assert-True -Condition ($environmentMap['physical-shard-routing']['VUS'] -eq '6') `
     -Message 'physical routing must distribute replay requests across six bounded customer identities'
+Assert-True -Condition ($environmentMap['cross-shard-global-quota']['RATE_LIMIT_SETTLE_SECONDS'] -eq '61') `
+    -Message 'global quota evidence must let its authenticated reservation-rate window expire before probing quota'
 Assert-True -Condition ($environmentMap['physical-shard-outage']['VUS_PER_SHARD'] -eq '2') `
     -Message 'outage evidence requires two independent healthy-shard writers'
 Assert-True -Condition ($environmentMap['legacy-vs-physical']['VUS_PER_PATH'] -eq '2') `

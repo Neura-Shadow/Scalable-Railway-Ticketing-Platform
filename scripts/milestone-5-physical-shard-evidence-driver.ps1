@@ -498,7 +498,7 @@ function New-Milestone5EnvironmentMap {
     $map['cross-shard-global-quota'] = [ordered]@{
         BASE_URL=$common.BASE_URL; ORIGIN_CODE='M2A'; DESTINATION_CODE='M2B'; SEAT_CLASS='standard'; TRAIN_RUN_IDS=$common.TRAIN_RUN_IDS
         CUSTOMER_TOKENS=($State.Customers[0].Token,$State.Customers[1].Token -join ','); PASSENGER_IDS=($quotaPassengers -join ',')
-        VUS='2'; MAX_ACTIVE_HOLDS_PER_CUSTOMER='1'
+        VUS='2'; MAX_ACTIVE_HOLDS_PER_CUSTOMER='1'; RATE_LIMIT_SETTLE_SECONDS='61'
     }
     $map['booking-command-recovery'] = [ordered]@{
         BASE_URL=$common.BASE_URL; ORIGIN_CODE='M2A'; DESTINATION_CODE='M2B'; SEAT_CLASS='standard'; TRAIN_RUN_ID=$script:M5TrainA
@@ -640,7 +640,19 @@ function Start-Milestone5Scenario {
     if ($null -eq $State.PSObject.Properties['EnvironmentByScenario']) { throw 'Milestone 5 driver state is invalid' }
     switch ($Scenario) {
         'physical-shard-routing' { return }
-        'cross-shard-global-quota' { return }
+        'cross-shard-global-quota' {
+            $settleSeconds = 0
+            if (-not [int]::TryParse([string]$Environment.RATE_LIMIT_SETTLE_SECONDS, [ref]$settleSeconds) -or
+                $settleSeconds -lt 60 -or $settleSeconds -gt 90) {
+                throw 'global quota evidence rate-limit settle interval must be between 60 and 90 seconds'
+            }
+            # Baseline holds are created through the public API for the same
+            # authenticated subjects. Let that fixed reservation-rate window
+            # expire so the subsequent rejection proves global quota rather
+            # than an unrelated HTTP rate limit.
+            Start-Sleep -Seconds $settleSeconds
+            return
+        }
         'booking-command-recovery' { Enable-Milestone5RecoveryFault -Context $Context; return }
         'physical-shard-outage' {
             Invoke-Milestone5DriverCompose -Context $Context -Arguments @('stop','booking-shard-0-postgres') -Artifact 'outage-stop.log' | Out-Null
