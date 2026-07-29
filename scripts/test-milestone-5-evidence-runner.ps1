@@ -51,6 +51,7 @@ function New-StrictK6Summary {
             same_idempotency_terminal_responses = [pscustomobject]@{ values = [pscustomobject]@{ count = 1 } }
             same_idempotency_converged_apis = [pscustomobject]@{ values = [pscustomobject]@{ count = 3 } }
             same_idempotency_identity_mismatches = [pscustomobject]@{ values = [pscustomobject]@{ count = 0 } }
+            same_idempotency_rate_limited_responses = [pscustomobject]@{ values = [pscustomobject]@{ count = 0 } }
             same_idempotency_unexpected_responses = [pscustomobject]@{ values = [pscustomobject]@{ count = 0 } }
         }
     }

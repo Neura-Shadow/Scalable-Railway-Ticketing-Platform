@@ -153,6 +153,7 @@ function Assert-Milestone5ScenarioMetrics {
             @('physical_route_success',2,$null), @('physical_route_conflicts',0,10), @('shard_rate_limited',0,0),
             @('same_idempotency_requests',100,100), @('same_idempotency_terminal_responses',1,$null),
             @('same_idempotency_converged_apis',3,3), @('same_idempotency_identity_mismatches',0,0),
+            @('same_idempotency_rate_limited_responses',0,0),
             @('same_idempotency_unexpected_responses',0,0)
         )
         'cross-shard-global-quota' = @(

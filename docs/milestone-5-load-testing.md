@@ -38,12 +38,14 @@ rate, retry count, response size, batch size, and artifact size.
 
 The disposable acceptance driver deliberately stops Redis only while the
 100-request same-idempotency probe runs. This exercises the reservation
-limiter's documented fail-open path so all 100 requests reach the real control
-and booking-shard PostgreSQL instances instead of being absorbed by the public
-per-owner rate limit. The driver restores Redis and waits for `PONG` before it
-proves waiting-room admission token issuance, physical reservation creation,
-and shard-local hold expiration. This bounded evidence technique is not a
-production rate-limiter or availability recommendation.
+limiter's documented fail-open path so the 100-request burst is not absorbed by
+the public per-owner Redis rate limit. Application-level reservation
+backpressure remains active and is recorded as a bounded deferred response;
+post-run database invariants, rather than HTTP response counts, prove exactly
+one durable control/shard result. The driver restores Redis and waits for
+`PONG` before it proves waiting-room admission token issuance, physical
+reservation creation, and shard-local hold expiration. This bounded evidence
+technique is not a production rate-limiter or availability recommendation.
 
 Before and after each run, capture assignments, both local fences, command and
 receipt counts, quota/directory state, inventory-mask uniqueness, outbox/event

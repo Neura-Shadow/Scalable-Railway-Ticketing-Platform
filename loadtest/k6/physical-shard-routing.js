@@ -25,6 +25,7 @@ export const clientSplitBrainObservations = new Counter('client_split_brain_obse
 export const sameIdempotencyRequests = new Counter('same_idempotency_requests');
 export const sameIdempotencyTerminalResponses = new Counter('same_idempotency_terminal_responses');
 export const sameIdempotencyDeferredResponses = new Counter('same_idempotency_deferred_responses');
+export const sameIdempotencyRateLimitedResponses = new Counter('same_idempotency_rate_limited_responses');
 export const sameIdempotencyConvergedAPIs = new Counter('same_idempotency_converged_apis');
 export const sameIdempotencyIdentityMismatches = new Counter('same_idempotency_identity_mismatches');
 export const sameIdempotencyUnexpectedResponses = new Counter('same_idempotency_unexpected_responses');
@@ -42,6 +43,7 @@ const routingOptions = boundedOptions({
   },
   same_idempotency_physical: {
     executor: 'per-vu-iterations',
+    startTime: '15s',
     vus: 1,
     iterations: 1,
     maxDuration: (__ENV.MAX_DURATION || '2m').trim(),
@@ -55,6 +57,7 @@ const routingOptions = boundedOptions({
   same_idempotency_terminal_responses: ['count>=1'],
   same_idempotency_converged_apis: ['count==3'],
   same_idempotency_identity_mismatches: ['count==0'],
+  same_idempotency_rate_limited_responses: ['count==0'],
   same_idempotency_unexpected_responses: ['count==0'],
   booking_success_duration: ['p(95)<2000', 'p(99)<5000'],
 });
@@ -95,8 +98,10 @@ function concurrentPhysicalIdentity() {
       sameIdempotencyTerminalResponses.add(1);
       continue;
     }
-    const boundedDeferred = (response.status === 409 && publicErrorCode(response) === 'conflict')
-      || (response.status === 503 && publicErrorCode(response) === 'unavailable');
+    const code = publicErrorCode(response);
+    const boundedDeferred = (response.status === 409 && code === 'conflict')
+      || (response.status === 503 && (code === 'unavailable' || code === 'reservation_backpressure'));
+    if (response.status === 429) sameIdempotencyRateLimitedResponses.add(1);
     if (boundedDeferred) sameIdempotencyDeferredResponses.add(1);
     else sameIdempotencyUnexpectedResponses.add(1);
   }
