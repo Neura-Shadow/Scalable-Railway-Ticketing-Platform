@@ -58,11 +58,13 @@ foreach ($required in @(
     'Invoke-Milestone5OperatorDurableSmoke', 'operator_booking_commands',
     'booking_command_receipts', 'expected_source_version', 'Idempotency-Key',
     'Stop-Milestone5DriverJob', 'target_write_observed_before_reverse',
-    'target_write_preserved_after_reverse'
+    'target_write_preserved_after_reverse', 'M5EvidenceDriverPath'
 )) {
     Assert-True -Condition $driver.Contains($required) `
         -Message "driver omitted trusted evidence token $required"
 }
+Assert-True -Condition (-not $driver.Contains('$MyInvocation.MyCommand.Path')) `
+    -Message 'background transition jobs must use the driver path captured while the script is dot-sourced'
 foreach ($forbidden in @(
     'final_write_pause_ms = 1',
     'dual_writer_violations = 0',

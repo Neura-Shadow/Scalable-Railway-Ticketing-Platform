@@ -3,6 +3,12 @@
 # artifact publication, sanitization and the ten k6 invocations.
 Set-StrictMode -Version Latest
 
+$script:M5EvidenceDriverPath = $PSCommandPath
+if ([string]::IsNullOrWhiteSpace($script:M5EvidenceDriverPath) -or
+    -not (Test-Path -LiteralPath $script:M5EvidenceDriverPath -PathType Leaf)) {
+    throw 'Milestone 5 evidence driver could not capture its trusted script path'
+}
+
 $script:M5TrainA = '21000000-0000-4000-8000-000000000401'
 $script:M5TrainB = '21000000-0000-4000-8000-000000000402'
 $script:M5TrainC = '21000000-0000-4000-8000-000000000403'
@@ -566,8 +572,7 @@ function Initialize-Milestone5Evidence {
 function Start-Milestone5DriverJob {
     param([object]$Context,[object]$State,[string]$Scenario,[string]$MigrationID,[string]$Target,[int]$DelayMilliseconds,[switch]$MeasurePause)
     if ($State.Jobs.ContainsKey($Scenario)) { throw "$Scenario already owns a transition job" }
-    $driverPath = $MyInvocation.MyCommand.Path
-    if (-not $driverPath) { $driverPath = Join-Path ([string]$Context.RepositoryPath) 'scripts/milestone-5-physical-shard-evidence-driver.ps1' }
+    $driverPath = $script:M5EvidenceDriverPath
     $jobContext = [pscustomobject]@{
         RepositoryPath=[string]$Context.RepositoryPath; RawDirectory=[string]$Context.RawDirectory; ProjectName=[string]$Context.ProjectName
         ComposeFile=[string]$Context.ComposeFile; ComposeArguments=[string[]]@($Context.ComposeArguments)
