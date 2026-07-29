@@ -209,6 +209,7 @@ function Invoke-Milestone5K6 {
     $result = Invoke-Milestone5Native -AllowFailure -Command { & docker @arguments }
     $result.Output | Out-File -LiteralPath (Join-Path $script:rawDirectory "$Scenario.log") -Encoding utf8
     if ($result.ExitCode -ne 0) { throw "$Scenario k6 workload failed" }
+    Remove-Milestone5K6SetupData -Path $summaryPath
     $rawSummary = Get-Content -Raw -LiteralPath $summaryPath | ConvertFrom-Json
     $strict = ConvertFrom-Milestone5K6Summary -Summary $rawSummary -Scenario $Scenario `
         -K6ExitCode $result.ExitCode

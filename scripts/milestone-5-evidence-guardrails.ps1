@@ -404,3 +404,16 @@ function Write-Milestone5JsonAtomic {
         if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force }
     }
 }
+
+function Remove-Milestone5K6SetupData {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw 'k6 summary is unavailable for setup-data sanitization'
+    }
+    $summary = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
+    if ($summary.PSObject.Properties.Match('setup_data').Count -gt 0) {
+        $summary.PSObject.Properties.Remove('setup_data')
+    }
+    Write-Milestone5JsonAtomic -Path $Path -Value $summary
+}

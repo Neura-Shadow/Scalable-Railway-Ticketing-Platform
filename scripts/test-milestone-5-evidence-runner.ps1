@@ -222,6 +222,19 @@ try {
     $safeValue = Get-Content -Raw -LiteralPath $safe | ConvertFrom-Json
     Assert-True -Condition ($safeValue.value -eq 2) `
         -Message 'atomic JSON publication did not replace an existing status file'
+    $k6Summary = Join-Path $temporaryRoot 'k6-summary.json'
+    Write-Milestone5JsonAtomic -Path $k6Summary -Value ([ordered]@{
+        metrics = [ordered]@{ http_reqs = [ordered]@{ values = [ordered]@{ count = 2 } } }
+        setup_data = [ordered]@{ tokens = @('synthetic-secret-value') }
+    })
+    Remove-Milestone5K6SetupData -Path $k6Summary
+    $sanitizedK6 = Get-Content -Raw -LiteralPath $k6Summary | ConvertFrom-Json
+    Assert-True -Condition (
+        $sanitizedK6.PSObject.Properties.Match('setup_data').Count -eq 0 -and
+        [int64]$sanitizedK6.metrics.http_reqs.values.count -eq 2
+    ) -Message 'k6 setup-data sanitization removed metrics or retained setup data'
+    Assert-Milestone5ArtifactsSanitized -EvidenceDirectory $temporaryRoot `
+        -SecretValues @('synthetic-secret-value')
     Assert-Milestone5ArtifactsSanitized -EvidenceDirectory $temporaryRoot
     $credentialShapedValue = [string]::Concat(
         'postgres', 'ql://operator:', 'synthetic@db.example.test/tickets'
@@ -257,7 +270,8 @@ foreach ($required in @(
     'Move-Item -LiteralPath $candidateSummary -Destination $canonicalSummary',
     'git status --porcelain=v1 --untracked-files=all',
     'compose_config_sha256',
-    'SecretValues'
+    'SecretValues',
+    'Remove-Milestone5K6SetupData -Path $summaryPath'
 )) {
     Assert-True -Condition $runner.Contains($required) -Message "runner omitted contract token: $required"
 }
