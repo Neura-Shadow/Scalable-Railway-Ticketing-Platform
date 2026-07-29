@@ -288,6 +288,25 @@ function Assert-Milestone5DatabaseInvariants {
         $writerCount -lt 1 -or $writerCount -gt 2) {
         throw 'enabled_writer_fences must prove the bounded one-writer topology'
     }
+    $connections = [ordered]@{}
+    foreach ($prefix in @('control_postgres', 'booking_shard_0_postgres', 'booking_shard_1_postgres')) {
+        $connectionValue = Get-Milestone5OptionalValue -Object $Evidence -Name "${prefix}_connections"
+        $maximumValue = Get-Milestone5OptionalValue -Object $Evidence -Name "${prefix}_max_connections"
+        $connectionCount = 0L
+        $maximumCount = 0L
+        if ($null -eq $connectionValue -or
+            -not [int64]::TryParse([string]$connectionValue, [ref]$connectionCount) -or
+            $connectionCount -lt 1) {
+            throw "database evidence ${prefix}_connections must be a measured positive count"
+        }
+        if ($null -eq $maximumValue -or
+            -not [int64]::TryParse([string]$maximumValue, [ref]$maximumCount) -or
+            $maximumCount -lt 1 -or $connectionCount -gt $maximumCount) {
+            throw "database evidence ${prefix}_max_connections must bound the observed count"
+        }
+        $connections["${prefix}_connections"] = $connectionCount
+        $connections["${prefix}_max_connections"] = $maximumCount
+    }
     return [ordered]@{
         status = 'passed'
         enabled_writer_fences = $writerCount
@@ -301,6 +320,12 @@ function Assert-Milestone5DatabaseInvariants {
         unreconciled_commands = 0
         online_copy_mutation_delta = $positive.online_copy_mutation_delta
         online_copy_journal_delta = $positive.online_copy_journal_delta
+        control_postgres_connections = $connections.control_postgres_connections
+        control_postgres_max_connections = $connections.control_postgres_max_connections
+        booking_shard_0_postgres_connections = $connections.booking_shard_0_postgres_connections
+        booking_shard_0_postgres_max_connections = $connections.booking_shard_0_postgres_max_connections
+        booking_shard_1_postgres_connections = $connections.booking_shard_1_postgres_connections
+        booking_shard_1_postgres_max_connections = $connections.booking_shard_1_postgres_max_connections
     }
 }
 
@@ -326,10 +351,39 @@ function Assert-Milestone5MeasuredMigrationEvidence {
     if ($targetGeneration -le 0 -or $reverseGeneration -le $targetGeneration) {
         throw 'reverse generation must be newer than the target-write generation'
     }
+    $positiveMeasurements = [ordered]@{}
+    foreach ($name in @(
+        'rows_copied', 'base_copy_duration_ms', 'base_copy_rows_per_second',
+        'rows_replayed', 'journal_replay_duration_ms', 'journal_replay_rows_per_second',
+        'forward_migration_duration_ms', 'reverse_migration_duration_ms'
+    )) {
+        $value = Get-Milestone5OptionalValue -Object $Evidence -Name $name
+        $parsed = 0.0
+        if ($null -eq $value -or -not [double]::TryParse([string]$value, [ref]$parsed) -or $parsed -le 0) {
+            throw "migration evidence $name must be a measured positive value"
+        }
+        $positiveMeasurements[$name] = $parsed
+    }
+    $journalLag = Get-Milestone5OptionalValue -Object $Evidence -Name 'final_journal_lag'
+    $parsedJournalLag = -1L
+    if ($null -eq $journalLag -or
+        -not [int64]::TryParse([string]$journalLag, [ref]$parsedJournalLag) -or
+        $parsedJournalLag -ne 0) {
+        throw 'final journal lag must be measured at exactly zero'
+    }
     return [ordered]@{
         status = 'passed'
         final_write_pause_ms = [Math]::Round($pauseValue, 3)
         maximum_final_write_pause_ms = [Math]::Round($limitValue, 3)
+        rows_copied = [int64]$positiveMeasurements.rows_copied
+        base_copy_duration_ms = [int64]$positiveMeasurements.base_copy_duration_ms
+        base_copy_rows_per_second = [Math]::Round($positiveMeasurements.base_copy_rows_per_second, 3)
+        rows_replayed = [int64]$positiveMeasurements.rows_replayed
+        journal_replay_duration_ms = [int64]$positiveMeasurements.journal_replay_duration_ms
+        journal_replay_rows_per_second = [Math]::Round($positiveMeasurements.journal_replay_rows_per_second, 3)
+        final_journal_lag = $parsedJournalLag
+        forward_migration_duration_ms = [int64]$positiveMeasurements.forward_migration_duration_ms
+        reverse_migration_duration_ms = [int64]$positiveMeasurements.reverse_migration_duration_ms
         target_write_observed_before_reverse = $true
         target_write_preserved_after_reverse = $true
         target_generation = $targetGeneration

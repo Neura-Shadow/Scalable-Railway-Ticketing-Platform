@@ -140,6 +140,12 @@ $databaseInput = [pscustomobject]@{
     unreconciled_commands = 0
     online_copy_mutation_delta = 2
     online_copy_journal_delta = 4
+    control_postgres_connections = 7
+    control_postgres_max_connections = 100
+    booking_shard_0_postgres_connections = 5
+    booking_shard_0_postgres_max_connections = 100
+    booking_shard_1_postgres_connections = 6
+    booking_shard_1_postgres_max_connections = 100
 }
 $database = Assert-Milestone5DatabaseInvariants -Evidence $databaseInput
 Assert-True -Condition ($database.status -eq 'passed' -and $database.enabled_writer_fences -eq 2) `
@@ -167,6 +173,15 @@ $measurementsInput = [pscustomobject]@{
     target_write_preserved_after_reverse = $true
     target_generation = 8
     reverse_generation = 9
+    rows_copied = 48
+    base_copy_duration_ms = 2000
+    base_copy_rows_per_second = 24
+    rows_replayed = 12
+    journal_replay_duration_ms = 500
+    journal_replay_rows_per_second = 24
+    final_journal_lag = 0
+    forward_migration_duration_ms = 4500
+    reverse_migration_duration_ms = 5100
 }
 $measurements = Assert-Milestone5MeasuredMigrationEvidence -Evidence $measurementsInput
 Assert-True -Condition ($measurements.status -eq 'passed' -and
@@ -186,6 +201,16 @@ $staleReverse = $measurementsInput.PSObject.Copy()
 $staleReverse.reverse_generation = 8
 Assert-Throws -Label 'non-monotonic reverse generation' -Action {
     Assert-Milestone5MeasuredMigrationEvidence -Evidence $staleReverse | Out-Null
+}
+$nonzeroJournalLag = $measurementsInput.PSObject.Copy()
+$nonzeroJournalLag.final_journal_lag = 1
+Assert-Throws -Label 'nonzero final journal lag' -Action {
+    Assert-Milestone5MeasuredMigrationEvidence -Evidence $nonzeroJournalLag | Out-Null
+}
+$missingCopyRate = $measurementsInput.PSObject.Copy()
+$missingCopyRate.base_copy_rows_per_second = 0
+Assert-Throws -Label 'missing base-copy rate' -Action {
+    Assert-Milestone5MeasuredMigrationEvidence -Evidence $missingCopyRate | Out-Null
 }
 
 $passedScenarios = @($expectedScenarios | ForEach-Object {

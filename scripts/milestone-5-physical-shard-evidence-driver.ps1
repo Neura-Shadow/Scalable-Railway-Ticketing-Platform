@@ -827,11 +827,30 @@ SELECT count(*) FROM latest JOIN public.train_run_shard_assignments a USING(trai
         $receiptConflicts += Get-Milestone5DriverScalar -Context $Context -Service $entry[0] -Artifact "receipt-conflicts-shard-$($entry[1]).log" -SQL "SELECT count(*) FROM public.booking_command_receipts r WHERE (r.status='succeeded' AND (r.result_id IS NULL OR r.completed_at IS NULL)) OR octet_length(r.request_fingerprint)<>32;"
     }
     $unreconciled=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'unreconciled-commands.log' -SQL "SELECT count(*) FROM public.booking_commands WHERE train_run_id IN ('$script:M5TrainA'::uuid,'$script:M5TrainB'::uuid,'$script:M5TrainC'::uuid) AND state NOT IN('finalized','failed','expired');"
+    $connectionEvidence = [ordered]@{}
+    foreach ($entry in @(
+        @('control-postgres', 'control_postgres'),
+        @('booking-shard-0-postgres', 'booking_shard_0_postgres'),
+        @('booking-shard-1-postgres', 'booking_shard_1_postgres')
+    )) {
+        $connectionEvidence["$($entry[1])_connections"] = Get-Milestone5DriverScalar `
+            -Context $Context -Service $entry[0] -Artifact "$($entry[1])-connections.log" `
+            -SQL "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE datname=current_database();"
+        $connectionEvidence["$($entry[1])_max_connections"] = Get-Milestone5DriverScalar `
+            -Context $Context -Service $entry[0] -Artifact "$($entry[1])-max-connections.log" `
+            -SQL "SELECT current_setting('max_connections')::bigint;"
+    }
     return [ordered]@{
         enabled_writer_fences=[int64]$writers[$script:M5TrainC]; dual_writer_violations=[int64]$dual
         assignment_ledger_mismatches=$assignmentMismatch; directory_mismatches=$directoryMismatch; quota_violations=$quotaViolations
         journal_gaps=$journalGaps; apply_receipt_conflicts=$applyConflicts; command_receipt_conflicts=$receiptConflicts; unreconciled_commands=$unreconciled
         online_copy_mutation_delta=[int64]$State.OnlineCopyMutationDelta; online_copy_journal_delta=[int64]$State.OnlineCopyJournalDelta
+        control_postgres_connections=[int64]$connectionEvidence.control_postgres_connections
+        control_postgres_max_connections=[int64]$connectionEvidence.control_postgres_max_connections
+        booking_shard_0_postgres_connections=[int64]$connectionEvidence.booking_shard_0_postgres_connections
+        booking_shard_0_postgres_max_connections=[int64]$connectionEvidence.booking_shard_0_postgres_max_connections
+        booking_shard_1_postgres_connections=[int64]$connectionEvidence.booking_shard_1_postgres_connections
+        booking_shard_1_postgres_max_connections=[int64]$connectionEvidence.booking_shard_1_postgres_max_connections
     }
 }
 
@@ -840,10 +859,23 @@ function Get-Milestone5MigrationEvidence {
     $targetGeneration=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'target-generation.log' -SQL "SELECT target_generation FROM public.physical_shard_migrations WHERE migration_id='$script:M5MigrationCSecond'::uuid;"
     $reverseGeneration=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'reverse-generation.log' -SQL "SELECT target_generation FROM public.physical_shard_migrations WHERE migration_id='$script:M5MigrationCReverse'::uuid;"
     $preserved=Get-Milestone5DriverScalar -Context $Context -Service 'booking-shard-0-postgres' -Artifact 'target-write-after-reverse.log' -SQL "SELECT count(*) FROM public.reservations WHERE id='$($State.TargetEraReservationID)'::uuid AND train_run_id='$script:M5TrainC'::uuid AND assignment_generation=$reverseGeneration;"
+    $rowsCopied=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'base-copy-rows.log' -SQL "SELECT rows_copied FROM public.physical_shard_migrations WHERE migration_id='$script:M5MigrationC'::uuid;"
+    $baseCopyDurationMs=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'base-copy-duration-ms.log' -SQL "SELECT GREATEST(1,(extract(epoch FROM (completed_at-created_at))*1000)::bigint) FROM public.physical_shard_migration_checkpoints WHERE migration_id='$script:M5MigrationC'::uuid AND checkpoint_kind='base_copy' AND object_name='migration_engine' AND status='completed';"
+    $rowsReplayed=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'journal-replay-rows.log' -SQL "SELECT rows_replayed FROM public.physical_shard_migrations WHERE migration_id='$script:M5MigrationC'::uuid;"
+    $journalReplayDurationMs=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'journal-replay-duration-ms.log' -SQL "SELECT GREATEST(1,(extract(epoch FROM (completed_at-created_at))*1000)::bigint) FROM public.physical_shard_migration_checkpoints WHERE migration_id='$script:M5MigrationC'::uuid AND checkpoint_kind='journal_replay' AND object_name='migration_engine' AND status='completed';"
+    $journalLag=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'final-journal-lag.log' -SQL "SELECT GREATEST(COALESCE(final_source_sequence,0)-COALESCE(last_replayed_sequence,0),0) FROM public.physical_shard_migrations WHERE migration_id='$script:M5MigrationC'::uuid;"
+    $forwardDurationMs=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'forward-migration-duration-ms.log' -SQL "SELECT GREATEST(1,(extract(epoch FROM (assignment_switched_at-created_at))*1000)::bigint) FROM public.physical_shard_migrations WHERE migration_id='$script:M5MigrationC'::uuid AND assignment_switched_at IS NOT NULL;"
+    $reverseDurationMs=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'reverse-migration-duration-ms.log' -SQL "SELECT GREATEST(1,(extract(epoch FROM (assignment_switched_at-created_at))*1000)::bigint) FROM public.physical_shard_migrations WHERE migration_id='$script:M5MigrationCReverse'::uuid AND reverse_migration AND assignment_switched_at IS NOT NULL;"
     $observedBefore=[bool]$State.TargetWriteObservedBeforeReverse
     $preservedAfter=($preserved -eq 1)
     return [ordered]@{
         final_write_pause_ms=[double]$State.FinalWritePauseMs; maximum_final_write_pause_ms=[double]$State.MaximumFinalWritePauseMs
+        rows_copied=$rowsCopied; base_copy_duration_ms=$baseCopyDurationMs
+        base_copy_rows_per_second=[Math]::Round(($rowsCopied*1000.0)/$baseCopyDurationMs,3)
+        rows_replayed=$rowsReplayed; journal_replay_duration_ms=$journalReplayDurationMs
+        journal_replay_rows_per_second=[Math]::Round(($rowsReplayed*1000.0)/$journalReplayDurationMs,3)
+        final_journal_lag=$journalLag; forward_migration_duration_ms=$forwardDurationMs
+        reverse_migration_duration_ms=$reverseDurationMs
         target_write_observed_before_reverse=$observedBefore; target_write_preserved_after_reverse=$preservedAfter
         target_generation=$targetGeneration; reverse_generation=$reverseGeneration
     }
