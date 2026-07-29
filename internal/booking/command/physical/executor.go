@@ -24,8 +24,19 @@ var (
 	ErrInvalidPayload        = errors.New("invalid physical booking payload")
 	ErrFareUnavailable       = errors.New("physical booking fare unavailable")
 	ErrInsufficientInventory = errors.New("physical booking inventory unavailable")
+	ErrReservationExpired    = errors.New("physical booking reservation expired")
+	ErrInvalidLifecycleState = errors.New("physical booking lifecycle state invalid")
 	ErrShardPersistence      = errors.New("physical booking persistence failed")
 )
+
+const mutationSavepoint = "booking_command_mutation"
+
+type durableRejection struct {
+	cause error
+}
+
+func (rejection *durableRejection) Error() string { return rejection.cause.Error() }
+func (rejection *durableRejection) Unwrap() error { return rejection.cause }
 
 type RouteResolver interface {
 	Resolve(context.Context, uuid.UUID, bool) (shardphysical.Resolution, error)
@@ -108,6 +119,13 @@ func (executor *Executor) executeOnce(
 		bookingCommand.Operation == command.OperationCancelReservation {
 		receipt, err := executor.executeLifecycleTx(ctx, tx, bookingCommand, resolved)
 		if err != nil {
+			var rejection *durableRejection
+			if errors.As(err, &rejection) {
+				if commitErr := tx.Commit(ctx); commitErr != nil {
+					return command.Receipt{}, ErrShardPersistence
+				}
+				return command.Receipt{}, rejection.cause
+			}
 			return rollback(err)
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -150,6 +168,25 @@ INSERT INTO booking_command_receipts (
 	); err != nil {
 		return rollback(err)
 	}
+	if err := beginMutationSavepoint(ctx, tx); err != nil {
+		return rollback(err)
+	}
+	rejectOrRollback := func(result error) (command.Receipt, error) {
+		code, permanent := rejectionCode(result)
+		if !permanent {
+			return rollback(result)
+		}
+		if err := rollbackMutationSavepoint(ctx, tx); err != nil {
+			return rollback(err)
+		}
+		if err := persistRejectedReceipt(ctx, tx, bookingCommand.ID, code); err != nil {
+			return rollback(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return command.Receipt{}, ErrShardPersistence
+		}
+		return command.Receipt{}, result
+	}
 
 	var (
 		fareID     uuid.UUID
@@ -172,7 +209,7 @@ FOR SHARE`, bookingCommand.TrainRunID, bookingCommand.Route.Generation().Int64()
 		bookingCommand.Payload.SeatClass,
 	).Scan(&fareID, &fareAmount, &currency)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return rollback(ErrFareUnavailable)
+		return rejectOrRollback(ErrFareUnavailable)
 	}
 	if err != nil || fareID == uuid.Nil || fareAmount < 0 || len(currency) != 3 {
 		return rollback(ErrShardPersistence)
@@ -223,7 +260,7 @@ WITH candidate AS MATERIALIZED (
 SELECT seat_id FROM updated`, bookingCommand.TrainRunID, bookingCommand.Route.Generation().Int64(),
 			bookingCommand.Payload.SeatClass, segmentCount, mask.String()).Scan(&seatID)
 		if errors.Is(err, pgx.ErrNoRows) {
-			return rollback(ErrInsufficientInventory)
+			return rejectOrRollback(ErrInsufficientInventory)
 		}
 		if err != nil || seatID == uuid.Nil {
 			return rollback(ErrShardPersistence)
@@ -309,6 +346,9 @@ WHERE command_id = $1
   AND status = 'started'`, bookingCommand.ID, bookingCommand.ReservationID); err != nil {
 		return rollback(err)
 	}
+	if err := releaseMutationSavepoint(ctx, tx); err != nil {
+		return rollback(err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return command.Receipt{}, ErrShardPersistence
 	}
@@ -320,23 +360,38 @@ func loadReceipt(ctx context.Context, tx pgx.Tx, bookingCommand command.Command)
 		fingerprint []byte
 		resourceID  uuid.UUID
 		status      string
+		errorCode   string
 	)
 	err := tx.QueryRow(ctx, `
-SELECT request_fingerprint, result_id, status
+SELECT request_fingerprint,
+       COALESCE(result_id, '00000000-0000-0000-0000-000000000000'::uuid),
+       status, COALESCE(error_code, '')
 FROM booking_command_receipts
-WHERE command_id = $1`, bookingCommand.ID).Scan(&fingerprint, &resourceID, &status)
+WHERE command_id = $1`, bookingCommand.ID).Scan(&fingerprint, &resourceID, &status, &errorCode)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return command.Receipt{}, false, nil
 	}
 	if err != nil {
 		return command.Receipt{}, false, ErrShardPersistence
 	}
-	if status != "succeeded" || len(fingerprint) != 32 || resourceID != bookingCommand.ReservationID {
+	if len(fingerprint) != 32 {
 		return command.Receipt{}, false, command.ErrReceiptMismatch
 	}
 	var stored [32]byte
 	copy(stored[:], fingerprint)
 	if stored != bookingCommand.RequestFingerprint {
+		return command.Receipt{}, false, command.ErrReceiptMismatch
+	}
+	if status == "rejected" {
+		if resourceID != uuid.Nil {
+			return command.Receipt{}, false, command.ErrReceiptMismatch
+		}
+		if rejection, ok := rejectionFromCode(errorCode); ok {
+			return command.Receipt{}, false, rejection
+		}
+		return command.Receipt{}, false, command.ErrReceiptMismatch
+	}
+	if status != "succeeded" || resourceID != bookingCommand.ReservationID || errorCode != "" {
 		return command.Receipt{}, false, command.ErrReceiptMismatch
 	}
 	receipt := committedReceipt(bookingCommand)
@@ -366,6 +421,64 @@ GROUP BY ticket_order.id`, bookingCommand.ReservationID).Scan(
 		}
 	}
 	return receipt, true, nil
+}
+
+func beginMutationSavepoint(ctx context.Context, tx pgx.Tx) error {
+	if _, err := tx.Exec(ctx, "SAVEPOINT "+mutationSavepoint); err != nil {
+		return ErrShardPersistence
+	}
+	return nil
+}
+
+func rollbackMutationSavepoint(ctx context.Context, tx pgx.Tx) error {
+	if _, err := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT "+mutationSavepoint); err != nil {
+		return ErrShardPersistence
+	}
+	return releaseMutationSavepoint(ctx, tx)
+}
+
+func releaseMutationSavepoint(ctx context.Context, tx pgx.Tx) error {
+	if _, err := tx.Exec(ctx, "RELEASE SAVEPOINT "+mutationSavepoint); err != nil {
+		return ErrShardPersistence
+	}
+	return nil
+}
+
+func persistRejectedReceipt(ctx context.Context, tx pgx.Tx, commandID uuid.UUID, code string) error {
+	return execOne(ctx, tx, `
+UPDATE booking_command_receipts
+SET status='rejected', error_code=$2, completed_at=clock_timestamp()
+WHERE command_id=$1 AND status='started'`, commandID, code)
+}
+
+func rejectionCode(err error) (string, bool) {
+	switch {
+	case errors.Is(err, ErrFareUnavailable):
+		return "fare_unavailable", true
+	case errors.Is(err, ErrInsufficientInventory):
+		return "inventory_unavailable", true
+	case errors.Is(err, ErrReservationExpired):
+		return "reservation_expired", true
+	case errors.Is(err, ErrInvalidLifecycleState):
+		return "invalid_lifecycle_state", true
+	default:
+		return "", false
+	}
+}
+
+func rejectionFromCode(code string) (error, bool) {
+	switch code {
+	case "fare_unavailable":
+		return ErrFareUnavailable, true
+	case "inventory_unavailable":
+		return ErrInsufficientInventory, true
+	case "reservation_expired":
+		return ErrReservationExpired, true
+	case "invalid_lifecycle_state":
+		return ErrInvalidLifecycleState, true
+	default:
+		return nil, false
+	}
 }
 
 func lockLocalAuthority(ctx context.Context, tx pgx.Tx, bookingCommand command.Command) (int, error) {

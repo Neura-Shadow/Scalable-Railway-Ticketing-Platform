@@ -9,12 +9,30 @@ import (
 	"time"
 
 	bookingcommand "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command"
+	commandphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command/physical"
 	bookingpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/postgres"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	shardphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physical"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
+
+func TestMapPhysicalCommandErrorPreservesTerminalDomainSemantics(t *testing.T) {
+	t.Parallel()
+	for _, testCase := range []struct {
+		input error
+		want  error
+	}{
+		{input: commandphysical.ErrFareUnavailable, want: bookingpostgres.ErrNotBookable},
+		{input: commandphysical.ErrInsufficientInventory, want: bookingpostgres.ErrInsufficientInventory},
+		{input: commandphysical.ErrReservationExpired, want: bookingpostgres.ErrReservationExpired},
+		{input: commandphysical.ErrInvalidLifecycleState, want: bookingpostgres.ErrInvalidState},
+	} {
+		if got := mapPhysicalCommandError(errors.Join(bookingcommand.ErrShardExecution, testCase.input)); !errors.Is(got, testCase.want) {
+			t.Errorf("mapPhysicalCommandError(%v) = %v, want %v", testCase.input, got, testCase.want)
+		}
+	}
+}
 
 func TestHybridReservationCommandsRoutesPhysicalCreateWithControlSnapshotVersion(t *testing.T) {
 	t.Parallel()

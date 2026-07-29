@@ -107,7 +107,9 @@ func physicalExecutionOutcome(err error) (string, string) {
 		return "unavailable", "database"
 	case errors.Is(err, commandphysical.ErrInvalidPayload),
 		errors.Is(err, commandphysical.ErrFareUnavailable),
-		errors.Is(err, commandphysical.ErrInsufficientInventory):
+		errors.Is(err, commandphysical.ErrInsufficientInventory),
+		errors.Is(err, commandphysical.ErrReservationExpired),
+		errors.Is(err, commandphysical.ErrInvalidLifecycleState):
 		return "rejected", "validation"
 	default:
 		return "failure", "database"
@@ -135,7 +137,9 @@ func physicalCoordinatorOutcome(err error) (string, string) {
 		return "unavailable", "database"
 	case errors.Is(err, commandphysical.ErrInvalidPayload),
 		errors.Is(err, commandphysical.ErrFareUnavailable),
-		errors.Is(err, commandphysical.ErrInsufficientInventory):
+		errors.Is(err, commandphysical.ErrInsufficientInventory),
+		errors.Is(err, commandphysical.ErrReservationExpired),
+		errors.Is(err, commandphysical.ErrInvalidLifecycleState):
 		return "rejected", "validation"
 	default:
 		return "failure", "database"

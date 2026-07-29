@@ -66,6 +66,62 @@ func TestFinalizeRejectsFingerprintMismatchBeforeTransaction(t *testing.T) {
 	}
 }
 
+func TestFailTerminalizesRejectedCreateAndReleasesControlReservations(t *testing.T) {
+	t.Parallel()
+	candidate := controlCandidate(t)
+	tx := &controlTx{row: controlRow{values: []any{
+		candidate.Command.RequestFingerprint[:], candidate.Command.ReservationID, string(candidate.Command.State),
+	}}}
+	store, err := NewStore(&controlDB{tx: tx})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.Fail(context.Background(), candidate, reconcile.FailureShardRejected); err != nil {
+		t.Fatalf("Fail() error = %v", err)
+	}
+	joined := strings.ToLower(strings.Join(tx.statements, "\n"))
+	for _, fragment := range []string{"update public.booking_commands", "update public.reservation_directory", "update public.booking_quota_leases"} {
+		if !strings.Contains(joined, fragment) {
+			t.Fatalf("rejected create did not apply %q: %s", fragment, joined)
+		}
+	}
+	if len(tx.execArgs) != 3 || tx.execArgs[0][1] != command.StateFailed || tx.execArgs[2][1] != "released" {
+		t.Fatalf("rejected create terminal arguments=%#v", tx.execArgs)
+	}
+	if !tx.committed || len(tx.statements) != 3 {
+		t.Fatalf("committed=%v statements=%d", tx.committed, len(tx.statements))
+	}
+}
+
+func TestFailTerminalizesRejectedLifecycleWithoutMutatingCreateResources(t *testing.T) {
+	t.Parallel()
+	candidate := controlCandidate(t)
+	candidate.Command.Operation = command.OperationConfirmReservation
+	tx := &controlTx{row: controlRow{values: []any{
+		candidate.Command.RequestFingerprint[:], candidate.Command.ReservationID, string(candidate.Command.State),
+	}}}
+	store, err := NewStore(&controlDB{tx: tx})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.Fail(context.Background(), candidate, reconcile.FailureShardRejected); err != nil {
+		t.Fatalf("Fail() error = %v", err)
+	}
+	joined := strings.ToLower(strings.Join(tx.statements, "\n"))
+	if !strings.Contains(joined, "update public.booking_commands") ||
+		strings.Contains(joined, "reservation_directory") || strings.Contains(joined, "booking_quota_leases") {
+		t.Fatalf("rejected lifecycle terminalization crossed control boundaries: %s", joined)
+	}
+	if len(tx.execArgs) != 1 || tx.execArgs[0][1] != command.StateFailed {
+		t.Fatalf("rejected lifecycle terminal arguments=%#v", tx.execArgs)
+	}
+	if !tx.committed || len(tx.statements) != 1 {
+		t.Fatalf("committed=%v statements=%d", tx.committed, len(tx.statements))
+	}
+}
+
 func TestFinalizeConfirmationRepairsLifecycleControlStateWithoutDirectoryMutation(t *testing.T) {
 	t.Parallel()
 	candidate := controlCandidate(t)

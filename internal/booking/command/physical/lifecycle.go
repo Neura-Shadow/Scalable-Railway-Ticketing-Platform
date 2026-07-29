@@ -34,6 +34,9 @@ INSERT INTO booking_command_receipts(
 		bookingCommand.Operation, bookingCommand.RequestFingerprint[:]); err != nil {
 		return command.Receipt{}, err
 	}
+	if err := beginMutationSavepoint(ctx, tx); err != nil {
+		return command.Receipt{}, err
+	}
 
 	var receipt command.Receipt
 	var changed bool
@@ -47,6 +50,15 @@ INSERT INTO booking_command_receipts(
 		return command.Receipt{}, ErrInvalidPayload
 	}
 	if err != nil {
+		if code, permanent := rejectionCode(err); permanent {
+			if rollbackErr := rollbackMutationSavepoint(ctx, tx); rollbackErr != nil {
+				return command.Receipt{}, rollbackErr
+			}
+			if persistErr := persistRejectedReceipt(ctx, tx, bookingCommand.ID, code); persistErr != nil {
+				return command.Receipt{}, persistErr
+			}
+			return command.Receipt{}, &durableRejection{cause: err}
+		}
 		return command.Receipt{}, err
 	}
 	if changed {
@@ -58,6 +70,9 @@ INSERT INTO booking_command_receipts(
 UPDATE booking_command_receipts
 SET status='succeeded',result_type='reservation',result_id=$2,completed_at=clock_timestamp()
 WHERE command_id=$1 AND status='started'`, bookingCommand.ID, bookingCommand.ReservationID); err != nil {
+		return command.Receipt{}, err
+	}
+	if err := releaseMutationSavepoint(ctx, tx); err != nil {
 		return command.Receipt{}, err
 	}
 	return receipt, nil
@@ -115,13 +130,20 @@ func confirmReservation(ctx context.Context, tx pgx.Tx, bookingCommand command.C
 		return command.Receipt{}, false, err
 	}
 	if status != "held" && status != "confirmed" {
-		return command.Receipt{}, false, ErrInvalidPayload
+		if status == "expired" {
+			return command.Receipt{}, false, ErrReservationExpired
+		}
+		return command.Receipt{}, false, ErrInvalidLifecycleState
 	}
 	if status == "held" {
-		if err := execOne(ctx, tx, `
+		tag, err := tx.Exec(ctx, `
 UPDATE reservations SET status='confirmed'
-WHERE id=$1 AND status='held' AND expires_at>clock_timestamp()`, bookingCommand.ReservationID); err != nil {
-			return command.Receipt{}, false, ErrInvalidPayload
+			WHERE id=$1 AND status='held' AND expires_at>clock_timestamp()`, bookingCommand.ReservationID)
+		if err != nil {
+			return command.Receipt{}, false, ErrShardPersistence
+		}
+		if tag.RowsAffected() != 1 {
+			return command.Receipt{}, false, ErrReservationExpired
 		}
 	}
 	orderID := uuid.NewSHA1(bookingCommand.ID, []byte("ticket-order"))
@@ -235,7 +257,7 @@ func cancelReservation(ctx context.Context, tx pgx.Tx, bookingCommand command.Co
 		return command.Receipt{}, false, err
 	}
 	if status != "held" && status != "confirmed" && status != "cancelled" {
-		return command.Receipt{}, false, ErrInvalidPayload
+		return command.Receipt{}, false, ErrInvalidLifecycleState
 	}
 	var released int
 	if err := tx.QueryRow(ctx, `SELECT count(*)::integer FROM reservation_seats WHERE reservation_id=$1`,

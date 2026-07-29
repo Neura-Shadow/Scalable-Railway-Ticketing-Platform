@@ -351,7 +351,14 @@ func mapPhysicalCommandError(err error) error {
 		return bookingpostgres.ErrNotFound
 	case errors.Is(err, bookingcommand.ErrInvalidCommand):
 		return bookingpostgres.ErrInvalidArgument
-	case errors.Is(err, commandphysical.ErrInvalidPayload):
+	case errors.Is(err, commandphysical.ErrFareUnavailable):
+		return bookingpostgres.ErrNotBookable
+	case errors.Is(err, commandphysical.ErrInsufficientInventory):
+		return bookingpostgres.ErrInsufficientInventory
+	case errors.Is(err, commandphysical.ErrReservationExpired):
+		return bookingpostgres.ErrReservationExpired
+	case errors.Is(err, commandphysical.ErrInvalidPayload),
+		errors.Is(err, commandphysical.ErrInvalidLifecycleState):
 		return bookingpostgres.ErrInvalidState
 	case errors.Is(err, sharding.ErrAssignmentStale), errors.Is(err, sharding.ErrWriteFenced):
 		return err

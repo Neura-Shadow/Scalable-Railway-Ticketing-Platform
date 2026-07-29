@@ -56,6 +56,153 @@ func TestExecutorCommitsReservationReceiptOutboxAndWriteEvidenceTogether(t *test
 	}
 }
 
+func TestExecutorPersistsNoFareRejectionWithoutBookingMutation(t *testing.T) {
+	t.Parallel()
+
+	cmd, resolution := commandFixture(t)
+	tx := &scriptedTx{rows: []scriptedRow{
+		{err: pgx.ErrNoRows},
+		{values: []any{int64(7), true, "active", true, int64(3), "scheduled", 3}},
+		{err: pgx.ErrNoRows},
+		{err: pgx.ErrNoRows},
+	}}
+	resolution.Handle = handleForTx(t, tx, true)
+	executor, _ := commandphysical.NewExecutor(&routeResolver{resolution: resolution}, commandphysical.Options{MaxHoldTTL: time.Hour})
+
+	_, err := executor.Execute(context.Background(), cmd)
+	if !errors.Is(err, commandphysical.ErrFareUnavailable) || tx.commits != 1 || tx.rollbacks != 0 {
+		t.Fatalf("err=%v commits=%d rollbacks=%d", err, tx.commits, tx.rollbacks)
+	}
+	joined := strings.Join(tx.execs, "\n")
+	for _, fragment := range []string{"SAVEPOINT booking_command_mutation", "ROLLBACK TO SAVEPOINT booking_command_mutation", "status='rejected'"} {
+		if !strings.Contains(joined, fragment) {
+			t.Fatalf("missing rejection boundary %q: %s", fragment, joined)
+		}
+	}
+	for _, forbidden := range []string{"INSERT INTO reservations", "INSERT INTO reservation_seats", "INSERT INTO outbox_events", "train_run_target_write_evidence"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("no-fare rejection retained booking mutation %q: %s", forbidden, joined)
+		}
+	}
+}
+
+func TestExecutorRollsBackPartialSeatAllocationBeforeInventoryRejection(t *testing.T) {
+	t.Parallel()
+
+	cmd, resolution := commandFixture(t)
+	cmd.Payload.PassengerIDs = append(cmd.Payload.PassengerIDs, uuid.New())
+	tx := &scriptedTx{rows: []scriptedRow{
+		{err: pgx.ErrNoRows},
+		{values: []any{int64(7), true, "active", true, int64(3), "scheduled", 3}},
+		{err: pgx.ErrNoRows},
+		{values: []any{uuid.New(), int64(1200), "TWD"}},
+		{values: []any{uuid.New()}},
+		{err: pgx.ErrNoRows},
+	}}
+	resolution.Handle = handleForTx(t, tx, true)
+	executor, _ := commandphysical.NewExecutor(&routeResolver{resolution: resolution}, commandphysical.Options{MaxHoldTTL: time.Hour})
+
+	_, err := executor.Execute(context.Background(), cmd)
+	if !errors.Is(err, commandphysical.ErrInsufficientInventory) || tx.commits != 1 || tx.rollbacks != 0 {
+		t.Fatalf("err=%v commits=%d rollbacks=%d", err, tx.commits, tx.rollbacks)
+	}
+	joined := strings.Join(tx.execs, "\n")
+	if !strings.Contains(joined, "ROLLBACK TO SAVEPOINT booking_command_mutation") ||
+		!strings.Contains(joined, "status='rejected'") || strings.Contains(joined, "INSERT INTO reservations") {
+		t.Fatalf("partial allocation was not reduced to one durable rejection: %s", joined)
+	}
+}
+
+func TestExecutorPersistsTerminalLifecycleRejections(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		status   string
+		want     error
+		wantCode string
+	}{
+		{name: "expired hold", status: "expired", want: commandphysical.ErrReservationExpired, wantCode: "reservation_expired"},
+		{name: "cancelled confirmation", status: "cancelled", want: commandphysical.ErrInvalidLifecycleState, wantCode: "invalid_lifecycle_state"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			cmd, resolution := commandFixture(t)
+			cmd.Operation, cmd.Payload = command.OperationConfirmReservation, command.CreateReservationPayload{}
+			tx := &scriptedTx{rows: []scriptedRow{
+				{err: pgx.ErrNoRows},
+				{values: []any{int64(7), true, "active", "scheduled"}},
+				{err: pgx.ErrNoRows},
+				{values: []any{testCase.status, int64(1200), "TWD"}},
+			}}
+			resolution.Handle = handleForTx(t, tx, true)
+			executor, _ := commandphysical.NewExecutor(&routeResolver{resolution: resolution}, commandphysical.Options{MaxHoldTTL: time.Hour})
+
+			_, err := executor.Execute(context.Background(), cmd)
+			if !errors.Is(err, testCase.want) || tx.commits != 1 || tx.rollbacks != 0 {
+				t.Fatalf("err=%v commits=%d rollbacks=%d", err, tx.commits, tx.rollbacks)
+			}
+			joined := strings.Join(tx.execs, "\n")
+			if !strings.Contains(joined, "ROLLBACK TO SAVEPOINT booking_command_mutation") ||
+				!strings.Contains(joined, "status='rejected'") || strings.Contains(joined, "ticket_orders") ||
+				strings.Contains(joined, "outbox_events") || strings.Contains(joined, "train_run_target_write_evidence") {
+				t.Fatalf("terminal lifecycle rejection leaked mutation: %s", joined)
+			}
+			lastArgs := tx.execArguments[len(tx.execArguments)-1]
+			if len(lastArgs) != 2 || lastArgs[1] != testCase.wantCode {
+				t.Fatalf("rejection code arguments=%v, want %q", lastArgs, testCase.wantCode)
+			}
+		})
+	}
+}
+
+func TestExecutorReplaysBoundedRejectionAndRejectsFingerprintConflict(t *testing.T) {
+	t.Parallel()
+
+	cmd, resolution := commandFixture(t)
+	for _, testCase := range []struct {
+		name        string
+		fingerprint []byte
+		want        error
+	}{
+		{name: "same fingerprint", fingerprint: cmd.RequestFingerprint[:], want: commandphysical.ErrFareUnavailable},
+		{name: "different fingerprint", fingerprint: make([]byte, 32), want: command.ErrReceiptMismatch},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			tx := &scriptedTx{rows: []scriptedRow{{values: []any{
+				testCase.fingerprint, uuid.Nil, "rejected", "fare_unavailable",
+			}}}}
+			resolution.Handle = handleForTx(t, tx, true)
+			executor, _ := commandphysical.NewExecutor(&routeResolver{resolution: resolution}, commandphysical.Options{MaxHoldTTL: time.Hour})
+
+			_, err := executor.Execute(context.Background(), cmd)
+			if !errors.Is(err, testCase.want) || tx.commits != 0 || tx.rollbacks == 0 || len(tx.execs) != 0 {
+				t.Fatalf("err=%v commits=%d rollbacks=%d execs=%v", err, tx.commits, tx.rollbacks, tx.execs)
+			}
+		})
+	}
+}
+
+func TestExecutorDoesNotTerminalizeAmbiguousShardFailure(t *testing.T) {
+	t.Parallel()
+
+	cmd, resolution := commandFixture(t)
+	tx := &scriptedTx{rows: []scriptedRow{
+		{err: pgx.ErrNoRows},
+		{values: []any{int64(7), true, "active", true, int64(3), "scheduled", 3}},
+		{err: pgx.ErrNoRows},
+		{err: errors.New("database read interrupted")},
+	}}
+	resolution.Handle = handleForTx(t, tx, true)
+	executor, _ := commandphysical.NewExecutor(&routeResolver{resolution: resolution}, commandphysical.Options{MaxHoldTTL: time.Hour})
+
+	_, err := executor.Execute(context.Background(), cmd)
+	if !errors.Is(err, commandphysical.ErrShardPersistence) || tx.commits != 0 || tx.rollbacks == 0 ||
+		strings.Contains(strings.Join(tx.execs, "\n"), "status='rejected'") {
+		t.Fatalf("ambiguous failure terminalized: err=%v commits=%d rollbacks=%d execs=%v", err, tx.commits, tx.rollbacks, tx.execs)
+	}
+}
+
 func TestExecutorRejectsARetainedPhysicalSourceFenceBeforeAnyCommandWrite(t *testing.T) {
 	t.Parallel()
 
@@ -100,7 +247,7 @@ func TestExecutorReturnsCommittedReceiptWithoutReapplyingMutation(t *testing.T) 
 
 	cmd, resolution := commandFixture(t)
 	cmd.Payload.HoldExpiresAt = time.Now().UTC().Add(-time.Minute)
-	tx := &scriptedTx{rows: []scriptedRow{{values: []any{cmd.RequestFingerprint[:], cmd.ReservationID, "succeeded"}}}}
+	tx := &scriptedTx{rows: []scriptedRow{{values: []any{cmd.RequestFingerprint[:], cmd.ReservationID, "succeeded", ""}}}}
 	resolution.Handle = handleForTx(t, tx, false)
 	executor, err := commandphysical.NewExecutor(&routeResolver{resolution: resolution}, commandphysical.Options{MaxHoldTTL: time.Hour})
 	if err != nil {
@@ -176,7 +323,7 @@ func TestExecutorLifecycleDuplicateReturnsReceiptWithoutMutation(t *testing.T) {
 	cmd, resolution := commandFixture(t)
 	cmd.Operation, cmd.Payload = command.OperationCancelReservation, command.CreateReservationPayload{}
 	tx := &scriptedTx{rows: []scriptedRow{
-		{values: []any{cmd.RequestFingerprint[:], cmd.ReservationID, "succeeded"}},
+		{values: []any{cmd.RequestFingerprint[:], cmd.ReservationID, "succeeded", ""}},
 		{values: []any{2}},
 	}}
 	resolution.Handle = handleForTx(t, tx, false)

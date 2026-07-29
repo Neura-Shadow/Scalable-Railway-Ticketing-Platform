@@ -7,6 +7,7 @@ import (
 	"time"
 
 	bookingcommand "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command"
+	commandphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command/physical"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	"github.com/google/uuid"
 )
@@ -77,6 +78,8 @@ func TestPhysicalMetricsOutcomeVocabulary(t *testing.T) {
 		{err: sharding.ErrShardUnavailable, wantResult: "unavailable", wantReason: "database"},
 		{err: bookingcommand.ErrReceiptMismatch, wantResult: "rejected", wantReason: "receipt", coordinator: true},
 		{err: bookingcommand.ErrFinalizationDeferred, wantResult: "deferred", wantReason: "database", coordinator: true},
+		{err: commandphysical.ErrReservationExpired, wantResult: "rejected", wantReason: "validation"},
+		{err: commandphysical.ErrInvalidLifecycleState, wantResult: "rejected", wantReason: "validation", coordinator: true},
 	}
 	for _, testCase := range tests {
 		result, reason := physicalExecutionOutcome(testCase.err)
