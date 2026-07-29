@@ -3,10 +3,13 @@
 ## Invariant
 
 Global user reservation limits remain control-database authority after booking
-state moves to independent databases. A control transaction locks the user's
-scope and counts both pending and active leases. It acquires exactly one lease
-per command before shard execution, so parallel commands routed to different
-shards cannot each observe unused quota.
+state moves to independent databases. A control transaction takes the same
+stable per-user advisory lock as the legacy/logical path and counts active
+legacy claims together with pending and active physical leases. It acquires
+exactly one lease per command before shard execution, so parallel commands routed to different
+paths or shards cannot each observe unused quota. A retained legacy claim and
+physical lease for the same reservation are counted once during reverse
+migration overlap.
 
 `booking_quota_leases` binds the command, owner, train run, reservation, and
 passenger count. Its bounded states distinguish pending uncertainty, active

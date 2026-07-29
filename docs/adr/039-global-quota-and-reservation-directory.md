@@ -27,10 +27,14 @@ contains globally unique lease identity, owner, train run, passenger count,
 state, expiry, and bounded timestamps. States include `pending`, `active_hold`,
 `released`, `expired`, and `repair_required`.
 
-The control transaction serializes quota decisions for one canonical user.
-Both `pending` and `active_hold` leases count against per-user,
+The control transaction serializes quota decisions for one canonical user by
+using the same stable PostgreSQL advisory-lock namespace as legacy and logical
+booking paths. Active `reservation_quota_claims` and physical `pending` or
+`active_hold` leases count together against per-user,
 per-train-run, and passenger limits. Concurrent commands therefore cannot
-exceed the configured limits before contacting separate shards.
+exceed the configured limits before contacting separate paths or shards. When
+reverse-migration overlap exposes both representations for one reservation,
+reservation identity de-duplicates the count conservatively.
 
 Shard commit converts the pending lease to `active_hold` during idempotent
 control finalization. Cancellation and expiration release it from durable

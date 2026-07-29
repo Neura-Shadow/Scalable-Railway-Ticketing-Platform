@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command"
+	bookingquota "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/quota"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -42,6 +43,9 @@ FOR UPDATE`, request.OwnerUserID).Scan(&active); err != nil || !active {
 		repository.recordQuota("create", "duplicate", "none")
 		return existing, nil
 	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, bookingquota.UserAdvisoryLockKey(request.OwnerUserID)); err != nil {
+		return command.Command{}, ErrControlWrite
+	}
 	holdTTL := time.Until(request.Payload.HoldExpiresAt)
 	if holdTTL <= 0 || holdTTL > repository.options.LeaseTTL {
 		return command.Command{}, ErrInvalidPayload
@@ -56,12 +60,32 @@ FOR UPDATE`, request.OwnerUserID).Scan(&active); err != nil || !active {
 	}
 	var activeHolds, activeTrainRunHolds, activePassengers int
 	if err := tx.QueryRow(ctx, `
+WITH active_legacy AS (
+    SELECT reservation_id, train_run_id, passenger_count
+    FROM public.reservation_quota_claims
+    WHERE user_id = $1
+      AND active
+), active_physical AS (
+    SELECT command.reservation_id, lease.train_run_id, lease.passenger_count
+    FROM public.booking_quota_leases AS lease
+    JOIN public.booking_commands AS command
+      ON command.command_id = lease.command_id
+    WHERE lease.owner_user_id = $1
+      AND lease.state IN ('pending', 'active_hold', 'repair_required')
+      AND NOT EXISTS (
+          SELECT 1
+          FROM active_legacy AS legacy
+          WHERE legacy.reservation_id = command.reservation_id
+      )
+), counted AS (
+    SELECT train_run_id, passenger_count FROM active_legacy
+    UNION ALL
+    SELECT train_run_id, passenger_count FROM active_physical
+)
 SELECT count(*)::integer,
        count(*) FILTER (WHERE train_run_id = $2)::integer,
        COALESCE(sum(passenger_count), 0)::integer
-FROM public.booking_quota_leases
-WHERE owner_user_id = $1
-  AND state IN ('pending', 'active_hold', 'repair_required')`,
+FROM counted`,
 		request.OwnerUserID,
 		request.TrainRunID,
 	).Scan(&activeHolds, &activeTrainRunHolds, &activePassengers); err != nil {
