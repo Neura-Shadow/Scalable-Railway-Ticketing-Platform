@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -105,6 +106,116 @@ func TestLoadFromForSchemaPOCUsesKnownLogicalShardDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadFromForParsesBoundedPhysicalShardControls(t *testing.T) {
+	t.Parallel()
+
+	env := validBookingShardAPIEnvironment()
+	env["BOOKING_SHARD_MODE"] = "physical"
+	env["BOOKING_SHARD_IDS"] = "physical-shard-0,physical-shard-1"
+	env["BOOKING_SHARD_0_DATABASE_URL"] = "postgres://booking@shard-0.example/railway"
+	env["BOOKING_SHARD_1_DATABASE_URL"] = "postgres://booking@shard-1.example/railway"
+	env["PHYSICAL_SHARD_MAX_COUNT"] = "2"
+	env["PHYSICAL_SHARD_MAX_OPEN_CONNS"] = "8"
+	env["PHYSICAL_SHARD_MAX_IDLE_CONNS"] = "4"
+	env["PHYSICAL_SHARD_CONN_MAX_LIFETIME_SECONDS"] = "300"
+	env["PHYSICAL_SHARD_CONN_MAX_IDLE_TIME_SECONDS"] = "60"
+	env["PHYSICAL_SHARD_CONNECT_TIMEOUT"] = "2s"
+	env["PHYSICAL_SHARD_QUERY_TIMEOUT"] = "1500ms"
+	env["PHYSICAL_SHARD_TOTAL_POOL_BUDGET"] = "16"
+
+	cfg, err := config.LoadFromFor(mapLookup(env), config.ProcessAPI)
+	if err != nil {
+		t.Fatalf("LoadFromFor(api) error = %v", err)
+	}
+	if cfg.BookingShardMode != config.BookingShardModePhysical ||
+		!reflect.DeepEqual(cfg.BookingShardIDs, []string{"physical-shard-0", "physical-shard-1"}) {
+		t.Fatalf("physical shard identity = mode %q ids %v", cfg.BookingShardMode, cfg.BookingShardIDs)
+	}
+	wantConnections := map[string]string{
+		"physical-shard-0": env["BOOKING_SHARD_0_DATABASE_URL"],
+		"physical-shard-1": env["BOOKING_SHARD_1_DATABASE_URL"],
+	}
+	if !reflect.DeepEqual(cfg.PhysicalShardConnections, wantConnections) {
+		t.Fatalf("PhysicalShardConnections keys/values did not match configured secrets")
+	}
+	if cfg.PhysicalShardMaxCount != 2 || cfg.PhysicalShardMaxOpenConns != 8 ||
+		cfg.PhysicalShardMaxIdleConns != 4 || cfg.PhysicalShardConnMaxLifetime != 5*time.Minute ||
+		cfg.PhysicalShardConnMaxIdleTime != time.Minute || cfg.PhysicalShardConnectTimeout != 2*time.Second ||
+		cfg.PhysicalShardQueryTimeout != 1500*time.Millisecond || cfg.PhysicalShardTotalPoolBudget != 16 {
+		t.Fatalf("physical shard bounds = %+v", cfg)
+	}
+}
+
+func TestConfigStringRedactsPhysicalShardConnectionSecrets(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Defaults()
+	cfg.BookingShardMode = config.BookingShardModePhysical
+	cfg.BookingShardIDs = []string{"physical-shard-0"}
+	cfg.PhysicalShardConnections = map[string]string{
+		"physical-shard-0": "postgres://booking:sentinel-secret@shard.example/railway",
+	}
+
+	formatted := fmt.Sprint(cfg)
+	if strings.Contains(formatted, "sentinel-secret") || strings.Contains(formatted, "shard.example") {
+		t.Fatalf("formatted config exposed a physical shard connection secret: %s", formatted)
+	}
+	if !strings.Contains(formatted, "physical-shard-0") {
+		t.Fatalf("formatted config omitted bounded shard identity: %s", formatted)
+	}
+}
+
+func TestLoadFromForRejectsUnsafePhysicalShardControls(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(map[string]string)
+		want   string
+	}{
+		{
+			name: "missing connection secret",
+			mutate: func(env map[string]string) {
+				delete(env, "BOOKING_SHARD_1_DATABASE_URL")
+			},
+			want: "allowlisted connection secret",
+		},
+		{
+			name: "duplicate database endpoint",
+			mutate: func(env map[string]string) {
+				env["BOOKING_SHARD_1_DATABASE_URL"] = env["BOOKING_SHARD_0_DATABASE_URL"]
+			},
+			want: "distinct databases",
+		},
+		{
+			name: "unsafe aggregate pool budget",
+			mutate: func(env map[string]string) {
+				env["PHYSICAL_SHARD_TOTAL_POOL_BUDGET"] = "15"
+			},
+			want: "PHYSICAL_SHARD_TOTAL_POOL_BUDGET",
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			env := validBookingShardAPIEnvironment()
+			env["BOOKING_SHARD_MODE"] = "physical"
+			env["BOOKING_SHARD_IDS"] = "physical-shard-0,physical-shard-1"
+			env["BOOKING_SHARD_0_DATABASE_URL"] = "postgres://booking@shard-0.example/railway"
+			env["BOOKING_SHARD_1_DATABASE_URL"] = "postgres://booking@shard-1.example/railway"
+			env["PHYSICAL_SHARD_MAX_OPEN_CONNS"] = "8"
+			env["PHYSICAL_SHARD_TOTAL_POOL_BUDGET"] = "16"
+			test.mutate(env)
+
+			_, err := config.LoadFromFor(mapLookup(env), config.ProcessAPI)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("LoadFromFor(api) error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestLoadFromForRejectsUnsafeBookingShardControls(t *testing.T) {
 	t.Parallel()
 
@@ -115,7 +226,7 @@ func TestLoadFromForRejectsUnsafeBookingShardControls(t *testing.T) {
 	}{
 		{
 			name: "unknown mode",
-			set:  map[string]string{"BOOKING_SHARD_MODE": "physical"},
+			set:  map[string]string{"BOOKING_SHARD_MODE": "remote"},
 			want: "BOOKING_SHARD_MODE",
 		},
 		{
