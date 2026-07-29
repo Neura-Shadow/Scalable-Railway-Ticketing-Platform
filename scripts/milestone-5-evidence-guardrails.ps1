@@ -203,10 +203,12 @@ function Assert-Milestone5ScenarioMetrics {
 function ConvertFrom-Milestone5K6Summary {
     param(
         [Parameter(Mandatory = $true)][object]$Summary,
-        [Parameter(Mandatory = $true)][string]$Scenario
+        [Parameter(Mandatory = $true)][string]$Scenario,
+        [int]$K6ExitCode = 0
     )
 
     if ($Scenario -notin (Get-Milestone5ScenarioNames)) { throw 'unknown Milestone 5 scenario' }
+    if ($K6ExitCode -ne 0) { throw "$Scenario k6 process failed" }
     $metrics = Get-Milestone5OptionalValue -Object $Summary -Name 'metrics'
     if ($null -eq $metrics) { throw "$Scenario k6 summary omitted metrics" }
     $checks = Get-Milestone5OptionalValue -Object $metrics -Name 'checks'
@@ -233,7 +235,13 @@ function ConvertFrom-Milestone5K6Summary {
         $thresholds = Get-Milestone5OptionalValue -Object $metric.Value -Name 'thresholds'
         if ($null -eq $thresholds) { continue }
         foreach ($threshold in $thresholds.PSObject.Properties) {
-            if (-not [bool](Get-Milestone5OptionalValue -Object $threshold.Value -Name 'ok' -Default $false)) {
+            # k6 0.54 legacy --summary-export writes threshold definitions as
+            # booleans (commonly false for abortOnFail), not pass/fail results.
+            # The process exit code is authoritative for that format. Newer
+            # object-shaped summaries expose an explicit `ok` result.
+            if ($threshold.Value -is [bool]) { continue }
+            $ok = Get-Milestone5OptionalValue -Object $threshold.Value -Name 'ok'
+            if ($ok -isnot [bool] -or -not $ok) {
                 throw "$Scenario k6 threshold failed"
             }
         }

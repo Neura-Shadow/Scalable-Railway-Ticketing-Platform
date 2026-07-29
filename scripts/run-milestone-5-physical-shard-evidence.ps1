@@ -210,7 +210,8 @@ function Invoke-Milestone5K6 {
     $result.Output | Out-File -LiteralPath (Join-Path $script:rawDirectory "$Scenario.log") -Encoding utf8
     if ($result.ExitCode -ne 0) { throw "$Scenario k6 workload failed" }
     $rawSummary = Get-Content -Raw -LiteralPath $summaryPath | ConvertFrom-Json
-    $strict = ConvertFrom-Milestone5K6Summary -Summary $rawSummary -Scenario $Scenario
+    $strict = ConvertFrom-Milestone5K6Summary -Summary $rawSummary -Scenario $Scenario `
+        -K6ExitCode $result.ExitCode
     Write-Milestone5JsonAtomic `
         -Path (Join-Path $script:canonicalDirectory "$Scenario.json") -Value $strict
     return $strict

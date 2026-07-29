@@ -82,6 +82,22 @@ $strict = ConvertFrom-Milestone5K6Summary -Summary (New-StrictK6Summary) `
 Assert-True -Condition ($strict.status -eq 'passed' -and $strict.checks_failed -eq 0 -and
     $strict.iterations -eq 2 -and $strict.http_requests -eq 8) `
     -Message 'strict k6 conversion did not preserve non-vacuous execution evidence'
+$legacyThresholdSummary = New-StrictK6Summary
+foreach ($metric in $legacyThresholdSummary.metrics.PSObject.Properties) {
+    $thresholds = Get-Milestone5OptionalValue -Object $metric.Value -Name 'thresholds'
+    if ($null -eq $thresholds) { continue }
+    foreach ($threshold in $thresholds.PSObject.Properties) {
+        $threshold.Value = $false
+    }
+}
+$legacyStrict = ConvertFrom-Milestone5K6Summary -Summary $legacyThresholdSummary `
+    -Scenario 'physical-shard-routing' -K6ExitCode 0
+Assert-True -Condition ($legacyStrict.status -eq 'passed') `
+    -Message 'k6 0.54 legacy boolean threshold metadata was misread as a failed threshold'
+Assert-Throws -Label 'nonzero k6 exit code' -Action {
+    ConvertFrom-Milestone5K6Summary -Summary $legacyThresholdSummary `
+        -Scenario 'physical-shard-routing' -K6ExitCode 99 | Out-Null
+}
 Assert-Throws -Label 'failed k6 checks' -Action {
     ConvertFrom-Milestone5K6Summary -Summary (New-StrictK6Summary -Failures 1) `
         -Scenario 'physical-shard-routing' | Out-Null
