@@ -249,7 +249,7 @@ function Move-Milestone5Migration {
     param(
         [Parameter(Mandatory = $true)][object]$Context,
         [Parameter(Mandatory = $true)][string]$MigrationID,
-        [Parameter(Mandatory = $true)][ValidateSet('base_copying', 'catching_up', 'validating_online', 'draining', 'rollback_window')][string]$Target,
+        [Parameter(Mandatory = $true)][ValidateSet('capture_enabled', 'base_copying', 'catching_up', 'validating_online', 'draining', 'rollback_window')][string]$Target,
         [Parameter(Mandatory = $true)][string]$Prefix,
         [switch]$ReverseStart
     )
@@ -593,6 +593,8 @@ function Initialize-Milestone5Evidence {
         FinalWritePauseMs=0.0; MaximumFinalWritePauseMs=30000.0; TargetEraReservationID=''; TargetWriteObservedBeforeReverse=$false
         OnlineCopyReservationCountBefore=-1L; OnlineCopyJournalCountBefore=-1L
         OnlineCopyMutationDelta=-1L; OnlineCopyJournalDelta=-1L
+        BaseCopyStartedAtUtc=$null; BaseCopyElapsedMs=0.0
+        JournalReplayStartedAtUtc=$null; JournalReplayElapsedMs=0.0
     }
     $state.Customers = New-Milestone5DriverCustomers -State $state -Count 24
     Add-Milestone5DriverQuotaBaseline -State $state
@@ -625,7 +627,7 @@ function Start-Milestone5DriverJob {
             return [pscustomobject]@{ final_write_pause_ms=([DateTimeOffset]::UtcNow-$started).TotalMilliseconds }
         }
         Move-Milestone5Migration -Context $JobContext -MigrationID $MigrationID -Target $Target -Prefix "$Scenario-job"
-        return [pscustomobject]@{ state=$Target }
+        return [pscustomobject]@{ state=$Target; completed_at_utc=[DateTimeOffset]::UtcNow.ToString('o') }
     } -ArgumentList $driverPath,$jobContext,$Scenario,$MigrationID,$Target,$DelayMilliseconds,$measurePauseEnabled
     $State.Jobs[$Scenario] = $job
 }
@@ -704,6 +706,8 @@ function Start-Milestone5Scenario {
         }
         'online-base-copy' {
             New-Milestone5Migration -Context $Context -TrainRunID $script:M5TrainC -TargetShard 'physical-shard-0' -MigrationID $script:M5MigrationC -Prefix 'train-c'
+            Move-Milestone5Migration -Context $Context -MigrationID $script:M5MigrationC -Target capture_enabled -Prefix 'train-c'
+            $State.BaseCopyStartedAtUtc = [DateTimeOffset]::UtcNow
             Move-Milestone5Migration -Context $Context -MigrationID $script:M5MigrationC -Target base_copying -Prefix 'train-c'
             $State.OnlineCopyReservationCountBefore = Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'online-copy-reservations-before.log' -SQL "SELECT count(*) FROM public.reservations WHERE train_run_id='$script:M5TrainC'::uuid;"
             $State.OnlineCopyJournalCountBefore = Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'online-copy-journal-before.log' -SQL "SELECT count(*) FROM public.physical_source_train_run_mutation_journal WHERE migration_id='$script:M5MigrationC'::uuid;"
@@ -759,7 +763,15 @@ function Stop-Milestone5Scenario {
             throw 'outage shard did not recover'
         }
         'online-base-copy' {
-            Stop-Milestone5DriverJob -State $State -Scenario $Scenario | Out-Null
+            $output = @(Stop-Milestone5DriverJob -State $State -Scenario $Scenario)
+            $measurement = @($output | Where-Object { $null -ne $_.PSObject.Properties['completed_at_utc'] }) | Select-Object -Last 1
+            if ($null -eq $measurement -or $null -eq $State.BaseCopyStartedAtUtc) {
+                throw 'online base copy omitted full-phase wall-clock boundaries'
+            }
+            $completedAt = [DateTimeOffset]::Parse([string]$measurement.completed_at_utc)
+            $State.BaseCopyElapsedMs = ($completedAt - [DateTimeOffset]$State.BaseCopyStartedAtUtc).TotalMilliseconds
+            $State.JournalReplayStartedAtUtc = $completedAt
+            if ($State.BaseCopyElapsedMs -le 0) { throw 'online base copy elapsed time was not positive' }
             $reservationAfter = Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'online-copy-reservations-after.log' -SQL "SELECT count(*) FROM public.reservations WHERE train_run_id='$script:M5TrainC'::uuid;"
             $journalAfter = Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'online-copy-journal-after.log' -SQL "SELECT count(*) FROM public.physical_source_train_run_mutation_journal WHERE migration_id='$script:M5MigrationC'::uuid;"
             $State.OnlineCopyMutationDelta = $reservationAfter - [int64]$State.OnlineCopyReservationCountBefore
@@ -768,7 +780,16 @@ function Stop-Milestone5Scenario {
                 throw 'online base copy did not produce real source mutations and journal progress'
             }
         }
-        'journal-catchup' { Stop-Milestone5DriverJob -State $State -Scenario $Scenario | Out-Null }
+        'journal-catchup' {
+            $output = @(Stop-Milestone5DriverJob -State $State -Scenario $Scenario)
+            $measurement = @($output | Where-Object { $null -ne $_.PSObject.Properties['completed_at_utc'] }) | Select-Object -Last 1
+            if ($null -eq $measurement -or $null -eq $State.JournalReplayStartedAtUtc) {
+                throw 'journal catch-up omitted full-phase wall-clock boundaries'
+            }
+            $completedAt = [DateTimeOffset]::Parse([string]$measurement.completed_at_utc)
+            $State.JournalReplayElapsedMs = ($completedAt - [DateTimeOffset]$State.JournalReplayStartedAtUtc).TotalMilliseconds
+            if ($State.JournalReplayElapsedMs -le 0) { throw 'journal replay elapsed time was not positive' }
+        }
         'physical-cutover' {
             $output = @(Stop-Milestone5DriverJob -State $State -Scenario $Scenario)
             $measurement = @($output | Where-Object { $null -ne $_.PSObject.Properties['final_write_pause_ms'] }) | Select-Object -Last 1
@@ -819,14 +840,16 @@ SELECT count(*) FROM latest JOIN public.train_run_shard_assignments a USING(trai
 "@
     $directoryMismatch=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'directory-mismatches.log' -SQL "SELECT count(*) FROM public.reservation_directory d JOIN public.booking_commands c ON c.command_id=d.command_id WHERE c.train_run_id IN ('$script:M5TrainA'::uuid,'$script:M5TrainB'::uuid,'$script:M5TrainC'::uuid) AND (d.reservation_id<>c.reservation_id OR d.last_known_shard_id<>c.target_shard_id OR d.last_known_generation<>c.assignment_generation OR d.state<>'active' OR c.state<>'finalized');"
     $quotaViolations=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'quota-violations.log' -SQL "WITH active AS(SELECT owner_user_id,train_run_id,passenger_count FROM public.booking_quota_leases WHERE state IN('pending','active_hold','repair_required') AND expires_at>clock_timestamp()), violations AS(SELECT owner_user_id FROM active GROUP BY owner_user_id HAVING count(*)>10 OR sum(passenger_count)>24 UNION SELECT owner_user_id FROM active GROUP BY owner_user_id,train_run_id HAVING count(*)>3) SELECT count(*) FROM violations;"
-    $journalGaps=0L; $applyConflicts=0L; $receiptConflicts=0L
+    $journalGaps=0L; $applyConflicts=0L; $receiptConflicts=0L; $publishedPhysicalOutboxEvents=0L
     $journalGaps += Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'journal-gaps-control.log' -SQL "SELECT count(*) FROM (SELECT migration_id FROM public.physical_source_train_run_mutation_journal GROUP BY migration_id HAVING max(mutation_sequence)-min(mutation_sequence)+1<>count(*)) gaps;"
     foreach($entry in @(@('booking-shard-0-postgres','0'),@('booking-shard-1-postgres','1'))){
         $journalGaps += Get-Milestone5DriverScalar -Context $Context -Service $entry[0] -Artifact "journal-gaps-shard-$($entry[1]).log" -SQL "SELECT count(*) FROM (SELECT migration_id FROM public.train_run_mutation_journal GROUP BY migration_id HAVING max(mutation_sequence)-min(mutation_sequence)+1<>count(*)) gaps;"
         $applyConflicts += Get-Milestone5DriverScalar -Context $Context -Service $entry[0] -Artifact "apply-conflicts-shard-$($entry[1]).log" -SQL "SELECT count(*) FROM public.migration_apply_receipts WHERE octet_length(apply_fingerprint)<>32 OR mutation_sequence<=0;"
         $receiptConflicts += Get-Milestone5DriverScalar -Context $Context -Service $entry[0] -Artifact "receipt-conflicts-shard-$($entry[1]).log" -SQL "SELECT count(*) FROM public.booking_command_receipts r WHERE (r.status='succeeded' AND (r.result_id IS NULL OR r.completed_at IS NULL)) OR octet_length(r.request_fingerprint)<>32;"
+        $publishedPhysicalOutboxEvents += Get-Milestone5DriverScalar -Context $Context -Service $entry[0] -Artifact "published-outbox-shard-$($entry[1]).log" -SQL "SELECT count(*) FROM public.outbox_events WHERE status='published' AND published_at IS NOT NULL;"
     }
     $unreconciled=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'unreconciled-commands.log' -SQL "SELECT count(*) FROM public.booking_commands WHERE train_run_id IN ('$script:M5TrainA'::uuid,'$script:M5TrainB'::uuid,'$script:M5TrainC'::uuid) AND state NOT IN('finalized','failed','expired');"
+    $physicalReadModelReceipts=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'physical-read-model-receipts.log' -SQL "SELECT count(DISTINCT d.reservation_id) FROM public.reservation_directory d WHERE d.train_run_id IN ('$script:M5TrainA'::uuid,'$script:M5TrainB'::uuid,'$script:M5TrainC'::uuid) AND d.state='active' AND EXISTS (SELECT 1 FROM public.read_model_event_receipts r WHERE r.aggregate_type='reservation' AND r.aggregate_id=d.reservation_id);"
     $connectionEvidence = [ordered]@{}
     foreach ($entry in @(
         @('control-postgres', 'control_postgres'),
@@ -845,6 +868,8 @@ SELECT count(*) FROM latest JOIN public.train_run_shard_assignments a USING(trai
         assignment_ledger_mismatches=$assignmentMismatch; directory_mismatches=$directoryMismatch; quota_violations=$quotaViolations
         journal_gaps=$journalGaps; apply_receipt_conflicts=$applyConflicts; command_receipt_conflicts=$receiptConflicts; unreconciled_commands=$unreconciled
         online_copy_mutation_delta=[int64]$State.OnlineCopyMutationDelta; online_copy_journal_delta=[int64]$State.OnlineCopyJournalDelta
+        published_physical_outbox_events=$publishedPhysicalOutboxEvents
+        physical_read_model_receipts=$physicalReadModelReceipts
         control_postgres_connections=[int64]$connectionEvidence.control_postgres_connections
         control_postgres_max_connections=[int64]$connectionEvidence.control_postgres_max_connections
         booking_shard_0_postgres_connections=[int64]$connectionEvidence.booking_shard_0_postgres_connections
@@ -860,9 +885,7 @@ function Get-Milestone5MigrationEvidence {
     $reverseGeneration=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'reverse-generation.log' -SQL "SELECT target_generation FROM public.physical_shard_migrations WHERE migration_id='$script:M5MigrationCReverse'::uuid;"
     $preserved=Get-Milestone5DriverScalar -Context $Context -Service 'booking-shard-0-postgres' -Artifact 'target-write-after-reverse.log' -SQL "SELECT count(*) FROM public.reservations WHERE id='$($State.TargetEraReservationID)'::uuid AND train_run_id='$script:M5TrainC'::uuid AND assignment_generation=$reverseGeneration;"
     $rowsCopied=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'base-copy-rows.log' -SQL "SELECT rows_copied FROM public.physical_shard_migrations WHERE migration_id='$script:M5MigrationC'::uuid;"
-    $baseCopyDurationMs=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'base-copy-duration-ms.log' -SQL "SELECT GREATEST(1,(extract(epoch FROM (completed_at-created_at))*1000)::bigint) FROM public.physical_shard_migration_checkpoints WHERE migration_id='$script:M5MigrationC'::uuid AND checkpoint_kind='base_copy' AND object_name='migration_engine' AND status='completed';"
     $rowsReplayed=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'journal-replay-rows.log' -SQL "SELECT rows_replayed FROM public.physical_shard_migrations WHERE migration_id='$script:M5MigrationC'::uuid;"
-    $journalReplayDurationMs=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'journal-replay-duration-ms.log' -SQL "SELECT GREATEST(1,(extract(epoch FROM (completed_at-created_at))*1000)::bigint) FROM public.physical_shard_migration_checkpoints WHERE migration_id='$script:M5MigrationC'::uuid AND checkpoint_kind='journal_replay' AND object_name='migration_engine' AND status='completed';"
     $journalLag=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'final-journal-lag.log' -SQL "SELECT GREATEST(COALESCE(final_source_sequence,0)-COALESCE(last_replayed_sequence,0),0) FROM public.physical_shard_migrations WHERE migration_id='$script:M5MigrationC'::uuid;"
     $forwardDurationMs=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'forward-migration-duration-ms.log' -SQL "SELECT GREATEST(1,(extract(epoch FROM (assignment_switched_at-created_at))*1000)::bigint) FROM public.physical_shard_migrations WHERE migration_id='$script:M5MigrationC'::uuid AND assignment_switched_at IS NOT NULL;"
     $reverseDurationMs=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'reverse-migration-duration-ms.log' -SQL "SELECT GREATEST(1,(extract(epoch FROM (assignment_switched_at-created_at))*1000)::bigint) FROM public.physical_shard_migrations WHERE migration_id='$script:M5MigrationCReverse'::uuid AND reverse_migration AND assignment_switched_at IS NOT NULL;"
@@ -870,10 +893,10 @@ function Get-Milestone5MigrationEvidence {
     $preservedAfter=($preserved -eq 1)
     return [ordered]@{
         final_write_pause_ms=[double]$State.FinalWritePauseMs; maximum_final_write_pause_ms=[double]$State.MaximumFinalWritePauseMs
-        rows_copied=$rowsCopied; base_copy_duration_ms=$baseCopyDurationMs
-        base_copy_rows_per_second=[Math]::Round(($rowsCopied*1000.0)/$baseCopyDurationMs,3)
-        rows_replayed=$rowsReplayed; journal_replay_duration_ms=$journalReplayDurationMs
-        journal_replay_rows_per_second=[Math]::Round(($rowsReplayed*1000.0)/$journalReplayDurationMs,3)
+        rows_copied=$rowsCopied; base_copy_elapsed_ms=[Math]::Round([double]$State.BaseCopyElapsedMs,3)
+        base_copy_rows_per_second=[Math]::Round(($rowsCopied*1000.0)/[double]$State.BaseCopyElapsedMs,3)
+        rows_replayed=$rowsReplayed; journal_replay_elapsed_ms=[Math]::Round([double]$State.JournalReplayElapsedMs,3)
+        journal_replay_rows_per_second=[Math]::Round(($rowsReplayed*1000.0)/[double]$State.JournalReplayElapsedMs,3)
         final_journal_lag=$journalLag; forward_migration_duration_ms=$forwardDurationMs
         reverse_migration_duration_ms=$reverseDurationMs
         target_write_observed_before_reverse=$observedBefore; target_write_preserved_after_reverse=$preservedAfter

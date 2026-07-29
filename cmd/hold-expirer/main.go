@@ -211,8 +211,12 @@ WHERE shard_id IN ('legacy', 'shard-0', 'shard-1')`, sharding.SupportedFencingPr
 }
 
 func physicalWorkerConfig(cfg config.Config, shardCount int) physicalworker.Config {
+	maxConcurrency := cfg.WorkerShardConcurrency
+	if maxConcurrency > shardCount {
+		maxConcurrency = shardCount
+	}
 	return physicalworker.Config{
-		MaxConcurrency: shardCount,
+		MaxConcurrency: maxConcurrency,
 		PerShardLimit:  cfg.HoldExpirerBatchSize,
 		PassLimit:      cfg.HoldExpirerBatchSize,
 		ShardTimeout:   cfg.PhysicalWorkerShardTimeout,

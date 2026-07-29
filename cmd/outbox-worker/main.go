@@ -239,8 +239,12 @@ func outboxReadinessTimeout(cfg config.Config) time.Duration {
 }
 
 func physicalOutboxWorkerConfig(cfg config.Config, shardCount int) physicalworker.Config {
+	maxConcurrency := cfg.WorkerShardConcurrency
+	if maxConcurrency > shardCount {
+		maxConcurrency = shardCount
+	}
 	return physicalworker.Config{
-		MaxConcurrency: shardCount,
+		MaxConcurrency: maxConcurrency,
 		PerShardLimit:  cfg.OutboxBatchSize,
 		PassLimit:      cfg.OutboxBatchSize,
 		ShardTimeout:   cfg.PhysicalWorkerShardTimeout,

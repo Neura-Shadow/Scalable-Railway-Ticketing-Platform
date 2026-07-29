@@ -30,7 +30,7 @@ multi-region, or exactly-once distributed-transaction evidence.
 | Cross-shard quota | 4 / 2 | 6 / 0 failed | 29.339 / 56.949 / 60.088 | 2 holds and 2 conservative rejections; no unexpected 5xx |
 | Command recovery | 3 / 1 | 3 / 0 failed | 12.552 / 22.379 / 23.252 | one repaired command; no duplicate observation |
 | Shard outage | 8 / 8 | 8 / 0 failed | 527.448 / 991.684 / 992.254 | 4 expected 503s and 2 healthy-shard commits; no fallback writer |
-| Online base copy | 12 / 4 | 16 / 0 failed | 9.612 / 99.754 / 120.056 | 4 source writes while copy ran; no duplicate observation |
+| Online base copy | 12 / 4 | 16 / 0 failed | 9.612 / 99.754 / 120.056 | 2 distinct source writes plus idempotent replays while copy ran; no duplicate observation |
 | Journal catch-up | 6 / 3 | 9 / 0 failed | 30.798 / 91.784 / 98.213 | 3 source mutations; no duplicate apply effect |
 | Physical cutover | 16 / 16 | 16 / 0 failed | 14.039 / 40.722 / 55.331 | 2 pause observations, 2 post-cutover successes, no split brain |
 | Stale router | 6 / 3 | 6 / 0 failed | 46.990 / 142.427 / 149.228 | 3 refresh successes; no split brain |

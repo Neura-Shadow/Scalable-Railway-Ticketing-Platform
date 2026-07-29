@@ -61,11 +61,20 @@ foreach ($required in @(
     'target_write_preserved_after_reverse', 'M5EvidenceDriverPath',
     'stale-prewarm-$index.log', 'Complete-Milestone5MigrationAfterRollbackWindow',
     'rollback_deadline_at<=clock_timestamp()', '$Prefix-complete.log',
-    'LEGACY_TRAIN_RUN_ID=$script:M5TrainF'
+    'LEGACY_TRAIN_RUN_ID=$script:M5TrainF',
+    'BaseCopyStartedAtUtc', 'base_copy_elapsed_ms',
+    'JournalReplayStartedAtUtc', 'journal_replay_elapsed_ms',
+    'published_physical_outbox_events', 'physical_read_model_receipts',
+    "-Target capture_enabled -Prefix 'train-c'",
+    'completed_at_utc=[DateTimeOffset]::UtcNow.ToString'
 )) {
     Assert-True -Condition $driver.Contains($required) `
         -Message "driver omitted trusted evidence token $required"
 }
+Assert-True -Condition (-not $driver.Contains("checkpoint_kind='base_copy' AND object_name='migration_engine'")) `
+    -Message 'base-copy throughput must not omit its first batch by using the late checkpoint insertion time'
+Assert-True -Condition (-not $driver.Contains("checkpoint_kind='journal_replay' AND object_name='migration_engine'")) `
+    -Message 'journal throughput must use the complete wall-clock replay phase rather than controller checkpoint timing'
 Assert-True -Condition (-not $driver.Contains('$MyInvocation.MyCommand.Path')) `
     -Message 'background transition jobs must use the driver path captured while the script is dot-sourced'
 Assert-True -Condition $driver.Contains('$MeasurePause.IsPresent') `

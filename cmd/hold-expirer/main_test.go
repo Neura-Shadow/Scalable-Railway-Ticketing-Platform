@@ -30,10 +30,16 @@ func TestPhysicalWorkerConfigKeepsBatchAsGlobalPassLimit(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.HoldExpirerBatchSize = 51
 	cfg.PhysicalWorkerShardTimeout = 3 * time.Second
+	cfg.WorkerShardConcurrency = 1
 
 	got := physicalWorkerConfig(cfg, 2)
-	if got.MaxConcurrency != 2 || got.PerShardLimit != 51 || got.PassLimit != 51 || got.ShardTimeout != 3*time.Second {
+	if got.MaxConcurrency != 1 || got.PerShardLimit != 51 || got.PassLimit != 51 || got.ShardTimeout != 3*time.Second {
 		t.Fatalf("physicalWorkerConfig() = %+v", got)
+	}
+
+	cfg.WorkerShardConcurrency = 3
+	if got := physicalWorkerConfig(cfg, 2); got.MaxConcurrency != 2 {
+		t.Fatalf("physicalWorkerConfig() capped concurrency = %d, want 2", got.MaxConcurrency)
 	}
 }
 

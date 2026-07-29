@@ -274,7 +274,10 @@ function Assert-Milestone5DatabaseInvariants {
         }
     }
     $positive = [ordered]@{}
-    foreach ($name in @('online_copy_mutation_delta', 'online_copy_journal_delta')) {
+    foreach ($name in @(
+        'online_copy_mutation_delta', 'online_copy_journal_delta',
+        'published_physical_outbox_events', 'physical_read_model_receipts'
+    )) {
         $value = Get-Milestone5OptionalValue -Object $Evidence -Name $name
         $parsed = 0L
         if ($null -eq $value -or -not [int64]::TryParse([string]$value, [ref]$parsed) -or $parsed -lt 1) {
@@ -320,6 +323,8 @@ function Assert-Milestone5DatabaseInvariants {
         unreconciled_commands = 0
         online_copy_mutation_delta = $positive.online_copy_mutation_delta
         online_copy_journal_delta = $positive.online_copy_journal_delta
+        published_physical_outbox_events = $positive.published_physical_outbox_events
+        physical_read_model_receipts = $positive.physical_read_model_receipts
         control_postgres_connections = $connections.control_postgres_connections
         control_postgres_max_connections = $connections.control_postgres_max_connections
         booking_shard_0_postgres_connections = $connections.booking_shard_0_postgres_connections
@@ -353,8 +358,8 @@ function Assert-Milestone5MeasuredMigrationEvidence {
     }
     $positiveMeasurements = [ordered]@{}
     foreach ($name in @(
-        'rows_copied', 'base_copy_duration_ms', 'base_copy_rows_per_second',
-        'rows_replayed', 'journal_replay_duration_ms', 'journal_replay_rows_per_second',
+        'rows_copied', 'base_copy_elapsed_ms', 'base_copy_rows_per_second',
+        'rows_replayed', 'journal_replay_elapsed_ms', 'journal_replay_rows_per_second',
         'forward_migration_duration_ms', 'reverse_migration_duration_ms'
     )) {
         $value = Get-Milestone5OptionalValue -Object $Evidence -Name $name
@@ -376,10 +381,10 @@ function Assert-Milestone5MeasuredMigrationEvidence {
         final_write_pause_ms = [Math]::Round($pauseValue, 3)
         maximum_final_write_pause_ms = [Math]::Round($limitValue, 3)
         rows_copied = [int64]$positiveMeasurements.rows_copied
-        base_copy_duration_ms = [int64]$positiveMeasurements.base_copy_duration_ms
+        base_copy_elapsed_ms = [Math]::Round($positiveMeasurements.base_copy_elapsed_ms, 3)
         base_copy_rows_per_second = [Math]::Round($positiveMeasurements.base_copy_rows_per_second, 3)
         rows_replayed = [int64]$positiveMeasurements.rows_replayed
-        journal_replay_duration_ms = [int64]$positiveMeasurements.journal_replay_duration_ms
+        journal_replay_elapsed_ms = [Math]::Round($positiveMeasurements.journal_replay_elapsed_ms, 3)
         journal_replay_rows_per_second = [Math]::Round($positiveMeasurements.journal_replay_rows_per_second, 3)
         final_journal_lag = $parsedJournalLag
         forward_migration_duration_ms = [int64]$positiveMeasurements.forward_migration_duration_ms

@@ -54,7 +54,9 @@ export default function () {
   }
   const committedReplay = created.status === 201 && replay.status === 201
     && createdID.length > 0 && createdID === replayID;
-  if (availability.status === 200 && committedReplay) baseCopySourceSuccess.add(1);
+  // One VU owns one durable command identity. Later iterations are explicit
+  // replay probes and must not inflate the distinct source-mutation count.
+  if (__ITER === 0 && availability.status === 200 && committedReplay) baseCopySourceSuccess.add(1);
 
   check({ availability, created, replay, createdID, replayID }, {
     'source availability remains readable during base copy': (value) => availabilityCountIsValid(value.availability),
