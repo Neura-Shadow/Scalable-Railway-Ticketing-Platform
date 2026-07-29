@@ -126,6 +126,80 @@ function Assert-Milestone5Status {
     }
 }
 
+function Get-Milestone5MetricCount {
+    param(
+        [Parameter(Mandatory = $true)][object]$Metrics,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Scenario
+    )
+    $metric = Get-Milestone5OptionalValue -Object $Metrics -Name $Name
+    $values = Get-Milestone5OptionalValue -Object $metric -Name 'values' -Default $metric
+    $value = Get-Milestone5OptionalValue -Object $values -Name 'count'
+    $parsed = 0L
+    if ($null -eq $metric -or $null -eq $value -or
+        -not [int64]::TryParse([string]$value, [ref]$parsed) -or $parsed -lt 0) {
+        throw "$Scenario k6 summary omitted bounded counter $Name"
+    }
+    return $parsed
+}
+
+function Assert-Milestone5ScenarioMetrics {
+    param(
+        [Parameter(Mandatory = $true)][object]$Metrics,
+        [Parameter(Mandatory = $true)][string]$Scenario
+    )
+    $policies = @{
+        'physical-shard-routing' = @(
+            @('physical_route_success',2,$null), @('physical_route_conflicts',0,10), @('shard_rate_limited',0,0)
+        )
+        'cross-shard-global-quota' = @(
+            @('global_quota_holds_created',2,2), @('global_quota_rejections',2,2)
+        )
+        'booking-command-recovery' = @(
+            @('command_recovery_success',1,1), @('duplicate_command_observations',0,0)
+        )
+        'physical-shard-outage' = @(
+            @('expected_outage_503',1,$null), @('healthy_shard_success',2,$null),
+            @('outage_fallback_writer_observations',0,0)
+        )
+        'online-base-copy' = @(
+            @('base_copy_source_success',2,$null), @('base_copy_duplicate_observations',0,0)
+        )
+        'journal-catchup' = @(
+            @('journal_mutation_success',1,$null), @('duplicate_apply_effect_observations',0,0)
+        )
+        'physical-cutover' = @(
+            @('cutover_pause_observations',1,$null), @('post_cutover_success',1,$null),
+            @('cutover_split_brain_observations',0,0)
+        )
+        'stale-router-physical' = @(
+            @('physical_stale_refresh_success',3,3), @('stale_router_split_brain_observations',0,0)
+        )
+        'reverse-migration' = @(
+            @('reverse_migration_preserved',1,1), @('reverse_migration_duplicate_observations',0,0)
+        )
+        'legacy-vs-physical' = @(
+            @('legacy_path_success',2,$null), @('physical_path_success',2,$null),
+            @('comparison_duplicate_observations',0,0)
+        )
+    }
+    foreach ($rule in $policies[$Scenario]) {
+        $count = Get-Milestone5MetricCount -Metrics $Metrics -Name $rule[0] -Scenario $Scenario
+        if ($count -lt [int64]$rule[1] -or ($null -ne $rule[2] -and $count -gt [int64]$rule[2])) {
+            throw "$Scenario k6 counter $($rule[0]) was outside its bounded evidence range"
+        }
+    }
+    if ($Scenario -eq 'legacy-vs-physical') {
+        $legacy = Get-Milestone5MetricCount -Metrics $Metrics -Name 'legacy_path_success' -Scenario $Scenario
+        $physical = Get-Milestone5MetricCount -Metrics $Metrics -Name 'physical_path_success' -Scenario $Scenario
+        $smaller = [Math]::Min($legacy, $physical)
+        $larger = [Math]::Max($legacy, $physical)
+        if ($smaller -lt 2 -or $larger -gt (2 * $smaller)) {
+            throw 'legacy-vs-physical successful lanes were not nontrivial and comparable'
+        }
+    }
+}
+
 function ConvertFrom-Milestone5K6Summary {
     param(
         [Parameter(Mandatory = $true)][object]$Summary,
@@ -164,6 +238,7 @@ function ConvertFrom-Milestone5K6Summary {
             }
         }
     }
+    Assert-Milestone5ScenarioMetrics -Metrics $metrics -Scenario $Scenario
     return [ordered]@{
         scenario = $Scenario
         status = 'passed'
@@ -190,6 +265,15 @@ function Assert-Milestone5DatabaseInvariants {
             throw "database invariant $name must be exactly zero"
         }
     }
+    $positive = [ordered]@{}
+    foreach ($name in @('online_copy_mutation_delta', 'online_copy_journal_delta')) {
+        $value = Get-Milestone5OptionalValue -Object $Evidence -Name $name
+        $parsed = 0L
+        if ($null -eq $value -or -not [int64]::TryParse([string]$value, [ref]$parsed) -or $parsed -lt 1) {
+            throw "database evidence $name must be a measured positive delta"
+        }
+        $positive[$name] = $parsed
+    }
     $writers = Get-Milestone5OptionalValue -Object $Evidence -Name 'enabled_writer_fences'
     $writerCount = 0L
     if ($null -eq $writers -or -not [int64]::TryParse([string]$writers, [ref]$writerCount) -or
@@ -207,6 +291,8 @@ function Assert-Milestone5DatabaseInvariants {
         apply_receipt_conflicts = 0
         command_receipt_conflicts = 0
         unreconciled_commands = 0
+        online_copy_mutation_delta = $positive.online_copy_mutation_delta
+        online_copy_journal_delta = $positive.online_copy_journal_delta
     }
 }
 

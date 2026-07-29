@@ -21,6 +21,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/shard-admin ./cmd/shard-admin && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/reconcile ./cmd/reconcile && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/booking-command-reconciler ./cmd/booking-command-reconciler && \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/physical-shard-admin ./cmd/physical-shard-admin && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/migrate ./cmd/migrate
 
 FROM alpine:3.22 AS runtime
@@ -36,6 +37,7 @@ COPY --from=build --chown=railway:railway /out/read-model-admin /usr/local/bin/r
 COPY --from=build --chown=railway:railway /out/shard-admin /usr/local/bin/shard-admin
 COPY --from=build --chown=railway:railway /out/reconcile /usr/local/bin/reconcile
 COPY --from=build --chown=railway:railway /out/booking-command-reconciler /usr/local/bin/booking-command-reconciler
+COPY --from=build --chown=railway:railway /out/physical-shard-admin /usr/local/bin/physical-shard-admin
 
 USER railway:railway
 
@@ -88,5 +90,8 @@ ENTRYPOINT ["/usr/local/bin/read-model-admin"]
 
 FROM runtime AS shard-admin
 ENTRYPOINT ["/usr/local/bin/shard-admin"]
+
+FROM runtime AS physical-shard-admin
+ENTRYPOINT ["/usr/local/bin/physical-shard-admin"]
 
 FROM api AS final

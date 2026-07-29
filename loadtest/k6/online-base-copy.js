@@ -4,12 +4,10 @@ import { Counter, Trend } from 'k6/metrics';
 import {
   availabilityCountIsValid,
   baseURL,
-  bookingStatusAllowed,
   boundedOptions,
   createHold,
   customerForVU,
   identityMismatches,
-  iterationKey,
   positiveInteger,
   readAvailability,
   required,
@@ -28,7 +26,7 @@ export const options = boundedOptions({
     gracefulStop: '5s',
   },
 }, {
-  base_copy_source_success: ['count>0'],
+  base_copy_source_success: ['count>=2'],
   base_copy_duplicate_observations: ['count==0'],
   base_copy_source_duration: ['p(95)<2000', 'p(99)<5000'],
 });
@@ -40,7 +38,7 @@ export default function () {
   const availability = readAvailability(url, trainRunID, {
     operation: 'base_copy_source_availability', trend: baseCopySourceDuration,
   });
-  const key = iterationKey('m5-base-copy');
+  const key = `m5-base-copy-${__VU}`;
   const created = createHold(url, trainRunID, customer, key, {
     operation: 'base_copy_source_create', trend: baseCopySourceDuration,
   });
@@ -53,14 +51,16 @@ export default function () {
     identityMismatches.add(1);
     baseCopyDuplicateObservations.add(1);
   }
-  if (availability.status === 200 && bookingStatusAllowed(created, false)) baseCopySourceSuccess.add(1);
+  const committedReplay = created.status === 201 && replay.status === 201
+    && createdID.length > 0 && createdID === replayID;
+  if (availability.status === 200 && committedReplay) baseCopySourceSuccess.add(1);
 
   check({ availability, created, replay, createdID, replayID }, {
     'source availability remains readable during base copy': (value) => availabilityCountIsValid(value.availability),
-    'source booking remains bounded while copy advances': (value) => bookingStatusAllowed(value.created, false),
-    'source booking replay remains bounded while copy advances': (value) => bookingStatusAllowed(value.replay, false),
+    'source mutation commits while copy advances': (value) => value.created.status === 201,
+    'source mutation replay commits while copy advances': (value) => value.replay.status === 201,
     'base-copy workload observes one idempotent identity': (value) =>
-      !value.createdID || !value.replayID || value.createdID === value.replayID,
+      value.createdID.length > 0 && value.createdID === value.replayID,
   });
   sleep(0.1);
 }

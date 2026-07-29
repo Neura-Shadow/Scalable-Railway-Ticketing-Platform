@@ -1,10 +1,10 @@
 # Scalable Railway Ticketing Platform
 
 A production-minded, single-region Go backend for railway booking with explicit
-train-run routing, monotonic PostgreSQL writer fencing, schema-isolated logical
-booking shards, a disposable journey read model, versioned Redis read caches,
-Redis-backed hot-train admission, and authoritative route-segment allocation
-under concurrency.
+train-run routing, monotonic PostgreSQL writer fencing, a bounded physical-
+PostgreSQL shard pilot, a disposable journey read model, versioned Redis read
+caches, Redis-backed hot-train admission, and authoritative route-segment
+allocation under concurrency.
 
 Milestone 4 is intentionally bounded. `legacy`, `shard-0`, and `shard-1` are
 logical schemas in one PostgreSQL database, not independent physical shards.
@@ -13,6 +13,18 @@ train run, never dual writes, and retains the source for a rollback window.
 This is not a zero-downtime, multi-region, production-capacity, or national-
 scale claim and does not implement payment. See
 [Milestone 4 limitations](docs/milestone-4-limitations.md).
+
+Milestone 5 adds an opt-in three-database pilot: one control PostgreSQL and two
+independent booking PostgreSQL instances. A durable control command saga owns
+global idempotency, quota leases, and the reservation directory; exactly one
+physical shard owns each routed booking transaction and its local receipt,
+VARBIT inventory mutation, fence, and outbox. No transaction spans databases.
+Online rebalancing means base copy and journal catch-up while the source serves,
+followed by a measured bounded write pause. It never dual writes, retains the
+source, and requires reverse migration after target-era writes. The pilot is
+single-region, not zero-downtime or production-capacity certification. See
+[the physical topology](docs/physical-shard-topology.md) and
+[Milestone 5 limitations](docs/milestone-5-limitations.md).
 
 ## Architecture
 
@@ -129,10 +141,22 @@ The API is versioned under `/api/v1`. Customer reservation routes derive ownersh
 | `POST` | `/api/v1/reservations/:id/confirm` | Confirm an owned hold |
 | `POST` | `/api/v1/reservations/:id/cancel` | Cancel an owned held/confirmed reservation |
 | `POST` | `/api/v1/admin/routes` | Create a named, timezone-bound route with ordered station codes and arrival/departure offsets |
+| `GET/PATCH` | `/api/v1/operator/train-runs/:id/fares/:resource_id` | Read authoritative physical fare version or submit an idempotent train-run fare update |
+| `GET/PATCH` | `/api/v1/operator/train-runs/:id/seats/:resource_id/booking-state` | Read or idempotently change shard-local seat booking eligibility |
+| `GET/PATCH` | `/api/v1/operator/train-runs/:id/booking-policy-version` | Read or idempotently advance the shard-local booking-policy version |
 | `GET/POST` | `/api/v1/operator/hot-train-policies` | List/create bounded policies as operator or admin |
 | `GET/PUT/DELETE` | `/api/v1/operator/hot-train-policies/:id` | Read, version-update, or soft-disable a policy |
 
 Errors use bounded public codes and do not expose SQL, DSNs, credentials, tokens, raw idempotency keys, or passenger data.
+
+Physical operator mutations require an `Idempotency-Key` and the exact
+authoritative `source_version` returned by the corresponding GET. They first
+reserve a durable control command, then commit one shard-local receipt and
+snapshot change, and finally atomically update the control projection and
+command state. A reconciler completes an interrupted finalization; it never
+repeats an already receipted shard mutation. The fare endpoint accepts only a
+fare already scoped directly to that train run. Route-level shared fares are
+rejected before shard execution.
 
 Registration and login are intentionally separate. Registration never returns access/refresh tokens, and its direct generic accepted response does not distinguish a new email from an existing one. Because Milestone 1 creates immediately active accounts without an email-verification workflow, a caller can still attempt a later login with an attacker-chosen registration password and infer whether that new credential took effect. Database timing can also differ and is not claimed to be constant-time. These residuals are rate-limited and documented rather than hidden; stronger activation proof and anti-automation controls remain outside this milestone.
 
@@ -170,6 +194,14 @@ and retained-public guards. It does not move train runs automatically. Keep
 before any explicit `schema_poc` opt-in. The down migration is blocked while a
 run is non-legacy, a migration is active, or a logical shard retains booking
 data.
+
+Migration 9 expands the control database with bounded physical connection
+references, the booking-command saga ledger, conservative quota leases, the
+reservation directory, physical migration checkpoints, and reconciliation
+evidence. Physical booking databases use the independent migration history at
+`migrations/booking-shard`, starting at version 1. Catalog rows never contain a
+DSN. Follow [the control rollout](docs/migrations/migration-9-control-plane-rollout.md)
+and [the booking-shard rollout](docs/migrations/booking-shard-v1-rollout.md).
 
 ## Read-only reconciliation
 
@@ -256,6 +288,16 @@ customer bootstrap token.
 Logical schema routing remains disabled by default. `schema_poc` requires the
 fixed allowlisted topology, Migration 8, compatible fenced writers, an explicit
 production acknowledgement, and the operator gates in the rollout runbook.
+
+The physical pilot is also disabled by default. A local isolated topology is
+available after its required command/worker binaries are built:
+
+```powershell
+docker compose -f docker-compose.physical-shards.yml up --build
+```
+
+It uses fixed `physical-shard-0` and `physical-shard-1` configuration keys and
+separate secret DSNs. Do not reuse its synthetic local credentials.
 
 ## Tests and validation
 

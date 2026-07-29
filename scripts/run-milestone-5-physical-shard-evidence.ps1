@@ -15,7 +15,7 @@ param(
     [string]$EvidenceDirectory = '',
 
     [ValidatePattern('^[1-9][0-9]*(s|m)$')]
-    [string]$ScenarioDuration = '15s'
+    [string]$ScenarioDuration = '45s'
 )
 
 Set-StrictMode -Version Latest

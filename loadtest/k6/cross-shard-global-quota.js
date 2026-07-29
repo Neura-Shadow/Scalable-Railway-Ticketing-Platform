@@ -19,6 +19,9 @@ export const globalQuotaRejections = new Counter('global_quota_rejections');
 
 const vus = positiveInteger('VUS', 8);
 const maximumActivePerCustomer = positiveInteger('MAX_ACTIVE_HOLDS_PER_CUSTOMER', 1);
+if (maximumActivePerCustomer !== 1) {
+  throw new Error('cross-shard quota evidence requires MAX_ACTIVE_HOLDS_PER_CUSTOMER=1');
+}
 
 export const options = boundedOptions({
   cross_shard_quota_race: {
@@ -29,8 +32,8 @@ export const options = boundedOptions({
   },
 }, {
   checks: ['rate==1'],
-  global_quota_holds_created: ['count>0', `count<=${vus * maximumActivePerCustomer}`],
-  global_quota_rejections: ['count>0'],
+  global_quota_holds_created: [`count==${vus}`],
+  global_quota_rejections: [`count==${vus}`],
 });
 
 export function setup() {
@@ -80,8 +83,10 @@ export default function (config) {
   }
 
   check(responses, {
-    'cross-shard quota race has only bounded outcomes': (values) =>
-      values.every((value) => [201, 409, 429].includes(value.status)),
+    'cross-shard quota race creates one final allowed hold per customer': (values) =>
+      values.filter((value) => value.status === 201).length === 1,
+    'cross-shard quota race rejects exactly one excess hold per customer': (values) =>
+      values.filter((value) => value.status === 429).length === 1,
     'quota rejection is typed and carries bounded retry guidance': (values) =>
       values.every((value) => value.status !== 429 || (
         publicErrorCode(value) === 'reservation_quota_exceeded'

@@ -5,6 +5,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 . (Join-Path $PSScriptRoot 'milestone-5-evidence-guardrails.ps1')
+$runnerSource = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'run-milestone-5-physical-shard-evidence.ps1')
 
 function Assert-True {
     param(
@@ -24,6 +25,9 @@ function Assert-Throws {
     if (-not $threw) { throw "$Label did not fail closed" }
 }
 
+Assert-True -Condition $runnerSource.Contains("[string]`$ScenarioDuration = '45s'") `
+    -Message 'formal Milestone 5 cutover window must default to the bounded 45 second evidence duration'
+
 function New-StrictK6Summary {
     param(
         [int64]$Passes = 4,
@@ -39,8 +43,10 @@ function New-StrictK6Summary {
             http_reqs = [pscustomobject]@{ values = [pscustomobject]@{ count = 8; rate = 2.0 } }
             physical_route_success = [pscustomobject]@{
                 values = [pscustomobject]@{ count = 2 }
-                thresholds = [pscustomobject]@{ 'count>0' = [pscustomobject]@{ ok = $ThresholdOK } }
+                thresholds = [pscustomobject]@{ 'count>=2' = [pscustomobject]@{ ok = $ThresholdOK } }
             }
+            physical_route_conflicts = [pscustomobject]@{ values = [pscustomobject]@{ count = 0 } }
+            shard_rate_limited = [pscustomobject]@{ values = [pscustomobject]@{ count = 0 } }
         }
     }
 }
@@ -87,6 +93,24 @@ Assert-Throws -Label 'failed k6 threshold' -Action {
 Assert-Throws -Label 'unknown k6 scenario' -Action {
     ConvertFrom-Milestone5K6Summary -Summary (New-StrictK6Summary) -Scenario 'optional-smoke' | Out-Null
 }
+$vacuousConflictSummary = New-StrictK6Summary
+$vacuousConflictSummary.metrics.physical_route_success.values.count = 1
+$vacuousConflictSummary.metrics.physical_route_conflicts.values.count = 47
+Assert-Throws -Label 'one success plus forty-seven conflicts' -Action {
+    ConvertFrom-Milestone5K6Summary -Summary $vacuousConflictSummary `
+        -Scenario 'physical-shard-routing' | Out-Null
+}
+$vacuousQuotaSummary = New-StrictK6Summary
+$vacuousQuotaSummary.metrics.PSObject.Properties.Remove('physical_route_success')
+$vacuousQuotaSummary.metrics.PSObject.Properties.Remove('physical_route_conflicts')
+$vacuousQuotaSummary.metrics | Add-Member -NotePropertyName global_quota_holds_created `
+    -NotePropertyValue ([pscustomobject]@{ values = [pscustomobject]@{ count = 1 } })
+$vacuousQuotaSummary.metrics | Add-Member -NotePropertyName global_quota_rejections `
+    -NotePropertyValue ([pscustomobject]@{ values = [pscustomobject]@{ count = 47 } })
+Assert-Throws -Label 'one success plus forty-seven quota responses' -Action {
+    ConvertFrom-Milestone5K6Summary -Summary $vacuousQuotaSummary `
+        -Scenario 'cross-shard-global-quota' | Out-Null
+}
 
 $databaseInput = [pscustomobject]@{
     enabled_writer_fences = 2
@@ -98,6 +122,8 @@ $databaseInput = [pscustomobject]@{
     apply_receipt_conflicts = 0
     command_receipt_conflicts = 0
     unreconciled_commands = 0
+    online_copy_mutation_delta = 2
+    online_copy_journal_delta = 4
 }
 $database = Assert-Milestone5DatabaseInvariants -Evidence $databaseInput
 Assert-True -Condition ($database.status -eq 'passed' -and $database.enabled_writer_fences -eq 2) `
@@ -106,6 +132,11 @@ $badDatabase = $databaseInput.PSObject.Copy()
 $badDatabase.dual_writer_violations = 1
 Assert-Throws -Label 'dual writer evidence' -Action {
     Assert-Milestone5DatabaseInvariants -Evidence $badDatabase | Out-Null
+}
+$noOnlineMutation = $databaseInput.PSObject.Copy()
+$noOnlineMutation.online_copy_mutation_delta = 0
+Assert-Throws -Label 'missing online-copy mutation delta' -Action {
+    Assert-Milestone5DatabaseInvariants -Evidence $noOnlineMutation | Out-Null
 }
 $missingDatabase = $databaseInput.PSObject.Copy()
 $missingDatabase.PSObject.Properties.Remove('journal_gaps')

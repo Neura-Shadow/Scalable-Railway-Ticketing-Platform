@@ -50,3 +50,61 @@ The base image name, schema topology, replica counts, and resource settings are
 non-production evidence defaults. They are not physical-shard, zero-downtime,
 benchmark, or sizing claims. See
 [production deployment](../docs/production-deployment.md).
+
+## Milestone 5 local physical-shard topology
+
+`docker-compose.physical-shards.yml` is the bounded, single-region local
+evidence topology. It runs one control PostgreSQL database, two independent
+booking PostgreSQL databases, Redis, three stateless API replicas, two
+admission workers, two read-model workers, the hold expirer, the outbox worker,
+the booking-command reconciler, and a round-robin reverse proxy. PostgreSQL
+instances have separate volumes and health checks; no database port is
+published to the host. The proxy uses the existing no-affinity upstream and
+publishes only to loopback.
+
+The committed password and key defaults are synthetic local values. Override
+all `*_PASSWORD`, DSN, JWT, and admission keyring variables before using a
+shared environment. The fixed `BOOKING_SHARD_0_DATABASE_URL` and
+`BOOKING_SHARD_1_DATABASE_URL` values are application configuration, not
+control-catalog data, and use distinct hosts and credentials. Per-process
+physical-shard pools are bounded at three connections per shard and six total.
+Every control-using process is capped at four connections. The physical-mode
+startup contract records ten control pools, three API replicas, three
+shard-aware workers with two fixed shard pools each, eight migration/admin reserve and
+sixteen operational reserve connections. The resulting combined ceiling is
+100; increasing any term without increasing and reviewing
+`POSTGRES_MAX_CONNECTIONS_LIMIT` fails startup.
+
+The booking-command reconciler also repairs durable physical operator commands.
+It reads only fixed catalog connection references, rotates boundedly across the
+two configured shards, validates receipts against the recorded operation,
+generation and fingerprint, and atomically finalizes the control projection.
+It does not probe arbitrary endpoints or create a second shard write.
+
+Render and validate the fully interpolated configuration without starting it:
+
+```bash
+docker compose -f docker-compose.physical-shards.yml config --quiet
+```
+
+Start the local topology only after the control and booking-shard migrations
+have been reviewed:
+
+```bash
+docker compose -f docker-compose.physical-shards.yml up --build --wait
+```
+
+The two shard containers are independent failure domains. The following local
+test stops only shard 0, leaving the control database and shard 1 running; use
+`start` to restore it. Repeat with `booking-shard-1-postgres` for the opposite
+case. This is failure-injection evidence, not a production availability claim.
+
+```bash
+docker compose -f docker-compose.physical-shards.yml stop booking-shard-0-postgres
+docker compose -f docker-compose.physical-shards.yml ps
+docker compose -f docker-compose.physical-shards.yml start booking-shard-0-postgres
+```
+
+Remove the evidence topology while retaining database volumes with `down`.
+Use `down --volumes` only when intentionally discarding all local evidence
+data. A source retained for rollback or reverse migration must not be deleted.

@@ -4,7 +4,6 @@ import { Counter, Trend } from 'k6/metrics';
 import {
   availabilityCountIsValid,
   baseURL,
-  bookingStatusAllowed,
   boundedOptions,
   createHold,
   identityMismatches,
@@ -28,8 +27,8 @@ export const options = boundedOptions({
   legacy_path: { executor: 'constant-vus', exec: 'legacy', vus, duration, gracefulStop: '5s' },
   physical_path: { executor: 'constant-vus', exec: 'physical', vus, duration, gracefulStop: '5s' },
 }, {
-  legacy_path_success: ['count>0'],
-  physical_path_success: ['count>0'],
+  legacy_path_success: ['count>=2'],
+  physical_path_success: ['count>=2'],
   comparison_duplicate_observations: ['count==0'],
   legacy_path_duration: ['p(95)<2000', 'p(99)<5000'],
   physical_path_duration: ['p(95)<2000', 'p(99)<5000'],
@@ -47,7 +46,7 @@ function exercise(label, trainRunID, participant, trend, successCounter) {
   const availability = readAvailability(url, trainRunID, {
     operation: `${label}_availability`, trend,
   });
-  const key = `m5-${label}-${__VU}-${__ITER}`;
+  const key = `m5-${label}-${__VU}`;
   const first = createHold(url, trainRunID, participant, key, {
     operation: `${label}_create`, trend,
   });
@@ -60,14 +59,18 @@ function exercise(label, trainRunID, participant, trend, successCounter) {
     identityMismatches.add(1);
     comparisonDuplicateObservations.add(1);
   }
-  if (availability.status === 200 && bookingStatusAllowed(first, false)) successCounter.add(1);
+  const committedReplay = first.status === 201 && replay.status === 201
+    && firstID.length > 0 && firstID === replayID;
+  // Each VU contributes at most one committed identity. Repeated replay loops
+  // cannot satisfy the cross-path minimum by themselves.
+  if (__ITER === 0 && availability.status === 200 && committedReplay) successCounter.add(1);
 
   check({ availability, first, replay, firstID, replayID }, {
     [`${label} availability remains valid`]: (value) => availabilityCountIsValid(value.availability),
-    [`${label} booking has a bounded outcome`]: (value) => bookingStatusAllowed(value.first, false),
-    [`${label} replay has a bounded outcome`]: (value) => bookingStatusAllowed(value.replay, false),
+    [`${label} booking commits successfully`]: (value) => value.first.status === 201,
+    [`${label} replay commits successfully`]: (value) => value.replay.status === 201,
     [`${label} successful replay preserves identity`]: (value) =>
-      !value.firstID || !value.replayID || value.firstID === value.replayID,
+      value.firstID.length > 0 && value.firstID === value.replayID,
   });
   sleep(0.1);
 }

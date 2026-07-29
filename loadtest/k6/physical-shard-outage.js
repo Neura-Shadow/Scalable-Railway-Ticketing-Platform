@@ -3,7 +3,6 @@ import { Counter } from 'k6/metrics';
 
 import {
   baseURL,
-  bookingStatusAllowed,
   boundedOptions,
   createHold,
   customerForVU,
@@ -30,7 +29,7 @@ export const options = boundedOptions({
 }, {
   checks: ['rate==1'],
   expected_outage_503: ['count>0'],
-  healthy_shard_success: ['count>0'],
+  healthy_shard_success: ['count>=2'],
   outage_fallback_writer_observations: ['count==0'],
 });
 
@@ -55,13 +54,14 @@ export function healthyShard() {
     baseURL(),
     required('HEALTHY_TRAIN_RUN_ID'),
     customerForVU(),
-    iterationKey('m5-healthy-peer'),
+    `m5-healthy-peer-${__VU}`,
     { operation: 'physical_shard_healthy_peer' },
   );
-  if (bookingStatusAllowed(response, false)) healthyShardSuccess.add(1);
+  // Count one independent commit per VU. Later iterations are replay checks
+  // and must not inflate the minimum real-commit evidence.
+  if (__ITER === 0 && response.status === 201) healthyShardSuccess.add(1);
   check(response, {
-    'healthy physical shard remains bounded during peer failure': (value) =>
-      bookingStatusAllowed(value, false),
+    'healthy physical shard continues committing during peer failure': (value) => value.status === 201,
   });
   sleep(0.1);
 }

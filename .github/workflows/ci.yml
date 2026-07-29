@@ -15,8 +15,8 @@ concurrency:
 
 env:
   GO_VERSION: "1.25.12"
-  IMAGE_NAME: scalable-railway-ticketing-platform:milestone-4
-  EVIDENCE_PROXY_IMAGE: scalable-railway-ticketing-proxy:milestone-4
+  IMAGE_NAME: scalable-railway-ticketing-platform:milestone-5
+  EVIDENCE_PROXY_IMAGE: scalable-railway-ticketing-proxy:milestone-5
 
 jobs:
   quality:
@@ -143,8 +143,10 @@ jobs:
             --command 'CREATE DATABASE railway_migration_rehearsal'
           mkdir -p "$RUNNER_TEMP/migrations-v6"
           mkdir -p "$RUNNER_TEMP/migrations-v7"
+          mkdir -p "$RUNNER_TEMP/migrations-v8"
           cp migrations/00000[1-6]_*.sql "$RUNNER_TEMP/migrations-v6/"
           cp migrations/00000[1-7]_*.sql "$RUNNER_TEMP/migrations-v7/"
+          cp migrations/00000[1-8]_*.sql "$RUNNER_TEMP/migrations-v8/"
           go run ./cmd/migrate \
             -path "$RUNNER_TEMP/migrations-v6" \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
@@ -190,11 +192,11 @@ jobs:
         shell: bash
         run: |
           go run ./cmd/migrate \
-            -path migrations \
+            -path "$RUNNER_TEMP/migrations-v8" \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             up
           go run ./cmd/migrate \
-            -path migrations \
+            -path "$RUNNER_TEMP/migrations-v8" \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             version
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
@@ -235,11 +237,11 @@ jobs:
         shell: bash
         run: |
           go run ./cmd/migrate \
-            -path migrations \
+            -path "$RUNNER_TEMP/migrations-v8" \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             down
           go run ./cmd/migrate \
-            -path migrations \
+            -path "$RUNNER_TEMP/migrations-v8" \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             version
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
@@ -253,11 +255,11 @@ jobs:
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone4_v7_after_down.sql
           go run ./cmd/migrate \
-            -path migrations \
+            -path "$RUNNER_TEMP/migrations-v8" \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             up
           go run ./cmd/migrate \
-            -path migrations \
+            -path "$RUNNER_TEMP/migrations-v8" \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             version
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
@@ -270,6 +272,50 @@ jobs:
             --file migrations/testdata/assert_milestone4_v8_schema.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone4_v8_data.sql
+      - name: Rehearse the populated version-8 to version-9 upgrade
+        shell: bash
+        run: |
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            up
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            version
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone5_v9_schema.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone5_v9_data.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_populated_v5_data.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_hot_train_v6_data.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_read_model_v7_data.sql
+      - name: Rehearse Milestone 5 one-step down and up with populated data
+        shell: bash
+        run: |
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            down
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            version
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone4_v8_schema.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone4_v8_data.sql
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            up
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone5_v9_schema.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone5_v9_data.sql
       - name: Apply migrations to an empty database
         run: go run ./cmd/migrate -path migrations up
       - name: Verify migration-up is safe to repeat
@@ -289,6 +335,137 @@ jobs:
         run: go test -p 1 ./internal/sharding/... ./internal/booking/postgres ./cmd/shard-admin ./cmd/reconcile -count=3 -timeout 420s
       - name: Run race-enabled persistence and concurrency tests
         run: go test -p 1 -race ./internal/accounts/postgres ./internal/admission/... ./internal/booking/postgres ./internal/offering/postgres ./internal/eventrelay/postgres ./internal/query/cache ./internal/query/readmodel ./internal/query/postgres -count=1 -timeout 540s
+
+  physical-shard-integration:
+    name: Three-PostgreSQL physical shard integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      control-postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: railway_control
+          POSTGRES_USER: railway_control
+          POSTGRES_PASSWORD: control-ci-local
+        ports:
+          - 55430:5432
+        options: >-
+          --health-cmd "pg_isready -U railway_control -d railway_control"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      booking-shard-0-postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: railway_booking
+          POSTGRES_USER: railway_booking
+          POSTGRES_PASSWORD: shard-0-ci-local
+        ports:
+          - 55431:5432
+        options: >-
+          --health-cmd "pg_isready -U railway_booking -d railway_booking"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      booking-shard-1-postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: railway_booking
+          POSTGRES_USER: railway_booking
+          POSTGRES_PASSWORD: shard-1-ci-local
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U railway_booking -d railway_booking"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      CONTROL_DATABASE_URL: postgres://railway_control:control-ci-local@localhost:55430/railway_control?sslmode=disable
+      BOOKING_SHARD_0_DATABASE_URL: postgres://railway_booking:shard-0-ci-local@localhost:55431/railway_booking?sslmode=disable
+      BOOKING_SHARD_1_DATABASE_URL: postgres://railway_booking:shard-1-ci-local@localhost:55432/railway_booking?sslmode=disable
+      TEST_CONTROL_DATABASE_URL: postgres://railway_control:control-ci-local@localhost:55430/railway_control?sslmode=disable
+      TEST_BOOKING_SHARD_0_DATABASE_URL: postgres://railway_booking:shard-0-ci-local@localhost:55431/railway_booking?sslmode=disable
+      TEST_BOOKING_SHARD_1_DATABASE_URL: postgres://railway_booking:shard-1-ci-local@localhost:55432/railway_booking?sslmode=disable
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+      - name: Apply and verify independent migration histories
+        shell: bash
+        run: |
+          go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" up
+          go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" up
+          go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" version
+          psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone5_v9_schema.sql
+          for database_url in \
+            "$BOOKING_SHARD_0_DATABASE_URL" \
+            "$BOOKING_SHARD_1_DATABASE_URL"
+          do
+            go run ./cmd/migrate -path migrations/booking-shard \
+              -database "$database_url" up
+            go run ./cmd/migrate -path migrations/booking-shard \
+              -database "$database_url" up
+            go run ./cmd/migrate -path migrations/booking-shard \
+              -database "$database_url" version
+            psql "$database_url" --set=ON_ERROR_STOP=1 \
+              --file migrations/testdata/assert_booking_shard_v1_schema.sql
+            go run ./cmd/migrate -path migrations/booking-shard \
+              -database "$database_url" down
+            go run ./cmd/migrate -path migrations/booking-shard \
+              -database "$database_url" up
+            psql "$database_url" --set=ON_ERROR_STOP=1 \
+              --file migrations/testdata/assert_booking_shard_v1_schema.sql
+          done
+      - name: Run legacy to physical to legacy reverse acceptance
+        shell: bash
+        run: bash scripts/run_m5_legacy_physical_reverse_e2e.sh
+      - name: Validate the bounded physical topology and k6 modules
+        shell: bash
+        run: |
+          docker compose -f docker-compose.physical-shards.yml config --quiet
+          for script in \
+            physical-shard-routing.js cross-shard-global-quota.js \
+            booking-command-recovery.js physical-shard-outage.js \
+            online-base-copy.js journal-catchup.js physical-cutover.js \
+            stale-router-physical.js reverse-migration.js legacy-vs-physical.js
+          do
+            docker run --rm -v "$PWD/loadtest/k6:/scripts:ro" grafana/k6:0.54.0 \
+              inspect "/scripts/$script" >/dev/null
+          done
+      - name: Run physical routing, saga, fencing, migration, and worker tests
+        run: >-
+          go test -p 1
+          ./internal/app
+          ./internal/booking/command/...
+          ./internal/sharding/physical/...
+          ./internal/sharding/physicalmigration/...
+          ./internal/sharding/physicalworker
+          ./cmd/booking-command-reconciler
+          ./cmd/hold-expirer
+          ./cmd/outbox-worker
+          ./cmd/physical-shard-admin
+          -count=3 -timeout 420s
+      - name: Run focused physical race tests
+        run: >-
+          go test -p 1 -race
+          ./internal/app
+          ./internal/booking/command/...
+          ./internal/sharding/physical/...
+          ./internal/sharding/physicalmigration/...
+          ./internal/sharding/physicalworker
+          ./cmd/booking-command-reconciler
+          ./cmd/hold-expirer
+          ./cmd/outbox-worker
+          ./cmd/physical-shard-admin
+          -count=1 -timeout 540s
 
   multi-replica-evidence:
     name: Multi-replica admission evidence
@@ -502,7 +679,7 @@ jobs:
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: scalable-railway-ticketing-platform:milestone-4
+          image-ref: scalable-railway-ticketing-platform:milestone-5
           format: table
           severity: CRITICAL,HIGH
           ignore-unfixed: true
@@ -511,7 +688,7 @@ jobs:
       - name: Trivy evidence proxy image scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: scalable-railway-ticketing-proxy:milestone-4
+          image-ref: scalable-railway-ticketing-proxy:milestone-5
           format: table
           severity: CRITICAL,HIGH
           ignore-unfixed: true
