@@ -14,23 +14,24 @@ import (
 // Dependencies contains transport-owned consumer interfaces. Nil dependencies
 // fail closed at the individual endpoint rather than weakening authentication.
 type Dependencies struct {
-	Readiness           ReadinessChecker
-	ReadinessTimeout    time.Duration
-	TokenParser         BearerTokenParser
-	Reservations        ReservationService
-	WaitingRoom         WaitingRoomService
-	HotTrainPolicies    HotTrainPolicyService
-	MaxRequestBodyBytes int64
-	MaxPassengers       int
-	HTTPMetrics         HTTPMetrics
-	MetricsHandler      http.Handler
-	Offering            OfferingQueries
-	Auth                AuthService
-	RateLimiter         RateLimiter
-	Passengers          PassengerService
-	Tickets             TicketQueries
-	Admin               AdminCommands
-	Operator            OperatorCommands
+	Readiness            ReadinessChecker
+	ReadinessTimeout     time.Duration
+	TokenParser          BearerTokenParser
+	Reservations         ReservationService
+	WaitingRoom          WaitingRoomService
+	HotTrainPolicies     HotTrainPolicyService
+	MaxRequestBodyBytes  int64
+	MaxPassengers        int
+	HTTPMetrics          HTTPMetrics
+	MetricsHandler       http.Handler
+	Offering             OfferingQueries
+	Auth                 AuthService
+	RateLimiter          RateLimiter
+	Passengers           PassengerService
+	Tickets              TicketQueries
+	Admin                AdminCommands
+	Operator             OperatorCommands
+	OperatorBookingState OperatorBookingStateQueries
 }
 
 // New builds the HTTP router.

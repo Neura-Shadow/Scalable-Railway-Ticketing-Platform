@@ -127,9 +127,28 @@ type OperatorCommands struct {
 	physicalCancellation interface {
 		CancelTrainRun(context.Context, uuid.UUID) error
 	}
+	physicalSnapshots interface {
+		InstallFare(context.Context, OperatorFareMutation) (httpapi.ResourceView, error)
+		SetSeatActive(context.Context, OperatorSeatMutation) (httpapi.ResourceView, error)
+		BumpBookingPolicy(context.Context, OperatorPolicyMutation) (httpapi.ResourceView, error)
+	}
 	metrics interface {
 		RecordOutbox(operation, eventType, result, reason string)
 	}
+}
+
+func NewPhysicalOperatorCommandsWithSnapshots(offering managementOffering, inventory inventoryInitializer, cancellation interface {
+	CancelTrainRun(context.Context, uuid.UUID) error
+}, snapshots interface {
+	InstallFare(context.Context, OperatorFareMutation) (httpapi.ResourceView, error)
+	SetSeatActive(context.Context, OperatorSeatMutation) (httpapi.ResourceView, error)
+	BumpBookingPolicy(context.Context, OperatorPolicyMutation) (httpapi.ResourceView, error)
+}, metrics ...interface {
+	RecordOutbox(operation, eventType, result, reason string)
+}) *OperatorCommands {
+	commands := NewPhysicalOperatorCommands(offering, inventory, cancellation, metrics...)
+	commands.physicalSnapshots = snapshots
+	return commands
 }
 
 func NewPhysicalOperatorCommands(offering managementOffering, inventory inventoryInitializer, cancellation interface {
@@ -209,6 +228,47 @@ func (o *OperatorCommands) ExecuteOperator(ctx context.Context, c httpapi.Operat
 			o.metrics.RecordOutbox("create", "trainrun.cancelled", "success", "none")
 		}
 		return httpapi.ResourceView{ID: v.ID}, nil
+	case httpapi.OperatorInstallFareSnapshot:
+		if o.physicalSnapshots == nil || c.FareSnapshot == nil {
+			return httpapi.ResourceView{}, httpapi.ErrUnavailable
+		}
+		trainRunID, runErr := uuid.Parse(c.TrainRunID)
+		fareID, resourceErr := uuid.Parse(c.ResourceID)
+		if runErr != nil || resourceErr != nil {
+			return httpapi.ResourceView{}, httpapi.ErrInvalidInput
+		}
+		return o.physicalSnapshots.InstallFare(ctx, OperatorFareMutation{
+			ActorID: c.ActorID, IdempotencyKey: c.IdempotencyKey, TrainRunID: trainRunID, FareID: fareID,
+			ExpectedSourceVersion: c.FareSnapshot.ExpectedSourceVersion,
+			FromStopIndex:         c.FareSnapshot.FromStopIndex, ToStopIndex: c.FareSnapshot.ToStopIndex,
+			SeatClass: c.FareSnapshot.SeatClass, AmountMinor: c.FareSnapshot.AmountMinor, Currency: c.FareSnapshot.Currency,
+		})
+	case httpapi.OperatorSetSeatBookingState:
+		if o.physicalSnapshots == nil || c.SeatState == nil {
+			return httpapi.ResourceView{}, httpapi.ErrUnavailable
+		}
+		trainRunID, runErr := uuid.Parse(c.TrainRunID)
+		seatID, resourceErr := uuid.Parse(c.ResourceID)
+		if runErr != nil || resourceErr != nil {
+			return httpapi.ResourceView{}, httpapi.ErrInvalidInput
+		}
+		return o.physicalSnapshots.SetSeatActive(ctx, OperatorSeatMutation{
+			ActorID: c.ActorID, IdempotencyKey: c.IdempotencyKey, TrainRunID: trainRunID, SeatID: seatID,
+			ExpectedSourceVersion: c.SeatState.ExpectedSourceVersion, Active: c.SeatState.Active,
+		})
+	case httpapi.OperatorBumpBookingPolicy:
+		if o.physicalSnapshots == nil || c.BookingPolicy == nil {
+			return httpapi.ResourceView{}, httpapi.ErrUnavailable
+		}
+		trainRunID, parseErr := uuid.Parse(c.TrainRunID)
+		if parseErr != nil {
+			return httpapi.ResourceView{}, httpapi.ErrInvalidInput
+		}
+		return o.physicalSnapshots.BumpBookingPolicy(ctx, OperatorPolicyMutation{
+			ActorID: c.ActorID, IdempotencyKey: c.IdempotencyKey, TrainRunID: trainRunID,
+			ExpectedSourceVersion:        c.BookingPolicy.ExpectedSourceVersion,
+			ExpectedBookingPolicyVersion: c.BookingPolicy.ExpectedBookingPolicyVersion,
+		})
 	default:
 		return httpapi.ResourceView{}, httpapi.ErrInvalidInput
 	}

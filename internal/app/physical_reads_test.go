@@ -81,9 +81,13 @@ func (router *hybridPhysicalRouter) Resolve(context.Context, uuid.UUID, bool) (s
 	return router.resolution, router.err
 }
 
-type hybridReadPool struct{ tx pgx.Tx }
+type hybridReadPool struct {
+	tx      pgx.Tx
+	options pgx.TxOptions
+}
 
-func (pool *hybridReadPool) BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error) {
+func (pool *hybridReadPool) BeginTx(_ context.Context, options pgx.TxOptions) (pgx.Tx, error) {
+	pool.options = options
 	return pool.tx, nil
 }
 func (*hybridReadPool) Close() {}
@@ -91,10 +95,19 @@ func (*hybridReadPool) Close() {}
 type hybridReadTx struct {
 	pgx.Tx
 	row       pgx.Row
+	rows      []pgx.Row
+	nextRow   int
 	commits   int
 	rollbacks int
 }
 
-func (tx *hybridReadTx) QueryRow(context.Context, string, ...any) pgx.Row { return tx.row }
-func (tx *hybridReadTx) Commit(context.Context) error                     { tx.commits++; return nil }
-func (tx *hybridReadTx) Rollback(context.Context) error                   { tx.rollbacks++; return nil }
+func (tx *hybridReadTx) QueryRow(context.Context, string, ...any) pgx.Row {
+	if tx.nextRow < len(tx.rows) {
+		row := tx.rows[tx.nextRow]
+		tx.nextRow++
+		return row
+	}
+	return tx.row
+}
+func (tx *hybridReadTx) Commit(context.Context) error   { tx.commits++; return nil }
+func (tx *hybridReadTx) Rollback(context.Context) error { tx.rollbacks++; return nil }

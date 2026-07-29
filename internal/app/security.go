@@ -97,6 +97,8 @@ func rateLimitPolicy(scope httpapi.RateLimitScope) (string, redisx.RateLimit, bo
 		return "passenger_create", redisx.RateLimit{Limit: 12, Window: time.Hour}, true
 	case httpapi.RateLimitPolicyMutation:
 		return "hot_train_policy_mutation", redisx.RateLimit{Limit: 20, Window: time.Hour}, true
+	case httpapi.RateLimitOperatorBooking:
+		return "operator_booking_mutation", redisx.RateLimit{Limit: 120, Window: time.Hour}, true
 	default:
 		return "", redisx.RateLimit{}, false
 	}
