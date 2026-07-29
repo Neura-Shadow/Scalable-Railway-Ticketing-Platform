@@ -696,7 +696,7 @@ function Start-Milestone5Scenario {
             foreach ($index in 0..2) {
                 $customer = $State.Customers[$index+18]
                 $body = @{train_run_id=$script:M5TrainC;origin_station_code='M2A';destination_station_code='M2B';seat_class='standard';passenger_ids=@($customer.PassengerIDs[0])} | ConvertTo-Json -Compress
-                $shell = "wget --server-response -O /dev/null --header=`"Authorization: Bearer `$M5_TOKEN`" --header='Content-Type: application/json' --header='Idempotency-Key: m5-prewarm-$index' --post-data='$body' http://127.0.0.1:8080/api/v1/reservations"
+                $shell = "wget -S -O /dev/null --header=`"Authorization: Bearer `$M5_TOKEN`" --header='Content-Type: application/json' --header='Idempotency-Key: m5-prewarm-$index' --post-data='$body' http://127.0.0.1:8080/api/v1/reservations"
                 Invoke-Milestone5DriverCompose -Context $Context -Arguments @('exec','-T','-e',"M5_TOKEN=$($customer.Token)","api-$($index+1)",'sh','-c',$shell) -Artifact "stale-prewarm-$index.log" | Out-Null
             }
             New-Milestone5Migration -Context $Context -TrainRunID $script:M5TrainC -TargetShard 'physical-shard-1' -MigrationID $script:M5MigrationCSecond -Prefix 'train-c-second'
