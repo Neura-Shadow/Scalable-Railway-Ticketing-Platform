@@ -211,6 +211,7 @@ SELECT shard_id,
        state,
        minimum_fencing_protocol_version
 FROM public.booking_shards
+WHERE storage_kind <> 'postgres'
 ORDER BY shard_id
 LIMIT $1`, limit+1)
 	if err != nil {
