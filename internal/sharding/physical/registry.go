@@ -57,11 +57,13 @@ type Pool interface {
 type PoolFactory func(context.Context, string, PoolLimits) (Pool, error)
 
 type PoolLimits struct {
-	MaxOpenConns   int
-	MaxIdleConns   int
-	MaxLifetime    time.Duration
-	MaxIdleTime    time.Duration
-	ConnectTimeout time.Duration
+	MaxOpenConns     int
+	MaxIdleConns     int
+	MaxLifetime      time.Duration
+	MaxIdleTime      time.Duration
+	ConnectTimeout   time.Duration
+	StatementTimeout time.Duration
+	LockTimeout      time.Duration
 }
 
 type ConnectionConfig struct {
@@ -122,7 +124,8 @@ func NewRegistry(ctx context.Context, config RegistryConfig, factory PoolFactory
 	if ctx == nil || factory == nil || config.MaxCount < 1 || config.MaxCount > 2 ||
 		len(config.Connections) < 1 || len(config.Connections) > config.MaxCount ||
 		config.Limits.MaxOpenConns < 1 || config.Limits.MaxIdleConns < 0 ||
-		config.Limits.MaxIdleConns > config.Limits.MaxOpenConns {
+		config.Limits.MaxIdleConns > config.Limits.MaxOpenConns ||
+		!validLocalTimeouts(config.Limits.StatementTimeout, config.Limits.LockTimeout) {
 		return nil, ErrInvalidRegistry
 	}
 

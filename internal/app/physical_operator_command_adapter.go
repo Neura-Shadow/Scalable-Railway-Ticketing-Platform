@@ -38,12 +38,20 @@ func (executor *PhysicalOperatorCommandShardExecutor) Execute(ctx context.Contex
 		return operatorcommand.Receipt{}, operatorcommand.ErrInvalidRequest
 	}
 	resolved, err := executor.routes.Resolve(ctx, command.TrainRunID, false)
-	if err != nil || resolved.Handle.Pool() == nil || !resolved.Handle.WriteEnabled() ||
-		resolved.Route.TrainRunID() != command.TrainRunID ||
+	if err != nil {
+		return operatorcommand.Receipt{}, err
+	}
+	if resolved.Handle.Pool() == nil {
+		return operatorcommand.Receipt{}, sharding.ErrShardUnavailable
+	}
+	if resolved.Route.TrainRunID() != command.TrainRunID ||
 		resolved.Route.ShardID() != command.Route.ShardID() ||
 		resolved.Route.Generation() != command.Route.Generation() ||
 		resolved.Handle.ShardID() != command.Route.ShardID() {
 		return operatorcommand.Receipt{}, sharding.ErrAssignmentStale
+	}
+	if !resolved.Handle.WriteEnabled() {
+		return operatorcommand.Receipt{}, sharding.ErrWriteFenced
 	}
 
 	var result commandphysical.OperatorMutationResult

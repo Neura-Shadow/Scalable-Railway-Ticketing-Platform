@@ -37,6 +37,56 @@ func TestCoordinatorReservesBeforeShardAndDefersFinalizerFailure(t *testing.T) {
 	}
 }
 
+func TestCoordinatorLeavesDeterministicShardRejectionForReceiptAwareRecovery(t *testing.T) {
+	request, command, _ := fixture(t, operatorcommand.OperationSeatDisable)
+	store := &fakeStore{command: command}
+	coordinator, err := operatorcommand.NewCoordinator(
+		store,
+		&fakeExecutor{err: sharding.ErrAssignmentStale},
+		&fakeFinalizer{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = coordinator.Execute(context.Background(), request)
+	if !errors.Is(err, operatorcommand.ErrShardExecution) ||
+		!errors.Is(err, sharding.ErrAssignmentStale) {
+		t.Fatalf("Execute stale error = %v", err)
+	}
+	if store.failed != 0 {
+		t.Fatalf("direct path terminalized %d commands without inspecting a receipt", store.failed)
+	}
+}
+
+func TestCoordinatorLeavesAmbiguousShardErrorsRecoverable(t *testing.T) {
+	for name, executionError := range map[string]error{
+		"timeout":     context.DeadlineExceeded,
+		"unavailable": sharding.ErrShardUnavailable,
+	} {
+		t.Run(name, func(t *testing.T) {
+			request, command, _ := fixture(t, operatorcommand.OperationSeatDisable)
+			store := &fakeStore{command: command}
+			coordinator, err := operatorcommand.NewCoordinator(
+				store,
+				&fakeExecutor{err: executionError},
+				&fakeFinalizer{},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = coordinator.Execute(context.Background(), request)
+			if !errors.Is(err, operatorcommand.ErrShardExecution) || !errors.Is(err, executionError) {
+				t.Fatalf("Execute ambiguous error = %v", err)
+			}
+			if store.failed != 0 {
+				t.Fatalf("ambiguous error terminalized %d commands", store.failed)
+			}
+		})
+	}
+}
+
 func TestReceiptRequiresHistoricalRouteAndExactResultVersions(t *testing.T) {
 	_, command, receipt := fixture(t, operatorcommand.OperationBookingPolicyBump)
 	if !operatorcommand.ValidReceipt(command, receipt) {
@@ -73,6 +123,83 @@ func TestRecoveryFinalizerFailureIsRetriedAfterLease(t *testing.T) {
 	second, err := service.RunOnce(context.Background())
 	if err != nil || second.Finalized != 1 || finalizer.calls != 2 {
 		t.Fatalf("second recovery = (%+v,%v), finalizer calls=%d", second, err, finalizer.calls)
+	}
+}
+
+func TestRecoveryTerminalizesDeterministicShardRejection(t *testing.T) {
+	_, command, _ := fixture(t, operatorcommand.OperationSeatEnable)
+	store := &fakeStore{command: command, candidates: []operatorcommand.Candidate{{Command: command}}}
+	service := recoveryWithExecutor(
+		t,
+		store,
+		&fakeExecutor{err: sharding.ErrWriteFenced},
+		&fakeInspector{found: false},
+		&fakeFinalizer{},
+		"worker-a",
+	)
+
+	result, err := service.RunOnce(context.Background())
+	if err != nil || result.Failed != 1 || result.Deferred != 0 || result.Failures != 0 {
+		t.Fatalf("recovery result = (%+v, %v)", result, err)
+	}
+	if store.failed != 1 || len(store.failureRequests) != 1 {
+		t.Fatalf("durable failed transitions = %d, requests=%d", store.failed, len(store.failureRequests))
+	}
+	request := store.failureRequests[0]
+	if request.Command.ID != command.ID || request.Category != operatorcommand.FailureShardRejected ||
+		request.LeaseOwner != "worker-a" {
+		t.Fatalf("failure request = %+v", request)
+	}
+}
+
+func TestRecoveryLeavesAmbiguousShardErrorsRecoverable(t *testing.T) {
+	for name, executionError := range map[string]error{
+		"timeout":     context.DeadlineExceeded,
+		"unavailable": sharding.ErrShardUnavailable,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, command, _ := fixture(t, operatorcommand.OperationSeatEnable)
+			store := &fakeStore{command: command, candidates: []operatorcommand.Candidate{{Command: command}}}
+			service := recoveryWithExecutor(
+				t,
+				store,
+				&fakeExecutor{err: executionError},
+				&fakeInspector{found: false},
+				&fakeFinalizer{},
+				"worker-a",
+			)
+
+			result, err := service.RunOnce(context.Background())
+			if !errors.Is(err, executionError) || result.Failed != 0 ||
+				result.Deferred != 1 || result.Failures != 1 {
+				t.Fatalf("recovery result = (%+v, %v)", result, err)
+			}
+			if store.failed != 0 {
+				t.Fatalf("ambiguous error terminalized %d commands", store.failed)
+			}
+		})
+	}
+}
+
+func TestRecoveryDefersWhenDeterministicFailureCannotBePersisted(t *testing.T) {
+	_, command, _ := fixture(t, operatorcommand.OperationSeatEnable)
+	persistenceError := errors.New("control unavailable")
+	store := &fakeStore{
+		command: command, candidates: []operatorcommand.Candidate{{Command: command}}, failErr: persistenceError,
+	}
+	service := recoveryWithExecutor(
+		t,
+		store,
+		&fakeExecutor{err: sharding.ErrAssignmentStale},
+		&fakeInspector{found: false},
+		&fakeFinalizer{},
+		"worker-a",
+	)
+
+	result, err := service.RunOnce(context.Background())
+	if !errors.Is(err, persistenceError) || result.Failed != 0 ||
+		result.Deferred != 1 || result.Failures != 1 || store.failed != 0 {
+		t.Fatalf("recovery result = (%+v, %v), failed=%d", result, err, store.failed)
 	}
 }
 
@@ -215,12 +342,15 @@ func fixture(t *testing.T, operation operatorcommand.Operation) (operatorcommand
 }
 
 type fakeStore struct {
-	mu         sync.Mutex
-	command    operatorcommand.Command
-	candidates []operatorcommand.Candidate
-	order      *[]string
-	reserves   int
-	leased     bool
+	mu              sync.Mutex
+	command         operatorcommand.Command
+	candidates      []operatorcommand.Candidate
+	order           *[]string
+	reserves        int
+	failed          int
+	failErr         error
+	failureRequests []operatorcommand.FailureRequest
+	leased          bool
 }
 
 func (store *fakeStore) Reserve(context.Context, operatorcommand.ReserveRequest) (operatorcommand.Command, error) {
@@ -244,10 +374,22 @@ func (store *fakeStore) Claim(_ context.Context, options operatorcommand.ClaimOp
 	return []operatorcommand.Candidate{candidate}, nil
 }
 
+func (store *fakeStore) Fail(_ context.Context, request operatorcommand.FailureRequest) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.failErr != nil {
+		return store.failErr
+	}
+	store.failed++
+	store.failureRequests = append(store.failureRequests, request)
+	return nil
+}
+
 func (store *fakeStore) releaseLease() { store.mu.Lock(); store.leased = false; store.mu.Unlock() }
 
 type fakeExecutor struct {
 	receipt  operatorcommand.Receipt
+	err      error
 	order    *[]string
 	calls    int
 	mutation operatorcommand.Mutation
@@ -259,7 +401,7 @@ func (executor *fakeExecutor) Execute(_ context.Context, _ operatorcommand.Comma
 	if executor.order != nil {
 		*executor.order = append(*executor.order, "shard")
 	}
-	return executor.receipt, nil
+	return executor.receipt, executor.err
 }
 
 type fakeFinalizer struct {

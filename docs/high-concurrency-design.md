@@ -21,6 +21,14 @@ PostgreSQL remains the only seat and durable-quota authority.
 - Redis waiting-room Lua scripts: atomically serialize duplicate join, monotonic sequence, queue capacity, global issue rate, inflight count, and token leases across replicas.
 - Booking per-user advisory transaction lock: serializes authoritative held-reservation quota counts.
 - API execution slot: provides a non-blocking local instance bound and never becomes a queue.
+- Physical booking command row and conservative quota lease: serialize one
+  cross-database intent before any shard-local allocation.
+- Physical shard command receipt: serializes retry execution by globally unique
+  command ID and fingerprint in the same local transaction as the seat change.
+- Physical train-run fence: rejects stale routes and wrong-database writers at
+  the shard-local transaction boundary.
+- Operator command identity and optimistic source version: serialize one
+  bounded booking-state change across retries before its local receipt commits.
 
 ## Allocation algorithm
 
@@ -70,6 +78,21 @@ Required cases:
 16. API/worker termination and Redis-finalize failure: transaction is atomic, lease recovery is bounded, and durable replay prevents duplication.
 
 Critical cases run repeatedly and under the Go race detector. Reconciliation follows every database concurrency suite.
+
+For the Milestone 5 pilot, concurrent requests on different physical shards
+still serialize their global quota acquisition in the control database. The
+shard transaction then validates only local snapshots, fence generation, the
+unique command receipt, and deterministic VARBIT rows; it performs no control-
+database read. A shard commit followed by control finalization failure leaves a
+conservative pending quota and directory entry that retry/reconciliation can
+finalize without touching inventory. This deliberately trades availability for
+no quota undercount and no duplicate seat mutation.
+
+Physical operator mutations follow the same single-writer rule. Their control
+ledger fixes the route and generation; the shard transaction locks the matching
+fence and snapshot row, rejects a stale source version, and records the result
+version with its receipt. The final control projection uses the same expected
+version, so a concurrent operator update cannot silently overwrite it.
 
 ## Deadlock controls
 

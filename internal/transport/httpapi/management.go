@@ -24,9 +24,9 @@ func registerManagementRoutes(group *gin.RouterGroup, dependencies Dependencies)
 	operator.PATCH("/train-runs/:id/fares/:resource_id", operatorFareSnapshotHandler(dependencies))
 	operator.PATCH("/train-runs/:id/seats/:resource_id/booking-state", operatorSeatBookingStateHandler(dependencies))
 	operator.PATCH("/train-runs/:id/booking-policy-version", operatorBookingPolicyHandler(dependencies))
-	operator.GET("/train-runs/:id/fares/:resource_id", operatorBookingStateHandler(dependencies, OperatorBookingFareState))
-	operator.GET("/train-runs/:id/seats/:resource_id/booking-state", operatorBookingStateHandler(dependencies, OperatorBookingSeatState))
-	operator.GET("/train-runs/:id/booking-policy-version", operatorBookingStateHandler(dependencies, OperatorBookingPolicyState))
+	operator.GET("/train-runs/:id/fares/:resource_id", withPhysicalQueryTimeout(dependencies, operatorBookingStateHandler(dependencies, OperatorBookingFareState))...)
+	operator.GET("/train-runs/:id/seats/:resource_id/booking-state", withPhysicalQueryTimeout(dependencies, operatorBookingStateHandler(dependencies, OperatorBookingSeatState))...)
+	operator.GET("/train-runs/:id/booking-policy-version", withPhysicalQueryTimeout(dependencies, operatorBookingStateHandler(dependencies, OperatorBookingPolicyState))...)
 }
 
 func operatorBookingStateHandler(dependencies Dependencies, kind OperatorBookingStateKind) gin.HandlerFunc {

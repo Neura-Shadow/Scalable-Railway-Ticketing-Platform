@@ -51,6 +51,9 @@ func (coordinator *Coordinator) Execute(ctx context.Context, request Request) (R
 	}
 	receipt, err := coordinator.executor.Execute(ctx, command, request.Mutation)
 	if err != nil {
+		// A direct retry cannot distinguish a pre-commit rejection from a
+		// committed shard receipt whose control finalization was interrupted.
+		// Only recovery may terminalize after an authoritative receipt miss.
 		return Result{}, fmt.Errorf("%w: %w", ErrShardExecution, err)
 	}
 	if !ValidReceipt(command, receipt) {
@@ -62,6 +65,10 @@ func (coordinator *Coordinator) Execute(ctx context.Context, request Request) (R
 	return resultFromReceipt(receipt, false), nil
 }
 
+func deterministicShardRejection(err error) bool {
+	return errors.Is(err, sharding.ErrAssignmentStale) || errors.Is(err, sharding.ErrWriteFenced)
+}
+
 type RecoveryOptions struct {
 	ClaimOptions
 	InspectTimeout time.Duration
@@ -70,6 +77,7 @@ type RecoveryOptions struct {
 type RecoveryResult struct {
 	Claimed   int
 	Finalized int
+	Failed    int
 	Deferred  int
 	Failures  int
 }
@@ -130,6 +138,17 @@ func (service *RecoveryService) RunOnce(ctx context.Context) (RecoveryResult, er
 			)
 			executionCancel()
 			if inspectErr != nil {
+				if deterministicShardRejection(inspectErr) {
+					if failErr := service.store.Fail(ctx, FailureRequest{
+						Command: candidate.Command, Category: FailureShardRejected,
+						LeaseOwner: candidate.LeaseOwner,
+					}); failErr == nil {
+						result.Failed++
+						continue
+					} else {
+						inspectErr = failErr
+					}
+				}
 				result.Deferred++
 				result.Failures++
 				failures = append(failures, inspectErr)

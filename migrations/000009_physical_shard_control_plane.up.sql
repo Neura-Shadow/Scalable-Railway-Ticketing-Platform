@@ -499,6 +499,33 @@ CREATE TRIGGER reservation_directory_set_updated_at
 BEFORE UPDATE ON public.reservation_directory
 FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
 
+-- Lifecycle projection is monotonic across independently finalized confirm and
+-- cancel commands. A cancellation tombstone may precede the delayed confirm
+-- locator and can never be downgraded by replaying an older receipt.
+CREATE TABLE public.reservation_lifecycle_states (
+    reservation_id uuid PRIMARY KEY
+        REFERENCES public.reservation_directory(reservation_id) ON DELETE RESTRICT,
+    owner_user_id uuid NOT NULL
+        REFERENCES public.users(id) ON DELETE RESTRICT,
+    status text NOT NULL CHECK (status IN ('confirmed', 'cancelled')),
+    lifecycle_rank smallint NOT NULL CHECK (lifecycle_rank IN (1, 2)),
+    last_command_id uuid NOT NULL
+        REFERENCES public.booking_commands(command_id) ON DELETE RESTRICT,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT reservation_lifecycle_states_rank_check CHECK (
+        (status = 'confirmed' AND lifecycle_rank = 1)
+        OR (status = 'cancelled' AND lifecycle_rank = 2)
+    )
+);
+
+CREATE INDEX reservation_lifecycle_states_owner_idx
+    ON public.reservation_lifecycle_states (owner_user_id, reservation_id);
+
+CREATE TRIGGER reservation_lifecycle_states_set_updated_at
+BEFORE UPDATE ON public.reservation_lifecycle_states
+FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
 -- Preserve every populated version-8 locator. Imported rows retain their v8
 -- locator as the rollback representation and intentionally have no synthetic
 -- command or fingerprint.

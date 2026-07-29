@@ -82,6 +82,7 @@ type Config struct {
 	PhysicalShardConnMaxIdleTime    time.Duration
 	PhysicalShardConnectTimeout     time.Duration
 	PhysicalShardQueryTimeout       time.Duration
+	PhysicalWorkerShardTimeout      time.Duration
 	PhysicalShardTotalPoolBudget    int
 	ControlDatabaseMaxOpenConns     int
 	ControlDatabasePoolCount        int
@@ -196,6 +197,7 @@ func Defaults() Config {
 		PhysicalShardConnMaxIdleTime:                5 * time.Minute,
 		PhysicalShardConnectTimeout:                 3 * time.Second,
 		PhysicalShardQueryTimeout:                   2 * time.Second,
+		PhysicalWorkerShardTimeout:                  30 * time.Second,
 		PhysicalShardTotalPoolBudget:                32,
 		ControlDatabaseMaxOpenConns:                 16,
 		ControlDatabasePoolCount:                    1,
@@ -379,6 +381,7 @@ func (c Config) ValidateFor(process Process) error {
 			validationCheck{"HOLD_EXPIRER_BATCH_SIZE", c.HoldExpirerBatchSize > 0},
 			validationCheck{"HOLD_EXPIRER_INTERVAL_SECONDS", c.HoldExpirerInterval > 0},
 			validationCheck{"WORKER_PASS_TIMEOUT", c.WorkerPassTimeout > 0},
+			validationCheck{"PHYSICAL_WORKER_SHARD_TIMEOUT", c.PhysicalWorkerShardTimeout > 0 && c.PhysicalWorkerShardTimeout <= c.WorkerPassTimeout},
 		)
 	case ProcessOutboxWorker:
 		validateWorkerHTTP()
@@ -402,6 +405,7 @@ func (c Config) ValidateFor(process Process) error {
 			validationCheck{"OUTBOX_RETRY_BASE_SECONDS", c.OutboxRetryBase > 0},
 			validationCheck{"OUTBOX_RETRY_MAX_SECONDS", c.OutboxRetryMax >= c.OutboxRetryBase},
 			validationCheck{"WORKER_PASS_TIMEOUT", c.WorkerPassTimeout > 0},
+			validationCheck{"PHYSICAL_WORKER_SHARD_TIMEOUT", c.PhysicalWorkerShardTimeout > 0 && c.PhysicalWorkerShardTimeout <= c.WorkerPassTimeout && c.PhysicalWorkerShardTimeout < c.OutboxProcessingTimeout},
 		)
 	case ProcessAdmissionWorker:
 		validateWorkerHTTP()
@@ -779,6 +783,7 @@ func loadBookingShardSettings(lookup LookupFunc, cfg *Config) error {
 	}{
 		{"PHYSICAL_SHARD_CONNECT_TIMEOUT", &cfg.PhysicalShardConnectTimeout},
 		{"PHYSICAL_SHARD_QUERY_TIMEOUT", &cfg.PhysicalShardQueryTimeout},
+		{"PHYSICAL_WORKER_SHARD_TIMEOUT", &cfg.PhysicalWorkerShardTimeout},
 	} {
 		if err := setDuration(lookup, item.name, item.target); err != nil {
 			return err
@@ -883,7 +888,7 @@ func validateBookingShardConfig(c Config) error {
 
 // PhysicalShardConnectionBudget returns the configured deployment-wide upper
 // bound. It is a capacity guard, not an observed connection count. Control
-// pools, API shard pools, bounded worker concurrency, and both reserves are
+// pools, API shard pools, every worker shard pool, and both reserves are
 // included explicitly so a catalog row can never create unbudgeted pools.
 func (c Config) PhysicalShardConnectionBudget() (int, error) {
 	values := []int{
@@ -898,12 +903,13 @@ func (c Config) PhysicalShardConnectionBudget() (int, error) {
 		}
 	}
 	if c.ControlDatabaseMaxOpenConns < 1 || c.ControlDatabasePoolCount < 1 ||
-		c.PhysicalShardAPIReplicaCount < 1 || c.WorkerShardConcurrency < 1 {
+		c.PhysicalShardAPIReplicaCount < 1 || c.PhysicalShardWorkerReplicas < 1 ||
+		c.WorkerShardConcurrency < 1 {
 		return 0, errors.New("physical shard deployment connection budget requires positive pool and concurrency values")
 	}
 	control := int64(c.ControlDatabaseMaxOpenConns) * int64(c.ControlDatabasePoolCount)
 	api := int64(c.PhysicalShardAPIReplicaCount) * int64(len(c.BookingShardIDs)) * int64(c.PhysicalShardMaxOpenConns)
-	workers := int64(c.PhysicalShardWorkerReplicas) * int64(c.WorkerShardConcurrency)
+	workers := int64(c.PhysicalShardWorkerReplicas) * int64(len(c.BookingShardIDs)) * int64(c.PhysicalShardMaxOpenConns)
 	total := control + api + workers + int64(c.PhysicalShardMigrationReserve) + int64(c.PhysicalShardOperationalReserve)
 	if total <= 0 || total > int64(math.MaxInt) {
 		return 0, errors.New("physical shard deployment connection budget overflows")

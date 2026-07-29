@@ -102,6 +102,44 @@ func TestFinalizeConfirmationRepairsLifecycleControlStateWithoutDirectoryMutatio
 	if count := strings.Count(joined, "insert into public.ticket_shard_locators"); count != len(receipt.TicketIDs) {
 		t.Fatalf("ticket locator writes = %d, want %d", count, len(receipt.TicketIDs))
 	}
+	if queries := strings.Join(tx.querySQL, "\n"); !strings.Contains(queries, "lifecycle_rank<=EXCLUDED.lifecycle_rank") {
+		t.Fatalf("lifecycle projection is not monotonic: %s", queries)
+	}
+}
+
+func TestDelayedConfirmationKeepsAnExistingCancellationTombstone(t *testing.T) {
+	t.Parallel()
+	candidate := controlCandidate(t)
+	candidate.Command.Operation = command.OperationConfirmReservation
+	candidate.Command.State = command.StateCommittedOnShard
+	tx := &controlTx{
+		row: controlRow{values: []any{
+			candidate.Command.RequestFingerprint[:], candidate.Command.ReservationID, string(candidate.Command.State),
+		}},
+		lifecycleStatus: "cancelled",
+	}
+	store, err := NewStore(&controlDB{tx: tx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := command.Receipt{
+		CommandID: candidate.Command.ID, RequestFingerprint: candidate.Command.RequestFingerprint,
+		ResultResourceID: candidate.Command.ReservationID, Status: command.ReceiptCommitted,
+		TicketOrderID: uuid.New(), TicketCount: 1, TicketIDs: []uuid.UUID{uuid.New()},
+		TotalAmountMinor: 1200, Currency: "TWD", OrderCreatedAt: time.Now().UTC(),
+	}
+	if err := store.Finalize(context.Background(), candidate, receipt); err != nil {
+		t.Fatalf("Finalize() error = %v", err)
+	}
+	for index, statement := range tx.statements {
+		if strings.Contains(strings.ToLower(statement), "insert into public.ticket_order_shard_locators") {
+			if len(tx.execArgs[index]) < 7 || tx.execArgs[index][6] != "cancelled" {
+				t.Fatalf("delayed confirmation locator status args = %#v", tx.execArgs[index])
+			}
+			return
+		}
+	}
+	t.Fatal("delayed confirmation omitted ticket-order locator")
 }
 
 func controlCandidate(t *testing.T) reconcile.Candidate {
@@ -134,20 +172,44 @@ func (db *controlDB) BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error) {
 
 type controlTx struct {
 	pgx.Tx
-	row        pgx.Row
-	statements []string
-	committed  bool
+	row             pgx.Row
+	lifecycleStatus string
+	statements      []string
+	execArgs        [][]any
+	querySQL        []string
+	committed       bool
 }
 
-func (tx *controlTx) QueryRow(context.Context, string, ...any) pgx.Row { return tx.row }
-func (tx *controlTx) Exec(_ context.Context, query string, _ ...any) (pgconn.CommandTag, error) {
+func (tx *controlTx) QueryRow(_ context.Context, query string, _ ...any) pgx.Row {
+	tx.querySQL = append(tx.querySQL, query)
+	if strings.Contains(query, "reservation_lifecycle_states") {
+		status := tx.lifecycleStatus
+		if status == "" {
+			status = "confirmed"
+		}
+		return controlStatusRow(status)
+	}
+	return tx.row
+}
+func (tx *controlTx) Exec(_ context.Context, query string, args ...any) (pgconn.CommandTag, error) {
 	tx.statements = append(tx.statements, query)
+	tx.execArgs = append(tx.execArgs, args)
 	return pgconn.NewCommandTag("UPDATE 1"), nil
 }
 func (tx *controlTx) Commit(context.Context) error { tx.committed = true; return nil }
 func (*controlTx) Rollback(context.Context) error  { return pgx.ErrTxClosed }
 
 type controlRow struct{ values []any }
+
+type controlStatusRow string
+
+func (row controlStatusRow) Scan(destinations ...any) error {
+	if len(destinations) != 1 {
+		return errors.New("scan arity mismatch")
+	}
+	*(destinations[0].(*string)) = string(row)
+	return nil
+}
 
 func (row controlRow) Scan(destinations ...any) error {
 	if len(destinations) != 3 || len(row.values) != 3 {

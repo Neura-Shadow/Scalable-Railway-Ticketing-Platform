@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -261,7 +262,6 @@ func TestCaptureOutboxResetsOnlyTransientRelayLeaseState(t *testing.T) {
 	record := testRecord()
 	eventID := uuid.New()
 	sourceTx := &fakeTx{
-		row: fakeRow{values: []any{1}},
 		resultRows: []pgx.Rows{&fakeRows{values: [][]any{{eventID, []byte(`{
             "id":"` + eventID.String() + `",
             "train_run_id":"` + record.TrainRunID.String() + `",
@@ -273,8 +273,10 @@ func TestCaptureOutboxResetsOnlyTransientRelayLeaseState(t *testing.T) {
 		}`)}}}},
 	}
 	source := &fakeDB{transactions: []pgx.Tx{sourceTx}}
-	tx := &fakeTx{rowsAffected: 1}
-	shards := newTestShards(t, source, &fakeDB{transactions: []pgx.Tx{tx}}, &fakeApplier{})
+	resetTx := &fakeTx{rowsAffected: 1}
+	stageTx := &fakeTx{rowsAffected: 1}
+	promoteTx := &fakeTx{rowsAffected: 1}
+	shards := newTestShards(t, source, &fakeDB{transactions: []pgx.Tx{resetTx, stageTx, promoteTx}}, &fakeApplier{})
 
 	if err := shards.CaptureOutbox(context.Background(), record, 10); err != nil {
 		t.Fatalf("CaptureOutbox() error = %v", err)
@@ -282,14 +284,79 @@ func TestCaptureOutboxResetsOnlyTransientRelayLeaseState(t *testing.T) {
 	if !sourceTx.committed {
 		t.Fatal("source outbox snapshot transaction was not committed")
 	}
-	if len(tx.execArgs) != 2 {
-		t.Fatalf("target exec calls = %d, want delete plus insert", len(tx.execArgs))
+	if len(stageTx.execArgs) != 3 || len(promoteTx.execArgs) != 3 {
+		t.Fatalf("stage exec calls=%d promote exec calls=%d", len(stageTx.execArgs), len(promoteTx.execArgs))
 	}
-	data := string(tx.execArgs[1][0].([]byte))
+	data := string(stageTx.execArgs[1][2].([]byte))
 	for _, want := range []string{`"assignment_generation":8`, `"status":"pending"`, `"locked_at":null`, `"locked_by":null`, `"lease_token":null`} {
 		if !strings.Contains(data, want) {
 			t.Fatalf("normalized outbox %s does not contain %s", data, want)
 		}
+	}
+	if !resetTx.committed || !stageTx.committed || !promoteTx.committed ||
+		!strings.Contains(promoteTx.execSQL[0], "DELETE FROM public.outbox_events") ||
+		!strings.Contains(promoteTx.execSQL[1], "jsonb_populate_record") {
+		t.Fatalf("outbox capture did not stage then atomically promote: reset=%v stage=%v promote=%v sql=%v",
+			resetTx.committed, stageTx.committed, promoteTx.committed, promoteTx.execSQL)
+	}
+}
+
+func TestCaptureOutboxStagesMultipleBoundedBatchesBeforeAtomicPromotion(t *testing.T) {
+	t.Parallel()
+
+	record := testRecord()
+	first := make([][]any, 0, 64)
+	for index := 0; index < 64; index++ {
+		id := uuid.New()
+		first = append(first, []any{id, []byte(`{"id":"` + id.String() + `","assignment_generation":7}`)})
+	}
+	lastID := uuid.New()
+	sourceTx := &fakeTx{resultRows: []pgx.Rows{
+		&fakeRows{values: first},
+		&fakeRows{values: [][]any{{lastID, []byte(`{"id":"` + lastID.String() + `","assignment_generation":7}`)}}},
+	}}
+	resetTx := &fakeTx{rowsAffected: 1}
+	firstStage := &fakeTx{rowsAffected: 1}
+	secondStage := &fakeTx{rowsAffected: 1}
+	promoteTx := &fakeTx{rowsAffected: 65}
+	shards := newTestShards(t, &fakeDB{transactions: []pgx.Tx{sourceTx}},
+		&fakeDB{transactions: []pgx.Tx{resetTx, firstStage, secondStage, promoteTx}}, &fakeApplier{})
+
+	if err := shards.CaptureOutbox(context.Background(), record, 100); err != nil {
+		t.Fatalf("CaptureOutbox() error = %v", err)
+	}
+	if len(firstStage.execSQL) != 66 || len(secondStage.execSQL) != 3 ||
+		strings.Contains(strings.Join(firstStage.execSQL, "\n"), "DELETE FROM public.outbox_events") ||
+		strings.Contains(strings.Join(secondStage.execSQL, "\n"), "DELETE FROM public.outbox_events") {
+		t.Fatalf("bounded staging was not isolated from authoritative replacement: first=%d second=%d",
+			len(firstStage.execSQL), len(secondStage.execSQL))
+	}
+	if !promoteTx.committed || len(promoteTx.execSQL) != 3 {
+		t.Fatalf("promotion committed=%v statements=%d", promoteTx.committed, len(promoteTx.execSQL))
+	}
+}
+
+func TestCaptureOutboxRejectsAnExceededAggregateStagingBudget(t *testing.T) {
+	t.Parallel()
+
+	record := testRecord()
+	eventID := uuid.New()
+	sourceTx := &fakeTx{resultRows: []pgx.Rows{&fakeRows{values: [][]any{
+		{eventID, []byte(`{"id":"` + eventID.String() + `","assignment_generation":7}`)},
+	}}}}
+	resetTx := &fakeTx{rowsAffected: 1}
+	stageTx := &fakeTx{rowsAffected: 0}
+	shards := newTestShards(t, &fakeDB{transactions: []pgx.Tx{sourceTx}},
+		&fakeDB{transactions: []pgx.Tx{resetTx, stageTx}}, &fakeApplier{})
+
+	err := shards.CaptureOutbox(context.Background(), record, 10)
+	if !errors.Is(err, physicalmigration.ErrCleanupLimitExceeded) || !stageTx.rolledBack || sourceTx.committed {
+		t.Fatalf("CaptureOutbox() error=%v stage rolled back=%v source committed=%v",
+			err, stageTx.rolledBack, sourceTx.committed)
+	}
+	if len(stageTx.execSQL) != 3 || !strings.Contains(stageTx.execSQL[0], "pg_advisory_xact_lock") ||
+		!strings.Contains(stageTx.execSQL[2], "sum(octet_length") {
+		t.Fatalf("aggregate staging budget was not serialized and checked: %v", stageTx.execSQL)
 	}
 }
 
@@ -619,7 +686,7 @@ type fakeTx struct {
 func (tx *fakeTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	tx.execSQL = append(tx.execSQL, sql)
 	tx.execArgs = append(tx.execArgs, args)
-	return pgconn.NewCommandTag("INSERT 0 " + string(rune('0'+tx.rowsAffected))), nil
+	return pgconn.NewCommandTag(fmt.Sprintf("INSERT 0 %d", tx.rowsAffected)), nil
 }
 func (tx *fakeTx) Commit(context.Context) error {
 	tx.committed = true

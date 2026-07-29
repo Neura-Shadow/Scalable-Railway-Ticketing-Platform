@@ -14,24 +14,25 @@ import (
 // Dependencies contains transport-owned consumer interfaces. Nil dependencies
 // fail closed at the individual endpoint rather than weakening authentication.
 type Dependencies struct {
-	Readiness            ReadinessChecker
-	ReadinessTimeout     time.Duration
-	TokenParser          BearerTokenParser
-	Reservations         ReservationService
-	WaitingRoom          WaitingRoomService
-	HotTrainPolicies     HotTrainPolicyService
-	MaxRequestBodyBytes  int64
-	MaxPassengers        int
-	HTTPMetrics          HTTPMetrics
-	MetricsHandler       http.Handler
-	Offering             OfferingQueries
-	Auth                 AuthService
-	RateLimiter          RateLimiter
-	Passengers           PassengerService
-	Tickets              TicketQueries
-	Admin                AdminCommands
-	Operator             OperatorCommands
-	OperatorBookingState OperatorBookingStateQueries
+	Readiness              ReadinessChecker
+	ReadinessTimeout       time.Duration
+	PhysicalRequestTimeout time.Duration
+	TokenParser            BearerTokenParser
+	Reservations           ReservationService
+	WaitingRoom            WaitingRoomService
+	HotTrainPolicies       HotTrainPolicyService
+	MaxRequestBodyBytes    int64
+	MaxPassengers          int
+	HTTPMetrics            HTTPMetrics
+	MetricsHandler         http.Handler
+	Offering               OfferingQueries
+	Auth                   AuthService
+	RateLimiter            RateLimiter
+	Passengers             PassengerService
+	Tickets                TicketQueries
+	Admin                  AdminCommands
+	Operator               OperatorCommands
+	OperatorBookingState   OperatorBookingStateQueries
 }
 
 // New builds the HTTP router.
@@ -58,6 +59,22 @@ func New(dependencies Dependencies) *gin.Engine {
 	registerWaitingRoomRoutes(api, dependencies)
 	registerHotTrainPolicyRoutes(api, dependencies)
 	return router
+}
+
+func withPhysicalQueryTimeout(dependencies Dependencies, handler gin.HandlerFunc) []gin.HandlerFunc {
+	if dependencies.PhysicalRequestTimeout <= 0 {
+		return []gin.HandlerFunc{handler}
+	}
+	return []gin.HandlerFunc{requestTimeout(dependencies.PhysicalRequestTimeout), handler}
+}
+
+func requestTimeout(timeout time.Duration) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), timeout)
+		defer cancel()
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+	}
 }
 
 func httpMetricsMiddleware(recorder HTTPMetrics) gin.HandlerFunc {

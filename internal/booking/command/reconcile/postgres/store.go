@@ -230,6 +230,10 @@ SET state='finalized',result_resource_id=$2,
 WHERE command_id=$1`, candidate.Command.ID, candidate.Command.ReservationID); err != nil {
 			return err
 		}
+		lifecycleStatus, err := advanceReconciledLifecycle(ctx, tx, candidate.Command)
+		if err != nil {
+			return err
+		}
 		if candidate.Command.Operation == command.OperationConfirmReservation {
 			if !validConfirmationReceipt(receipt) || receipt.TotalAmountMinor < 0 ||
 				len(receipt.Currency) != 3 || receipt.OrderCreatedAt.IsZero() {
@@ -239,8 +243,8 @@ WHERE command_id=$1`, candidate.Command.ID, candidate.Command.ReservationID); er
 INSERT INTO public.ticket_order_shard_locators(
  ticket_order_id,reservation_id,train_run_id,shard_id,assignment_generation,
  owner_user_id,status,total_amount_minor,currency,created_at
-) VALUES($1,$2,$3,$4,$5,$6,'confirmed',$7,$8,$9)
-ON CONFLICT(ticket_order_id) DO UPDATE SET status='confirmed',
+) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+ON CONFLICT(ticket_order_id) DO UPDATE SET status=EXCLUDED.status,
  total_amount_minor=EXCLUDED.total_amount_minor,currency=EXCLUDED.currency,created_at=EXCLUDED.created_at
 WHERE ticket_order_shard_locators.reservation_id=EXCLUDED.reservation_id
  AND ticket_order_shard_locators.owner_user_id=EXCLUDED.owner_user_id
@@ -249,7 +253,7 @@ WHERE ticket_order_shard_locators.reservation_id=EXCLUDED.reservation_id
  AND ticket_order_shard_locators.assignment_generation=EXCLUDED.assignment_generation`,
 				receipt.TicketOrderID, candidate.Command.ReservationID, candidate.Command.TrainRunID,
 				candidate.Command.Route.ShardID().String(), candidate.Command.Route.Generation().Int64(),
-				candidate.Command.OwnerUserID, receipt.TotalAmountMinor, receipt.Currency, receipt.OrderCreatedAt.UTC())
+				candidate.Command.OwnerUserID, lifecycleStatus, receipt.TotalAmountMinor, receipt.Currency, receipt.OrderCreatedAt.UTC())
 			if err != nil || locatorTag.RowsAffected() != 1 {
 				return ErrControlStore
 			}
@@ -257,8 +261,8 @@ WHERE ticket_order_shard_locators.reservation_id=EXCLUDED.reservation_id
 				return err
 			}
 		} else if candidate.Command.Operation == command.OperationCancelReservation {
-			if _, err := tx.Exec(ctx, `UPDATE public.ticket_order_shard_locators SET status='cancelled'
-WHERE reservation_id=$1 AND owner_user_id=$2`, candidate.Command.ReservationID, candidate.Command.OwnerUserID); err != nil {
+			if _, err := tx.Exec(ctx, `UPDATE public.ticket_order_shard_locators SET status=$3
+WHERE reservation_id=$1 AND owner_user_id=$2`, candidate.Command.ReservationID, candidate.Command.OwnerUserID, lifecycleStatus); err != nil {
 				return ErrControlStore
 			}
 		}
@@ -284,6 +288,35 @@ VALUES($1,'booking_command',$2,'booking_command.finalized',1,$3)
 ON CONFLICT(id) DO NOTHING`, uuid.NewSHA1(uuid.NameSpaceOID, []byte("booking-command.finalized:"+candidate.Command.ID.String())), candidate.Command.ID, payload)
 		return err
 	})
+}
+
+func advanceReconciledLifecycle(ctx context.Context, tx pgx.Tx, bookingCommand command.Command) (string, error) {
+	status, rank := "confirmed", int16(1)
+	if bookingCommand.Operation == command.OperationCancelReservation {
+		status, rank = "cancelled", 2
+	}
+	var storedStatus string
+	err := tx.QueryRow(ctx, `
+WITH advanced AS (
+ INSERT INTO public.reservation_lifecycle_states(
+  reservation_id,owner_user_id,status,lifecycle_rank,last_command_id
+ ) VALUES($1,$2,$3,$4,$5)
+ ON CONFLICT(reservation_id) DO UPDATE SET
+  status=EXCLUDED.status,lifecycle_rank=EXCLUDED.lifecycle_rank,
+  last_command_id=EXCLUDED.last_command_id
+ WHERE reservation_lifecycle_states.owner_user_id=EXCLUDED.owner_user_id
+   AND reservation_lifecycle_states.lifecycle_rank<=EXCLUDED.lifecycle_rank
+ RETURNING status
+)
+SELECT status FROM advanced
+UNION ALL
+SELECT status FROM public.reservation_lifecycle_states
+WHERE reservation_id=$1 AND owner_user_id=$2 AND NOT EXISTS(SELECT 1 FROM advanced)
+LIMIT 1`, bookingCommand.ReservationID, bookingCommand.OwnerUserID, status, rank, bookingCommand.ID).Scan(&storedStatus)
+	if err != nil || (storedStatus != "confirmed" && storedStatus != "cancelled") {
+		return "", ErrControlStore
+	}
+	return storedStatus, nil
 }
 
 func validConfirmationReceipt(receipt command.Receipt) bool {

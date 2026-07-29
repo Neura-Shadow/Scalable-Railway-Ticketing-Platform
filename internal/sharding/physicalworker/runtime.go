@@ -55,11 +55,13 @@ func newRuntime(
 		Connections: connections,
 		MaxCount:    cfg.PhysicalShardMaxCount,
 		Limits: physical.PoolLimits{
-			MaxOpenConns:   cfg.PhysicalShardMaxOpenConns,
-			MaxIdleConns:   cfg.PhysicalShardMaxIdleConns,
-			MaxLifetime:    cfg.PhysicalShardConnMaxLifetime,
-			MaxIdleTime:    cfg.PhysicalShardConnMaxIdleTime,
-			ConnectTimeout: cfg.PhysicalShardConnectTimeout,
+			MaxOpenConns:     cfg.PhysicalShardMaxOpenConns,
+			MaxIdleConns:     cfg.PhysicalShardMaxIdleConns,
+			MaxLifetime:      cfg.PhysicalShardConnMaxLifetime,
+			MaxIdleTime:      cfg.PhysicalShardConnMaxIdleTime,
+			ConnectTimeout:   cfg.PhysicalShardConnectTimeout,
+			StatementTimeout: cfg.PhysicalShardQueryTimeout,
+			LockTimeout:      cfg.PhysicalShardQueryTimeout,
 		},
 	}, factory)
 	if err != nil {

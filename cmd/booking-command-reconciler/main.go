@@ -75,7 +75,8 @@ func run(logger *slog.Logger, lookup func(string) (string, bool)) error {
 		Limits: shardphysical.PoolLimits{
 			MaxOpenConns: cfg.shardMaxConns, MaxIdleConns: cfg.shardMaxConns,
 			MaxLifetime: 30 * time.Minute, MaxIdleTime: 5 * time.Minute,
-			ConnectTimeout: cfg.connectTimeout,
+			ConnectTimeout: cfg.connectTimeout, StatementTimeout: cfg.queryTimeout,
+			LockTimeout: cfg.queryTimeout,
 		},
 	}, func(ctx context.Context, dsn string, limits shardphysical.PoolLimits) (shardphysical.Pool, error) {
 		pool, openErr := shardphysical.OpenPGXPool(ctx, dsn, limits)
@@ -170,14 +171,15 @@ func run(logger *slog.Logger, lookup func(string) (string, bool)) error {
 				"claimed", result.Claimed, "finalized", result.Finalized, "failed", result.Failed,
 				"expired", result.Expired, "deferred", result.Deferred, "failure_count", result.Failures,
 				"operator_claimed", operatorResult.Claimed, "operator_finalized", operatorResult.Finalized,
-				"operator_deferred", operatorResult.Deferred, "operator_failures", operatorResult.Failures)
+				"operator_failed", operatorResult.Failed, "operator_deferred", operatorResult.Deferred,
+				"operator_failures", operatorResult.Failures)
 			return
 		}
 		logger.Info("booking command reconciliation pass complete",
 			"claimed", result.Claimed, "finalized", result.Finalized, "failed", result.Failed,
 			"expired", result.Expired, "deferred", result.Deferred,
 			"operator_claimed", operatorResult.Claimed, "operator_finalized", operatorResult.Finalized,
-			"operator_deferred", operatorResult.Deferred)
+			"operator_failed", operatorResult.Failed, "operator_deferred", operatorResult.Deferred)
 	}
 	if cfg.enabled {
 		runPass()
@@ -260,6 +262,7 @@ type runtimeConfig struct {
 	shutdownTimeout  time.Duration
 	readinessTimeout time.Duration
 	connectTimeout   time.Duration
+	queryTimeout     time.Duration
 	routeTTL         time.Duration
 }
 
@@ -273,7 +276,8 @@ func loadConfig(lookup func(string) (string, bool)) (runtimeConfig, error) {
 		controlMaxConns: 4, shardMaxConns: 2, leaseTTL: 30 * time.Second,
 		inspectTimeout: 3 * time.Second, pollInterval: 2 * time.Second,
 		passTimeout: 20 * time.Second, shutdownTimeout: 10 * time.Second,
-		readinessTimeout: 3 * time.Second, connectTimeout: 3 * time.Second, routeTTL: 2 * time.Second,
+		readinessTimeout: 3 * time.Second, connectTimeout: 3 * time.Second,
+		queryTimeout: 2 * time.Second, routeTTL: 2 * time.Second,
 	}
 	cfg.databaseURL = env(lookup, "DATABASE_URL", "")
 	cfg.shardZeroURL = env(lookup, "BOOKING_SHARD_0_DATABASE_URL", "")
@@ -289,8 +293,8 @@ func loadConfig(lookup func(string) (string, bool)) (runtimeConfig, error) {
 		target *int
 	}{
 		{"BOOKING_COMMAND_RECONCILER_BATCH_SIZE", &cfg.batchSize},
-		{"BOOKING_COMMAND_RECONCILER_CONTROL_MAX_CONNS", &cfg.controlMaxConns},
-		{"BOOKING_COMMAND_RECONCILER_SHARD_MAX_CONNS", &cfg.shardMaxConns},
+		{"CONTROL_DATABASE_MAX_OPEN_CONNS", &cfg.controlMaxConns},
+		{"PHYSICAL_SHARD_MAX_OPEN_CONNS", &cfg.shardMaxConns},
 	} {
 		if *item.target, err = envInt(lookup, item.name, *item.target); err != nil {
 			return runtimeConfig{}, err
@@ -305,6 +309,7 @@ func loadConfig(lookup func(string) (string, bool)) (runtimeConfig, error) {
 		{"BOOKING_COMMAND_RECONCILER_POLL_INTERVAL", &cfg.pollInterval},
 		{"WORKER_PASS_TIMEOUT", &cfg.passTimeout}, {"SHUTDOWN_TIMEOUT", &cfg.shutdownTimeout},
 		{"DATABASE_TIMEOUT", &cfg.readinessTimeout}, {"PHYSICAL_SHARD_CONNECT_TIMEOUT", &cfg.connectTimeout},
+		{"PHYSICAL_SHARD_QUERY_TIMEOUT", &cfg.queryTimeout},
 		{"BOOKING_ROUTE_CACHE_TTL", &cfg.routeTTL},
 	} {
 		if *item.target, err = envDuration(lookup, item.name, *item.target); err != nil {
@@ -318,7 +323,8 @@ func loadConfig(lookup func(string) (string, bool)) (runtimeConfig, error) {
 		cfg.inspectTimeout >= cfg.leaseTTL || cfg.inspectTimeout > 10*time.Second || cfg.pollInterval <= 0 ||
 		cfg.passTimeout <= 0 || cfg.passTimeout > cfg.leaseTTL || cfg.shutdownTimeout <= 0 ||
 		cfg.readinessTimeout <= 0 || cfg.readinessTimeout > 10*time.Second || cfg.connectTimeout <= 0 ||
-		cfg.connectTimeout > 10*time.Second || cfg.routeTTL <= 0 || cfg.routeTTL > 5*time.Minute {
+		cfg.connectTimeout > 10*time.Second || cfg.queryTimeout <= 0 || cfg.queryTimeout > 30*time.Second ||
+		cfg.routeTTL <= 0 || cfg.routeTTL > 5*time.Minute {
 		return runtimeConfig{}, errors.New("bounded configuration invalid")
 	}
 	return cfg, nil
@@ -414,7 +420,7 @@ func (metrics *workerMetrics) record(result reconcile.Result, err error, duratio
 func (metrics *workerMetrics) recordOperator(result operatorcommand.RecoveryResult) {
 	for outcome, count := range map[string]int{
 		"operator_finalized": result.Finalized, "operator_deferred": result.Deferred,
-		"operator_failure": result.Failures,
+		"operator_failed": result.Failed, "operator_failure": result.Failures,
 	} {
 		metrics.outcomes.WithLabelValues(outcome).Add(float64(count))
 	}

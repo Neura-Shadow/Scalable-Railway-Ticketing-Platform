@@ -29,7 +29,7 @@ func TestPhysicalWorkerConfigKeepsBatchAsGlobalPassLimit(t *testing.T) {
 	t.Parallel()
 	cfg := config.Defaults()
 	cfg.HoldExpirerBatchSize = 51
-	cfg.PhysicalShardQueryTimeout = 3 * time.Second
+	cfg.PhysicalWorkerShardTimeout = 3 * time.Second
 
 	got := physicalWorkerConfig(cfg, 2)
 	if got.MaxConcurrency != 2 || got.PerShardLimit != 51 || got.PassLimit != 51 || got.ShardTimeout != 3*time.Second {

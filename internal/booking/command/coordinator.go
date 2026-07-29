@@ -165,8 +165,10 @@ func (coordinator *Coordinator) ExecuteLifecycle(ctx context.Context, request Li
 		receipt.ResultResourceID != bookingCommand.ReservationID {
 		return Result{}, ErrReceiptMismatch
 	}
-	if err := coordinator.control.Finalize(ctx, bookingCommand, receipt); err != nil {
-		return Result{}, fmt.Errorf("%w: %w", ErrFinalizationDeferred, err)
+	if !replayed {
+		if err := coordinator.control.Finalize(ctx, bookingCommand, receipt); err != nil {
+			return Result{}, fmt.Errorf("%w: %w", ErrFinalizationDeferred, err)
+		}
 	}
 	return Result{
 		CommandID: bookingCommand.ID, ReservationID: receipt.ResultResourceID,

@@ -110,6 +110,32 @@ func TestCoordinatorLifecycleRetryAfterControlFinalizationFailure(t *testing.T) 
 	}
 }
 
+func TestCoordinatorFinalizedLifecycleReplayReadsReceiptWithoutReapplyingControlProjection(t *testing.T) {
+	t.Parallel()
+	trainRunID, reservationID, ownerID := uuid.New(), uuid.New(), uuid.New()
+	generation, _ := sharding.NewAssignmentGeneration(9)
+	route, _ := sharding.NewShardRoute(trainRunID, sharding.ShardPhysicalOne, generation)
+	control := &controlRepository{command: command.Command{
+		ID: uuid.New(), Operation: command.OperationConfirmReservation, OwnerUserID: ownerID,
+		TrainRunID: trainRunID, ReservationID: reservationID, Route: route,
+		RequestFingerprint: [32]byte{4}, State: command.StateFinalized,
+	}}
+	shard := &shardExecutor{receipt: command.Receipt{
+		CommandID: control.command.ID, RequestFingerprint: control.command.RequestFingerprint,
+		ResultResourceID: reservationID, Status: command.ReceiptCommitted,
+		TicketOrderID: uuid.New(), TicketCount: 1,
+	}}
+	coordinator, _ := command.NewCoordinator(control, shard)
+	result, err := coordinator.ExecuteLifecycle(context.Background(), command.LifecycleRequest{
+		OwnerUserID: ownerID, ReservationID: reservationID,
+		Operation: command.OperationConfirmReservation, IdempotencyKeyHash: [32]byte{3},
+		RequestFingerprint: control.command.RequestFingerprint,
+	})
+	if err != nil || !result.Replayed || shard.executeCalls != 1 || control.finalizeCalls != 0 {
+		t.Fatalf("result=%+v err=%v shard=%d finalize=%d", result, err, shard.executeCalls, control.finalizeCalls)
+	}
+}
+
 type controlRepository struct {
 	command          command.Command
 	reserveCalls     int

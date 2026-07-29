@@ -27,12 +27,13 @@ BEGIN
               'idempotency_records',
               'booking_command_receipts',
               'outbox_events',
+              'migration_outbox_staging',
               'train_run_write_fences',
               'train_run_target_write_evidence',
               'migration_capture_state',
               'train_run_mutation_journal',
               'migration_apply_receipts'
-          )) <> 16 THEN
+          )) <> 17 THEN
         RAISE EXCEPTION 'booking shard version 1 tables are incomplete';
     END IF;
 
@@ -41,6 +42,14 @@ BEGIN
         WHERE trigger_schema = 'public'
           AND trigger_name LIKE '%_capture_mutation') <> 10 THEN
         RAISE EXCEPTION 'mutation capture trigger coverage is incomplete';
+    END IF;
+
+    IF (SELECT count(*)
+        FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND indexname LIKE '%_migration_cursor_idx'
+          AND indexdef LIKE '%(train_run_id, assignment_generation, id)%') <> 11 THEN
+        RAISE EXCEPTION 'base-copy keyset cursor indexes are incomplete';
     END IF;
 
     IF (SELECT count(*)
@@ -54,6 +63,25 @@ BEGIN
               'baseline_outbox_count'
           )) <> 4 THEN
         RAISE EXCEPTION 'target-write rollback baselines are incomplete';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'migration_outbox_staging'
+          AND column_name = 'created_at'
+          AND data_type = 'timestamp with time zone'
+          AND is_nullable = 'NO'
+    ) OR NOT EXISTS (
+        SELECT 1
+        FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND tablename = 'migration_outbox_staging'
+          AND indexname = 'migration_outbox_staging_created_at_idx'
+          AND indexdef LIKE '%(created_at, migration_id)%'
+    ) THEN
+        RAISE EXCEPTION 'bounded migration outbox staging observability is incomplete';
     END IF;
 
     IF EXISTS (

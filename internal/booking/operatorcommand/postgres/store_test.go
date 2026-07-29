@@ -107,6 +107,47 @@ func TestClaimUsesFixedRecoveryStatesSkipLockedAndBoundedLease(t *testing.T) {
 	}
 }
 
+func TestFailTerminalizesOnlyMatchingReservedCommandAndRecoveryLease(t *testing.T) {
+	request := reserveFixture(operatorcommand.OperationBookingPolicyBump)
+	generation, _ := sharding.NewAssignmentGeneration(4)
+	route, _ := sharding.NewShardRoute(request.TrainRunID, sharding.ShardPhysicalZero, generation)
+	command := operatorcommand.Command{
+		ID: uuid.New(), ActorID: request.ActorID, TrainRunID: request.TrainRunID,
+		ResourceID: request.ResourceID, Operation: request.Operation,
+		IdempotencyKeyHash: request.IdempotencyKeyHash, RequestFingerprint: request.RequestFingerprint,
+		Route: route, ExpectedSourceVersion: request.ExpectedSourceVersion,
+		ExpectedBookingPolicyVersion: request.ExpectedBookingPolicyVersion,
+		FinalizePayload:              request.FinalizePayload, State: operatorcommand.StateReserved,
+	}
+	tx := &storeTx{execTag: pgconn.NewCommandTag("UPDATE 1")}
+	store, _ := NewStore(&storeDB{tx: tx})
+	if err := store.Fail(context.Background(), operatorcommand.FailureRequest{
+		Command: command, Category: operatorcommand.FailureShardRejected,
+	}); !errors.Is(err, ErrControlStore) || tx.execQuery != "" {
+		t.Fatalf("Fail without recovery lease = %v, query=%q", err, tx.execQuery)
+	}
+	err := store.Fail(context.Background(), operatorcommand.FailureRequest{
+		Command: command, Category: operatorcommand.FailureShardRejected, LeaseOwner: "worker-1",
+	})
+	if err != nil || !tx.committed {
+		t.Fatalf("Fail = %v, committed=%v", err, tx.committed)
+	}
+	for _, required := range []string{
+		"SET state='failed'", "bounded_error_category=$12", "completed_at=clock_timestamp()",
+		"state='reserved'", "idempotency_key_hash=$4", "request_fingerprint=$5",
+		"assignment_generation=$9", "expected_source_version=$10",
+		"lease_owner=$13", "lease_until>=clock_timestamp()",
+	} {
+		if !strings.Contains(tx.execQuery, required) {
+			t.Fatalf("failure SQL omitted %q: %s", required, tx.execQuery)
+		}
+	}
+	if len(tx.execArgs) != 13 || tx.execArgs[11] != string(operatorcommand.FailureShardRejected) ||
+		tx.execArgs[12] != "worker-1" {
+		t.Fatalf("failure arguments = %#v", tx.execArgs)
+	}
+}
+
 func TestReserveExistingKeyRejectsChangedFingerprint(t *testing.T) {
 	request := reserveFixture(operatorcommand.OperationSeatDisable)
 	commandID := uuid.New()

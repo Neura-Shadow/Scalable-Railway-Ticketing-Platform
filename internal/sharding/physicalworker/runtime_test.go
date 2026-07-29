@@ -26,7 +26,9 @@ func TestRuntimeUsesOnlyConfiguredCatalogHandlesAndValidatesSchema(t *testing.T)
 		"physical-shard-0": runtimeCatalogRow("physical-shard-0", true),
 		"physical-shard-1": runtimeCatalogRow("physical-shard-1", false),
 	}}
-	runtime, err := newRuntime(context.Background(), cfg, catalog, func(_ context.Context, dsn string, _ physical.PoolLimits) (physical.Pool, error) {
+	var openedLimits []physical.PoolLimits
+	runtime, err := newRuntime(context.Background(), cfg, catalog, func(_ context.Context, dsn string, limits physical.PoolLimits) (physical.Pool, error) {
+		openedLimits = append(openedLimits, limits)
 		pool, ok := pools[dsn]
 		if !ok {
 			return nil, errors.New("unconfigured endpoint")
@@ -46,6 +48,15 @@ func TestRuntimeUsesOnlyConfiguredCatalogHandlesAndValidatesSchema(t *testing.T)
 	}
 	if len(catalog.requested) != 2 || catalog.requested[0] != "physical-shard-0" || catalog.requested[1] != "physical-shard-1" {
 		t.Fatalf("catalog requests = %v, want exact configured IDs", catalog.requested)
+	}
+	if len(openedLimits) != 2 {
+		t.Fatalf("opened pool limits = %d, want 2", len(openedLimits))
+	}
+	for _, limits := range openedLimits {
+		if limits.StatementTimeout != cfg.PhysicalShardQueryTimeout ||
+			limits.LockTimeout != cfg.PhysicalShardQueryTimeout {
+			t.Fatalf("worker pool local timeouts = %+v", limits)
+		}
 	}
 }
 

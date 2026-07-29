@@ -7,6 +7,7 @@ DROP TABLE IF EXISTS migration_apply_receipts;
 DROP TABLE IF EXISTS train_run_mutation_journal;
 DROP TABLE IF EXISTS migration_capture_state;
 DROP TABLE IF EXISTS train_run_target_write_evidence;
+DROP TABLE IF EXISTS migration_outbox_staging;
 DROP TABLE IF EXISTS outbox_events;
 DROP TABLE IF EXISTS tickets;
 DROP TABLE IF EXISTS ticket_orders;

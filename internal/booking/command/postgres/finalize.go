@@ -143,6 +143,10 @@ SET state='finalized', result_resource_id=$2,
 WHERE command_id=$1`, bookingCommand.ID, receipt.ResultResourceID); err != nil {
 		return ErrControlWrite
 	}
+	lifecycleStatus, err := advanceReservationLifecycle(ctx, tx, bookingCommand)
+	if err != nil {
+		return err
+	}
 	if bookingCommand.Operation == command.OperationConfirmReservation {
 		if !validConfirmationReceipt(receipt) || receipt.TotalAmountMinor < 0 ||
 			len(receipt.Currency) != 3 || receipt.OrderCreatedAt.IsZero() {
@@ -152,9 +156,9 @@ WHERE command_id=$1`, bookingCommand.ID, receipt.ResultResourceID); err != nil {
 INSERT INTO public.ticket_order_shard_locators(
  ticket_order_id,reservation_id,train_run_id,shard_id,assignment_generation,
  owner_user_id,status,total_amount_minor,currency,created_at
-) VALUES($1,$2,$3,$4,$5,$6,'confirmed',$7,$8,$9)
+) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 ON CONFLICT(ticket_order_id) DO UPDATE
-SET status='confirmed',total_amount_minor=EXCLUDED.total_amount_minor,
+SET status=EXCLUDED.status,total_amount_minor=EXCLUDED.total_amount_minor,
     currency=EXCLUDED.currency,created_at=EXCLUDED.created_at
 WHERE ticket_order_shard_locators.reservation_id=EXCLUDED.reservation_id
   AND ticket_order_shard_locators.owner_user_id=EXCLUDED.owner_user_id
@@ -163,7 +167,7 @@ WHERE ticket_order_shard_locators.reservation_id=EXCLUDED.reservation_id
   AND ticket_order_shard_locators.assignment_generation=EXCLUDED.assignment_generation`,
 			receipt.TicketOrderID, bookingCommand.ReservationID, bookingCommand.TrainRunID,
 			bookingCommand.Route.ShardID().String(), bookingCommand.Route.Generation().Int64(),
-			bookingCommand.OwnerUserID, receipt.TotalAmountMinor, receipt.Currency, receipt.OrderCreatedAt.UTC())
+			bookingCommand.OwnerUserID, lifecycleStatus, receipt.TotalAmountMinor, receipt.Currency, receipt.OrderCreatedAt.UTC())
 		if err != nil || locatorTag.RowsAffected() != 1 {
 			return ErrControlWrite
 		}
@@ -172,8 +176,8 @@ WHERE ticket_order_shard_locators.reservation_id=EXCLUDED.reservation_id
 		}
 	} else if bookingCommand.Operation == command.OperationCancelReservation {
 		if _, err := tx.Exec(ctx, `
-UPDATE public.ticket_order_shard_locators SET status='cancelled'
-WHERE reservation_id=$1 AND owner_user_id=$2`, bookingCommand.ReservationID, bookingCommand.OwnerUserID); err != nil {
+UPDATE public.ticket_order_shard_locators SET status=$3
+WHERE reservation_id=$1 AND owner_user_id=$2`, bookingCommand.ReservationID, bookingCommand.OwnerUserID, lifecycleStatus); err != nil {
 			return ErrControlWrite
 		}
 	}
@@ -211,6 +215,35 @@ ON CONFLICT(id) DO NOTHING`,
 	repository.recordQuota("release", "committed", "none")
 	repository.recordDirectory("success", "none")
 	return nil
+}
+
+func advanceReservationLifecycle(ctx context.Context, tx pgx.Tx, bookingCommand command.Command) (string, error) {
+	status, rank := "confirmed", int16(1)
+	if bookingCommand.Operation == command.OperationCancelReservation {
+		status, rank = "cancelled", 2
+	}
+	var storedStatus string
+	err := tx.QueryRow(ctx, `
+WITH advanced AS (
+ INSERT INTO public.reservation_lifecycle_states(
+  reservation_id,owner_user_id,status,lifecycle_rank,last_command_id
+ ) VALUES($1,$2,$3,$4,$5)
+ ON CONFLICT(reservation_id) DO UPDATE SET
+  status=EXCLUDED.status,lifecycle_rank=EXCLUDED.lifecycle_rank,
+  last_command_id=EXCLUDED.last_command_id
+ WHERE reservation_lifecycle_states.owner_user_id=EXCLUDED.owner_user_id
+   AND reservation_lifecycle_states.lifecycle_rank<=EXCLUDED.lifecycle_rank
+ RETURNING status
+)
+SELECT status FROM advanced
+UNION ALL
+SELECT status FROM public.reservation_lifecycle_states
+WHERE reservation_id=$1 AND owner_user_id=$2 AND NOT EXISTS(SELECT 1 FROM advanced)
+LIMIT 1`, bookingCommand.ReservationID, bookingCommand.OwnerUserID, status, rank, bookingCommand.ID).Scan(&storedStatus)
+	if err != nil || (storedStatus != "confirmed" && storedStatus != "cancelled") {
+		return "", ErrControlWrite
+	}
+	return storedStatus, nil
 }
 
 func validConfirmationReceipt(receipt command.Receipt) bool {

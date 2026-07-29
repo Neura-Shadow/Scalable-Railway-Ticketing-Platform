@@ -21,8 +21,8 @@ func registerCustomerRoutes(group *gin.RouterGroup, dependencies Dependencies) {
 	passengers.DELETE("/:id", passengerItemHandler(dependencies, http.MethodDelete))
 
 	tickets := group.Group("/ticket-orders", authenticate(dependencies.TokenParser), authorize(RoleCustomer))
-	tickets.GET("", listTicketOrdersHandler(dependencies))
-	tickets.GET("/:id", getTicketOrderHandler(dependencies))
+	tickets.GET("", withPhysicalQueryTimeout(dependencies, listTicketOrdersHandler(dependencies))...)
+	tickets.GET("/:id", withPhysicalQueryTimeout(dependencies, getTicketOrderHandler(dependencies))...)
 }
 
 func listPassengersHandler(dependencies Dependencies) gin.HandlerFunc {

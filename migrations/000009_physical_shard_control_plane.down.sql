@@ -339,6 +339,7 @@ DROP TRIGGER physical_shard_migrations_operator_command_guard
     ON public.physical_shard_migrations;
 DROP FUNCTION public.reject_physical_migration_with_operator_command();
 DROP TABLE public.physical_shard_migrations;
+DROP TABLE public.reservation_lifecycle_states;
 DROP TABLE public.reservation_directory;
 DROP TABLE public.booking_quota_leases;
 DROP TABLE public.booking_commands;

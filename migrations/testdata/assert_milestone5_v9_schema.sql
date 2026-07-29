@@ -32,6 +32,7 @@ BEGIN
               'operator_booking_commands',
               'booking_quota_leases',
               'reservation_directory',
+              'reservation_lifecycle_states',
               'train_run_seat_booking_overrides',
               'train_run_booking_policy_versions',
               'physical_shard_migrations',
@@ -42,7 +43,7 @@ BEGIN
               'physical_source_train_run_mutation_journal',
               'physical_control_target_apply_receipts',
               'physical_control_target_apply_authorizations'
-          )) <> 14 THEN
+          )) <> 15 THEN
         RAISE EXCEPTION 'control-plane version 9 tables are incomplete';
     END IF;
 

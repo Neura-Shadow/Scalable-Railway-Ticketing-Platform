@@ -129,9 +129,22 @@ type ClaimOptions struct {
 	LeaseTTL  time.Duration
 }
 
+type FailureCategory string
+
+const FailureShardRejected FailureCategory = "shard_rejected"
+
+// FailureRequest terminalizes a command only when its immutable identity and
+// mandatory recovery lease still match the durable control row.
+type FailureRequest struct {
+	Command    Command
+	Category   FailureCategory
+	LeaseOwner string
+}
+
 type Store interface {
 	Reserve(context.Context, ReserveRequest) (Command, error)
 	Claim(context.Context, ClaimOptions) ([]Candidate, error)
+	Fail(context.Context, FailureRequest) error
 }
 
 type ShardExecutor interface {
@@ -170,6 +183,22 @@ func validOperation(operation Operation) bool {
 func ValidClaimOptions(options ClaimOptions) bool {
 	return workerIDPattern.MatchString(options.WorkerID) && options.BatchSize >= 1 &&
 		options.BatchSize <= MaxClaimBatch && options.LeaseTTL > 0 && options.LeaseTTL <= MaxClaimLeaseTTL
+}
+
+func ValidFailureRequest(request FailureRequest) bool {
+	command := request.Command
+	return request.Category == FailureShardRejected && command.State == StateReserved &&
+		workerIDPattern.MatchString(request.LeaseOwner) &&
+		ValidReserveRequest(ReserveRequest{
+			ActorID: command.ActorID, TrainRunID: command.TrainRunID, ResourceID: command.ResourceID,
+			Operation: command.Operation, IdempotencyKeyHash: command.IdempotencyKeyHash,
+			RequestFingerprint:           command.RequestFingerprint,
+			ExpectedSourceVersion:        command.ExpectedSourceVersion,
+			ExpectedBookingPolicyVersion: command.ExpectedBookingPolicyVersion,
+			FinalizePayload:              command.FinalizePayload,
+		}) && command.ID != uuid.Nil && command.Route.TrainRunID() == command.TrainRunID &&
+		command.Route.Generation().Int64() > 0 &&
+		(command.Route.ShardID() == sharding.ShardPhysicalZero || command.Route.ShardID() == sharding.ShardPhysicalOne)
 }
 
 func ValidReserveRequest(request ReserveRequest) bool {

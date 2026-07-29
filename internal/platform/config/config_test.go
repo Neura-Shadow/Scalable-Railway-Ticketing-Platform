@@ -129,7 +129,7 @@ func TestLoadFromForParsesBoundedPhysicalShardControls(t *testing.T) {
 	env["WORKER_SHARD_CONCURRENCY"] = "2"
 	env["PHYSICAL_SHARD_MIGRATION_ADMIN_RESERVE"] = "4"
 	env["PHYSICAL_SHARD_OPERATIONAL_RESERVE"] = "6"
-	env["POSTGRES_MAX_CONNECTIONS_LIMIT"] = "80"
+	env["POSTGRES_MAX_CONNECTIONS_LIMIT"] = "108"
 
 	cfg, err := config.LoadFromFor(mapLookup(env), config.ProcessAPI)
 	if err != nil {
@@ -152,8 +152,8 @@ func TestLoadFromForParsesBoundedPhysicalShardControls(t *testing.T) {
 		cfg.PhysicalShardQueryTimeout != 1500*time.Millisecond || cfg.PhysicalShardTotalPoolBudget != 16 {
 		t.Fatalf("physical shard bounds = %+v", cfg)
 	}
-	if got, err := cfg.PhysicalShardConnectionBudget(); err != nil || got != 80 {
-		t.Fatalf("PhysicalShardConnectionBudget() = %d, %v, want 80", got, err)
+	if got, err := cfg.PhysicalShardConnectionBudget(); err != nil || got != 108 {
+		t.Fatalf("PhysicalShardConnectionBudget() = %d, %v, want 108", got, err)
 	}
 }
 
@@ -185,6 +185,13 @@ func TestLoadFromForRejectsUnsafePhysicalShardControls(t *testing.T) {
 		want   string
 	}{
 		{
+			name: "missing physical worker pool declaration",
+			mutate: func(env map[string]string) {
+				env["PHYSICAL_SHARD_WORKER_REPLICA_COUNT"] = "0"
+			},
+			want: "positive pool",
+		},
+		{
 			name: "missing connection secret",
 			mutate: func(env map[string]string) {
 				delete(env, "BOOKING_SHARD_1_DATABASE_URL")
@@ -215,7 +222,7 @@ func TestLoadFromForRejectsUnsafePhysicalShardControls(t *testing.T) {
 				env["WORKER_SHARD_CONCURRENCY"] = "2"
 				env["PHYSICAL_SHARD_MIGRATION_ADMIN_RESERVE"] = "4"
 				env["PHYSICAL_SHARD_OPERATIONAL_RESERVE"] = "4"
-				env["POSTGRES_MAX_CONNECTIONS_LIMIT"] = "71"
+				env["POSTGRES_MAX_CONNECTIONS_LIMIT"] = "99"
 			},
 			want: "POSTGRES_MAX_CONNECTIONS_LIMIT",
 		},
@@ -231,6 +238,7 @@ func TestLoadFromForRejectsUnsafePhysicalShardControls(t *testing.T) {
 			env["BOOKING_SHARD_1_DATABASE_URL"] = "postgres://booking@shard-1.example/railway"
 			env["PHYSICAL_SHARD_MAX_OPEN_CONNS"] = "8"
 			env["PHYSICAL_SHARD_TOTAL_POOL_BUDGET"] = "16"
+			env["PHYSICAL_SHARD_WORKER_REPLICA_COUNT"] = "1"
 			test.mutate(env)
 
 			_, err := config.LoadFromFor(mapLookup(env), config.ProcessAPI)

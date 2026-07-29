@@ -34,6 +34,9 @@ table allowlist, deterministic primary-key order, row/byte/time caps, streaming
 `COPY` or bounded parameterized batches, and explicit cancellation. The export
 snapshot and WAL pressure have hard duration/headroom limits. Checkpoints record
 object, cursor, rows, bytes/checksum, journal watermark, and status without PII.
+Every base-copy table has a `(train_run_id, assignment_generation, id)` cursor
+index so each page can use a bounded keyset range instead of rescanning and
+sorting the remaining train-run rows.
 
 See [ADR 043](adr/043-online-copy-catchup-and-cutover.md) and
 [the mutation journal](mutation-journal.md).

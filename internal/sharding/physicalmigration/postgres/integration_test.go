@@ -78,6 +78,49 @@ FROM public.booking_command_receipts WHERE command_id=$1`, commandID).Scan(
 		}
 	})
 
+	t.Run("outbox staging promotes a normalized snapshot atomically", func(t *testing.T) {
+		record := integrationRecord(13, 14)
+		defer cleanupTrainRun(t, source, record.TrainRunID)
+		defer cleanupTrainRun(t, target, record.TrainRunID)
+		seedSnapshotAndFence(t, source, record.TrainRunID, record.SourceGeneration, "active", true, false)
+		seedSnapshotAndFence(t, target, record.TrainRunID, record.TargetGeneration, "standby", false, false)
+		eventID := uuid.New()
+		if _, err := source.Exec(context.Background(), `
+INSERT INTO public.outbox_events(
+ id,train_run_id,assignment_generation,aggregate_type,aggregate_id,event_type,
+ payload,status,locked_at,locked_by,lease_token
+) VALUES($1,$2,$3,'train_run',$2,'train_run.updated','{}','processing',
+         clock_timestamp(),'relay-test',$4)`, eventID, record.TrainRunID,
+			record.SourceGeneration, uuid.New()); err != nil {
+			t.Fatal(err)
+		}
+		shards, err := physicalpostgres.NewDefaultShards(source, target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := shards.CaptureOutbox(context.Background(), record, 10); err != nil {
+			t.Fatalf("CaptureOutbox() error = %v", err)
+		}
+		var (
+			generation int64
+			status     string
+			lockedAt   *time.Time
+			lockedBy   *string
+			leaseToken *uuid.UUID
+		)
+		if err := target.QueryRow(context.Background(), `
+SELECT assignment_generation,status,locked_at,locked_by,lease_token
+FROM public.outbox_events WHERE id=$1`, eventID).Scan(
+			&generation, &status, &lockedAt, &lockedBy, &leaseToken); err != nil {
+			t.Fatal(err)
+		}
+		if generation != record.TargetGeneration || status != "pending" ||
+			lockedAt != nil || lockedBy != nil || leaseToken != nil {
+			t.Fatalf("promoted outbox generation/status/lease = %d/%s/%v/%v/%v",
+				generation, status, lockedAt, lockedBy, leaseToken)
+		}
+	})
+
 	t.Run("semantic corruption fails validation", func(t *testing.T) {
 		record := integrationRecord(17, 18)
 		defer cleanupTrainRun(t, source, record.TrainRunID)

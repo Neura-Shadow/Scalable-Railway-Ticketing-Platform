@@ -5,11 +5,52 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physical"
 	"github.com/jackc/pgx/v5"
 )
+
+func TestRegistryRejectsIncompleteTransactionLocalTimeoutsBeforeOpeningPools(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		statement time.Duration
+		lock      time.Duration
+	}{
+		{name: "missing lock timeout", statement: time.Second},
+		{name: "lock exceeds statement", statement: time.Second, lock: 2 * time.Second},
+		{name: "statement exceeds config bound", statement: 31 * time.Second, lock: time.Second},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			created := 0
+			_, err := physical.NewRegistry(context.Background(), physical.RegistryConfig{
+				Connections: map[string]physical.ConnectionConfig{
+					"physical-shard-0": {ShardID: sharding.ShardPhysicalZero, DSN: "postgres://booking@shard-0.example/railway"},
+				},
+				MaxCount: 1,
+				Limits: physical.PoolLimits{
+					MaxOpenConns: 4, MaxIdleConns: 2, StatementTimeout: test.statement, LockTimeout: test.lock,
+				},
+			}, func(context.Context, string, physical.PoolLimits) (physical.Pool, error) {
+				created++
+				return &stubPool{}, nil
+			})
+			if !errors.Is(err, physical.ErrInvalidRegistry) {
+				t.Fatalf("NewRegistry() error = %v, want %v", err, physical.ErrInvalidRegistry)
+			}
+			if created != 0 {
+				t.Fatalf("pool creations = %d, want 0 for invalid local timeout contract", created)
+			}
+		})
+	}
+}
 
 func TestRegistryRejectsCatalogConnectionReferenceNotConfigured(t *testing.T) {
 	t.Parallel()

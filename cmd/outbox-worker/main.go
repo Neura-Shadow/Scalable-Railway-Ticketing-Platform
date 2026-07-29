@@ -20,6 +20,7 @@ import (
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/redisx"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/workerhttp"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/workerlane"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physicalworker"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
@@ -188,19 +189,17 @@ func main() {
 	run := func() {
 		passContext, cancel := context.WithTimeout(ctx, cfg.WorkerPassTimeout)
 		defer cancel()
-		result, runErr := worker.RunOnce(passContext)
-		physicalProcessed := 0
-		var physicalErr error
+		var physical func(context.Context) (physicalworker.Result, error)
 		if physicalOutbox != nil {
-			physicalResult, physicalRunErr := physicalOutbox.RunOnce(passContext)
-			physicalProcessed = physicalResult.Processed
-			physicalErr = physicalRunErr
+			physical = physicalOutbox.RunOnce
 		}
-		if runErr != nil || physicalErr != nil {
-			logger.Error("outbox pass completed with isolated failures", "control_claimed", result.Claimed, "physical_processed", physicalProcessed)
+		outcome, laneErr := workerlane.Run(passContext, cfg.WorkerPassTimeout,
+			cfg.PhysicalWorkerShardTimeout, worker.RunOnce, physical)
+		if laneErr != nil || outcome.ControlErr != nil || outcome.PhysicalErr != nil {
+			logger.Error("outbox pass completed with isolated failures", "control_claimed", outcome.Control.Claimed, "physical_processed", outcome.Physical.Processed)
 			return
 		}
-		logger.Info("outbox pass complete", "control_claimed", result.Claimed, "control_published", result.Published, "control_retried", result.Retried, "control_dead_letter", result.DeadLetter, "physical_processed", physicalProcessed)
+		logger.Info("outbox pass complete", "control_claimed", outcome.Control.Claimed, "control_published", outcome.Control.Published, "control_retried", outcome.Control.Retried, "control_dead_letter", outcome.Control.DeadLetter, "physical_processed", outcome.Physical.Processed)
 	}
 	run()
 	ticker := clock.RealClock{}.NewTicker(cfg.OutboxPollInterval)
@@ -244,7 +243,7 @@ func physicalOutboxWorkerConfig(cfg config.Config, shardCount int) physicalworke
 		MaxConcurrency: shardCount,
 		PerShardLimit:  cfg.OutboxBatchSize,
 		PassLimit:      cfg.OutboxBatchSize,
-		ShardTimeout:   cfg.PhysicalShardQueryTimeout,
+		ShardTimeout:   cfg.PhysicalWorkerShardTimeout,
 	}
 }
 

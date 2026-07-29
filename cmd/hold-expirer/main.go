@@ -18,6 +18,7 @@ import (
 	platformmetrics "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/metrics"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/workerhttp"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/workerlane"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physicalworker"
 	shardingpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/postgres"
@@ -132,19 +133,17 @@ func main() {
 	run := func() {
 		passContext, cancel := context.WithTimeout(ctx, cfg.WorkerPassTimeout)
 		defer cancel()
-		result, runErr := expirer.RunOnce(passContext)
-		physicalExpired := 0
-		var physicalErr error
+		var physical func(context.Context) (physicalworker.Result, error)
 		if physicalExpirer != nil {
-			physicalResult, physicalRunErr := physicalExpirer.RunOnce(passContext)
-			physicalExpired = physicalResult.Processed
-			physicalErr = physicalRunErr
+			physical = physicalExpirer.RunOnce
 		}
-		if runErr != nil || physicalErr != nil {
-			logger.Error("hold expiration pass completed with isolated failures", "control_expired_count", result.Expired, "physical_expired_count", physicalExpired)
+		outcome, laneErr := workerlane.Run(passContext, cfg.WorkerPassTimeout,
+			cfg.PhysicalWorkerShardTimeout, expirer.RunOnce, physical)
+		if laneErr != nil || outcome.ControlErr != nil || outcome.PhysicalErr != nil {
+			logger.Error("hold expiration pass completed with isolated failures", "control_expired_count", outcome.Control.Expired, "physical_expired_count", outcome.Physical.Processed)
 			return
 		}
-		logger.Info("hold expiration pass complete", "control_expired_count", result.Expired, "physical_expired_count", physicalExpired)
+		logger.Info("hold expiration pass complete", "control_expired_count", outcome.Control.Expired, "physical_expired_count", outcome.Physical.Processed)
 	}
 	runInitialExpirationPass(cfg.HoldExpirerEnabled, run)
 	if !cfg.HoldExpirerEnabled {
@@ -216,7 +215,7 @@ func physicalWorkerConfig(cfg config.Config, shardCount int) physicalworker.Conf
 		MaxConcurrency: shardCount,
 		PerShardLimit:  cfg.HoldExpirerBatchSize,
 		PassLimit:      cfg.HoldExpirerBatchSize,
-		ShardTimeout:   cfg.PhysicalShardQueryTimeout,
+		ShardTimeout:   cfg.PhysicalWorkerShardTimeout,
 	}
 }
 

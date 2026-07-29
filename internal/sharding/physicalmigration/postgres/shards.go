@@ -11,6 +11,15 @@ import (
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physicalmigration"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+)
+
+const (
+	captureOutboxBatchRows     = 64
+	captureOutboxBatchBytes    = 5 * 1024 * 1024
+	captureOutboxTotalBytes    = 64 * 1024 * 1024
+	captureOutboxGlobalBytes   = 256 * 1024 * 1024
+	captureOutboxBudgetLockKey = int64(0x4D354F5554424F58) // "M5OUTBOX"
 )
 
 var (
@@ -391,6 +400,26 @@ func (shards *Shards) CaptureOutbox(ctx context.Context, record physicalmigratio
 	if maxRows <= 0 {
 		return physicalmigration.ErrInvalidInput
 	}
+	resetTx, err := shards.target.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return fmt.Errorf("%w: begin target outbox staging reset", ErrShardOperation)
+	}
+	if err := lockOutboxStagingBudget(ctx, resetTx); err != nil {
+		_ = resetTx.Rollback(context.WithoutCancel(ctx))
+		return err
+	}
+	if _, err := resetTx.Exec(ctx, `DELETE FROM public.migration_outbox_staging WHERE migration_id=$1`,
+		record.MigrationID); err != nil {
+		_ = resetTx.Rollback(context.WithoutCancel(ctx))
+		return fmt.Errorf("%w: reset target outbox staging", ErrShardOperation)
+	}
+	if err := enforceOutboxStagingBudget(ctx, resetTx); err != nil {
+		_ = resetTx.Rollback(context.WithoutCancel(ctx))
+		return err
+	}
+	if err := resetTx.Commit(ctx); err != nil {
+		return fmt.Errorf("%w: commit target outbox staging reset", ErrShardOperation)
+	}
 	sourceTx, err := shards.source.BeginTx(ctx, pgx.TxOptions{
 		IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly,
 	})
@@ -401,40 +430,88 @@ func (shards *Shards) CaptureOutbox(ctx context.Context, record physicalmigratio
 		_ = sourceTx.Rollback(context.WithoutCancel(ctx))
 		return result
 	}
-	var count int
-	if err := sourceTx.QueryRow(ctx, `
-SELECT count(*)
-FROM public.outbox_events
-WHERE train_run_id = $1 AND assignment_generation = $2`, record.TrainRunID,
-		record.SourceGeneration).Scan(&count); err != nil {
-		return rollbackSource(fmt.Errorf("%w: count source outbox", ErrShardOperation))
-	}
-	if count > maxRows {
-		return rollbackSource(physicalmigration.ErrCleanupLimitExceeded)
-	}
-	rows, err := sourceTx.Query(ctx, `
+	var cursor pgtype.UUID
+	total := 0
+	var totalBytes int64
+	for {
+		rows, queryErr := sourceTx.Query(ctx, `
 SELECT id, to_jsonb(source_outbox)
 FROM public.outbox_events AS source_outbox
 WHERE train_run_id = $1 AND assignment_generation = $2
+  AND ($3::uuid IS NULL OR id > $3)
 ORDER BY id
-LIMIT $3`, record.TrainRunID, record.SourceGeneration, maxRows+1)
-	if err != nil {
-		return rollbackSource(fmt.Errorf("%w: capture source outbox", ErrShardOperation))
-	}
-	payload := make([]JSONRow, 0, count)
-	for rows.Next() {
-		var row JSONRow
-		row.Table = "outbox_events"
-		if err := rows.Scan(&row.ID, &row.Data); err != nil {
-			rows.Close()
-			return rollbackSource(fmt.Errorf("%w: scan source outbox", ErrShardOperation))
+LIMIT $4`, record.TrainRunID, record.SourceGeneration, cursor, captureOutboxBatchRows)
+		if queryErr != nil {
+			return rollbackSource(fmt.Errorf("%w: capture source outbox", ErrShardOperation))
 		}
-		payload = append(payload, row)
-	}
-	iterationErr := rows.Err()
-	rows.Close()
-	if iterationErr != nil || len(payload) != count {
-		return rollbackSource(fmt.Errorf("%w: unstable source outbox capture", ErrShardOperation))
+		payload := make([]JSONRow, 0, captureOutboxBatchRows)
+		batchBytes := 0
+		for rows.Next() {
+			var row JSONRow
+			row.Table = "outbox_events"
+			if err := rows.Scan(&row.ID, &row.Data); err != nil {
+				rows.Close()
+				return rollbackSource(fmt.Errorf("%w: scan source outbox", ErrShardOperation))
+			}
+			normalized, normalizeErr := normalizeRow(row.Data, row.Table, record.TargetGeneration)
+			if normalizeErr != nil {
+				rows.Close()
+				return rollbackSource(physicalmigration.ErrInvalidBatch)
+			}
+			row.Data = normalized
+			batchBytes += len(normalized)
+			totalBytes, normalizeErr = boundedCaptureBytes(totalBytes, len(normalized))
+			if normalizeErr != nil {
+				rows.Close()
+				return rollbackSource(normalizeErr)
+			}
+			if batchBytes > captureOutboxBatchBytes {
+				rows.Close()
+				return rollbackSource(physicalmigration.ErrCleanupLimitExceeded)
+			}
+			payload = append(payload, row)
+		}
+		iterationErr := rows.Err()
+		rows.Close()
+		if iterationErr != nil {
+			return rollbackSource(fmt.Errorf("%w: iterate source outbox", ErrShardOperation))
+		}
+		if len(payload) == 0 {
+			break
+		}
+		total += len(payload)
+		if total > maxRows {
+			return rollbackSource(physicalmigration.ErrCleanupLimitExceeded)
+		}
+		stageTx, beginErr := shards.target.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if beginErr != nil {
+			return rollbackSource(fmt.Errorf("%w: begin target outbox staging batch", ErrShardOperation))
+		}
+		if lockErr := lockOutboxStagingBudget(ctx, stageTx); lockErr != nil {
+			_ = stageTx.Rollback(context.WithoutCancel(ctx))
+			return rollbackSource(lockErr)
+		}
+		for _, row := range payload {
+			if _, stageErr := stageTx.Exec(ctx, `
+INSERT INTO public.migration_outbox_staging(migration_id,source_event_id,row_data)
+VALUES($1,$2,$3)
+ON CONFLICT(migration_id,source_event_id) DO UPDATE SET row_data=EXCLUDED.row_data`,
+				record.MigrationID, row.ID, row.Data); stageErr != nil {
+				_ = stageTx.Rollback(context.WithoutCancel(ctx))
+				return rollbackSource(fmt.Errorf("%w: stage target outbox batch", ErrShardOperation))
+			}
+		}
+		if budgetErr := enforceOutboxStagingBudget(ctx, stageTx); budgetErr != nil {
+			_ = stageTx.Rollback(context.WithoutCancel(ctx))
+			return rollbackSource(budgetErr)
+		}
+		if commitErr := stageTx.Commit(ctx); commitErr != nil {
+			return rollbackSource(fmt.Errorf("%w: commit target outbox staging batch", ErrShardOperation))
+		}
+		cursor = pgtype.UUID{Bytes: payload[len(payload)-1].ID, Valid: true}
+		if len(payload) < captureOutboxBatchRows {
+			break
+		}
 	}
 	if err := sourceTx.Commit(ctx); err != nil {
 		return fmt.Errorf("%w: commit source outbox snapshot", ErrShardOperation)
@@ -452,18 +529,51 @@ DELETE FROM public.outbox_events
 WHERE train_run_id = $1 AND assignment_generation = $2`, record.TrainRunID, record.TargetGeneration); err != nil {
 		return rollback(fmt.Errorf("%w: replace target outbox", ErrShardOperation))
 	}
-	spec, _ := findTable("outbox_events")
-	for _, row := range payload {
-		normalized, err := normalizeRow(row.Data, row.Table, record.TargetGeneration)
-		if err != nil {
-			return rollback(physicalmigration.ErrInvalidBatch)
-		}
-		if _, err := tx.Exec(ctx, upsertSQL(spec), normalized); err != nil {
-			return rollback(fmt.Errorf("%w: apply target outbox capture", ErrShardOperation))
-		}
+	tag, err := tx.Exec(ctx, `
+INSERT INTO public.outbox_events
+SELECT (jsonb_populate_record(NULL::public.outbox_events, staged.row_data)).*
+FROM public.migration_outbox_staging AS staged
+WHERE staged.migration_id=$1
+ORDER BY staged.source_event_id`, record.MigrationID)
+	if err != nil || tag.RowsAffected() != int64(total) {
+		return rollback(fmt.Errorf("%w: promote target outbox capture", ErrShardOperation))
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM public.migration_outbox_staging WHERE migration_id=$1`,
+		record.MigrationID); err != nil {
+		return rollback(fmt.Errorf("%w: clear promoted outbox staging", ErrShardOperation))
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("%w: commit target outbox capture", ErrShardOperation)
+	}
+	return nil
+}
+
+func boundedCaptureBytes(total int64, next int) (int64, error) {
+	if total < 0 || next < 0 || total > captureOutboxTotalBytes-int64(next) {
+		return total, physicalmigration.ErrCleanupLimitExceeded
+	}
+	return total + int64(next), nil
+}
+
+func lockOutboxStagingBudget(ctx context.Context, tx pgx.Tx) error {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, captureOutboxBudgetLockKey); err != nil {
+		return fmt.Errorf("%w: lock target outbox staging budget", ErrShardOperation)
+	}
+	return nil
+}
+
+func enforceOutboxStagingBudget(ctx context.Context, tx pgx.Tx) error {
+	tag, err := tx.Exec(ctx, `
+SELECT 1
+WHERE (
+    SELECT COALESCE(sum(octet_length(row_data::text)), 0)
+    FROM public.migration_outbox_staging
+) <= $1`, int64(captureOutboxGlobalBytes))
+	if err != nil {
+		return fmt.Errorf("%w: inspect target outbox staging budget", ErrShardOperation)
+	}
+	if tag.RowsAffected() != 1 {
+		return physicalmigration.ErrCleanupLimitExceeded
 	}
 	return nil
 }

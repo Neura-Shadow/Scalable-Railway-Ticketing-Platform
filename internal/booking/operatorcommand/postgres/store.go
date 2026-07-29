@@ -181,6 +181,41 @@ FROM claimed ORDER BY updated_at,command_id`, options.BatchSize, options.WorkerI
 	return result, nil
 }
 
+func (store *Store) Fail(ctx context.Context, request operatorcommand.FailureRequest) error {
+	if store == nil || ctx == nil || !operatorcommand.ValidFailureRequest(request) {
+		return ErrControlStore
+	}
+	tx, err := store.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return ErrControlStore
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	command := request.Command
+	tag, err := tx.Exec(ctx, `UPDATE public.operator_booking_commands
+SET state='failed',result_source_version=NULL,result_booking_policy_version=NULL,
+    lease_owner=NULL,lease_until=NULL,completed_at=clock_timestamp(),
+    bounded_error_category=$12
+WHERE command_id=$1 AND actor_id=$2 AND operation=$3
+  AND idempotency_key_hash=$4 AND request_fingerprint=$5
+  AND train_run_id=$6 AND resource_id=$7 AND target_shard_id=$8
+  AND assignment_generation=$9 AND expected_source_version=$10
+  AND expected_booking_policy_version IS NOT DISTINCT FROM $11
+  AND state='reserved'
+  AND lease_owner=$13 AND lease_until>=clock_timestamp()`,
+		command.ID, command.ActorID, command.Operation, command.IdempotencyKeyHash[:],
+		command.RequestFingerprint[:], command.TrainRunID, command.ResourceID,
+		command.Route.ShardID().String(), command.Route.Generation().Int64(),
+		command.ExpectedSourceVersion, nullablePositive(command.ExpectedBookingPolicyVersion),
+		string(request.Category), request.LeaseOwner)
+	if err != nil || tag.RowsAffected() != 1 {
+		return ErrControlStore
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ErrControlStore
+	}
+	return nil
+}
+
 type rowScanner interface{ Scan(...any) error }
 
 func loadByIdempotency(ctx context.Context, tx pgx.Tx, actorID uuid.UUID, operation operatorcommand.Operation, keyHash [32]byte) (operatorcommand.Command, bool, error) {

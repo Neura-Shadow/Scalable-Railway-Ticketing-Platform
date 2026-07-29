@@ -74,6 +74,31 @@ func TestPhysicalOperatorCommandAdapterRouteMismatchFailsBeforeShardExecution(t 
 	}
 }
 
+func TestPhysicalOperatorCommandAdapterPreservesAmbiguousRouteErrors(t *testing.T) {
+	command := adapterCommand(t, operatorcommand.OperationSeatDisable, sharding.ShardPhysicalZero, 4)
+	for name, routeError := range map[string]error{
+		"timeout":     context.DeadlineExceeded,
+		"unavailable": sharding.ErrShardUnavailable,
+	} {
+		t.Run(name, func(t *testing.T) {
+			shard := &operatorCommandShardFake{}
+			adapter, _ := NewPhysicalOperatorCommandShardExecutor(
+				&operatorCommandRouteFake{err: routeError},
+				&operatorCommandFareFake{snapshotID: uuid.New()},
+				shard,
+			)
+
+			_, err := adapter.Execute(context.Background(), command, command.FinalizePayload)
+			if !errors.Is(err, routeError) || errors.Is(err, sharding.ErrAssignmentStale) {
+				t.Fatalf("ambiguous route error = %v", err)
+			}
+			if shard.calls != 0 {
+				t.Fatalf("ambiguous route error reached shard %d times", shard.calls)
+			}
+		})
+	}
+}
+
 func TestPhysicalOperatorCommandAdapterRejectsShardResultRouteMismatch(t *testing.T) {
 	command := adapterCommand(t, operatorcommand.OperationSeatDisable, sharding.ShardPhysicalZero, 4)
 	shard := &operatorCommandShardFake{result: commandphysical.OperatorMutationResult{
@@ -113,10 +138,13 @@ func adapterCommand(t *testing.T, operation operatorcommand.Operation, shardID s
 		ExpectedBookingPolicyVersion: policy, FinalizePayload: payload, State: operatorcommand.StateReserved}
 }
 
-type operatorCommandRouteFake struct{ resolution shardphysical.Resolution }
+type operatorCommandRouteFake struct {
+	resolution shardphysical.Resolution
+	err        error
+}
 
 func (resolver *operatorCommandRouteFake) Resolve(context.Context, uuid.UUID, bool) (shardphysical.Resolution, error) {
-	return resolver.resolution, nil
+	return resolver.resolution, resolver.err
 }
 
 func adapterRouteResolver(t *testing.T, trainRunID uuid.UUID, shardID sharding.ShardID, generationValue int64) *operatorCommandRouteFake {

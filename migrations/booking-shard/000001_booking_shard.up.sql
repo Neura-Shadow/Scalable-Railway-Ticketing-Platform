@@ -506,6 +506,48 @@ CREATE TRIGGER outbox_events_set_updated_at
 BEFORE UPDATE ON outbox_events
 FOR EACH ROW EXECUTE FUNCTION booking_shard_set_updated_at();
 
+-- Every base-copy table uses the same keyset cursor. These indexes prevent
+-- each 500-row page from rescanning and resorting the remaining train-run
+-- boundary while source writes continue.
+CREATE INDEX train_run_booking_snapshots_migration_cursor_idx
+    ON train_run_booking_snapshots (train_run_id, assignment_generation, id);
+CREATE INDEX booking_seat_catalog_migration_cursor_idx
+    ON booking_seat_catalog (train_run_id, assignment_generation, id);
+CREATE INDEX booking_fare_snapshots_migration_cursor_idx
+    ON booking_fare_snapshots (train_run_id, assignment_generation, id);
+CREATE INDEX seat_inventory_migration_cursor_idx
+    ON seat_inventory (train_run_id, assignment_generation, id);
+CREATE INDEX reservations_migration_cursor_idx
+    ON reservations (train_run_id, assignment_generation, id);
+CREATE INDEX reservation_seats_migration_cursor_idx
+    ON reservation_seats (train_run_id, assignment_generation, id);
+CREATE INDEX ticket_orders_migration_cursor_idx
+    ON ticket_orders (train_run_id, assignment_generation, id);
+CREATE INDEX tickets_migration_cursor_idx
+    ON tickets (train_run_id, assignment_generation, id);
+CREATE INDEX idempotency_records_migration_cursor_idx
+    ON idempotency_records (train_run_id, assignment_generation, id);
+CREATE INDEX booking_command_receipts_migration_cursor_idx
+    ON booking_command_receipts (train_run_id, assignment_generation, id);
+CREATE INDEX outbox_events_migration_cursor_idx
+    ON outbox_events (train_run_id, assignment_generation, id);
+
+-- Migration tooling stages bounded normalized outbox batches here, then
+-- atomically promotes the complete replacement. The authoritative outbox is
+-- never partially replaced and retries can discard incomplete staging safely.
+CREATE TABLE migration_outbox_staging (
+    migration_id uuid NOT NULL,
+    source_event_id uuid NOT NULL,
+    row_data jsonb NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (migration_id, source_event_id),
+    CHECK (jsonb_typeof(row_data) = 'object'),
+    CHECK (octet_length(row_data::text) <= 131072)
+);
+
+CREATE INDEX migration_outbox_staging_created_at_idx
+    ON migration_outbox_staging (created_at, migration_id);
+
 CREATE TABLE train_run_write_fences (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     train_run_id uuid NOT NULL UNIQUE,

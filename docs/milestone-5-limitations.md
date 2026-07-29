@@ -29,6 +29,21 @@ applies only to the recorded single-region disposable topology and workload.
   production sizing, RPO/RTO, disaster recovery, or national-scale throughput.
 - Security review and synthetic failure tests are not production certification
   or a substitute for deployment-specific threat, backup and access reviews.
+- Physical operator fare mutation supports only existing fares directly scoped
+  to one train run. Route-level shared-fare fanout is rejected before shard
+  execution and requires a separately designed workflow.
+- Application route and generation fences constrain the normal runtime roles;
+  a PostgreSQL superuser or equally privileged direct database actor can bypass
+  application invariants. Deployment must use least-privilege roles, private
+  database networks, audited administrative access, and separate migration
+  credentials.
+- API and reconciler route, fence, command, quota and repair metrics are
+  persistently scrapeable. Migration administration remains a bounded
+  one-shot CLI, so its phase/copy/replay/write-pause counters are durable
+  structured evidence rather than a persistent Prometheus exporter. Startup
+  pool-open failures likewise occur before a metrics listener exists. A
+  long-running migration collector/controller is intentionally not introduced
+  in this pilot.
 
 Current runtime/load evidence is tracked in
 [the benchmark report](benchmark-report-milestone-5.md). Any incomplete or

@@ -44,13 +44,17 @@ func TestLoadConfigUsesBoundedIndependentConnections(t *testing.T) {
 		"BOOKING_COMMAND_RECONCILER_ID":         "reconciler-1",
 		"BOOKING_COMMAND_RECONCILER_BATCH_SIZE": "25",
 		"BOOKING_COMMAND_RECONCILER_LEASE_TTL":  "45s",
+		"CONTROL_DATABASE_MAX_OPEN_CONNS":       "5",
+		"PHYSICAL_SHARD_MAX_OPEN_CONNS":         "3",
+		"PHYSICAL_SHARD_QUERY_TIMEOUT":          "1500ms",
 	}
 	cfg, err := loadConfig(mapLookup(values))
 	if err != nil {
 		t.Fatalf("loadConfig() error = %v", err)
 	}
 	if cfg.batchSize != 25 || cfg.leaseTTL != 45*time.Second || cfg.workerID != "reconciler-1" ||
-		cfg.shardZeroURL == cfg.shardOneURL {
+		cfg.shardZeroURL == cfg.shardOneURL || cfg.controlMaxConns != 5 || cfg.shardMaxConns != 3 ||
+		cfg.queryTimeout != 1500*time.Millisecond {
 		t.Fatalf("loadConfig() = %+v", cfg)
 	}
 }
@@ -68,6 +72,11 @@ func TestLoadConfigRejectsUnboundedOrAliasedShardSettings(t *testing.T) {
 	base["BOOKING_COMMAND_RECONCILER_BATCH_SIZE"] = "501"
 	if _, err := loadConfig(mapLookup(base)); err == nil {
 		t.Fatal("loadConfig() accepted unbounded batch")
+	}
+	base["BOOKING_COMMAND_RECONCILER_BATCH_SIZE"] = "25"
+	base["PHYSICAL_SHARD_QUERY_TIMEOUT"] = "31s"
+	if _, err := loadConfig(mapLookup(base)); err == nil {
+		t.Fatal("loadConfig() accepted unbounded physical query timeout")
 	}
 }
 

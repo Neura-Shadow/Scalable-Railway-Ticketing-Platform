@@ -104,7 +104,9 @@ func run(logger *slog.Logger) error {
 
 	var physicalRegistry *shardphysical.Registry
 	var physicalRouter *shardphysical.CatalogRouter
+	var physicalRequestTimeout time.Duration
 	if cfg.BookingShardMode == config.BookingShardModePhysical {
+		physicalRequestTimeout = cfg.PhysicalShardQueryTimeout
 		connections := make(map[string]shardphysical.ConnectionConfig, len(cfg.PhysicalShardConnections))
 		for reference, dsn := range cfg.PhysicalShardConnections {
 			shardID, parseErr := sharding.ParseShardID(reference)
@@ -117,11 +119,13 @@ func run(logger *slog.Logger) error {
 			Connections: connections,
 			MaxCount:    cfg.PhysicalShardMaxCount,
 			Limits: shardphysical.PoolLimits{
-				MaxOpenConns:   cfg.PhysicalShardMaxOpenConns,
-				MaxIdleConns:   cfg.PhysicalShardMaxIdleConns,
-				MaxLifetime:    cfg.PhysicalShardConnMaxLifetime,
-				MaxIdleTime:    cfg.PhysicalShardConnMaxIdleTime,
-				ConnectTimeout: cfg.PhysicalShardConnectTimeout,
+				MaxOpenConns:     cfg.PhysicalShardMaxOpenConns,
+				MaxIdleConns:     cfg.PhysicalShardMaxIdleConns,
+				MaxLifetime:      cfg.PhysicalShardConnMaxLifetime,
+				MaxIdleTime:      cfg.PhysicalShardConnMaxIdleTime,
+				ConnectTimeout:   cfg.PhysicalShardConnectTimeout,
+				StatementTimeout: cfg.PhysicalShardQueryTimeout,
+				LockTimeout:      cfg.PhysicalShardQueryTimeout,
 			},
 		}, shardphysical.OpenPGXPool)
 		if err != nil {
@@ -400,24 +404,25 @@ func run(logger *slog.Logger) error {
 		}
 	}
 	router := httpapi.New(httpapi.Dependencies{
-		Readiness:            readiness,
-		ReadinessTimeout:     readinessTimeout(cfg),
-		TokenParser:          tokenParser,
-		Reservations:         reservationService,
-		WaitingRoom:          app.NewWaitingRoomService(policyStore, queryStore, admissionControl, admissionKeyring, metrics),
-		HotTrainPolicies:     app.NewHotTrainPolicyService(policyStore),
-		MaxRequestBodyBytes:  maxRequestBodyBytes,
-		MaxPassengers:        cfg.MaxPassengersPerReservation,
-		HTTPMetrics:          metrics,
-		MetricsHandler:       promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
-		Offering:             app.NewOfferingQueries(cachedQueryStore),
-		Auth:                 auth,
-		RateLimiter:          app.NewRateLimiter(rateLimitBackend),
-		Passengers:           passengers,
-		Tickets:              ticketQueries,
-		Admin:                app.NewAdminCommands(offeringStore),
-		Operator:             operatorCommands,
-		OperatorBookingState: operatorBookingState,
+		Readiness:              readiness,
+		ReadinessTimeout:       readinessTimeout(cfg),
+		PhysicalRequestTimeout: physicalRequestTimeout,
+		TokenParser:            tokenParser,
+		Reservations:           reservationService,
+		WaitingRoom:            app.NewWaitingRoomService(policyStore, queryStore, admissionControl, admissionKeyring, metrics),
+		HotTrainPolicies:       app.NewHotTrainPolicyService(policyStore),
+		MaxRequestBodyBytes:    maxRequestBodyBytes,
+		MaxPassengers:          cfg.MaxPassengersPerReservation,
+		HTTPMetrics:            metrics,
+		MetricsHandler:         promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
+		Offering:               app.NewOfferingQueries(cachedQueryStore),
+		Auth:                   auth,
+		RateLimiter:            app.NewRateLimiter(rateLimitBackend),
+		Passengers:             passengers,
+		Tickets:                ticketQueries,
+		Admin:                  app.NewAdminCommands(offeringStore),
+		Operator:               operatorCommands,
+		OperatorBookingState:   operatorBookingState,
 	})
 	if err := router.SetTrustedProxies(cfg.TrustedProxies); err != nil {
 		return errors.New("trusted proxy configuration invalid")
