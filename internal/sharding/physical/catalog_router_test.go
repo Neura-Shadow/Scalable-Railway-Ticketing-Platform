@@ -43,6 +43,9 @@ func TestCatalogRouterRefreshesStaleRouteWithoutReadingAConnectionString(t *test
 	if strings.Contains(strings.ToLower(db.query), "dsn") || strings.Contains(strings.ToLower(db.query), "database_url") {
 		t.Fatalf("catalog query requested a connection secret: %s", db.query)
 	}
+	if !strings.Contains(db.query, "'rollback_window'") {
+		t.Fatalf("catalog query would stop routing the target during its rollback window: %s", db.query)
+	}
 }
 
 func TestCatalogRouterRejectsUnsupportedCatalogMetadata(t *testing.T) {

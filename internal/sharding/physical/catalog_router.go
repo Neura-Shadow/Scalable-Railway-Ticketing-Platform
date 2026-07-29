@@ -115,7 +115,7 @@ FROM public.train_run_shard_assignments AS assignment
 JOIN public.booking_shards AS shard
   ON shard.shard_id = assignment.shard_id
 WHERE assignment.train_run_id = $1
-  AND assignment.assignment_state = 'stable'`, trainRunID).Scan(
+  AND assignment.assignment_state IN ('stable', 'rollback_window')`, trainRunID).Scan(
 		&rawShardID,
 		&rawGeneration,
 		&rawStorageKind,

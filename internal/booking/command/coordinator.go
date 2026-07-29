@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"sort"
 	"time"
@@ -124,7 +125,7 @@ func (coordinator *Coordinator) Execute(ctx context.Context, request ReserveRequ
 	}
 	bookingCommand, err := coordinator.control.Reserve(ctx, request)
 	if err != nil {
-		return Result{}, ErrControlUnavailable
+		return Result{}, fmt.Errorf("%w: %w", ErrControlUnavailable, err)
 	}
 	if !validCommandForRequest(bookingCommand, request) {
 		return Result{}, ErrInvalidCommand
@@ -137,7 +138,7 @@ func (coordinator *Coordinator) Execute(ctx context.Context, request ReserveRequ
 	}
 	receipt, err := coordinator.shard.Execute(ctx, bookingCommand)
 	if err != nil {
-		return Result{}, ErrShardExecution
+		return Result{}, fmt.Errorf("%w: %w", ErrShardExecution, err)
 	}
 	if receipt.Status != ReceiptCommitted || receipt.CommandID != bookingCommand.ID ||
 		receipt.RequestFingerprint != bookingCommand.RequestFingerprint ||
@@ -145,7 +146,7 @@ func (coordinator *Coordinator) Execute(ctx context.Context, request ReserveRequ
 		return Result{}, ErrReceiptMismatch
 	}
 	if err := coordinator.control.Finalize(ctx, bookingCommand, receipt); err != nil {
-		return Result{}, ErrFinalizationDeferred
+		return Result{}, fmt.Errorf("%w: %w", ErrFinalizationDeferred, err)
 	}
 	return Result{CommandID: bookingCommand.ID, ReservationID: receipt.ResultResourceID}, nil
 }

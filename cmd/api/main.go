@@ -16,6 +16,9 @@ import (
 	admissionpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/admission/postgres"
 	admissionredis "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/admission/redis"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/app"
+	bookingcommand "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command"
+	commandphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command/physical"
+	commandpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command/postgres"
 	bookingpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/postgres"
 	offeringpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/offering/postgres"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/clock"
@@ -26,6 +29,7 @@ import (
 	querypostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/postgres"
 	queryreadmodel "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/readmodel"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
+	shardphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physical"
 	shardingpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/postgres"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/routecache"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/transport/httpapi"
@@ -85,6 +89,38 @@ func run(logger *slog.Logger) error {
 		return errors.New("postgres configuration invalid")
 	}
 	defer pool.Close()
+
+	var physicalRegistry *shardphysical.Registry
+	var physicalRouter *shardphysical.CatalogRouter
+	if cfg.BookingShardMode == config.BookingShardModePhysical {
+		connections := make(map[string]shardphysical.ConnectionConfig, len(cfg.PhysicalShardConnections))
+		for reference, dsn := range cfg.PhysicalShardConnections {
+			shardID, parseErr := sharding.ParseShardID(reference)
+			if parseErr != nil {
+				return errors.New("physical shard registry initialization failed")
+			}
+			connections[reference] = shardphysical.ConnectionConfig{ShardID: shardID, DSN: dsn}
+		}
+		physicalRegistry, err = shardphysical.NewRegistry(signalContext, shardphysical.RegistryConfig{
+			Connections: connections,
+			MaxCount:    cfg.PhysicalShardMaxCount,
+			Limits: shardphysical.PoolLimits{
+				MaxOpenConns:   cfg.PhysicalShardMaxOpenConns,
+				MaxIdleConns:   cfg.PhysicalShardMaxIdleConns,
+				MaxLifetime:    cfg.PhysicalShardConnMaxLifetime,
+				MaxIdleTime:    cfg.PhysicalShardConnMaxIdleTime,
+				ConnectTimeout: cfg.PhysicalShardConnectTimeout,
+			},
+		}, shardphysical.OpenPGXPool)
+		if err != nil {
+			return errors.New("physical shard registry initialization failed")
+		}
+		defer physicalRegistry.Close()
+		physicalRouter, err = shardphysical.NewCatalogRouter(pool, physicalRegistry, cfg.BookingRouteCacheTTL)
+		if err != nil {
+			return errors.New("physical shard router initialization failed")
+		}
+	}
 
 	redisClient := redis.NewClient(redisx.BoundedClientOptions(
 		cfg.RedisAddress,
@@ -247,20 +283,63 @@ func run(logger *slog.Logger) error {
 			return errors.New("sharded booking reads initialization failed")
 		}
 	}
+	var physicalCommands *app.HybridReservationCommands
+	var physicalReads *app.HybridReservationReader
+	if physicalRouter != nil {
+		controlCommands, commandErr := commandpostgres.NewRepository(pool, commandpostgres.Options{
+			LeaseTTL:                   cfg.HoldTTL,
+			MaxActiveHoldsPerUser:      cfg.ReservationMaxActiveHoldsPerUser,
+			MaxActiveHoldsPerTrainRun:  cfg.ReservationMaxActiveHoldsPerUserPerTrainRun,
+			MaxActivePassengersPerUser: cfg.ReservationMaxActivePassengersPerUser,
+		})
+		if commandErr != nil {
+			return errors.New("physical booking control initialization failed")
+		}
+		shardExecutor, commandErr := commandphysical.NewExecutor(physicalRouter, commandphysical.Options{MaxHoldTTL: cfg.HoldTTL})
+		if commandErr != nil {
+			return errors.New("physical booking executor initialization failed")
+		}
+		coordinator, commandErr := bookingcommand.NewCoordinator(controlCommands, shardExecutor)
+		if commandErr != nil {
+			return errors.New("physical booking coordinator initialization failed")
+		}
+		physicalCommands, commandErr = app.NewHybridReservationCommands(pool, bookingStore, coordinator, physicalRouter)
+		if commandErr != nil {
+			return errors.New("hybrid booking command initialization failed")
+		}
+		physicalReads, commandErr = app.NewHybridReservationReader(pool, reads, physicalRouter)
+		if commandErr != nil {
+			return errors.New("physical booking read initialization failed")
+		}
+	}
 	rateLimitBackend, err := redisx.NewRateLimiter(redisClient, "railway-api")
 	if err != nil {
 		return errors.New("rate limiter initialization failed")
 	}
 
-	router := httpapi.New(httpapi.Dependencies{
-		Readiness:        app.NewReadinessChecker(pool, redisClient, cfg),
-		ReadinessTimeout: readinessTimeout(cfg),
-		TokenParser:      tokenParser,
-		Reservations: app.NewAdmissionProtectedReservationService(
-			bookingStore, bookingStore, queryStore, reads, policyStore, admissionControl,
+	reservationService := app.NewAdmissionProtectedReservationService(
+		bookingStore, bookingStore, queryStore, reads, policyStore, admissionControl,
+		admissionKeyring, executionSlots, passwordClock, cfg.HoldTTL,
+		cfg.MaxPassengersPerReservation, metrics,
+	).WithDatabaseCommandTimeout(cfg.DatabaseTimeout)
+	if physicalCommands != nil && physicalReads != nil {
+		reservationService = app.NewAdmissionProtectedReservationService(
+			physicalCommands, physicalCommands, queryStore, physicalReads, policyStore, admissionControl,
 			admissionKeyring, executionSlots, passwordClock, cfg.HoldTTL,
 			cfg.MaxPassengersPerReservation, metrics,
-		).WithDatabaseCommandTimeout(cfg.DatabaseTimeout),
+		).WithDatabaseCommandTimeout(cfg.DatabaseTimeout)
+	}
+
+	readiness := app.NewReadinessChecker(pool, redisClient, cfg)
+	if physicalRegistry != nil {
+		readiness = app.NewReadinessChecker(pool, redisClient, cfg, physicalRegistry)
+	}
+
+	router := httpapi.New(httpapi.Dependencies{
+		Readiness:           readiness,
+		ReadinessTimeout:    readinessTimeout(cfg),
+		TokenParser:         tokenParser,
+		Reservations:        reservationService,
 		WaitingRoom:         app.NewWaitingRoomService(policyStore, queryStore, admissionControl, admissionKeyring, metrics),
 		HotTrainPolicies:    app.NewHotTrainPolicyService(policyStore),
 		MaxRequestBodyBytes: maxRequestBodyBytes,
