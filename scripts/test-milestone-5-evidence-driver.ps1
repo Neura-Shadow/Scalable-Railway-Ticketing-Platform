@@ -68,6 +68,8 @@ Assert-True -Condition (-not $driver.Contains('$MyInvocation.MyCommand.Path')) `
     -Message 'background transition jobs must use the driver path captured while the script is dot-sourced'
 Assert-True -Condition $driver.Contains('$MeasurePause.IsPresent') `
     -Message 'background transition jobs must serialize the switch presence as a primitive boolean'
+Assert-True -Condition (-not $driver.Contains('--header=''Authorization: Bearer `$M5_TOKEN''')) `
+    -Message 'stale prewarm must not single-quote the shell token expansion'
 foreach ($forbidden in @(
     'final_write_pause_ms = 1',
     'dual_writer_violations = 0',
