@@ -58,7 +58,8 @@ foreach ($required in @(
     'Invoke-Milestone5OperatorDurableSmoke', 'operator_booking_commands',
     'booking_command_receipts', 'expected_source_version', 'Idempotency-Key',
     'Stop-Milestone5DriverJob', 'target_write_observed_before_reverse',
-    'target_write_preserved_after_reverse', 'M5EvidenceDriverPath'
+    'target_write_preserved_after_reverse', 'M5EvidenceDriverPath',
+    'stale-prewarm-$index.log'
 )) {
     Assert-True -Condition $driver.Contains($required) `
         -Message "driver omitted trusted evidence token $required"
