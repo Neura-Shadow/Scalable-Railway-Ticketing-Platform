@@ -120,6 +120,7 @@ function concurrentPhysicalIdentity() {
       if (!recoveredID) sleep(0.1);
     }
     if (recoveredID) {
+      sameIdempotencyTerminalResponses.add(1);
       if (authoritativeID && recoveredID !== authoritativeID) sameIdempotencyIdentityMismatches.add(1);
       if (!authoritativeID) authoritativeID = recoveredID;
       sameIdempotencyConvergedAPIs.add(1);

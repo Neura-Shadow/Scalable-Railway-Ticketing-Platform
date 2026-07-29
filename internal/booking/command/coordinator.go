@@ -276,8 +276,12 @@ func validCreateReservationPayload(payload CreateReservationPayload, passengerCo
 func equalCreateReservationPayload(left, right CreateReservationPayload) bool {
 	left = CloneCreateReservationPayload(left)
 	right = CloneCreateReservationPayload(right)
+	// Hold expiry is assigned by the API clock, not supplied by the customer or
+	// included in the request fingerprint. Replays use the control lease's
+	// stored expiry and must not conflict only because a retry observed a newer
+	// server timestamp.
 	return left.FromStopIndex == right.FromStopIndex && left.ToStopIndex == right.ToStopIndex &&
-		left.SeatClass == right.SeatClass && left.HoldExpiresAt.Equal(right.HoldExpiresAt) &&
+		left.SeatClass == right.SeatClass &&
 		left.ExpectedSnapshotVersion == right.ExpectedSnapshotVersion &&
 		reflect.DeepEqual(left.PassengerIDs, right.PassengerIDs)
 }

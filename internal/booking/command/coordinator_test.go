@@ -96,6 +96,52 @@ func TestCoordinatorOneHundredConcurrentSameKeyRequestsConvergeOnOnePhysicalMuta
 	}
 }
 
+func TestCoordinatorReplayIgnoresServerDerivedHoldExpiry(t *testing.T) {
+	t.Parallel()
+
+	trainRunID, reservationID, ownerID, passengerID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	generation, err := sharding.NewAssignmentGeneration(7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	route, err := sharding.NewShardRoute(trainRunID, sharding.ShardPhysicalZero, generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedPayload := command.CreateReservationPayload{
+		FromStopIndex: 0, ToStopIndex: 2, SeatClass: "standard",
+		PassengerIDs: []uuid.UUID{passengerID}, HoldExpiresAt: time.Now().UTC().Add(5 * time.Minute),
+		ExpectedSnapshotVersion: 3,
+	}
+	bookingCommand := command.Command{
+		ID: uuid.New(), Operation: command.OperationCreateReservation, OwnerUserID: ownerID,
+		TrainRunID: trainRunID, ReservationID: reservationID, Route: route,
+		RequestFingerprint: [32]byte{4, 5, 6}, State: command.StateReserved, Payload: storedPayload,
+	}
+	control := &controlRepository{command: bookingCommand}
+	shard := &shardExecutor{receipt: command.Receipt{
+		CommandID: bookingCommand.ID, RequestFingerprint: bookingCommand.RequestFingerprint,
+		ResultResourceID: reservationID, Status: command.ReceiptCommitted,
+	}}
+	coordinator, err := command.NewCoordinator(control, shard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryPayload := storedPayload
+	retryPayload.HoldExpiresAt = storedPayload.HoldExpiresAt.Add(2 * time.Second)
+	result, err := coordinator.Execute(context.Background(), command.ReserveRequest{
+		OwnerUserID: ownerID, TrainRunID: trainRunID, Operation: command.OperationCreateReservation,
+		IdempotencyKeyHash: [32]byte{9, 8, 7}, RequestFingerprint: bookingCommand.RequestFingerprint,
+		PassengerCount: 1, Payload: retryPayload,
+	})
+	if err != nil {
+		t.Fatalf("Execute() server-derived expiry replay error = %v", err)
+	}
+	if result.CommandID != bookingCommand.ID || result.ReservationID != reservationID {
+		t.Fatalf("Execute() server-derived expiry replay result = %+v", result)
+	}
+}
+
 func TestCoordinatorRetryFinalizesOneShardCommittedReservation(t *testing.T) {
 	t.Parallel()
 
