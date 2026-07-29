@@ -77,6 +77,7 @@ func TestReserveCountsLegacyAndPhysicalQuotaClaimsTogether(t *testing.T) {
 		t.Fatalf("Reserve() error = %v, want %v", err, postgres.ErrQuotaExceeded)
 	}
 	if len(tx.queries) != 5 ||
+		!strings.Contains(tx.queries[3], "'migrating'") ||
 		!strings.Contains(tx.queries[4], "public.reservation_quota_claims") ||
 		!strings.Contains(tx.queries[4], "public.booking_quota_leases") ||
 		len(tx.execs) != 1 || !strings.Contains(tx.execs[0], "pg_advisory_xact_lock") {

@@ -44,6 +44,18 @@ BEGIN
         RAISE EXCEPTION 'mutation capture trigger coverage is incomplete';
     END IF;
 
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND tablename = 'booking_fare_snapshots'
+          AND indexname = 'booking_fare_snapshots_active_version_unique_idx'
+          AND indexdef LIKE 'CREATE UNIQUE INDEX%'
+          AND indexdef LIKE '%WHERE active%'
+    ) THEN
+        RAISE EXCEPTION 'active fare version uniqueness is missing';
+    END IF;
+
     IF (SELECT count(*)
         FROM pg_indexes
         WHERE schemaname = 'public'

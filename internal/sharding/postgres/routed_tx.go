@@ -137,7 +137,14 @@ FOR SHARE OF shard`, expected.TrainRunID()).Scan(
 	case "rollback_window":
 		// The cut-over target is authoritative and intentionally retains an
 		// active migration row during the bounded rollback window.
-	case "draining", "migrating":
+	case "migrating":
+		// Online copy and journal catch-up retain the currently assigned source
+		// generation as the sole writer. The local fence below remains the final
+		// database authority and draining is still rejected.
+		if !hasActiveMigration {
+			return fail(sharding.ErrShardUnavailable)
+		}
+	case "draining":
 		return fail(sharding.ErrTrainRunMigrating)
 	default:
 		return fail(sharding.ErrShardUnavailable)

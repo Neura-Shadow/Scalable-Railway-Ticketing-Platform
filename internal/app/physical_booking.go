@@ -198,7 +198,7 @@ SELECT shard.storage_kind
 FROM public.train_run_shard_assignments AS assignment
 JOIN public.booking_shards AS shard ON shard.shard_id = assignment.shard_id
 WHERE assignment.train_run_id = $1
-  AND assignment.assignment_state IN ('stable', 'rollback_window')`, trainRunID).Scan(&storageKind)
+  AND assignment.assignment_state IN ('stable', 'migrating', 'rollback_window')`, trainRunID).Scan(&storageKind)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, bookingpostgres.ErrNotFound
 	}

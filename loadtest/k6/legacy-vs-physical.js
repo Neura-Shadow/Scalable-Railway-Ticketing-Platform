@@ -21,11 +21,12 @@ export const legacyPathDuration = new Trend('legacy_path_duration', true);
 export const physicalPathDuration = new Trend('physical_path_duration', true);
 
 const vus = positiveInteger('VUS_PER_PATH', 4);
-const duration = (__ENV.DURATION || '15s').trim();
+const maxDuration = (__ENV.DURATION || '15s').trim();
+const iterations = positiveInteger('ITERATIONS_PER_VU', 2);
 
 export const options = boundedOptions({
-  legacy_path: { executor: 'constant-vus', exec: 'legacy', vus, duration, gracefulStop: '5s' },
-  physical_path: { executor: 'constant-vus', exec: 'physical', vus, duration, gracefulStop: '5s' },
+  legacy_path: { executor: 'per-vu-iterations', exec: 'legacy', vus, iterations, maxDuration, gracefulStop: '5s' },
+  physical_path: { executor: 'per-vu-iterations', exec: 'physical', vus, iterations, maxDuration, gracefulStop: '5s' },
 }, {
   legacy_path_success: ['count>=2'],
   physical_path_success: ['count>=2'],

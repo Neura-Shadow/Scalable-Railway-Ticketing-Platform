@@ -269,7 +269,7 @@ func TestDueReservationQueriesSelectOnlyAuthoritativeWritableLocatorRows(t *test
 			"public.reservation_shard_locators",
 			"public.train_run_shard_assignments",
 			"assignment.assignment_generation = locator.assignment_generation",
-			"assignment.assignment_state IN ('stable', 'rollback_window')",
+			"assignment.assignment_state IN ('stable', 'migrating', 'rollback_window')",
 			"catalog.write_enabled",
 			"catalog.minimum_fencing_protocol_version <= $2",
 			"locator.shard_id = '" + shardID.String() + "'",

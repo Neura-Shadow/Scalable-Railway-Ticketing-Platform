@@ -26,6 +26,11 @@ local state. Migration copies snapshot dependencies before mutable booking
 rows and validates identities, versions, segment bounds, classes, and
 relationships at the target.
 
+Active fare versions remain unique for one train run, generation, interval,
+class, and source version. Inactive reservation-era fare snapshots may coexist
+under distinct stable identities so base copy preserves historical charged
+amounts without treating those rows as current offering authority.
+
 Snapshots deliberately duplicate non-PII reference data. They do not make the
 booking shard authoritative for global offering management. See
 [ADR 040](adr/040-shard-local-booking-reference-snapshots.md).

@@ -67,6 +67,9 @@ func TestHybridReservationCommandsPreservesLegacyCreatePath(t *testing.T) {
 	if err != nil || got.ReservationID != want.ReservationID || legacy.createCalls != 1 {
 		t.Fatalf("CreateHold() = (%+v, %v), legacy calls=%d", got, err, legacy.createCalls)
 	}
+	if !strings.Contains(commands.control.(*hybridControl).query, "'migrating'") {
+		t.Fatalf("legacy source is not routable during online base copy: %s", commands.control.(*hybridControl).query)
+	}
 }
 
 func TestHybridReservationCommandsRoutesPhysicalLifecycleWithoutLegacyFallback(t *testing.T) {
@@ -110,6 +113,11 @@ func TestPhysicalTrainRunCancellationPreservesLegacyAndEnforcesPhysical(t *testi
 		&hybridControl{rows: []pgx.Row{hybridRow{values: []any{"postgres", "draining"}}}}, executor)
 	if err := draining.CancelTrainRun(context.Background(), runID); !errors.Is(err, sharding.ErrWriteFenced) || executor.calls != 1 {
 		t.Fatalf("draining cancellation err=%v calls=%d", err, executor.calls)
+	}
+	migrating, _ := NewPhysicalTrainRunCancellation(
+		&hybridControl{rows: []pgx.Row{hybridRow{values: []any{"postgres", "migrating"}}}}, executor)
+	if err := migrating.CancelTrainRun(context.Background(), runID); err != nil || executor.calls != 2 {
+		t.Fatalf("migrating source cancellation err=%v calls=%d", err, executor.calls)
 	}
 }
 
@@ -204,9 +212,11 @@ func (legacy *hybridLegacy) CancelReservation(context.Context, bookingpostgres.R
 type hybridControl struct {
 	rows  []pgx.Row
 	calls int
+	query string
 }
 
-func (control *hybridControl) QueryRow(context.Context, string, ...any) pgx.Row {
+func (control *hybridControl) QueryRow(_ context.Context, query string, _ ...any) pgx.Row {
+	control.query = query
 	row := control.rows[control.calls]
 	control.calls++
 	return row

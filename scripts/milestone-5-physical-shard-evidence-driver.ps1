@@ -309,7 +309,7 @@ function New-Milestone5DriverCustomers {
         if (-not $token) { throw 'synthetic login omitted token' }
         $State.SecretValues.Add($token)
         $passengers = @()
-        $passengerCount = if ($index -lt 2) { 11 } else { 7 }
+        $passengerCount = if ($index -lt 2) { 13 } else { 7 }
         foreach ($passengerIndex in 0..($passengerCount-1)) {
             $passenger = Invoke-Milestone5DriverAPI -BaseURL $State.BaseURL -Method POST -Path '/api/v1/passengers' -Token $token -Body @{
                 display_name="M5 Synthetic Passenger $index-$passengerIndex"
@@ -527,10 +527,15 @@ function New-Milestone5EnvironmentMap {
             VUS='2'; ITERATIONS='8'; MAX_PAUSE_MS='30000'
         }
     }
+    $map['online-base-copy']['ITERATIONS_PER_VU']='2'
+    $map['journal-catchup']['VUS']='3'; $map['journal-catchup']['ITERATIONS']='3'
+    $map['physical-cutover']['CUSTOMER_TOKENS']=($State.Customers[0].Token,$State.Customers[1].Token -join ',')
+    $map['physical-cutover']['PASSENGER_IDS']=($State.Customers[0].PassengerIDs[11],$State.Customers[1].PassengerIDs[11] -join ',')
+    $map['physical-cutover']['ITERATIONS_PER_VU']='8'
     $map['stale-router-physical'] = [ordered]@{
         API_URLS='http://api-1:8080,http://api-2:8080,http://api-3:8080'; ORIGIN_CODE='M2A'; DESTINATION_CODE='M2B'; SEAT_CLASS='standard'; TRAIN_RUN_ID=$script:M5TrainC
-        CUSTOMER_TOKENS=($State.Customers[2].Token,$State.Customers[3].Token,$State.Customers[4].Token -join ',')
-        PASSENGER_IDS=($State.Customers[2].PassengerIDs[5],$State.Customers[3].PassengerIDs[5],$State.Customers[4].PassengerIDs[5] -join ',')
+        CUSTOMER_TOKENS=($State.Customers[5].Token,$State.Customers[6].Token,$State.Customers[7].Token -join ',')
+        PASSENGER_IDS=($State.Customers[5].PassengerIDs[5],$State.Customers[6].PassengerIDs[5],$State.Customers[7].PassengerIDs[5] -join ',')
     }
     $map['reverse-migration'] = [ordered]@{
         BASE_URL=$common.BASE_URL; ORIGIN_CODE='M2A'; DESTINATION_CODE='M2B'; SEAT_CLASS='standard'; TRAIN_RUN_ID=$script:M5TrainC
@@ -540,7 +545,7 @@ function New-Milestone5EnvironmentMap {
     $map['legacy-vs-physical'] = [ordered]@{
         BASE_URL=$common.BASE_URL; ORIGIN_CODE='M2A'; DESTINATION_CODE='M2B'; SEAT_CLASS='standard'; LEGACY_TRAIN_RUN_ID=$script:M5TrainD; PHYSICAL_TRAIN_RUN_ID=$script:M5TrainC
         LEGACY_CUSTOMER_TOKENS=($State.Customers[5].Token,$State.Customers[6].Token -join ','); LEGACY_PASSENGER_IDS=($State.Customers[5].PassengerIDs[0],$State.Customers[6].PassengerIDs[0] -join ',')
-        PHYSICAL_CUSTOMER_TOKENS=($State.Customers[2].Token,$State.Customers[3].Token -join ','); PHYSICAL_PASSENGER_IDS=($State.Customers[2].PassengerIDs[6],$State.Customers[3].PassengerIDs[6] -join ','); VUS_PER_PATH='2'
+        PHYSICAL_CUSTOMER_TOKENS=($State.Customers[5].Token,$State.Customers[6].Token -join ','); PHYSICAL_PASSENGER_IDS=($State.Customers[5].PassengerIDs[2],$State.Customers[6].PassengerIDs[2] -join ','); VUS_PER_PATH='2'; ITERATIONS_PER_VU='2'
     }
     return $map
 }

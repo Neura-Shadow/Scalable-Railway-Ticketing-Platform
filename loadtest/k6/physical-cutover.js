@@ -23,9 +23,10 @@ const maximumPauseMilliseconds = positiveInteger('MAX_PAUSE_MS', 30000);
 
 export const options = boundedOptions({
   cutover_overlap: {
-    executor: 'constant-vus',
+    executor: 'per-vu-iterations',
     vus: positiveInteger('VUS', 6),
-    duration: (__ENV.DURATION || '30s').trim(),
+    iterations: positiveInteger('ITERATIONS_PER_VU', 8),
+    maxDuration: (__ENV.DURATION || '30s').trim(),
     gracefulStop: '5s',
   },
 }, {
@@ -87,7 +88,7 @@ export default function () {
       value.status === 201 || (value.status === 503
         && publicErrorCode(value) === 'service_temporarily_rebalancing'),
   });
-  sleep(0.1);
+  sleep(1.5);
 }
 
 // The external controller proves source-disable precedes target-enable. This

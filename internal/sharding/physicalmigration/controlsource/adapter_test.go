@@ -23,6 +23,20 @@ func TestFareSnapshotUsesDurableControlSourceVersion(t *testing.T) {
 	}
 }
 
+func TestBookingShardFareVersionUniquenessAppliesOnlyToActiveSnapshots(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join("..", "..", "..", "..", "migrations", "booking-shard", "000001_booking_shard.up.sql")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read booking shard migration: %v", err)
+	}
+	sql := string(raw)
+	if !strings.Contains(sql, "booking_fare_snapshots_active_version_unique_idx") ||
+		!strings.Contains(sql, "WHERE active") {
+		t.Fatal("inactive historical reservation fares cannot coexist during base copy")
+	}
+}
+
 func TestNewAcceptsOnlyTheFixedControlSourceIDs(t *testing.T) {
 	t.Parallel()
 

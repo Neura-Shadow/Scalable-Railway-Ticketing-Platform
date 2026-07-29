@@ -92,7 +92,7 @@ $fakeCustomers = @(0..7 | ForEach-Object {
     $customerIndex = [int]$_
     [pscustomobject]@{
         Token = "synthetic-token-$customerIndex"
-        PassengerIDs = [string[]]@(0..10 | ForEach-Object {
+        PassengerIDs = [string[]]@(0..12 | ForEach-Object {
             "21000000-0000-4000-8$customerIndex$($_.ToString('00'))-$($customerIndex.ToString('00'))$($_.ToString('0000000000'))"
         })
     }
@@ -111,8 +111,17 @@ Assert-True -Condition ($environmentMap['physical-shard-outage']['VUS_PER_SHARD'
     -Message 'outage evidence requires two independent healthy-shard writers'
 Assert-True -Condition ($environmentMap['physical-shard-outage']['ITERATIONS_PER_VU'] -eq '2') `
     -Message 'outage evidence must use bounded iterations below the public reservation-rate limit'
+Assert-True -Condition ($environmentMap['online-base-copy']['ITERATIONS_PER_VU'] -eq '2') `
+    -Message 'online base-copy evidence must use bounded source mutations'
+Assert-True -Condition ($environmentMap['journal-catchup']['VUS'] -eq '3' -and `
+    $environmentMap['journal-catchup']['ITERATIONS'] -eq '3') `
+    -Message 'journal catch-up must use one bounded mutation identity per customer'
+Assert-True -Condition ($environmentMap['physical-cutover']['ITERATIONS_PER_VU'] -eq '8') `
+    -Message 'cutover evidence must poll through the bounded pause without exceeding the public rate limit'
 Assert-True -Condition ($environmentMap['legacy-vs-physical']['VUS_PER_PATH'] -eq '2') `
     -Message 'legacy/physical comparison requires two independent writers per path'
+Assert-True -Condition ($environmentMap['legacy-vs-physical']['ITERATIONS_PER_VU'] -eq '2') `
+    -Message 'legacy/physical comparison must use bounded replay iterations'
 foreach ($scriptName in @('physical-shard-outage.js', 'legacy-vs-physical.js')) {
     $scriptSource = Get-Content -Raw -LiteralPath (Join-Path $root "loadtest/k6/$scriptName")
     Assert-True -Condition $scriptSource.Contains('__ITER === 0') `
@@ -121,6 +130,11 @@ foreach ($scriptName in @('physical-shard-outage.js', 'legacy-vs-physical.js')) 
 $outageSource = Get-Content -Raw -LiteralPath (Join-Path $root 'loadtest/k6/physical-shard-outage.js')
 Assert-True -Condition $outageSource.Contains("executor: 'per-vu-iterations'") `
     -Message 'physical shard outage evidence must not turn a correctness probe into an unbounded rate-limit load loop'
+foreach ($scriptName in @('online-base-copy.js', 'physical-cutover.js', 'legacy-vs-physical.js')) {
+    $scriptSource = Get-Content -Raw -LiteralPath (Join-Path $root "loadtest/k6/$scriptName")
+    Assert-True -Condition $scriptSource.Contains("executor: 'per-vu-iterations'") `
+        -Message "$scriptName must use bounded iterations below the production reservation-rate limit"
+}
 
 $compose = Get-Content -Raw -LiteralPath $composePath
 foreach ($required in @(

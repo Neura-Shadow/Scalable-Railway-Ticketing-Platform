@@ -13,7 +13,10 @@ state. Source and target are never simultaneously valid writers.
    pool budget, storage headroom, and detect-only reconciliation.
 2. Create the control migration ledger with a new UUID and a strictly newer
    target generation. Bootstrap a disabled target fence and local snapshots.
-3. Enable source-local trigger capture and record its start sequence.
+3. Enable source-local trigger capture and record its start sequence. The
+   current assignment remains `migrating`; routing continues to that same
+   source shard and generation while its database-local fence is active.
+   `draining` is the first state that rejects new writes.
 4. Open a bounded PostgreSQL `REPEATABLE READ`, read-only source transaction;
    copy the approved dependency-ordered table set in deterministic batches.
 5. Replay committed journal batches through target-local apply receipts while

@@ -20,9 +20,10 @@ export const baseCopySourceDuration = new Trend('base_copy_source_duration', tru
 
 export const options = boundedOptions({
   source_while_copying: {
-    executor: 'constant-vus',
+    executor: 'per-vu-iterations',
     vus: positiveInteger('VUS', 4),
-    duration: (__ENV.DURATION || '20s').trim(),
+    iterations: positiveInteger('ITERATIONS_PER_VU', 2),
+    maxDuration: (__ENV.DURATION || '20s').trim(),
     gracefulStop: '5s',
   },
 }, {
@@ -62,7 +63,7 @@ export default function () {
     'base-copy workload observes one idempotent identity': (value) =>
       value.createdID.length > 0 && value.createdID === value.replayID,
   });
-  sleep(0.1);
+  sleep(0.5);
 }
 
 // The external controller owns snapshot/copy checkpoints and proves progress;

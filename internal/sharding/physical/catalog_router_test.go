@@ -46,6 +46,9 @@ func TestCatalogRouterRefreshesStaleRouteWithoutReadingAConnectionString(t *test
 	if !strings.Contains(db.query, "'rollback_window'") {
 		t.Fatalf("catalog query would stop routing the target during its rollback window: %s", db.query)
 	}
+	if !strings.Contains(db.query, "'migrating'") {
+		t.Fatalf("catalog query would stop routing the source during online base copy: %s", db.query)
+	}
 }
 
 func TestCatalogRouterRejectsUnsupportedCatalogMetadata(t *testing.T) {

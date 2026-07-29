@@ -103,10 +103,6 @@ CREATE TABLE booking_fare_snapshots (
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     UNIQUE (id, train_run_id, assignment_generation),
-    UNIQUE (
-        train_run_id, assignment_generation, from_stop_index, to_stop_index,
-        seat_class, source_version
-    ),
     FOREIGN KEY (train_run_id, assignment_generation, segment_count)
         REFERENCES train_run_booking_snapshots(
             train_run_id, assignment_generation, segment_count
@@ -114,6 +110,13 @@ CREATE TABLE booking_fare_snapshots (
     CHECK (from_stop_index < to_stop_index),
     CHECK (to_stop_index <= segment_count)
 );
+
+CREATE UNIQUE INDEX booking_fare_snapshots_active_version_unique_idx
+    ON booking_fare_snapshots (
+        train_run_id, assignment_generation, from_stop_index, to_stop_index,
+        seat_class, source_version
+    )
+    WHERE active;
 
 CREATE INDEX booking_fare_snapshots_lookup_idx
     ON booking_fare_snapshots (

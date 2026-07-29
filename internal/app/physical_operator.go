@@ -51,7 +51,7 @@ WHERE assignment.train_run_id=$1`, trainRunID).Scan(&storageKind, &assignmentSta
 		}
 		return sharding.ErrShardUnavailable
 	}
-	if assignmentState != "stable" && assignmentState != "rollback_window" {
+	if assignmentState != "stable" && assignmentState != "migrating" && assignmentState != "rollback_window" {
 		return sharding.ErrWriteFenced
 	}
 	return cancellation.executor.CancelTrainRun(ctx, trainRunID)
