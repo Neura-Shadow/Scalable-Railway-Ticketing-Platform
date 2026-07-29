@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"errors"
 
@@ -180,12 +181,76 @@ WHERE owner_user_id = $1
   AND state = 'finalized'`, params.UserID, params.TrainRunID,
 		params.IdempotencyKeyHash, params.RequestFingerprint).Scan(&reservationID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return bookingpostgres.CreateHoldResult{}, false, nil
+		return commands.lookupCopiedCreateHold(ctx, params)
 	}
 	if err != nil || reservationID == uuid.Nil {
 		return bookingpostgres.CreateHoldResult{}, false, sharding.ErrShardUnavailable
 	}
 	return bookingpostgres.CreateHoldResult{ReservationID: reservationID, Replayed: true}, true, nil
+}
+
+func (commands *HybridReservationCommands) lookupCopiedCreateHold(
+	ctx context.Context,
+	params bookingpostgres.CompletedCreateHoldLookupParams,
+) (bookingpostgres.CreateHoldResult, bool, error) {
+	resolved, err := commands.router.Resolve(ctx, params.TrainRunID, false)
+	if err != nil {
+		resolved, err = commands.router.Resolve(ctx, params.TrainRunID, true)
+	}
+	if err != nil || resolved.Route.TrainRunID() != params.TrainRunID {
+		return bookingpostgres.CreateHoldResult{}, false, sharding.ErrShardUnavailable
+	}
+	tx, err := resolved.Handle.Pool().BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return bookingpostgres.CreateHoldResult{}, false, sharding.ErrShardUnavailable
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+
+	var (
+		storedFingerprint []byte
+		status            string
+		reservationID     uuid.UUID
+		seatCount         int
+	)
+	err = tx.QueryRow(ctx, `
+SELECT record.request_fingerprint, record.status, record.resource_id,
+       (SELECT count(*)::integer
+        FROM public.reservation_seats AS seat
+        WHERE seat.reservation_id = record.resource_id
+          AND seat.train_run_id = record.train_run_id
+          AND seat.assignment_generation = record.assignment_generation)
+FROM public.idempotency_records AS record
+JOIN public.reservations AS reservation
+  ON reservation.id = record.resource_id
+ AND reservation.train_run_id = record.train_run_id
+ AND reservation.assignment_generation = record.assignment_generation
+ AND reservation.user_id = record.user_id
+WHERE record.user_id = $1
+  AND record.train_run_id = $2
+  AND record.assignment_generation = $3
+  AND record.operation = 'reservation.create'
+  AND record.key_hash = $4
+  AND record.status = 'completed'
+  AND record.resource_type = 'reservation'
+  AND record.expires_at > clock_timestamp()`, params.UserID, params.TrainRunID,
+		resolved.Route.Generation().Int64(), params.IdempotencyKeyHash).Scan(
+		&storedFingerprint, &status, &reservationID, &seatCount,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return bookingpostgres.CreateHoldResult{}, false, nil
+	}
+	if err != nil || status != "completed" || reservationID == uuid.Nil || seatCount <= 0 {
+		return bookingpostgres.CreateHoldResult{}, false, sharding.ErrShardUnavailable
+	}
+	if !bytes.Equal(storedFingerprint, params.RequestFingerprint) {
+		return bookingpostgres.CreateHoldResult{}, false, bookingpostgres.ErrIdempotencyConflict
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return bookingpostgres.CreateHoldResult{}, false, sharding.ErrShardUnavailable
+	}
+	return bookingpostgres.CreateHoldResult{
+		ReservationID: reservationID, SeatCount: seatCount, Replayed: true,
+	}, true, nil
 }
 
 func (commands *HybridReservationCommands) assignedPhysical(ctx context.Context, trainRunID uuid.UUID) (bool, error) {
@@ -200,7 +265,18 @@ JOIN public.booking_shards AS shard ON shard.shard_id = assignment.shard_id
 WHERE assignment.train_run_id = $1
   AND assignment.assignment_state IN ('stable', 'migrating', 'rollback_window')`, trainRunID).Scan(&storageKind)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, bookingpostgres.ErrNotFound
+		var assignmentState string
+		stateErr := commands.control.QueryRow(ctx, `
+SELECT assignment_state
+FROM public.train_run_shard_assignments
+WHERE train_run_id = $1`, trainRunID).Scan(&assignmentState)
+		if stateErr == nil && assignmentState == "draining" {
+			return false, sharding.ErrTrainRunMigrating
+		}
+		if errors.Is(stateErr, pgx.ErrNoRows) {
+			return false, bookingpostgres.ErrNotFound
+		}
+		return false, sharding.ErrShardUnavailable
 	}
 	if err != nil {
 		return false, sharding.ErrShardUnavailable

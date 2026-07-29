@@ -72,6 +72,60 @@ func TestHybridReservationCommandsPreservesLegacyCreatePath(t *testing.T) {
 	}
 }
 
+func TestHybridReservationCommandsReportsDrainAsRebalancing(t *testing.T) {
+	t.Parallel()
+	legacy := &hybridLegacy{}
+	saga := &hybridSaga{}
+	commands, err := NewHybridReservationCommands(
+		&hybridControl{rows: []pgx.Row{
+			hybridRow{err: pgx.ErrNoRows},
+			hybridRow{values: []any{"draining"}},
+		}},
+		legacy,
+		saga,
+		&hybridPhysicalRouter{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = commands.CreateHold(context.Background(), bookingpostgres.CreateHoldParams{TrainRunID: uuid.New()})
+	if !errors.Is(err, sharding.ErrTrainRunMigrating) || legacy.createCalls != 0 || saga.calls != 0 {
+		t.Fatalf("CreateHold() error=%v legacy=%d saga=%d", err, legacy.createCalls, saga.calls)
+	}
+}
+
+func TestHybridReservationCommandsReplaysCopiedLegacyIdempotencyAfterPhysicalCutover(t *testing.T) {
+	t.Parallel()
+	owner, trainRunID, reservationID := uuid.New(), uuid.New(), uuid.New()
+	fingerprint := makeHash(2)
+	router, _, targetTx := hybridSnapshotRouter(t, trainRunID, 4, 7)
+	targetTx.rows = []pgx.Row{hybridRow{values: []any{
+		fingerprint, "completed", reservationID, 1,
+	}}}
+	commands, err := NewHybridReservationCommands(
+		&hybridControl{rows: []pgx.Row{
+			hybridRow{values: []any{"postgres"}},
+			hybridRow{err: pgx.ErrNoRows},
+		}},
+		&hybridLegacy{},
+		&hybridSaga{},
+		router,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, found, err := commands.LookupCompletedCreateHold(context.Background(), bookingpostgres.CompletedCreateHoldLookupParams{
+		UserID: owner, TrainRunID: trainRunID,
+		IdempotencyKeyHash: makeHash(1), RequestFingerprint: fingerprint,
+	})
+	if err != nil || !found || !result.Replayed || result.ReservationID != reservationID || result.SeatCount != 1 {
+		t.Fatalf("LookupCompletedCreateHold() result=%+v found=%v error=%v", result, found, err)
+	}
+	if !strings.Contains(targetTx.query, "FROM public.idempotency_records") || targetTx.commits != 1 {
+		t.Fatalf("target replay query=%q commits=%d", targetTx.query, targetTx.commits)
+	}
+}
+
 func TestHybridReservationCommandsRoutesPhysicalLifecycleWithoutLegacyFallback(t *testing.T) {
 	t.Parallel()
 	legacy := &hybridLegacy{}
