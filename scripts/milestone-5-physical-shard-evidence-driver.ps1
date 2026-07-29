@@ -486,7 +486,10 @@ function New-Milestone5EnvironmentMap {
     $map = [ordered]@{}
     $routing = [ordered]@{}
     foreach ($entry in $common.GetEnumerator()) { $routing[[string]$entry.Key] = [string]$entry.Value }
-    $routing['VUS']='2'; $routing['ITERATIONS']='12'
+    # Each iteration performs a create plus an idempotent replay. Six bounded
+    # identities keep the 12-iteration proof below the production per-user
+    # reservation limit without weakening that control for evidence.
+    $routing['VUS']='6'; $routing['ITERATIONS']='12'
     $map['physical-shard-routing'] = $routing
     $quotaPassengers = @(
         $State.Customers[0].PassengerIDs[9], $State.Customers[0].PassengerIDs[10],
