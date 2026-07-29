@@ -215,6 +215,15 @@ func applyAllMigrations(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	}
 	sort.Strings(paths)
 	for _, path := range paths {
+		if filepath.Base(path) == "000009_physical_shard_control_plane.up.sql" {
+			var installed bool
+			if err := pool.QueryRow(ctx, `SELECT to_regclass('public.physical_shard_migrations') IS NOT NULL`).Scan(&installed); err != nil {
+				t.Fatalf("inspect control-plane migration state: %v", err)
+			}
+			if installed {
+				continue
+			}
+		}
 		sql, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("read migration %s: %v", path, err)
