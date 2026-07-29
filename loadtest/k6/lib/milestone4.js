@@ -30,6 +30,13 @@ export function positiveInteger(name, fallback) {
   return value;
 }
 
+export function positiveNumber(name, fallback) {
+  const raw = (__ENV[name] || `${fallback}`).trim();
+  const value = Number.parseFloat(raw);
+  if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} must be a positive number`);
+  return value;
+}
+
 export function enabled(name, fallback = false) {
   const value = (__ENV[name] || (fallback ? 'yes' : 'no')).trim().toLowerCase();
   if (!['yes', 'no'].includes(value)) throw new Error(`${name} must be yes or no`);

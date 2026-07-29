@@ -8,6 +8,7 @@ import {
   boundedOptions,
   customerForVU,
   positiveInteger,
+  positiveNumber,
   publicErrorCode,
   requestDuration,
   required,
@@ -20,6 +21,7 @@ export const cutoverSplitBrainObservations = new Counter('cutover_split_brain_ob
 export const physicalCutoverPauseDuration = new Trend('physical_cutover_pause_duration', true);
 
 const maximumPauseMilliseconds = positiveInteger('MAX_PAUSE_MS', 30000);
+const cutoverIntervalSeconds = positiveNumber('CUTOVER_INTERVAL_SECONDS', 3);
 
 export const options = boundedOptions({
   cutover_overlap: {
@@ -88,7 +90,7 @@ export default function () {
       value.status === 201 || (value.status === 503
         && publicErrorCode(value) === 'service_temporarily_rebalancing'),
   });
-  sleep(1.5);
+  sleep(cutoverIntervalSeconds);
 }
 
 // The external controller proves source-disable precedes target-enable. This

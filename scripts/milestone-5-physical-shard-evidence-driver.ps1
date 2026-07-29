@@ -532,6 +532,7 @@ function New-Milestone5EnvironmentMap {
     $map['physical-cutover']['CUSTOMER_TOKENS']=($State.Customers[8].Token,$State.Customers[9].Token -join ',')
     $map['physical-cutover']['PASSENGER_IDS']=($State.Customers[8].PassengerIDs[4],$State.Customers[9].PassengerIDs[4] -join ',')
     $map['physical-cutover']['ITERATIONS_PER_VU']='8'
+    $map['physical-cutover']['CUTOVER_INTERVAL_SECONDS']='3'
     $map['stale-router-physical'] = [ordered]@{
         API_URLS='http://api-1:8080,http://api-2:8080,http://api-3:8080'; ORIGIN_CODE='M2A'; DESTINATION_CODE='M2B'; SEAT_CLASS='standard'; TRAIN_RUN_ID=$script:M5TrainC
         CUSTOMER_TOKENS=($State.Customers[5].Token,$State.Customers[6].Token,$State.Customers[7].Token -join ',')

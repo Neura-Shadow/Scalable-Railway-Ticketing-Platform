@@ -120,6 +120,8 @@ Assert-True -Condition ($environmentMap['journal-catchup']['VUS'] -eq '3' -and `
     -Message 'journal catch-up must use one bounded mutation identity per customer'
 Assert-True -Condition ($environmentMap['physical-cutover']['ITERATIONS_PER_VU'] -eq '8') `
     -Message 'cutover evidence must poll through the bounded pause without exceeding the public rate limit'
+Assert-True -Condition ($environmentMap['physical-cutover']['CUTOVER_INTERVAL_SECONDS'] -eq '3') `
+    -Message 'cutover polling must span the full bounded state transition and observe recovery'
 Assert-True -Condition ($environmentMap['physical-cutover']['CUSTOMER_TOKENS'] -eq 'synthetic-token-8,synthetic-token-9') `
     -Message 'cutover evidence must use dedicated synthetic customer rate-limit windows'
 Assert-True -Condition ($environmentMap['legacy-vs-physical']['VUS_PER_PATH'] -eq '2') `
@@ -139,6 +141,9 @@ foreach ($scriptName in @('online-base-copy.js', 'physical-cutover.js', 'legacy-
     Assert-True -Condition $scriptSource.Contains("executor: 'per-vu-iterations'") `
         -Message "$scriptName must use bounded iterations below the production reservation-rate limit"
 }
+$cutoverSource = Get-Content -Raw -LiteralPath (Join-Path $root 'loadtest/k6/physical-cutover.js')
+Assert-True -Condition $cutoverSource.Contains("positiveNumber('CUTOVER_INTERVAL_SECONDS', 3)") `
+    -Message 'physical cutover workload must use the configured bounded polling interval'
 
 $compose = Get-Content -Raw -LiteralPath $composePath
 foreach ($required in @(
