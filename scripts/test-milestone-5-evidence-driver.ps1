@@ -78,6 +78,8 @@ Assert-True -Condition (-not $driver.Contains('--post-data=')) `
     -Message 'stale prewarm must pass BusyBox post data as a separate argument'
 Assert-True -Condition (-not $driver.Contains("'sh','-c',`$shell")) `
     -Message 'stale prewarm must preserve JSON and header argv boundaries without a shell command string'
+Assert-True -Condition $driver.Contains("'--post-data',`$nativeBody") `
+    -Message 'stale prewarm must preserve JSON quotes through Windows native argv marshalling'
 foreach ($forbidden in @(
     'final_write_pause_ms = 1',
     'dual_writer_violations = 0',
