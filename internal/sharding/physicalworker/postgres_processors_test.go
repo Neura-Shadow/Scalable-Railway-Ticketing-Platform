@@ -98,25 +98,7 @@ func TestOutboxProcessorPublishFailureCreatesBoundedLocalRetry(t *testing.T) {
 	}
 }
 
-func TestHoldExpirationProcessorRequiresAuthoritativeHandle(t *testing.T) {
-	processor, err := NewHoldExpirationProcessor(HoldExpirationOptions{
-		StatementTimeout: time.Second,
-		LockTimeout:      time.Second,
-		Now:              func() time.Time { return time.Now().UTC() },
-	})
-	if err != nil {
-		t.Fatalf("NewHoldExpirationProcessor() error = %v", err)
-	}
-	processed, err := processor.Process(context.Background(), writeHandle{
-		fakeHandle: fakeHandle{id: sharding.ShardPhysicalZero, pool: &queuePool{}},
-		write:      false,
-	}, 1)
-	if !errors.Is(err, ErrExpirationFenced) || processed != 0 {
-		t.Fatalf("Process() = (%d, %v), want fenced", processed, err)
-	}
-}
-
-func TestHoldExpirationProcessorExpiresWithLocalRowLease(t *testing.T) {
+func TestHoldExpirationProcessorUsesCurrentLocalFenceAfterStartupMetadataWasWriteDisabled(t *testing.T) {
 	reservationID := uuid.New()
 	trainRunID := uuid.New()
 	now := time.Unix(200, 0).UTC()
@@ -141,7 +123,7 @@ func TestHoldExpirationProcessorExpiresWithLocalRowLease(t *testing.T) {
 
 	processed, err := processor.Process(context.Background(), writeHandle{
 		fakeHandle: fakeHandle{id: sharding.ShardPhysicalZero, pool: pool},
-		write:      true,
+		write:      false,
 	}, 1)
 	if err != nil || processed != 1 {
 		t.Fatalf("Process() = (%d, %v), want (1, nil)", processed, err)
@@ -149,6 +131,9 @@ func TestHoldExpirationProcessorExpiresWithLocalRowLease(t *testing.T) {
 	claim := tx.findCall("FOR UPDATE OF fence, reservation SKIP LOCKED")
 	if claim == nil {
 		t.Fatalf("reservation was not protected by a shard-local row lease: %+v", tx.calls)
+	}
+	if !strings.Contains(claim.query, "fence.state = 'active'") || !strings.Contains(claim.query, "fence.write_enabled") {
+		t.Fatalf("expiration did not use the current database-local write fence: %s", claim.query)
 	}
 	outbox := tx.findCall("INSERT INTO outbox_events")
 	if outbox == nil {

@@ -19,6 +19,7 @@ import (
 	platformmetrics "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/metrics"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/redisx"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/workerhttp"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physicalworker"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
@@ -43,6 +44,15 @@ func main() {
 		os.Exit(1)
 	}
 	defer pool.Close()
+	var physicalRuntime *physicalworker.Runtime
+	if cfg.BookingShardMode == config.BookingShardModePhysical {
+		physicalRuntime, err = physicalworker.NewRuntime(ctx, cfg, pool)
+		if err != nil {
+			logger.Error("outbox physical shard runtime unavailable")
+			os.Exit(1)
+		}
+		defer physicalRuntime.Close()
+	}
 	store, err := eventpostgres.NewStore(pool)
 	if err != nil {
 		logger.Error("outbox store initialization failed")
@@ -67,7 +77,11 @@ func main() {
 		}
 		return nil
 	}
-	readiness := workerhttp.ReadinessCheck(databaseReadiness)
+	readinessChecks := []workerhttp.ReadinessCheck{databaseReadiness}
+	if physicalRuntime != nil {
+		readinessChecks = append(readinessChecks, physicalRuntime.Ready)
+	}
+	readiness := allReady(readinessChecks...)
 	if cfg.OutboxPublisherEnabled {
 		switch cfg.OutboxPublisher {
 		case "redis_stream":
@@ -88,7 +102,8 @@ func main() {
 				os.Exit(1)
 			}
 			eventPublisher, err = publisher.NewRedisStream(redisClient, "railway:outbox:v1")
-			readiness = allReady(databaseReadiness, redisReady)
+			readinessChecks = append(readinessChecks, redisReady)
+			readiness = allReady(readinessChecks...)
 		case "log":
 			if cfg.Environment == config.EnvironmentProduction {
 				logger.Warn("production log publisher override enabled", "category", "production_log_publisher_override")
@@ -134,8 +149,9 @@ func main() {
 			return
 		}
 	}
+	workerID := "outbox-" + uuid.NewString()
 	worker, err := application.NewWorker(store, eventPublisher, clock.RealClock{}, metrics, application.Config{
-		WorkerID:          "outbox-" + uuid.NewString(),
+		WorkerID:          workerID,
 		BatchSize:         cfg.OutboxBatchSize,
 		MaxAttempts:       cfg.OutboxMaxAttempts,
 		ProcessingTimeout: cfg.OutboxProcessingTimeout,
@@ -146,16 +162,45 @@ func main() {
 		logger.Error("outbox worker initialization failed")
 		os.Exit(1)
 	}
+	var physicalOutbox *physicalworker.Orchestrator
+	if physicalRuntime != nil {
+		processor, processorErr := physicalworker.NewOutboxProcessor(eventPublisher, physicalworker.OutboxOptions{
+			WorkerID:          workerID,
+			MaxAttempts:       cfg.OutboxMaxAttempts,
+			ProcessingTimeout: cfg.OutboxProcessingTimeout,
+			RetryBase:         cfg.OutboxRetryBase,
+			RetryMax:          cfg.OutboxRetryMax,
+			StatementTimeout:  cfg.PhysicalShardQueryTimeout,
+			LockTimeout:       cfg.PhysicalShardQueryTimeout,
+			Now:               clock.RealClock{}.Now,
+		})
+		if processorErr != nil {
+			logger.Error("outbox physical processor initialization failed")
+			os.Exit(1)
+		}
+		physicalOutbox, err = physicalworker.New(physicalRuntime.Handles(), processor, physicalOutboxWorkerConfig(cfg, len(physicalRuntime.Handles())))
+		if err != nil {
+			logger.Error("outbox physical orchestrator initialization failed")
+			os.Exit(1)
+		}
+	}
 
 	run := func() {
 		passContext, cancel := context.WithTimeout(ctx, cfg.WorkerPassTimeout)
 		defer cancel()
 		result, runErr := worker.RunOnce(passContext)
-		if runErr != nil {
-			logger.Error("outbox pass completed with finalize failures")
+		physicalProcessed := 0
+		var physicalErr error
+		if physicalOutbox != nil {
+			physicalResult, physicalRunErr := physicalOutbox.RunOnce(passContext)
+			physicalProcessed = physicalResult.Processed
+			physicalErr = physicalRunErr
+		}
+		if runErr != nil || physicalErr != nil {
+			logger.Error("outbox pass completed with isolated failures", "control_claimed", result.Claimed, "physical_processed", physicalProcessed)
 			return
 		}
-		logger.Info("outbox pass complete", "claimed", result.Claimed, "published", result.Published, "retried", result.Retried, "dead_letter", result.DeadLetter)
+		logger.Info("outbox pass complete", "control_claimed", result.Claimed, "control_published", result.Published, "control_retried", result.Retried, "control_dead_letter", result.DeadLetter, "physical_processed", physicalProcessed)
 	}
 	run()
 	ticker := clock.RealClock{}.NewTicker(cfg.OutboxPollInterval)
@@ -192,6 +237,15 @@ func outboxReadinessTimeout(cfg config.Config) time.Duration {
 		timeout = cfg.RedisTimeout
 	}
 	return timeout
+}
+
+func physicalOutboxWorkerConfig(cfg config.Config, shardCount int) physicalworker.Config {
+	return physicalworker.Config{
+		MaxConcurrency: shardCount,
+		PerShardLimit:  cfg.OutboxBatchSize,
+		PassLimit:      cfg.OutboxBatchSize,
+		ShardTimeout:   cfg.PhysicalShardQueryTimeout,
+	}
 }
 
 func shutdownWorkerHTTP(server *http.Server, timeout time.Duration) {

@@ -5,6 +5,9 @@ import (
 	"errors"
 	"net/http"
 	"testing"
+	"time"
+
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
 )
 
 func TestInitialExpirationPassHonorsDisabledConfiguration(t *testing.T) {
@@ -19,6 +22,18 @@ func TestInitialExpirationPassHonorsDisabledConfiguration(t *testing.T) {
 	runInitialExpirationPass(true, func() { calls++ })
 	if calls != 1 {
 		t.Fatalf("enabled initial expiration pass calls = %d, want 1", calls)
+	}
+}
+
+func TestPhysicalWorkerConfigKeepsBatchAsGlobalPassLimit(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	cfg.HoldExpirerBatchSize = 51
+	cfg.PhysicalShardQueryTimeout = 3 * time.Second
+
+	got := physicalWorkerConfig(cfg, 2)
+	if got.MaxConcurrency != 2 || got.PerShardLimit != 51 || got.PassLimit != 51 || got.ShardTimeout != 3*time.Second {
+		t.Fatalf("physicalWorkerConfig() = %+v", got)
 	}
 }
 

@@ -19,7 +19,6 @@ var (
 	ErrOutboxStore              = errors.New("shard-local outbox store unavailable")
 	ErrOutboxPublish            = errors.New("shard-local outbox publish failed")
 	ErrExpirationStore          = errors.New("shard-local expiration store unavailable")
-	ErrExpirationFenced         = errors.New("shard-local expiration write fenced")
 )
 
 type OutboxPublisher interface {
@@ -240,23 +239,14 @@ func NewHoldExpirationProcessor(options HoldExpirationOptions) (*HoldExpirationP
 	return &HoldExpirationProcessor{options: options}, nil
 }
 
-type authoritativeHandle interface {
-	Handle
-	WriteEnabled() bool
-}
-
 func (processor *HoldExpirationProcessor) Process(ctx context.Context, handle Handle, limit int) (int, error) {
 	if processor == nil || ctx == nil || isNil(handle) || isNil(handle.Pool()) || limit < 1 || limit > maxWorkLimit {
 		return 0, ErrInvalidPostgresProcessor
 	}
-	authoritative, ok := handle.(authoritativeHandle)
-	if !ok || !authoritative.WriteEnabled() {
-		return 0, ErrExpirationFenced
-	}
 	now := processor.options.Now().UTC()
 	processed := 0
 	for processed < limit {
-		expired, err := processor.expireOne(ctx, authoritative, now)
+		expired, err := processor.expireOne(ctx, handle, now)
 		if err != nil {
 			return processed, err
 		}
@@ -270,7 +260,7 @@ func (processor *HoldExpirationProcessor) Process(ctx context.Context, handle Ha
 
 func (processor *HoldExpirationProcessor) expireOne(
 	ctx context.Context,
-	handle authoritativeHandle,
+	handle Handle,
 	now time.Time,
 ) (bool, error) {
 	tx, err := handle.Pool().BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
