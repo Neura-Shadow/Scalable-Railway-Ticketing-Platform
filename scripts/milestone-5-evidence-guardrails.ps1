@@ -150,7 +150,10 @@ function Assert-Milestone5ScenarioMetrics {
     )
     $policies = @{
         'physical-shard-routing' = @(
-            @('physical_route_success',2,$null), @('physical_route_conflicts',0,10), @('shard_rate_limited',0,0)
+            @('physical_route_success',2,$null), @('physical_route_conflicts',0,10), @('shard_rate_limited',0,0),
+            @('same_idempotency_requests',100,100), @('same_idempotency_terminal_responses',1,$null),
+            @('same_idempotency_converged_apis',3,3), @('same_idempotency_identity_mismatches',0,0),
+            @('same_idempotency_unexpected_responses',0,0)
         )
         'cross-shard-global-quota' = @(
             @('global_quota_holds_created',2,2), @('global_quota_rejections',2,2)
@@ -276,7 +279,8 @@ function Assert-Milestone5DatabaseInvariants {
     $positive = [ordered]@{}
     foreach ($name in @(
         'online_copy_mutation_delta', 'online_copy_journal_delta',
-        'published_physical_outbox_events', 'physical_read_model_receipts'
+        'published_physical_outbox_events', 'physical_read_model_receipts',
+        'physical_admission_journeys', 'physical_hold_expirations'
     )) {
         $value = Get-Milestone5OptionalValue -Object $Evidence -Name $name
         $parsed = 0L
@@ -284,6 +288,13 @@ function Assert-Milestone5DatabaseInvariants {
             throw "database evidence $name must be a measured positive delta"
         }
         $positive[$name] = $parsed
+    }
+    $sameIdempotency = Get-Milestone5OptionalValue -Object $Evidence -Name 'physical_same_idempotency_requests'
+    $sameIdempotencyCount = 0L
+    if ($null -eq $sameIdempotency -or
+        -not [int64]::TryParse([string]$sameIdempotency, [ref]$sameIdempotencyCount) -or
+        $sameIdempotencyCount -ne 100) {
+        throw 'physical_same_idempotency_requests must prove exactly 100 real requests'
     }
     $writers = Get-Milestone5OptionalValue -Object $Evidence -Name 'enabled_writer_fences'
     $writerCount = 0L
@@ -310,6 +321,18 @@ function Assert-Milestone5DatabaseInvariants {
         $connections["${prefix}_connections"] = $connectionCount
         $connections["${prefix}_max_connections"] = $maximumCount
     }
+    $postgresSettings = [ordered]@{}
+    foreach ($prefix in @('control_postgres', 'booking_shard_0_postgres', 'booking_shard_1_postgres')) {
+        foreach ($suffix in @('server_version_num', 'shared_buffers_bytes', 'work_mem_bytes')) {
+            $name = "${prefix}_${suffix}"
+            $value = Get-Milestone5OptionalValue -Object $Evidence -Name $name
+            $parsed = 0L
+            if ($null -eq $value -or -not [int64]::TryParse([string]$value, [ref]$parsed) -or $parsed -lt 1) {
+                throw "database runtime profile $name must be a measured positive value"
+            }
+            $postgresSettings[$name] = $parsed
+        }
+    }
     return [ordered]@{
         status = 'passed'
         enabled_writer_fences = $writerCount
@@ -325,12 +348,24 @@ function Assert-Milestone5DatabaseInvariants {
         online_copy_journal_delta = $positive.online_copy_journal_delta
         published_physical_outbox_events = $positive.published_physical_outbox_events
         physical_read_model_receipts = $positive.physical_read_model_receipts
+        physical_same_idempotency_requests = $sameIdempotencyCount
+        physical_admission_journeys = $positive.physical_admission_journeys
+        physical_hold_expirations = $positive.physical_hold_expirations
         control_postgres_connections = $connections.control_postgres_connections
         control_postgres_max_connections = $connections.control_postgres_max_connections
         booking_shard_0_postgres_connections = $connections.booking_shard_0_postgres_connections
         booking_shard_0_postgres_max_connections = $connections.booking_shard_0_postgres_max_connections
         booking_shard_1_postgres_connections = $connections.booking_shard_1_postgres_connections
         booking_shard_1_postgres_max_connections = $connections.booking_shard_1_postgres_max_connections
+        control_postgres_server_version_num = $postgresSettings.control_postgres_server_version_num
+        control_postgres_shared_buffers_bytes = $postgresSettings.control_postgres_shared_buffers_bytes
+        control_postgres_work_mem_bytes = $postgresSettings.control_postgres_work_mem_bytes
+        booking_shard_0_postgres_server_version_num = $postgresSettings.booking_shard_0_postgres_server_version_num
+        booking_shard_0_postgres_shared_buffers_bytes = $postgresSettings.booking_shard_0_postgres_shared_buffers_bytes
+        booking_shard_0_postgres_work_mem_bytes = $postgresSettings.booking_shard_0_postgres_work_mem_bytes
+        booking_shard_1_postgres_server_version_num = $postgresSettings.booking_shard_1_postgres_server_version_num
+        booking_shard_1_postgres_shared_buffers_bytes = $postgresSettings.booking_shard_1_postgres_shared_buffers_bytes
+        booking_shard_1_postgres_work_mem_bytes = $postgresSettings.booking_shard_1_postgres_work_mem_bytes
     }
 }
 
@@ -401,6 +436,7 @@ function Test-Milestone5CanonicalSummaryReady {
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Scenarios,
         [Parameter(Mandatory = $true)][bool]$DatabaseInvariantsPassed,
         [Parameter(Mandatory = $true)][bool]$MigrationEvidencePassed,
+        [Parameter(Mandatory = $true)][bool]$ExecutionProfilePassed,
         [Parameter(Mandatory = $true)][bool]$TeardownCompleted,
         [Parameter(Mandatory = $true)][bool]$SanitizationCompleted
     )
@@ -412,8 +448,69 @@ function Test-Milestone5CanonicalSummaryReady {
         if ($name -in (Get-Milestone5ScenarioNames) -and $status -eq 'passed') { $seen[$name] = $true }
     }
     return $seen.Count -eq (Get-Milestone5ScenarioNames).Count -and
-        $DatabaseInvariantsPassed -and $MigrationEvidencePassed -and
+        $DatabaseInvariantsPassed -and $MigrationEvidencePassed -and $ExecutionProfilePassed -and
         $TeardownCompleted -and $SanitizationCompleted
+}
+
+function Assert-Milestone5ExecutionProfile {
+    param([Parameter(Mandatory=$true)][object]$Profile)
+    $hostProfile = Get-Milestone5OptionalValue -Object $Profile -Name 'host'
+    foreach ($name in @('docker_engine_logical_cpus','docker_engine_memory_bytes','workspace_disk_total_bytes','workspace_disk_free_bytes')) {
+        $value = Get-Milestone5OptionalValue -Object $hostProfile -Name $name
+        $parsed = 0L
+        if ($null -eq $value -or -not [int64]::TryParse([string]$value,[ref]$parsed) -or $parsed -lt 1) {
+            throw "execution host profile omitted $name"
+        }
+    }
+    $images = Get-Milestone5OptionalValue -Object $Profile -Name 'images'
+    foreach ($name in @('api','reverse_proxy','admission_worker','hold_expirer','postgres','redis','k6')) {
+        $value = [string](Get-Milestone5OptionalValue -Object $images -Name $name)
+        if ($value -notmatch '^sha256:[0-9a-f]{64}$') { throw "execution image profile omitted $name digest" }
+    }
+    $configuration = Get-Milestone5OptionalValue -Object $Profile -Name 'configuration'
+    if ([string](Get-Milestone5OptionalValue -Object $configuration -Name 'source') -ne 'docker compose config --format json' -or
+        [string](Get-Milestone5OptionalValue -Object $configuration -Name 'compose_file') -ne 'docker-compose.physical-shards.yml' -or
+        [string](Get-Milestone5OptionalValue -Object $configuration -Name 'compose_config_sha256') -notmatch '^[0-9a-f]{64}$') {
+        throw 'execution configuration profile omitted immutable Compose provenance'
+    }
+    $values = [ordered]@{}
+    foreach ($name in @(
+        'scenario_count','physical_shard_count','api_service_count','admission_worker_service_count',
+        'read_model_worker_service_count','physical_shard_worker_service_count','computed_connection_budget',
+        'control_database_max_open_connections','control_database_pool_count',
+        'physical_shard_max_open_connections','physical_shard_max_idle_connections',
+        'physical_shard_total_pool_budget','physical_shard_api_replica_count',
+        'physical_shard_worker_replica_count','worker_shard_concurrency',
+        'physical_shard_migration_admin_reserve','physical_shard_operational_reserve',
+        'postgres_max_connections_limit'
+    )) {
+        $value = Get-Milestone5OptionalValue -Object $configuration -Name $name
+        $parsed = 0L
+        if ($null -eq $value -or -not [int64]::TryParse([string]$value,[ref]$parsed) -or $parsed -lt 1) {
+            throw "execution configuration profile omitted $name"
+        }
+        $values[$name] = $parsed
+    }
+    if ($values.scenario_count -ne 10 -or $values.physical_shard_count -ne 2 -or
+        $values.api_service_count -ne 3 -or $values.admission_worker_service_count -ne 2 -or
+        $values.read_model_worker_service_count -ne 2 -or
+        $values.physical_shard_api_replica_count -ne $values.api_service_count -or
+        $values.physical_shard_worker_replica_count -ne $values.physical_shard_worker_service_count -or
+        $values.physical_shard_max_idle_connections -gt $values.physical_shard_max_open_connections -or
+        $values.physical_shard_total_pool_budget -ne ($values.physical_shard_count * $values.physical_shard_max_open_connections)) {
+        throw 'execution configuration profile disagreed with the resolved physical topology'
+    }
+    $expectedBudget =
+        ($values.control_database_max_open_connections * $values.control_database_pool_count) +
+        ($values.physical_shard_api_replica_count * $values.physical_shard_count * $values.physical_shard_max_open_connections) +
+        ($values.physical_shard_worker_replica_count * $values.physical_shard_count * $values.physical_shard_max_open_connections) +
+        $values.physical_shard_migration_admin_reserve +
+        $values.physical_shard_operational_reserve
+    if ($values.computed_connection_budget -ne $expectedBudget -or
+        $values.computed_connection_budget -gt $values.postgres_max_connections_limit) {
+        throw 'execution configuration profile failed the deployment-wide connection budget'
+    }
+    return $Profile
 }
 
 function Assert-Milestone5ArtifactsSanitized {

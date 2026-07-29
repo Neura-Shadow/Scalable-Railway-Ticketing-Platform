@@ -47,6 +47,11 @@ function New-StrictK6Summary {
             }
             physical_route_conflicts = [pscustomobject]@{ values = [pscustomobject]@{ count = 0 } }
             shard_rate_limited = [pscustomobject]@{ values = [pscustomobject]@{ count = 0 } }
+            same_idempotency_requests = [pscustomobject]@{ values = [pscustomobject]@{ count = 100 } }
+            same_idempotency_terminal_responses = [pscustomobject]@{ values = [pscustomobject]@{ count = 1 } }
+            same_idempotency_converged_apis = [pscustomobject]@{ values = [pscustomobject]@{ count = 3 } }
+            same_idempotency_identity_mismatches = [pscustomobject]@{ values = [pscustomobject]@{ count = 0 } }
+            same_idempotency_unexpected_responses = [pscustomobject]@{ values = [pscustomobject]@{ count = 0 } }
         }
     }
 }
@@ -142,12 +147,24 @@ $databaseInput = [pscustomobject]@{
     online_copy_journal_delta = 4
     published_physical_outbox_events = 9
     physical_read_model_receipts = 3
+    physical_same_idempotency_requests = 100
+    physical_admission_journeys = 1
+    physical_hold_expirations = 1
     control_postgres_connections = 7
     control_postgres_max_connections = 100
     booking_shard_0_postgres_connections = 5
     booking_shard_0_postgres_max_connections = 100
     booking_shard_1_postgres_connections = 6
     booking_shard_1_postgres_max_connections = 100
+    control_postgres_server_version_num = 160010
+    control_postgres_shared_buffers_bytes = 134217728
+    control_postgres_work_mem_bytes = 4194304
+    booking_shard_0_postgres_server_version_num = 160010
+    booking_shard_0_postgres_shared_buffers_bytes = 134217728
+    booking_shard_0_postgres_work_mem_bytes = 4194304
+    booking_shard_1_postgres_server_version_num = 160010
+    booking_shard_1_postgres_shared_buffers_bytes = 134217728
+    booking_shard_1_postgres_work_mem_bytes = 4194304
 }
 $database = Assert-Milestone5DatabaseInvariants -Evidence $databaseInput
 Assert-True -Condition ($database.status -eq 'passed' -and $database.enabled_writer_fences -eq 2) `
@@ -218,24 +235,57 @@ Assert-Throws -Label 'missing base-copy rate' -Action {
 $passedScenarios = @($expectedScenarios | ForEach-Object {
     [pscustomobject]@{ scenario = $_; status = 'passed' }
 })
+$executionProfileInput = [pscustomobject]@{
+    host = [pscustomobject]@{ docker_engine_logical_cpus=8;docker_engine_memory_bytes=17179869184;workspace_disk_total_bytes=1000000000;workspace_disk_free_bytes=500000000 }
+    images = [pscustomobject]@{ api=('sha256:'+'1'*64);reverse_proxy=('sha256:'+'2'*64);admission_worker=('sha256:'+'3'*64);hold_expirer=('sha256:'+'4'*64);postgres=('sha256:'+'5'*64);redis=('sha256:'+'6'*64);k6=('sha256:'+'7'*64) }
+    configuration = [pscustomobject]@{
+        source='docker compose config --format json';compose_file='docker-compose.physical-shards.yml';compose_config_sha256=('a'*64)
+        scenario_duration='45s';scenario_count=10;physical_shard_count=2;api_service_count=3
+        admission_worker_service_count=2;read_model_worker_service_count=2;physical_shard_worker_service_count=3
+        computed_connection_budget=100;control_database_max_open_connections=4;control_database_pool_count=10
+        physical_shard_max_open_connections=3;physical_shard_max_idle_connections=2;physical_shard_total_pool_budget=6
+        physical_shard_api_replica_count=3;physical_shard_worker_replica_count=3;worker_shard_concurrency=2
+        physical_shard_migration_admin_reserve=8;physical_shard_operational_reserve=16;postgres_max_connections_limit=100
+    }
+}
+Assert-Milestone5ExecutionProfile -Profile $executionProfileInput | Out-Null
+$staleReplicaProfile = $executionProfileInput.PSObject.Copy()
+$staleReplicaProfile.configuration = $executionProfileInput.configuration.PSObject.Copy()
+$staleReplicaProfile.configuration.api_service_count = 2
+Assert-Throws -Label 'resolved API replica disagreement' -Action {
+    Assert-Milestone5ExecutionProfile -Profile $staleReplicaProfile | Out-Null
+}
+$badBudgetProfile = $executionProfileInput.PSObject.Copy()
+$badBudgetProfile.configuration = $executionProfileInput.configuration.PSObject.Copy()
+$badBudgetProfile.configuration.computed_connection_budget = 99
+Assert-Throws -Label 'stale computed connection budget' -Action {
+    Assert-Milestone5ExecutionProfile -Profile $badBudgetProfile | Out-Null
+}
+$missingDigestProfile = $executionProfileInput.PSObject.Copy()
+$missingDigestProfile.images = $executionProfileInput.images.PSObject.Copy()
+$missingDigestProfile.images.k6 = 'grafana/k6:0.54.0'
+Assert-Throws -Label 'mutable execution image tag' -Action {
+    Assert-Milestone5ExecutionProfile -Profile $missingDigestProfile | Out-Null
+}
 Assert-True -Condition (Test-Milestone5CanonicalSummaryReady `
     -Scenarios $passedScenarios -DatabaseInvariantsPassed $true `
-    -MigrationEvidencePassed $true -TeardownCompleted $true -SanitizationCompleted $true) `
+    -MigrationEvidencePassed $true -ExecutionProfilePassed $true -TeardownCompleted $true -SanitizationCompleted $true) `
     -Message 'complete evidence set was not publishable'
 Assert-True -Condition (-not (Test-Milestone5CanonicalSummaryReady `
     -Scenarios @() -DatabaseInvariantsPassed $false `
-    -MigrationEvidencePassed $false -TeardownCompleted $false -SanitizationCompleted $true)) `
+    -MigrationEvidencePassed $false -ExecutionProfilePassed $false -TeardownCompleted $false -SanitizationCompleted $true)) `
     -Message 'empty scenario evidence must remain non-publishable without masking the original failure'
 foreach ($case in @(
-    @{ Name = 'missing scenario'; Scenarios = $passedScenarios[0..8]; DB = $true; Migration = $true; Down = $true; Sanitized = $true },
-    @{ Name = 'database failure'; Scenarios = $passedScenarios; DB = $false; Migration = $true; Down = $true; Sanitized = $true },
-    @{ Name = 'migration failure'; Scenarios = $passedScenarios; DB = $true; Migration = $false; Down = $true; Sanitized = $true },
-    @{ Name = 'teardown failure'; Scenarios = $passedScenarios; DB = $true; Migration = $true; Down = $false; Sanitized = $true },
-    @{ Name = 'sanitization failure'; Scenarios = $passedScenarios; DB = $true; Migration = $true; Down = $true; Sanitized = $false }
+    @{ Name = 'missing scenario'; Scenarios = $passedScenarios[0..8]; DB = $true; Migration = $true; Profile = $true; Down = $true; Sanitized = $true },
+    @{ Name = 'database failure'; Scenarios = $passedScenarios; DB = $false; Migration = $true; Profile = $true; Down = $true; Sanitized = $true },
+    @{ Name = 'migration failure'; Scenarios = $passedScenarios; DB = $true; Migration = $false; Profile = $true; Down = $true; Sanitized = $true },
+    @{ Name = 'profile failure'; Scenarios = $passedScenarios; DB = $true; Migration = $true; Profile = $false; Down = $true; Sanitized = $true },
+    @{ Name = 'teardown failure'; Scenarios = $passedScenarios; DB = $true; Migration = $true; Profile = $true; Down = $false; Sanitized = $true },
+    @{ Name = 'sanitization failure'; Scenarios = $passedScenarios; DB = $true; Migration = $true; Profile = $true; Down = $true; Sanitized = $false }
 )) {
     Assert-True -Condition (-not (Test-Milestone5CanonicalSummaryReady `
         -Scenarios $case.Scenarios -DatabaseInvariantsPassed $case.DB `
-        -MigrationEvidencePassed $case.Migration -TeardownCompleted $case.Down `
+        -MigrationEvidencePassed $case.Migration -ExecutionProfilePassed $case.Profile -TeardownCompleted $case.Down `
         -SanitizationCompleted $case.Sanitized)) `
         -Message "canonical publication accepted $($case.Name)"
 }
@@ -312,6 +362,9 @@ $moveIndex = $runner.IndexOf('Move-Item -LiteralPath $candidateSummary -Destinat
 $sanitizationIndex = $runner.LastIndexOf('Assert-Milestone5ArtifactsSanitized')
 Assert-True -Condition ($moveIndex -gt $sanitizationIndex) `
     -Message 'canonical passed summary is published before sanitization'
+$passedStatusIndex = $runner.LastIndexOf("Write-Milestone5Status -Status 'passed' -Reason 'complete'")
+Assert-True -Condition ($passedStatusIndex -gt $moveIndex) `
+    -Message 'raw passed status is published before the canonical summary exists'
 Assert-True -Condition (-not $runner.Contains('KeepEnvironment')) `
     -Message 'runner must not permit canonical evidence while retaining disposable topology'
 Assert-True -Condition (-not $runner.Contains('milestone-5-summary.json'' | Out-File')) `

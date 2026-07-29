@@ -17,7 +17,7 @@ database invariants and post-run reconciliation also pass.
 
 | Script | Primary assertion |
 | --- | --- |
-| `physical-shard-routing.js` | current assignment plus local fence selects one physical writer |
+| `physical-shard-routing.js` | current assignment plus local fence selects one physical writer; 100 same-idempotency requests across three API replicas converge to one physical reservation |
 | `cross-shard-global-quota.js` | parallel shard commands cannot exceed control quota |
 | `booking-command-recovery.js` | lost finalization/retry converges to one reservation |
 | `physical-shard-outage.js` | failed assigned shard is isolated; no fallback writer |
@@ -35,6 +35,15 @@ control finalization, capture start, snapshot established, copy checkpoint,
 journal high watermark, source disable, target enable, and control switch. Do
 not coordinate concurrency with arbitrary sleeps. Bound VUs, duration, request
 rate, retry count, response size, batch size, and artifact size.
+
+The disposable acceptance driver deliberately stops Redis only while the
+100-request same-idempotency probe runs. This exercises the reservation
+limiter's documented fail-open path so all 100 requests reach the real control
+and booking-shard PostgreSQL instances instead of being absorbed by the public
+per-owner rate limit. The driver restores Redis and waits for `PONG` before it
+proves waiting-room admission token issuance, physical reservation creation,
+and shard-local hold expiration. This bounded evidence technique is not a
+production rate-limiter or availability recommendation.
 
 Before and after each run, capture assignments, both local fences, command and
 receipt counts, quota/directory state, inventory-mask uniqueness, outbox/event

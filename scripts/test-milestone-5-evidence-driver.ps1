@@ -65,6 +65,10 @@ foreach ($required in @(
     'BaseCopyStartedAtUtc', 'base_copy_elapsed_ms',
     'JournalReplayStartedAtUtc', 'journal_replay_elapsed_ms',
     'published_physical_outbox_events', 'physical_read_model_receipts',
+    'physical_same_idempotency_requests', 'physical_admission_journeys', 'physical_hold_expirations',
+    'Assert-Milestone5ConcurrentPhysicalIdentity', 'Invoke-Milestone5PhysicalAdmissionExpiryJourney',
+    'same-idempotency-command-count.log', 'physical-hold-expiry-proof.log',
+    'final_source_sequence IS NULL OR last_replayed_sequence IS NULL',
     "-Target capture_enabled -Prefix 'train-c'",
     'completed_at_utc=[DateTimeOffset]::UtcNow.ToString'
 )) {
@@ -114,9 +118,10 @@ Assert-Throws -Label 'unknown scenario start' -Action {
         -Scenario 'unknown' -Environment @{}
 }
 
-$fakeCustomers = @(0..23 | ForEach-Object {
+$fakeCustomers = @(0..25 | ForEach-Object {
     $customerIndex = [int]$_
     [pscustomobject]@{
+        Email = "m5-contract-$customerIndex@example.test"
         Token = "synthetic-token-$customerIndex"
         PassengerIDs = [string[]]@(0..10 | ForEach-Object {
             "21000000-0000-4000-8$customerIndex$($_.ToString('00'))-$($customerIndex.ToString('00'))$($_.ToString('0000000000'))"
@@ -131,6 +136,9 @@ Assert-True -Condition ($environmentMap.Count -eq 10) `
     -Message 'driver did not construct all ten scenario environments'
 Assert-True -Condition ($environmentMap['physical-shard-routing']['VUS'] -eq '6') `
     -Message 'physical routing must distribute replay requests across six bounded customer identities'
+Assert-True -Condition ($environmentMap['physical-shard-routing']['CONCURRENT_CUSTOMER_TOKEN'] -eq 'synthetic-token-24' -and `
+    $environmentMap['physical-shard-routing']['API_URLS'] -eq 'http://api-1:8080,http://api-2:8080,http://api-3:8080') `
+    -Message 'physical routing must run the 100-way identity against all three API replicas'
 Assert-True -Condition ($environmentMap['cross-shard-global-quota']['RATE_LIMIT_SETTLE_SECONDS'] -eq '61') `
     -Message 'global quota evidence must let its authenticated reservation-rate window expire before probing quota'
 Assert-True -Condition ($environmentMap['physical-shard-outage']['VUS_PER_SHARD'] -eq '2') `

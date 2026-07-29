@@ -172,12 +172,14 @@ function Invoke-Milestone5DriverAPI {
         [object]$Body = $null,
         [string]$Token = '',
         [string]$IdempotencyKey = '',
+        [string]$AdmissionToken = '',
         [string]$ForwardedFor = '',
         [int[]]$ExpectedStatus = @(200)
     )
     $headers = @{ Accept = 'application/json' }
     if ($Token) { $headers.Authorization = "Bearer $Token" }
     if ($IdempotencyKey) { $headers['Idempotency-Key'] = $IdempotencyKey }
+    if ($AdmissionToken) { $headers['X-Admission-Token'] = $AdmissionToken }
     if ($ForwardedFor) { $headers['X-Forwarded-For'] = $ForwardedFor }
     $parameters = @{
         Uri = "$($BaseURL.TrimEnd('/'))$Path"; Method = $Method; Headers = $headers
@@ -191,9 +193,11 @@ function Invoke-Milestone5DriverAPI {
         $response = Invoke-WebRequest @parameters
         $status = [int]$response.StatusCode
         $content = [string]$response.Content
+        $responseHeaders = $response.Headers
     } catch {
         if ($null -eq $_.Exception.Response) { throw }
         $status = [int]$_.Exception.Response.StatusCode
+        $responseHeaders = $_.Exception.Response.Headers
         $stream = $_.Exception.Response.GetResponseStream()
         $reader = [System.IO.StreamReader]::new($stream)
         try { $content = $reader.ReadToEnd() } finally { $reader.Dispose() }
@@ -201,7 +205,7 @@ function Invoke-Milestone5DriverAPI {
     $decoded = $null
     if (-not [string]::IsNullOrWhiteSpace($content)) { $decoded = $content | ConvertFrom-Json }
     if ($status -notin $ExpectedStatus) { throw "API $Method $Path returned unexpected status $status" }
-    return [pscustomobject]@{ StatusCode = $status; Body = $decoded }
+    return [pscustomobject]@{ StatusCode = $status; Body = $decoded; Headers = $responseHeaders }
 }
 
 function Wait-Milestone5DriverReady {
@@ -342,7 +346,7 @@ function New-Milestone5DriverCustomers {
             } -ExpectedStatus @(201)
             $passengers += [string]$passenger.Body.id
         }
-        $customers += [pscustomobject]@{ Token=$token; PassengerIDs=[string[]]$passengers }
+        $customers += [pscustomobject]@{ Email=$email; Token=$token; PassengerIDs=[string[]]$passengers }
     }
     $password = $null
     return $customers
@@ -522,6 +526,11 @@ function New-Milestone5EnvironmentMap {
     # identities keep the 12-iteration proof below the production per-user
     # reservation limit without weakening that control for evidence.
     $routing['VUS']='6'; $routing['ITERATIONS']='12'
+    $routing['API_URLS']='http://api-1:8080,http://api-2:8080,http://api-3:8080'
+    $routing['CONCURRENT_CUSTOMER_TOKEN']=$State.Customers[24].Token
+    $routing['CONCURRENT_PASSENGER_ID']=$State.Customers[24].PassengerIDs[0]
+    $routing['CONCURRENT_TRAIN_RUN_ID']=$script:M5TrainA
+    $routing['CONCURRENT_IDEMPOTENCY_KEY']="m5-100-way-$($State.Suffix)"
     $map['physical-shard-routing'] = $routing
     $quotaPassengers = @(
         $State.Customers[0].PassengerIDs[9], $State.Customers[0].PassengerIDs[10],
@@ -593,10 +602,11 @@ function Initialize-Milestone5Evidence {
         FinalWritePauseMs=0.0; MaximumFinalWritePauseMs=30000.0; TargetEraReservationID=''; TargetWriteObservedBeforeReverse=$false
         OnlineCopyReservationCountBefore=-1L; OnlineCopyJournalCountBefore=-1L
         OnlineCopyMutationDelta=-1L; OnlineCopyJournalDelta=-1L
+        PhysicalSameIdempotencyRequests=0L; PhysicalAdmissionJourneys=0L; PhysicalHoldExpirations=0L; PhysicalRateLimiterOutage=$false
         BaseCopyStartedAtUtc=$null; BaseCopyElapsedMs=0.0
         JournalReplayStartedAtUtc=$null; JournalReplayElapsedMs=0.0
     }
-    $state.Customers = New-Milestone5DriverCustomers -State $state -Count 24
+    $state.Customers = New-Milestone5DriverCustomers -State $state -Count 26
     Add-Milestone5DriverQuotaBaseline -State $state
     New-Milestone5Migration -Context $Context -TrainRunID $script:M5TrainA -TargetShard 'physical-shard-0' -MigrationID $script:M5MigrationA -Prefix 'train-a'
     Move-Milestone5Migration -Context $Context -MigrationID $script:M5MigrationA -Target rollback_window -Prefix 'train-a'
@@ -683,7 +693,11 @@ function Start-Milestone5Scenario {
     Assert-Milestone5DriverContext -Context $Context
     if ($null -eq $State.PSObject.Properties['EnvironmentByScenario']) { throw 'Milestone 5 driver state is invalid' }
     switch ($Scenario) {
-        'physical-shard-routing' { return }
+        'physical-shard-routing' {
+            Invoke-Milestone5DriverCompose -Context $Context -Arguments @('stop','redis') -Artifact 'same-idempotency-rate-limiter-stop.log' | Out-Null
+            $State.PhysicalRateLimiterOutage = $true
+            return
+        }
         'cross-shard-global-quota' {
             $settleSeconds = 0
             if (-not [int]::TryParse([string]$Environment.RATE_LIMIT_SETTLE_SECONDS, [ref]$settleSeconds) -or
@@ -748,10 +762,91 @@ function Start-Milestone5Scenario {
     }
 }
 
+function Assert-Milestone5ConcurrentPhysicalIdentity {
+    param([Parameter(Mandatory=$true)][object]$Context,[Parameter(Mandatory=$true)][object]$State)
+    $email = [string]$State.Customers[24].Email
+    if ($email -notmatch '^m5-[a-z0-9]+-24@example\.test$') { throw 'concurrency evidence customer identity is invalid' }
+    $ownerID = Get-Milestone5DriverUUID -Context $Context -Service 'control-postgres' -Artifact 'same-idempotency-owner.log' -SQL "SELECT id FROM public.users WHERE email='$email';"
+    $commandCount = Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'same-idempotency-command-count.log' -SQL "SELECT count(*) FROM public.booking_commands WHERE owner_user_id='$ownerID'::uuid AND operation='reservation.create' AND train_run_id='$script:M5TrainA'::uuid;"
+    $directoryCount = Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'same-idempotency-directory-count.log' -SQL "SELECT count(*) FROM public.reservation_directory d JOIN public.booking_commands c USING(command_id) WHERE c.owner_user_id='$ownerID'::uuid AND c.train_run_id='$script:M5TrainA'::uuid AND c.state='finalized' AND d.state='active' AND d.reservation_id=c.reservation_id;"
+    $quotaCount = Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'same-idempotency-quota-count.log' -SQL "SELECT count(*) FROM public.booking_quota_leases q JOIN public.booking_commands c USING(command_id) WHERE c.owner_user_id='$ownerID'::uuid AND c.train_run_id='$script:M5TrainA'::uuid AND q.state='active_hold';"
+    $receiptCount = Get-Milestone5DriverScalar -Context $Context -Service 'booking-shard-0-postgres' -Artifact 'same-idempotency-receipt-count.log' -SQL "SELECT count(*) FROM public.booking_command_receipts r JOIN public.reservations v ON v.id=r.result_id WHERE r.train_run_id='$script:M5TrainA'::uuid AND r.status='succeeded' AND v.user_id='$ownerID'::uuid;"
+    $reservationCount = Get-Milestone5DriverScalar -Context $Context -Service 'booking-shard-0-postgres' -Artifact 'same-idempotency-reservation-count.log' -SQL "SELECT count(*) FROM public.reservations WHERE train_run_id='$script:M5TrainA'::uuid AND user_id='$ownerID'::uuid AND status='held';"
+    $seatAndOutboxCount = Get-Milestone5DriverScalar -Context $Context -Service 'booking-shard-0-postgres' -Artifact 'same-idempotency-seat-outbox-count.log' -SQL "SELECT count(*) FROM public.reservation_seats s JOIN public.reservations r ON r.id=s.reservation_id WHERE r.train_run_id='$script:M5TrainA'::uuid AND r.user_id='$ownerID'::uuid AND EXISTS(SELECT 1 FROM public.outbox_events o WHERE o.aggregate_id=r.id AND o.event_type='reservation.held');"
+    if ($commandCount -ne 1 -or $directoryCount -ne 1 -or $quotaCount -ne 1 -or $receiptCount -ne 1 -or $reservationCount -ne 1 -or $seatAndOutboxCount -ne 1) {
+        throw "100-way physical idempotency did not converge to one command/directory/quota/receipt/reservation/seat/outbox ($commandCount/$directoryCount/$quotaCount/$receiptCount/$reservationCount/$seatAndOutboxCount)"
+    }
+    $State.PhysicalSameIdempotencyRequests = 100L
+}
+
+function Invoke-Milestone5PhysicalAdmissionExpiryJourney {
+    param([Parameter(Mandatory=$true)][object]$Context,[Parameter(Mandatory=$true)][object]$State)
+    $customer = $State.Customers[25]
+    Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'physical-admission-policy-enable.log' -SQL "UPDATE public.hot_train_policies SET enabled=true,version=version+1,redis_initialized_version=NULL,updated_at=clock_timestamp() WHERE train_run_id='$script:M5TrainA'::uuid AND seat_class='standard'; SELECT count(*) FROM public.hot_train_policies WHERE train_run_id='$script:M5TrainA'::uuid AND seat_class='standard' AND enabled;" | Out-Null
+    try {
+        $initialized = $false
+        for ($attempt=1;$attempt -le 120;$attempt++) {
+            $ready = Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'physical-admission-policy-ready.log' -SQL "SELECT count(*) FROM public.hot_train_policies WHERE train_run_id='$script:M5TrainA'::uuid AND seat_class='standard' AND enabled AND redis_initialized_version=version;"
+            if ($ready -eq 1) { $initialized=$true; break }
+            Start-Sleep -Milliseconds 250
+        }
+        if (-not $initialized) { throw 'physical admission policy was not initialized by the admission topology' }
+        $join = Invoke-Milestone5DriverAPI -BaseURL $State.BaseURL -Method POST -Path '/api/v1/waiting-room/entries' -Token $customer.Token -Body @{
+            train_run_id=$script:M5TrainA;origin_station_code='M2A';destination_station_code='M2B';seat_class='standard';passenger_count=1
+        } -ExpectedStatus @(201)
+        $entryID = [string]$join.Body.entry_id
+        if ($entryID -notmatch '^[0-9a-fA-F-]{36}$') { throw 'physical admission journey omitted its waiting-room identity' }
+        $admissionToken = ''
+        for ($attempt=1;$attempt -le 240;$attempt++) {
+            $status = Invoke-Milestone5DriverAPI -BaseURL $State.BaseURL -Method GET -Path "/api/v1/waiting-room/entries/$entryID" -Token $customer.Token -ExpectedStatus @(200,404,410)
+            if ($status.StatusCode -eq 200 -and [string]$status.Body.status -eq 'admitted') {
+                $admissionToken = [string]$status.Headers['X-Admission-Token']
+                if ($admissionToken) { break }
+            }
+            Start-Sleep -Milliseconds 250
+        }
+        if (-not $admissionToken) { throw 'physical admission journey did not receive a one-time token' }
+        $State.SecretValues.Add($admissionToken)
+        $created = Invoke-Milestone5DriverAPI -BaseURL $State.BaseURL -Method POST -Path '/api/v1/reservations' -Token $customer.Token -AdmissionToken $admissionToken -IdempotencyKey "m5-physical-admission-$($State.Suffix)" -Body @{
+            train_run_id=$script:M5TrainA;origin_station_code='M2A';destination_station_code='M2B';seat_class='standard';passenger_ids=@($customer.PassengerIDs[0])
+        } -ExpectedStatus @(201)
+        $reservationID = [string]$created.Body.id
+        if ($reservationID -notmatch '^[0-9a-fA-F-]{36}$') { throw 'physical admission reservation omitted its identity' }
+        $expiredSeed = Get-Milestone5DriverScalar -Context $Context -Service 'booking-shard-0-postgres' -Artifact 'physical-hold-expiry-seed.log' -SQL "UPDATE public.reservations SET expires_at=clock_timestamp()-interval '1 second' WHERE id='$reservationID'::uuid AND status='held'; SELECT count(*) FROM public.reservations WHERE id='$reservationID'::uuid AND status='held' AND expires_at<=clock_timestamp();"
+        if ($expiredSeed -ne 1) { throw 'physical admission reservation could not enter the deterministic expiry barrier' }
+        $expired = $false
+        for ($attempt=1;$attempt -le 60;$attempt++) {
+            $proof = Get-Milestone5DriverScalar -Context $Context -Service 'booking-shard-0-postgres' -Artifact 'physical-hold-expiry-proof.log' -SQL "SELECT count(*) FROM public.reservations r WHERE r.id='$reservationID'::uuid AND r.status='expired' AND EXISTS(SELECT 1 FROM public.outbox_events o WHERE o.aggregate_id=r.id AND o.event_type='reservation.expired') AND NOT EXISTS(SELECT 1 FROM public.reservation_seats s JOIN public.seat_inventory i ON i.train_run_id=s.train_run_id AND i.assignment_generation=s.assignment_generation AND i.seat_id=s.seat_id WHERE s.reservation_id=r.id AND (i.occupied_segments & s.segment_mask)<>repeat('0',bit_length(s.segment_mask))::bit varying);"
+            if ($proof -eq 1) { $expired=$true; break }
+            Start-Sleep -Seconds 1
+        }
+        if (-not $expired) { throw 'physical hold-expirer did not release the shard-local seat and publish expiry evidence' }
+        $State.PhysicalAdmissionJourneys = 1L
+        $State.PhysicalHoldExpirations = 1L
+    } finally {
+        Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'physical-admission-policy-disable.log' -SQL "UPDATE public.hot_train_policies SET enabled=false,version=version+1,redis_initialized_version=NULL,updated_at=clock_timestamp() WHERE train_run_id='$script:M5TrainA'::uuid AND seat_class='standard'; SELECT count(*) FROM public.hot_train_policies WHERE train_run_id='$script:M5TrainA'::uuid AND seat_class='standard' AND NOT enabled;" | Out-Null
+    }
+}
+
 function Stop-Milestone5Scenario {
     param([Parameter(Mandatory=$true)][object]$Context,[Parameter(Mandatory=$true)][object]$State,[Parameter(Mandatory=$true)][string]$Scenario,[Parameter(Mandatory=$true)][bool]$Started)
     if (-not $Started) { return }
     switch ($Scenario) {
+        'physical-shard-routing' {
+            if ($State.PhysicalRateLimiterOutage) {
+                Invoke-Milestone5DriverCompose -Context $Context -Arguments @('start','redis') -Artifact 'same-idempotency-rate-limiter-start.log' | Out-Null
+                $redisReady = $false
+                for ($attempt=1;$attempt -le 60;$attempt++) {
+                    $probe = Invoke-Milestone5DriverCompose -Context $Context -AllowFailure -Arguments @('exec','-T','redis','redis-cli','ping')
+                    if ($probe.ExitCode -eq 0 -and (@($probe.Output) -join '').Trim() -eq 'PONG') { $redisReady=$true; break }
+                    Start-Sleep -Seconds 1
+                }
+                if (-not $redisReady) { throw 'Redis did not recover after the bounded rate-limiter fail-open concurrency probe' }
+                $State.PhysicalRateLimiterOutage = $false
+            }
+            Assert-Milestone5ConcurrentPhysicalIdentity -Context $Context -State $State
+            Invoke-Milestone5PhysicalAdmissionExpiryJourney -Context $Context -State $State
+        }
         'booking-command-recovery' { Disable-Milestone5RecoveryFault -Context $Context }
         'physical-shard-outage' {
             Invoke-Milestone5DriverCompose -Context $Context -Arguments @('start','booking-shard-0-postgres') -Artifact 'outage-start.log' | Out-Null
@@ -863,6 +958,22 @@ SELECT count(*) FROM latest JOIN public.train_run_shard_assignments a USING(trai
             -Context $Context -Service $entry[0] -Artifact "$($entry[1])-max-connections.log" `
             -SQL "SELECT current_setting('max_connections')::bigint;"
     }
+    $postgresSettings = [ordered]@{}
+    foreach ($entry in @(
+        @('control-postgres', 'control_postgres'),
+        @('booking-shard-0-postgres', 'booking_shard_0_postgres'),
+        @('booking-shard-1-postgres', 'booking_shard_1_postgres')
+    )) {
+        $postgresSettings["$($entry[1])_server_version_num"] = Get-Milestone5DriverScalar `
+            -Context $Context -Service $entry[0] -Artifact "$($entry[1])-server-version.log" `
+            -SQL "SELECT current_setting('server_version_num')::bigint;"
+        $postgresSettings["$($entry[1])_shared_buffers_bytes"] = Get-Milestone5DriverScalar `
+            -Context $Context -Service $entry[0] -Artifact "$($entry[1])-shared-buffers.log" `
+            -SQL "SELECT pg_size_bytes(current_setting('shared_buffers'));"
+        $postgresSettings["$($entry[1])_work_mem_bytes"] = Get-Milestone5DriverScalar `
+            -Context $Context -Service $entry[0] -Artifact "$($entry[1])-work-mem.log" `
+            -SQL "SELECT pg_size_bytes(current_setting('work_mem'));"
+    }
     return [ordered]@{
         enabled_writer_fences=[int64]$writers[$script:M5TrainC]; dual_writer_violations=[int64]$dual
         assignment_ledger_mismatches=$assignmentMismatch; directory_mismatches=$directoryMismatch; quota_violations=$quotaViolations
@@ -870,12 +981,24 @@ SELECT count(*) FROM latest JOIN public.train_run_shard_assignments a USING(trai
         online_copy_mutation_delta=[int64]$State.OnlineCopyMutationDelta; online_copy_journal_delta=[int64]$State.OnlineCopyJournalDelta
         published_physical_outbox_events=$publishedPhysicalOutboxEvents
         physical_read_model_receipts=$physicalReadModelReceipts
+        physical_same_idempotency_requests=[int64]$State.PhysicalSameIdempotencyRequests
+        physical_admission_journeys=[int64]$State.PhysicalAdmissionJourneys
+        physical_hold_expirations=[int64]$State.PhysicalHoldExpirations
         control_postgres_connections=[int64]$connectionEvidence.control_postgres_connections
         control_postgres_max_connections=[int64]$connectionEvidence.control_postgres_max_connections
         booking_shard_0_postgres_connections=[int64]$connectionEvidence.booking_shard_0_postgres_connections
         booking_shard_0_postgres_max_connections=[int64]$connectionEvidence.booking_shard_0_postgres_max_connections
         booking_shard_1_postgres_connections=[int64]$connectionEvidence.booking_shard_1_postgres_connections
         booking_shard_1_postgres_max_connections=[int64]$connectionEvidence.booking_shard_1_postgres_max_connections
+        control_postgres_server_version_num=[int64]$postgresSettings.control_postgres_server_version_num
+        control_postgres_shared_buffers_bytes=[int64]$postgresSettings.control_postgres_shared_buffers_bytes
+        control_postgres_work_mem_bytes=[int64]$postgresSettings.control_postgres_work_mem_bytes
+        booking_shard_0_postgres_server_version_num=[int64]$postgresSettings.booking_shard_0_postgres_server_version_num
+        booking_shard_0_postgres_shared_buffers_bytes=[int64]$postgresSettings.booking_shard_0_postgres_shared_buffers_bytes
+        booking_shard_0_postgres_work_mem_bytes=[int64]$postgresSettings.booking_shard_0_postgres_work_mem_bytes
+        booking_shard_1_postgres_server_version_num=[int64]$postgresSettings.booking_shard_1_postgres_server_version_num
+        booking_shard_1_postgres_shared_buffers_bytes=[int64]$postgresSettings.booking_shard_1_postgres_shared_buffers_bytes
+        booking_shard_1_postgres_work_mem_bytes=[int64]$postgresSettings.booking_shard_1_postgres_work_mem_bytes
     }
 }
 
@@ -886,7 +1009,7 @@ function Get-Milestone5MigrationEvidence {
     $preserved=Get-Milestone5DriverScalar -Context $Context -Service 'booking-shard-0-postgres' -Artifact 'target-write-after-reverse.log' -SQL "SELECT count(*) FROM public.reservations WHERE id='$($State.TargetEraReservationID)'::uuid AND train_run_id='$script:M5TrainC'::uuid AND assignment_generation=$reverseGeneration;"
     $rowsCopied=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'base-copy-rows.log' -SQL "SELECT rows_copied FROM public.physical_shard_migrations WHERE migration_id='$script:M5MigrationC'::uuid;"
     $rowsReplayed=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'journal-replay-rows.log' -SQL "SELECT rows_replayed FROM public.physical_shard_migrations WHERE migration_id='$script:M5MigrationC'::uuid;"
-    $journalLag=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'final-journal-lag.log' -SQL "SELECT GREATEST(COALESCE(final_source_sequence,0)-COALESCE(last_replayed_sequence,0),0) FROM public.physical_shard_migrations WHERE migration_id='$script:M5MigrationC'::uuid;"
+    $journalLag=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'final-journal-lag.log' -SQL "SELECT CASE WHEN final_source_sequence IS NULL OR last_replayed_sequence IS NULL THEN NULL ELSE GREATEST(final_source_sequence-last_replayed_sequence,0) END FROM public.physical_shard_migrations WHERE migration_id='$script:M5MigrationC'::uuid;"
     $forwardDurationMs=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'forward-migration-duration-ms.log' -SQL "SELECT GREATEST(1,(extract(epoch FROM (assignment_switched_at-created_at))*1000)::bigint) FROM public.physical_shard_migrations WHERE migration_id='$script:M5MigrationC'::uuid AND assignment_switched_at IS NOT NULL;"
     $reverseDurationMs=Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' -Artifact 'reverse-migration-duration-ms.log' -SQL "SELECT GREATEST(1,(extract(epoch FROM (assignment_switched_at-created_at))*1000)::bigint) FROM public.physical_shard_migrations WHERE migration_id='$script:M5MigrationCReverse'::uuid AND reverse_migration AND assignment_switched_at IS NOT NULL;"
     $observedBefore=[bool]$State.TargetWriteObservedBeforeReverse
