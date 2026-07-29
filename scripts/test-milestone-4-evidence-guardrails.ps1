@@ -276,7 +276,7 @@ try {
         Envelope = [pscustomobject]@{
             command = 'inspect-health'; status = 'completed'; read_only = $true
             result = [pscustomobject]@{
-                ready = $true; schema_version = 8; schema_dirty = $false
+                ready = $true; schema_version = 9; schema_dirty = $false
                 shard_catalog_entries = 3; writable_active_shards = 3; degraded_shards = 0
                 active_migrations_observed = 0; active_migrations_truncated = $false
             }
@@ -290,7 +290,7 @@ try {
         Envelope = [pscustomobject]@{
             command = 'inspect-health'; status = 'failed'; read_only = $true
             result = [pscustomobject]@{
-                ready = $false; schema_version = 8; schema_dirty = $false
+                ready = $false; schema_version = 9; schema_dirty = $false
                 shard_catalog_entries = 3; writable_active_shards = 2; degraded_shards = 1
                 active_migrations_observed = 2; active_migrations_truncated = $false
             }
