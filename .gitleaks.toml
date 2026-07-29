@@ -5,3 +5,8 @@ useDefault = true
 description = "Threat-model trust-boundary prose, not credential material"
 paths = ['''^docs/security-threat-model\.md$''']
 regexes = ['''JWT/application''']
+
+[[allowlists]]
+description = "Public UUID fixture used as an operator subject, not a secret"
+paths = ['''^internal/transport/httpapi/management_test\.go$''']
+regexes = ['''a61f534f-ff82-4659-81d8-64de3c99746c''']

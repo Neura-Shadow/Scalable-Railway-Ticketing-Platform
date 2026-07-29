@@ -51,7 +51,7 @@ func TestBackendErrorsCollapseToBoundedPublicCategories(t *testing.T) {
 type roleDB struct{ allowed bool }
 
 func (db roleDB) QueryRow(context.Context, string, ...any) pgx.Row {
-	return roleRow{allowed: db.allowed}
+	return roleRow(db)
 }
 
 type roleRow struct{ allowed bool }
