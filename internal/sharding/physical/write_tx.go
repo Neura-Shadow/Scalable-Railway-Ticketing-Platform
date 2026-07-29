@@ -35,38 +35,40 @@ func BeginWrite(
 	}
 
 	var (
-		generation      int64
-		writeEnabled    bool
-		assignmentEpoch int64
-		snapshotActive  bool
-		snapshotVersion int64
-		bookingState    string
+		generation       int64
+		writeEnabled     bool
+		fenceState       string
+		snapshotBookable bool
+		snapshotVersion  int64
+		serviceStatus    string
 	)
 	if err := tx.QueryRow(ctx, `
-SELECT fence.generation,
+SELECT fence.assignment_generation,
        fence.write_enabled,
-       fence.assignment_epoch,
-       snapshot.active,
+       fence.state,
+       snapshot.bookable,
        snapshot.source_version,
-       snapshot.booking_state
+       snapshot.status
 FROM train_run_write_fences AS fence
 JOIN train_run_booking_snapshots AS snapshot
   ON snapshot.train_run_id = fence.train_run_id
+ AND snapshot.assignment_generation = fence.assignment_generation
 WHERE fence.train_run_id = $1
 FOR UPDATE OF fence, snapshot`, route.TrainRunID()).Scan(
 		&generation,
 		&writeEnabled,
-		&assignmentEpoch,
-		&snapshotActive,
+		&fenceState,
+		&snapshotBookable,
 		&snapshotVersion,
-		&bookingState,
+		&serviceStatus,
 	); err != nil {
 		return rollback(sharding.ErrShardUnavailable)
 	}
-	if generation != route.Generation().Int64() || assignmentEpoch != route.Generation().Int64() {
+	if generation != route.Generation().Int64() {
 		return rollback(sharding.ErrAssignmentStale)
 	}
-	if !writeEnabled || !snapshotActive || (bookingState != "active" && bookingState != "stable") {
+	if !writeEnabled || fenceState != "active" || !snapshotBookable ||
+		(serviceStatus != "scheduled" && serviceStatus != "boarding") {
 		return rollback(sharding.ErrWriteFenced)
 	}
 	if expectedSnapshotVersion <= 0 || snapshotVersion != expectedSnapshotVersion {
