@@ -16,15 +16,18 @@ import {
 
 export const outageFallbackWriterObservations = new Counter('outage_fallback_writer_observations');
 
-const duration = (__ENV.DURATION || '15s').trim();
+const maxDuration = (__ENV.DURATION || '15s').trim();
 const vus = positiveInteger('VUS_PER_SHARD', 3);
+const iterationsPerVU = positiveInteger('ITERATIONS_PER_VU', 2);
 
 export const options = boundedOptions({
   unavailable_physical_shard: {
-    executor: 'constant-vus', exec: 'unavailableShard', vus, duration, gracefulStop: '5s',
+    executor: 'per-vu-iterations', exec: 'unavailableShard', vus,
+    iterations: iterationsPerVU, maxDuration, gracefulStop: '5s',
   },
   healthy_physical_shard: {
-    executor: 'constant-vus', exec: 'healthyShard', vus, duration, gracefulStop: '5s',
+    executor: 'per-vu-iterations', exec: 'healthyShard', vus,
+    iterations: iterationsPerVU, maxDuration, gracefulStop: '5s',
   },
 }, {
   checks: ['rate==1'],

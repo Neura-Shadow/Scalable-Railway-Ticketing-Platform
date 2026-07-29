@@ -507,7 +507,7 @@ function New-Milestone5EnvironmentMap {
     }
     $map['physical-shard-outage'] = [ordered]@{
         BASE_URL=$common.BASE_URL; ORIGIN_CODE='M2A'; DESTINATION_CODE='M2B'; SEAT_CLASS='standard'; OUTAGE_TRAIN_RUN_ID=$script:M5TrainA; HEALTHY_TRAIN_RUN_ID=$script:M5TrainB
-        CUSTOMER_TOKENS=($State.Customers[3].Token,$State.Customers[4].Token -join ','); PASSENGER_IDS=($State.Customers[3].PassengerIDs[0],$State.Customers[4].PassengerIDs[0] -join ','); VUS_PER_SHARD='2'
+        CUSTOMER_TOKENS=($State.Customers[3].Token,$State.Customers[4].Token -join ','); PASSENGER_IDS=($State.Customers[3].PassengerIDs[0],$State.Customers[4].PassengerIDs[0] -join ','); VUS_PER_SHARD='2'; ITERATIONS_PER_VU='2'
     }
     foreach ($scenarioSpec in @(
         @('online-base-copy',2), @('journal-catchup',3), @('physical-cutover',4)

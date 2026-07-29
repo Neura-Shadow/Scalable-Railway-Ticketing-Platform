@@ -107,6 +107,8 @@ Assert-True -Condition ($environmentMap['cross-shard-global-quota']['RATE_LIMIT_
     -Message 'global quota evidence must let its authenticated reservation-rate window expire before probing quota'
 Assert-True -Condition ($environmentMap['physical-shard-outage']['VUS_PER_SHARD'] -eq '2') `
     -Message 'outage evidence requires two independent healthy-shard writers'
+Assert-True -Condition ($environmentMap['physical-shard-outage']['ITERATIONS_PER_VU'] -eq '2') `
+    -Message 'outage evidence must use bounded iterations below the public reservation-rate limit'
 Assert-True -Condition ($environmentMap['legacy-vs-physical']['VUS_PER_PATH'] -eq '2') `
     -Message 'legacy/physical comparison requires two independent writers per path'
 foreach ($scriptName in @('physical-shard-outage.js', 'legacy-vs-physical.js')) {
@@ -114,6 +116,9 @@ foreach ($scriptName in @('physical-shard-outage.js', 'legacy-vs-physical.js')) 
     Assert-True -Condition $scriptSource.Contains('__ITER === 0') `
         -Message "$scriptName lets replay loops inflate its independent-commit counter"
 }
+$outageSource = Get-Content -Raw -LiteralPath (Join-Path $root 'loadtest/k6/physical-shard-outage.js')
+Assert-True -Condition $outageSource.Contains("executor: 'per-vu-iterations'") `
+    -Message 'physical shard outage evidence must not turn a correctness probe into an unbounded rate-limit load loop'
 
 $compose = Get-Content -Raw -LiteralPath $composePath
 foreach ($required in @(
