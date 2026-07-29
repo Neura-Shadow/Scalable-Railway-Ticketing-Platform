@@ -769,7 +769,7 @@ function Invoke-MigrationToCutoverReady {
     Invoke-ShardAdmin -Arguments @(
         'plan-migration', '--train-run-id', $TrainRunID, '--target-shard', $TargetShard,
         '--migration-id', $MigrationID, '--rollback-window', '5m', '--confirm', '--timeout', '30s'
-    ) -Artifact "$Prefix-plan.json" | Out-Null
+    ) -Artifact "$Prefix-plan.log" | Out-Null
     $copyTimer = [Diagnostics.Stopwatch]::StartNew()
     $state = 'planned'
     $finalEnvelope = $null
@@ -777,7 +777,7 @@ function Invoke-MigrationToCutoverReady {
         $command = if ($page -eq 1) { 'start-migration' } else { 'resume-migration' }
         $copy = Invoke-ShardAdmin -Arguments @(
             $command, '--migration-id', $MigrationID, '--batch-size', '100', '--confirm', '--timeout', '30s'
-        ) -Artifact "$Prefix-copy-$page.json"
+        ) -Artifact "$Prefix-copy-$page.log"
         $finalEnvelope = $copy.Envelope
         $state = Get-Milestone4MigrationState -Envelope $copy.Envelope
     }
@@ -791,7 +791,7 @@ function Invoke-MigrationToCutoverReady {
         $validation = Invoke-ShardAdmin -Arguments @(
             'validate-migration', '--migration-id', $MigrationID, '--row-cap', '10000',
             '--confirm', '--timeout', '30s'
-        ) -Artifact "$Prefix-validate.json"
+        ) -Artifact "$Prefix-validate.log"
         $validationTimer.Stop()
         $validationDurationMilliseconds = $validationTimer.Elapsed.TotalMilliseconds
         $finalEnvelope = $validation.Envelope
@@ -823,7 +823,7 @@ function Invoke-Cutover {
     $cutover = Invoke-ShardAdmin -Arguments @(
         'cutover', '--migration-id', $MigrationID, '--row-cap', '10000',
         '--locator-row-cap', '10000', '--confirm', '--timeout', '30s'
-    ) -Artifact "$Prefix-cutover.json"
+    ) -Artifact "$Prefix-cutover.log"
     $cutoverTimer.Stop()
     if ((Get-Milestone4MigrationState -Envelope $cutover.Envelope) -ne 'rollback_window') {
         throw 'cutover did not reach rollback_window'
@@ -1014,7 +1014,7 @@ SELECT service_date::text FROM public.train_runs WHERE id='$fixtureTrainA'::uuid
     }
 
     $failureCategory = 'operator_health_baseline'
-    $health = Invoke-ShardAdmin -Arguments @('inspect-health', '--timeout', '30s') -Artifact 'operator-health-baseline.json' -AllowFailure
+    $health = Invoke-ShardAdmin -Arguments @('inspect-health', '--timeout', '30s') -Artifact 'operator-health-baseline.log' -AllowFailure
     if ($health.ExitCode -ne 0 -or $null -eq $health.Envelope) {
         $failureCategory = 'operator_cli_unrun'
         throw 'hardened shard-admin service is unavailable'
@@ -1026,7 +1026,7 @@ SELECT service_date::text FROM public.train_runs WHERE id='$fixtureTrainA'::uuid
     $adminBaseline = Invoke-Reconcile -Arguments @(
         'shard-assignments', '--page-size', '100', '--max-pages', '1000',
         '--max-rows', '100000', '--timeout', '30s'
-    ) -Artifact 'admin-fanout-complete-before.json'
+    ) -Artifact 'admin-fanout-complete-before.log'
     $adminFanoutEvidence['complete_before'] = Assert-BoundedShardReport `
         -Invocation $adminBaseline -Expected 'complete'
 
@@ -1206,7 +1206,7 @@ SELECT count(*) FROM armed;
     $failureCategory = 'train_a_read_model_catchup'
     $trainAPreCutoverReceiptCount = Wait-TrainRunReadModelCaughtUp -TrainRunID $fixtureTrainA
     $assignmentBeforeCutover = Get-AssignmentState -TrainRunID $fixtureTrainA `
-        -Artifact 'train-a-assignment-before-cutover.json'
+        -Artifact 'train-a-assignment-before-cutover.log'
     $availabilityVersionBefore = Get-AvailabilityCacheVersion -TrainRunID $fixtureTrainA
     if ([string]::IsNullOrWhiteSpace($availabilityVersionBefore)) {
         throw 'train A prewarm did not establish an availability cache namespace'
@@ -1235,7 +1235,7 @@ SELECT count(*) FROM armed;
     $failureCategory = 'train_a_cutover'
     Invoke-Cutover -MigrationID $migrationA -Prefix 'train-a'
     $assignmentAfterCutover = Get-AssignmentState -TrainRunID $fixtureTrainA `
-        -Artifact 'train-a-assignment-after-cutover.json'
+        -Artifact 'train-a-assignment-after-cutover.log'
     if ([int64]$assignmentAfterCutover.assignment_generation -le [int64]$assignmentBeforeCutover.assignment_generation -or
         [int64]$assignmentAfterCutover.availability_generation -le [int64]$assignmentBeforeCutover.availability_generation -or
         [string]$assignmentAfterCutover.shard_id -ne 'shard-0') {
@@ -1256,7 +1256,7 @@ SELECT count(*) FROM armed;
         redis_namespace_rotated = ($availabilityVersionAfter -ne $availabilityVersionBefore)
     }
     $legacySourceFingerprints['train-a'] = Get-LegacySourceFingerprint `
-        -TrainRunID $fixtureTrainA -Artifact 'train-a-legacy-source-after-cutover.json'
+        -TrainRunID $fixtureTrainA -Artifact 'train-a-legacy-source-after-cutover.log'
 
     $failureCategory = 'stale_router_refresh_workload'
     $refreshEnvironment = $commonK6.Clone()
@@ -1384,7 +1384,7 @@ SELECT count(*) FROM armed;
     $failureCategory = 'train_b_read_model_catchup'
     $trainBPreCutoverReceiptCount = Wait-TrainRunReadModelCaughtUp -TrainRunID $fixtureTrainB
     $trainBAssignmentBeforeCutover = Get-AssignmentState -TrainRunID $fixtureTrainB `
-        -Artifact 'train-b-assignment-before-cutover.json'
+        -Artifact 'train-b-assignment-before-cutover.log'
     $trainBAvailabilityVersionBefore = Get-AvailabilityCacheVersion -TrainRunID $fixtureTrainB
     if ([string]::IsNullOrWhiteSpace($trainBAvailabilityVersionBefore)) {
         throw 'train B prewarm did not establish an availability cache namespace'
@@ -1415,7 +1415,7 @@ SELECT count(*) FROM armed;
         }
     }
     $trainBAssignmentAfterCutover = Get-AssignmentState -TrainRunID $fixtureTrainB `
-        -Artifact 'train-b-assignment-after-cutover.json'
+        -Artifact 'train-b-assignment-after-cutover.log'
     if ([int64]$trainBAssignmentAfterCutover.assignment_generation -le
             [int64]$trainBAssignmentBeforeCutover.assignment_generation -or
         [int64]$trainBAssignmentAfterCutover.availability_generation -le
@@ -1438,7 +1438,7 @@ SELECT count(*) FROM armed;
         redis_namespace_rotated = ($trainBAvailabilityVersionAfter -ne $trainBAvailabilityVersionBefore)
     }
     $legacySourceFingerprints['train-b'] = Get-LegacySourceFingerprint `
-        -TrainRunID $fixtureTrainB -Artifact 'train-b-legacy-source-after-cutover.json'
+        -TrainRunID $fixtureTrainB -Artifact 'train-b-legacy-source-after-cutover.log'
     $copiedTrainBCancellation = Invoke-API -Method POST `
         -Path "/api/v1/reservations/$($seedReservations[1])/cancel" `
         -Token $fixtureCustomers[0].Token `
@@ -1477,13 +1477,13 @@ WHERE shard_id='shard-0';
     try {
         $failureCategory = 'admin_fanout_partial'
         $partialHealth = Invoke-ShardAdmin -Arguments @('inspect-health', '--timeout', '30s') `
-            -Artifact 'operator-health-partial.json' -AllowFailure
+            -Artifact 'operator-health-partial.log' -AllowFailure
         $operatorHealthEvidence['catalog_disabled'] = Assert-Milestone4OperatorHealth `
             -Invocation $partialHealth -ExpectedReady $false
         $adminPartial = Invoke-Reconcile -Arguments @(
             'shard-assignments', '--page-size', '100', '--max-pages', '1000',
             '--max-rows', '100000', '--timeout', '30s'
-        ) -Artifact 'admin-fanout-partial.json' -AllowFailure
+        ) -Artifact 'admin-fanout-partial.log' -AllowFailure
         $partialReport = Assert-BoundedShardReport -Invocation $adminPartial -Expected 'partial' `
             -ExpectedUnavailableShardID 'shard-0' -ExpectedUnavailableFailure 'catalog_disabled'
         if ([int]$partialReport.healthy_shards -ne 2 -or
@@ -1513,11 +1513,11 @@ WHERE shard_id='shard-0';
     $adminRecovery = Invoke-Reconcile -Arguments @(
         'shard-assignments', '--page-size', '100', '--max-pages', '1000',
         '--max-rows', '100000', '--timeout', '30s'
-    ) -Artifact 'admin-fanout-complete-after.json'
+    ) -Artifact 'admin-fanout-complete-after.log'
     $adminFanoutEvidence['complete_after_restore'] = Assert-BoundedShardReport `
         -Invocation $adminRecovery -Expected 'complete'
     $recoveredHealth = Invoke-ShardAdmin -Arguments @('inspect-health', '--timeout', '30s') `
-        -Artifact 'operator-health-recovered.json' -AllowFailure
+        -Artifact 'operator-health-recovered.log' -AllowFailure
     $operatorHealthEvidence['recovered'] = Assert-Milestone4OperatorHealth `
         -Invocation $recoveredHealth -ExpectedReady $true
     $failureCategory = 'outbox_drain'
@@ -1529,7 +1529,7 @@ WHERE shard_id='shard-0';
     )) {
         $reconciliation = Invoke-ShardAdmin -Arguments @(
             'reconcile', '--train-run-id', $pair.Run, '--row-cap', '10000', '--timeout', '30s'
-        ) -Artifact "$($pair.Name)-reconcile.json"
+        ) -Artifact "$($pair.Name)-reconcile.log"
         $reconciliationResult = Get-Milestone4AdminResult -Envelope $reconciliation.Envelope
         $completeness = [string](Get-ObjectPropertyValue -Object $reconciliationResult -Name 'completeness')
         $rowsExamined = [int64](Get-ObjectPropertyValue -Object $reconciliationResult -Name 'rows_examined')
@@ -1549,14 +1549,14 @@ WHERE shard_id='shard-0';
     $assignmentReconcile = Invoke-HealthyReconcile -Arguments @(
         'shard-assignments', '--page-size', '100', '--max-pages', '1000',
         '--max-rows', '100000', '--timeout', '30s'
-    ) -Artifact 'reconcile-shard-assignments.json'
+    ) -Artifact 'reconcile-shard-assignments.log'
     $reconciliationEvidence['shard-assignments'] = Assert-BoundedShardReport `
         -Invocation $assignmentReconcile -Expected 'complete'
 
     $locatorReconcile = Invoke-HealthyReconcile -Arguments @(
         'shard-locators', '--page-size', '100', '--max-pages', '1000',
         '--max-rows', '100000', '--timeout', '30s'
-    ) -Artifact 'reconcile-shard-locators.json'
+    ) -Artifact 'reconcile-shard-locators.log'
     $reconciliationEvidence['shard-locators'] = Assert-BoundedShardReport `
         -Invocation $locatorReconcile -Expected 'complete'
 
@@ -1567,7 +1567,7 @@ WHERE shard_id='shard-0';
         $migrationReconcile = Invoke-HealthyReconcile -Arguments @(
             'shard-migration', '--migration-id', $migration.ID, '--page-size', '100',
             '--max-pages', '1000', '--max-rows', '100000', '--timeout', '30s'
-        ) -Artifact "reconcile-$($migration.Name)-migration.json"
+        ) -Artifact "reconcile-$($migration.Name)-migration.log"
         $boundedMigration = Assert-BoundedShardReport -Invocation $migrationReconcile -Expected 'complete'
         $migrationSummary = $migrationReconcile.Envelope.result.migration
         if ($null -eq $migrationSummary -or
@@ -1588,7 +1588,7 @@ WHERE shard_id='shard-0';
 
     $admissionReconcile = Invoke-HealthyReconcile -Arguments @(
         'admission-state', '--page-size', '100', '--max-pages', '1000', '--timeout', '30s'
-    ) -Artifact 'reconcile-admission-state.json' -Attempts 10
+    ) -Artifact 'reconcile-admission-state.log' -Attempts 10
     $admissionResult = $admissionReconcile.Envelope.result
     $admissionViolationTotal = [int64]$admissionResult.duplicate_active_users +
         [int64]$admissionResult.inflight_token_mismatches +
@@ -1616,7 +1616,7 @@ WHERE shard_id='shard-0';
     )) {
         $readModelReconcile = Invoke-HealthyReconcile -Arguments @(
             'read-model', '--train-run-id', $pair.Run, '--timeout', '30s'
-        ) -Artifact "reconcile-$($pair.Name)-read-model.json" -Attempts 30
+        ) -Artifact "reconcile-$($pair.Name)-read-model.log" -Attempts 30
         $readModelResult = $readModelReconcile.Envelope.result
         if (-not [bool]$readModelResult.Consistent -or
             [int]$readModelResult.ExpectedRows -le 0 -or
@@ -1633,7 +1633,7 @@ WHERE shard_id='shard-0';
 
         $cacheReconcile = Invoke-HealthyReconcile -Arguments @(
             'cache-versions', '--train-run-id', $pair.Run, '--timeout', '30s'
-        ) -Artifact "reconcile-$($pair.Name)-cache-versions.json" -Attempts 10
+        ) -Artifact "reconcile-$($pair.Name)-cache-versions.log" -Attempts 10
         $cacheResult = $cacheReconcile.Envelope.result
         if ([int]$cacheResult.checked -ne 3 -or
             [int]$cacheResult.missing -ne 0 -or [int]$cacheResult.invalid -ne 0) {
@@ -1653,19 +1653,19 @@ WHERE shard_id='shard-0';
         @{ Name = 'train-a'; Run = $fixtureTrainA },
         @{ Name = 'train-b'; Run = $fixtureTrainB }
     )) {
-        $afterArtifact = "$($sourceCheck.Name)-legacy-source-final.json"
+        $afterArtifact = "$($sourceCheck.Name)-legacy-source-final.log"
         $finalFingerprint = Get-LegacySourceFingerprint `
             -TrainRunID $sourceCheck.Run -Artifact $afterArtifact
         $sourceEvidence = Assert-LegacySourceUnchanged `
             -Before $legacySourceFingerprints[$sourceCheck.Name] -After $finalFingerprint
-        $sourceEvidence['after_cutover_artifact'] = "$($sourceCheck.Name)-legacy-source-after-cutover.json"
+        $sourceEvidence['after_cutover_artifact'] = "$($sourceCheck.Name)-legacy-source-after-cutover.log"
         $sourceEvidence['final_artifact'] = $afterArtifact
         $sourceEvidence['copied_reservation_transitioned_on_target'] = $true
         $legacySourceImmutabilityEvidence[$sourceCheck.Name] = $sourceEvidence
     }
 
     $failureCategory = 'integrity_validation'
-    $integrityResult = Invoke-PSQL -Artifact 'integrity-evidence.json' -SQL @"
+    $integrityResult = Invoke-PSQL -Artifact 'integrity-evidence.log' -SQL @"
 WITH selected_assignments AS (
     SELECT train_run_id, shard_id, assignment_generation
     FROM public.train_run_shard_assignments
@@ -1992,8 +1992,8 @@ SELECT json_build_object(
         admin_fanout_evidence = $adminFanoutEvidence
         operator_health_evidence = $operatorHealthEvidence
         admin_fanout_artifacts = @(
-            'admin-fanout-complete-before.json', 'admin-fanout-partial.json',
-            'admin-fanout-complete-after.json'
+            'admin-fanout-complete-before.log', 'admin-fanout-partial.log',
+            'admin-fanout-complete-after.log'
         )
         reconciliation_evidence = $reconciliationEvidence
         postgres_connections = [ordered]@{
@@ -2003,14 +2003,14 @@ SELECT json_build_object(
         redis_latency = $redisLatencyEvidence
         workloads = $workloads
         integrity_counts = $integrity
-        integrity_artifact = 'integrity-evidence.json'
+        integrity_artifact = 'integrity-evidence.log'
         reconciliation_artifacts = @(
-            'train-a-reconcile.json', 'train-b-reconcile.json',
-            'reconcile-shard-assignments.json', 'reconcile-shard-locators.json',
-            'reconcile-train-a-migration.json', 'reconcile-train-b-migration.json',
-            'reconcile-admission-state.json', 'reconcile-train-a-read-model.json',
-            'reconcile-train-b-read-model.json', 'reconcile-train-a-cache-versions.json',
-            'reconcile-train-b-cache-versions.json'
+            'train-a-reconcile.log', 'train-b-reconcile.log',
+            'reconcile-shard-assignments.log', 'reconcile-shard-locators.log',
+            'reconcile-train-a-migration.log', 'reconcile-train-b-migration.log',
+            'reconcile-admission-state.log', 'reconcile-train-a-read-model.log',
+            'reconcile-train-b-read-model.log', 'reconcile-train-a-cache-versions.log',
+            'reconcile-train-b-cache-versions.log'
         )
         limitations = @(
             'Bounded local functional and latency smoke; it is not production capacity evidence.',
