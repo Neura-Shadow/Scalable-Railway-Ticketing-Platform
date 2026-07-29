@@ -291,6 +291,32 @@ function New-Milestone5Migration {
     ) -Artifact "$Prefix-plan.log" | Out-Null
 }
 
+function Complete-Milestone5MigrationAfterRollbackWindow {
+    param(
+        [Parameter(Mandatory = $true)][object]$Context,
+        [Parameter(Mandatory = $true)][string]$MigrationID,
+        [Parameter(Mandatory = $true)][string]$Prefix,
+        [int]$MaximumWaitSeconds = 360
+    )
+    if ($MaximumWaitSeconds -lt 1 -or $MaximumWaitSeconds -gt 600) {
+        throw 'rollback completion wait must be bounded between 1 and 600 seconds'
+    }
+    $eligible = 0L
+    foreach ($attempt in 1..$MaximumWaitSeconds) {
+        $eligible = Get-Milestone5DriverScalar -Context $Context -Service 'control-postgres' `
+            -Artifact "$Prefix-completion-eligibility.log" -SQL "SELECT CASE WHEN state='rollback_window' AND rollback_deadline_at IS NOT NULL AND rollback_deadline_at<=clock_timestamp() THEN 1 ELSE 0 END FROM public.physical_shard_migrations WHERE migration_id='$MigrationID'::uuid;"
+        if ($eligible -eq 1) { break }
+        Start-Sleep -Seconds 1
+    }
+    if ($eligible -ne 1) { throw "$Prefix rollback window did not become completion-eligible" }
+    Invoke-Milestone5DriverAdmin -Context $Context -Arguments @(
+        'cutover','--migration-id',$MigrationID,'--confirm','--timeout','2m'
+    ) -Artifact "$Prefix-complete.log" | Out-Null
+    if ((Get-Milestone5MigrationState -Context $Context -MigrationID $MigrationID -Artifact "$Prefix-completed-state.log") -ne 'completed') {
+        throw "$Prefix did not complete after its rollback deadline"
+    }
+}
+
 function New-Milestone5DriverCustomers {
     param([object]$State, [int]$Count)
     $password = "M5-$([guid]::NewGuid().ToString('N').Substring(0,12))-Aa1!"
@@ -693,6 +719,7 @@ function Start-Milestone5Scenario {
             return
         }
         'stale-router-physical' {
+            Complete-Milestone5MigrationAfterRollbackWindow -Context $Context -MigrationID $script:M5MigrationC -Prefix 'train-c'
             foreach ($index in 0..2) {
                 $customer = $State.Customers[$index+18]
                 $body = @{train_run_id=$script:M5TrainC;origin_station_code='M2A';destination_station_code='M2B';seat_class='standard';passenger_ids=@($customer.PassengerIDs[0])} | ConvertTo-Json -Compress
