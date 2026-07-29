@@ -49,6 +49,17 @@ func parseStorage(value string) (fixedStorage, bool) {
 	}
 }
 
+func logicalStorageKindMatches(storage fixedStorage, kind string) bool {
+	switch storage {
+	case storageLegacy:
+		return kind == "legacy" || kind == "legacy_schema"
+	case storageZero, storageOne:
+		return kind == "schema" || kind == "logical_schema"
+	default:
+		return false
+	}
+}
+
 type catalogObservation struct {
 	ShardID      string
 	StorageKind  string
@@ -292,11 +303,7 @@ func (service *service) Assignments(ctx context.Context, limits Limits) (Report,
 	var catalogViolations int64
 	for _, row := range catalog {
 		storage, valid := parseStorage(row.ShardID)
-		expectedKind := "schema"
-		if storage == storageLegacy {
-			expectedKind = "legacy"
-		}
-		if !valid || row.StorageKind != expectedKind {
+		if !valid || !logicalStorageKindMatches(storage, row.StorageKind) {
 			catalogViolations++
 			continue
 		}

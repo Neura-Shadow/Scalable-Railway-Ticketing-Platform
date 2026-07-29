@@ -204,6 +204,31 @@ func TestAssignmentsHealthyUsesDeterministicFixedFanout(t *testing.T) {
 	}
 }
 
+func TestAssignmentsHealthyAcceptsUpgradedLogicalCatalog(t *testing.T) {
+	runID := uuid.MustParse("10000000-0000-0000-0000-000000000011")
+	fake := &fakeSource{
+		catalog: []catalogObservation{
+			{ShardID: "legacy", StorageKind: "legacy_schema", Enabled: true, WriteEnabled: true, State: "active"},
+			{ShardID: "shard-0", StorageKind: "logical_schema", Enabled: true, WriteEnabled: true, State: "active"},
+			{ShardID: "shard-1", StorageKind: "logical_schema", Enabled: true, WriteEnabled: true, State: "active"},
+		},
+		assignments: []assignmentObservation{{
+			TrainRunID: runID, AssignmentPresent: true, ShardID: "legacy", Generation: 1,
+			State: "stable", CatalogPresent: true, CatalogEnabled: true, CatalogWriteEnabled: true,
+		}},
+		fences: map[fixedStorage][]fenceObservation{
+			storageLegacy: {{TrainRunID: runID, Generation: 1, Enabled: true}},
+		},
+		fenceErrors: make(map[fixedStorage]error),
+	}
+	report, err := newService(fake).Assignments(
+		context.Background(), Limits{PageSize: 10, MaxPages: 20, MaxRows: 100},
+	)
+	if err != nil || report.Violations != 0 || report.Completeness != CompletenessComplete {
+		t.Fatalf("Assignments() report=%+v error=%v, want healthy upgraded logical catalog", report, err)
+	}
+}
+
 func TestAssignmentsReturnsPartialWithoutHidingHealthyShards(t *testing.T) {
 	runID := uuid.MustParse("10000000-0000-0000-0000-000000000002")
 	fake := &fakeSource{

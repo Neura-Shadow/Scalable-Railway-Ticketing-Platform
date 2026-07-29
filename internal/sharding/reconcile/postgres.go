@@ -120,6 +120,7 @@ func (source *postgresSource) Catalog(ctx context.Context) ([]catalogObservation
 		rows, err := query.Query(ctx, `
 SELECT shard_id, storage_kind, enabled, write_enabled, state
 FROM public.booking_shards
+WHERE storage_kind <> 'postgres'
 ORDER BY shard_id`)
 		if err != nil {
 			return err
