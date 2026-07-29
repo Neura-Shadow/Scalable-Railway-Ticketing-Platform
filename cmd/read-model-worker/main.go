@@ -27,7 +27,7 @@ import (
 const (
 	readModelStream                = "railway:outbox:v1"
 	readModelDLQ                   = "railway:outbox:v1:read-model:dlq"
-	schemaVersion                  = 8
+	schemaVersion                  = 9
 	projectionLagObservationPeriod = 5 * time.Second
 )
 

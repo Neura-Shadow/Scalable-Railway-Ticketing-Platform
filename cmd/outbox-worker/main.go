@@ -25,7 +25,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const outboxSchemaVersion = 8
+const outboxSchemaVersion = 9
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))

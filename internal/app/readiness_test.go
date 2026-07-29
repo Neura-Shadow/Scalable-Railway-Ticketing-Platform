@@ -12,12 +12,16 @@ import (
 
 func TestShardReadinessQueryMatchesFixedCatalogSchema(t *testing.T) {
 	if strings.Contains(shardReadinessQuery, "schema_name") {
-		t.Fatal("shard readiness must not query a catalog column that migration 8 does not define")
+		t.Fatal("shard readiness must not query a catalog column that migration 9 does not define")
 	}
 	for _, fragment := range []string{
-		"shard_id = 'legacy' AND storage_kind = 'legacy'",
-		"shard_id = 'shard-0' AND storage_kind = 'schema'",
-		"shard_id = 'shard-1' AND storage_kind = 'schema'",
+		"shard_id = 'legacy' AND storage_kind = 'legacy_schema'",
+		"shard_id = 'shard-0' AND storage_kind = 'logical_schema'",
+		"shard_id = 'shard-1' AND storage_kind = 'logical_schema'",
+		"shard_id = 'physical-shard-0' AND storage_kind = 'postgres'",
+		"shard_id = 'physical-shard-1' AND storage_kind = 'postgres'",
+		"connection_ref = 'physical-shard-0'",
+		"connection_ref = 'physical-shard-1'",
 		"to_regnamespace('booking_shard_0')",
 		"to_regnamespace('booking_shard_1')",
 		"shard_id = ANY($2::text[])",
