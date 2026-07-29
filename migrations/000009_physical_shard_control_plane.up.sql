@@ -770,6 +770,7 @@ DECLARE
     assigned_shard_id text;
     assigned_generation bigint;
     assigned_state text;
+    active_migration_id uuid;
     active_physical_migration_id uuid;
     catalog_enabled boolean;
     catalog_write_enabled boolean;
@@ -788,12 +789,14 @@ BEGIN
     SELECT assignment.shard_id,
            assignment.assignment_generation,
            assignment.assignment_state,
+           assignment.active_migration_id,
            assignment.active_physical_migration_id,
            shard.enabled,
            shard.write_enabled
     INTO assigned_shard_id,
          assigned_generation,
          assigned_state,
+         active_migration_id,
          active_physical_migration_id,
          catalog_enabled,
          catalog_write_enabled
@@ -1021,8 +1024,26 @@ BEGIN
     END IF;
 
     IF assigned_state = 'migrating' THEN
-        RAISE EXCEPTION 'logical migration lacks an active physical migration ledger'
-            USING ERRCODE = '23514';
+        IF active_migration_id IS NULL
+           OR NOT EXISTS (
+                SELECT 1
+                FROM public.train_run_shard_migrations AS migration
+                WHERE migration.id = active_migration_id
+                  AND migration.train_run_id = checked_train_run_id
+                  AND migration.source_shard_id = assigned_shard_id
+                  AND migration.source_generation = assigned_generation
+                  AND migration.state IN (
+                      'copying', 'validating', 'cutover_ready', 'cutting_over'
+                  )
+           ) THEN
+            RAISE EXCEPTION 'logical migration lacks an active logical migration ledger'
+                USING ERRCODE = '23514';
+        END IF;
+        IF enabled_fence_count <> 0 THEN
+            RAISE EXCEPTION 'logical migration must remain in a zero-writer state'
+                USING ERRCODE = '23514';
+        END IF;
+        RETURN;
     END IF;
 
     IF enabled_fence_count <> 1

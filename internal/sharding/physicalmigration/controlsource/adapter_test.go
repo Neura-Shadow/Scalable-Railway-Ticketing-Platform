@@ -216,6 +216,37 @@ func TestControlMigrationDefinesBoundedPayloadFreeTransactionalCapture(t *testin
 	}
 }
 
+func TestControlMigrationPreservesLogicalMigrationZeroWriterInvariant(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join("..", "..", "..", "..", "migrations", "000009_physical_shard_control_plane.up.sql")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read migration: %v", err)
+	}
+	sql := string(raw)
+	guardStart := strings.Index(sql, "CREATE OR REPLACE FUNCTION public.assert_train_run_fence_invariant")
+	if guardStart < 0 {
+		t.Fatal("control migration omitted the train-run fence invariant")
+	}
+	guardEnd := strings.Index(sql[guardStart:], "\n$$;")
+	if guardEnd < 0 {
+		t.Fatal("control migration omitted the train-run fence invariant terminator")
+	}
+	guardSQL := sql[guardStart : guardStart+guardEnd+len("\n$$;")]
+	for _, required := range []string{
+		"assignment.active_migration_id",
+		"FROM public.train_run_shard_migrations AS migration",
+		"migration.id = active_migration_id",
+		"migration.train_run_id = checked_train_run_id",
+		"logical migration must remain in a zero-writer state",
+	} {
+		if !strings.Contains(guardSQL, required) {
+			t.Fatalf("logical migration fence guard omitted %q", required)
+		}
+	}
+}
+
 func TestControlMigrationScopesReverseApplyAuthorizationToTheExactTransaction(t *testing.T) {
 	t.Parallel()
 
