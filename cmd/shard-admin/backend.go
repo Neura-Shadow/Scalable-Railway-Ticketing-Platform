@@ -857,10 +857,16 @@ func validShardSummary(summary shardSummary) bool {
 	if err != nil || summary.MinimumFencingProtocolVersion <= 0 {
 		return false
 	}
-	if summary.StorageKind != "legacy" && summary.StorageKind != "schema" {
-		return false
-	}
-	if (shardID == sharding.ShardLegacy) != (summary.StorageKind == "legacy") {
+	switch shardID {
+	case sharding.ShardLegacy:
+		if summary.StorageKind != "legacy" && summary.StorageKind != "legacy_schema" {
+			return false
+		}
+	case sharding.ShardZero, sharding.ShardOne:
+		if summary.StorageKind != "schema" && summary.StorageKind != "logical_schema" {
+			return false
+		}
+	default:
 		return false
 	}
 	switch summary.State {

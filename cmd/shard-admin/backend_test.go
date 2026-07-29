@@ -153,6 +153,37 @@ func TestShardEligibilityRejectsUnsupportedFencingProtocol(t *testing.T) {
 	}
 }
 
+func TestValidShardSummaryAcceptsVersionEightAndNineLogicalStorageKinds(t *testing.T) {
+	tests := []struct {
+		name        string
+		shardID     string
+		storageKind string
+		want        bool
+	}{
+		{name: "version eight legacy", shardID: "legacy", storageKind: "legacy", want: true},
+		{name: "version nine legacy", shardID: "legacy", storageKind: "legacy_schema", want: true},
+		{name: "version eight logical", shardID: "shard-0", storageKind: "schema", want: true},
+		{name: "version nine logical", shardID: "shard-1", storageKind: "logical_schema", want: true},
+		{name: "physical catalog belongs to physical admin", shardID: "physical-shard-0", storageKind: "postgres", want: false},
+		{name: "legacy cannot claim logical storage", shardID: "legacy", storageKind: "logical_schema", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			summary := shardSummary{
+				ShardID:                       test.shardID,
+				StorageKind:                   test.storageKind,
+				Enabled:                       true,
+				WriteEnabled:                  true,
+				State:                         "active",
+				MinimumFencingProtocolVersion: 1,
+			}
+			if got := validShardSummary(summary); got != test.want {
+				t.Fatalf("validShardSummary(%s, %s) = %t, want %t", test.shardID, test.storageKind, got, test.want)
+			}
+		})
+	}
+}
+
 func TestMigrationSummaryOmitsCheckpointAndValidationDigests(t *testing.T) {
 	now := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
 	record := control.Record{
