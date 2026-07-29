@@ -812,7 +812,7 @@ function Invoke-Milestone5PhysicalAdmissionExpiryJourney {
         } -ExpectedStatus @(201)
         $reservationID = [string]$created.Body.id
         if ($reservationID -notmatch '^[0-9a-fA-F-]{36}$') { throw 'physical admission reservation omitted its identity' }
-        $expiredSeed = Get-Milestone5DriverScalar -Context $Context -Service 'booking-shard-0-postgres' -Artifact 'physical-hold-expiry-seed.log' -SQL "UPDATE public.reservations SET expires_at=clock_timestamp()-interval '1 second' WHERE id='$reservationID'::uuid AND status='held'; SELECT count(*) FROM public.reservations WHERE id='$reservationID'::uuid AND status='held' AND expires_at<=clock_timestamp();"
+        $expiredSeed = Get-Milestone5DriverScalar -Context $Context -Service 'booking-shard-0-postgres' -Artifact 'physical-hold-expiry-seed.log' -SQL "UPDATE public.reservations SET expires_at=created_at+interval '1 microsecond' WHERE id='$reservationID'::uuid AND status='held'; SELECT count(*) FROM public.reservations WHERE id='$reservationID'::uuid AND status='held' AND expires_at<=clock_timestamp();"
         if ($expiredSeed -ne 1) { throw 'physical admission reservation could not enter the deterministic expiry barrier' }
         $expired = $false
         for ($attempt=1;$attempt -le 60;$attempt++) {

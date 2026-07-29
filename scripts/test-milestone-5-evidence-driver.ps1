@@ -68,6 +68,7 @@ foreach ($required in @(
     'physical_same_idempotency_requests', 'physical_admission_journeys', 'physical_hold_expirations',
     'Assert-Milestone5ConcurrentPhysicalIdentity', 'Invoke-Milestone5PhysicalAdmissionExpiryJourney',
     'same-idempotency-command-count.log', 'physical-hold-expiry-proof.log',
+    "expires_at=created_at+interval '1 microsecond'",
     'final_source_sequence IS NULL OR last_replayed_sequence IS NULL',
     "-Target capture_enabled -Prefix 'train-c'",
     'completed_at_utc=[DateTimeOffset]::UtcNow.ToString'
