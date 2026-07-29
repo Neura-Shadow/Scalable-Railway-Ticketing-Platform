@@ -309,7 +309,7 @@ function New-Milestone5DriverCustomers {
         if (-not $token) { throw 'synthetic login omitted token' }
         $State.SecretValues.Add($token)
         $passengers = @()
-        $passengerCount = if ($index -lt 2) { 13 } else { 7 }
+        $passengerCount = if ($index -lt 2) { 11 } else { 7 }
         foreach ($passengerIndex in 0..($passengerCount-1)) {
             $passenger = Invoke-Milestone5DriverAPI -BaseURL $State.BaseURL -Method POST -Path '/api/v1/passengers' -Token $token -Body @{
                 display_name="M5 Synthetic Passenger $index-$passengerIndex"
@@ -529,8 +529,8 @@ function New-Milestone5EnvironmentMap {
     }
     $map['online-base-copy']['ITERATIONS_PER_VU']='2'
     $map['journal-catchup']['VUS']='3'; $map['journal-catchup']['ITERATIONS']='3'
-    $map['physical-cutover']['CUSTOMER_TOKENS']=($State.Customers[0].Token,$State.Customers[1].Token -join ',')
-    $map['physical-cutover']['PASSENGER_IDS']=($State.Customers[0].PassengerIDs[11],$State.Customers[1].PassengerIDs[11] -join ',')
+    $map['physical-cutover']['CUSTOMER_TOKENS']=($State.Customers[8].Token,$State.Customers[9].Token -join ',')
+    $map['physical-cutover']['PASSENGER_IDS']=($State.Customers[8].PassengerIDs[4],$State.Customers[9].PassengerIDs[4] -join ',')
     $map['physical-cutover']['ITERATIONS_PER_VU']='8'
     $map['stale-router-physical'] = [ordered]@{
         API_URLS='http://api-1:8080,http://api-2:8080,http://api-3:8080'; ORIGIN_CODE='M2A'; DESTINATION_CODE='M2B'; SEAT_CLASS='standard'; TRAIN_RUN_ID=$script:M5TrainC
@@ -563,7 +563,7 @@ function Initialize-Milestone5Evidence {
         OnlineCopyReservationCountBefore=-1L; OnlineCopyJournalCountBefore=-1L
         OnlineCopyMutationDelta=-1L; OnlineCopyJournalDelta=-1L
     }
-    $state.Customers = New-Milestone5DriverCustomers -State $state -Count 8
+    $state.Customers = New-Milestone5DriverCustomers -State $state -Count 10
     Add-Milestone5DriverQuotaBaseline -State $state
     New-Milestone5Migration -Context $Context -TrainRunID $script:M5TrainA -TargetShard 'physical-shard-0' -MigrationID $script:M5MigrationA -Prefix 'train-a'
     Move-Milestone5Migration -Context $Context -MigrationID $script:M5MigrationA -Target rollback_window -Prefix 'train-a'

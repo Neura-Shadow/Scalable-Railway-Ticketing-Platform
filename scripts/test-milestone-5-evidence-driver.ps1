@@ -88,11 +88,11 @@ Assert-Throws -Label 'unknown scenario start' -Action {
         -Scenario 'unknown' -Environment @{}
 }
 
-$fakeCustomers = @(0..7 | ForEach-Object {
+$fakeCustomers = @(0..9 | ForEach-Object {
     $customerIndex = [int]$_
     [pscustomobject]@{
         Token = "synthetic-token-$customerIndex"
-        PassengerIDs = [string[]]@(0..12 | ForEach-Object {
+        PassengerIDs = [string[]]@(0..10 | ForEach-Object {
             "21000000-0000-4000-8$customerIndex$($_.ToString('00'))-$($customerIndex.ToString('00'))$($_.ToString('0000000000'))"
         })
     }
@@ -118,6 +118,8 @@ Assert-True -Condition ($environmentMap['journal-catchup']['VUS'] -eq '3' -and `
     -Message 'journal catch-up must use one bounded mutation identity per customer'
 Assert-True -Condition ($environmentMap['physical-cutover']['ITERATIONS_PER_VU'] -eq '8') `
     -Message 'cutover evidence must poll through the bounded pause without exceeding the public rate limit'
+Assert-True -Condition ($environmentMap['physical-cutover']['CUSTOMER_TOKENS'] -eq 'synthetic-token-8,synthetic-token-9') `
+    -Message 'cutover evidence must use dedicated synthetic customer rate-limit windows'
 Assert-True -Condition ($environmentMap['legacy-vs-physical']['VUS_PER_PATH'] -eq '2') `
     -Message 'legacy/physical comparison requires two independent writers per path'
 Assert-True -Condition ($environmentMap['legacy-vs-physical']['ITERATIONS_PER_VU'] -eq '2') `
