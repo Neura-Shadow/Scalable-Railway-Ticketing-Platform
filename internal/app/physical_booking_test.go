@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,11 +21,12 @@ func TestHybridReservationCommandsRoutesPhysicalCreateWithControlSnapshotVersion
 	owner, trainRunID, passengerID, reservationID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	legacy := &hybridLegacy{}
 	saga := &hybridSaga{result: bookingcommand.Result{ReservationID: reservationID}}
+	router, pool, snapshotTx := hybridSnapshotRouter(t, trainRunID, 4, 7)
 	commands, err := NewHybridReservationCommands(
 		&hybridControl{rows: []pgx.Row{hybridRow{values: []any{"postgres"}}}},
 		legacy,
 		saga,
-		hybridSnapshotRouter(t, trainRunID, 4, 7),
+		router,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -42,6 +44,9 @@ func TestHybridReservationCommandsRoutesPhysicalCreateWithControlSnapshotVersion
 		saga.request.Payload.ExpectedSnapshotVersion != 7 ||
 		!reflect.DeepEqual(saga.request.Payload.PassengerIDs, []uuid.UUID{passengerID}) {
 		t.Fatalf("result=%+v request=%+v legacy_calls=%d", result, saga.request, legacy.createCalls)
+	}
+	if pool.options.AccessMode != pgx.ReadOnly || strings.Contains(snapshotTx.query, "FOR SHARE") {
+		t.Fatalf("snapshot read options=%+v query=%q; read-only PostgreSQL transactions cannot take row locks", pool.options, snapshotTx.query)
 	}
 }
 
@@ -108,8 +113,10 @@ func TestPhysicalTrainRunCancellationPreservesLegacyAndEnforcesPhysical(t *testi
 	}
 }
 
-func hybridSnapshotRouter(t *testing.T, trainRunID uuid.UUID, generation, version int64) *hybridPhysicalRouter {
+func hybridSnapshotRouter(t *testing.T, trainRunID uuid.UUID, generation, version int64) (*hybridPhysicalRouter, *hybridReadPool, *hybridReadTx) {
 	t.Helper()
+	snapshotTx := &hybridReadTx{row: hybridRow{values: []any{version}}}
+	pool := &hybridReadPool{tx: snapshotTx}
 	registry, err := shardphysical.NewRegistry(context.Background(), shardphysical.RegistryConfig{
 		Connections: map[string]shardphysical.ConnectionConfig{
 			"physical-shard-0": {ShardID: sharding.ShardPhysicalZero, DSN: "synthetic-shard-0"},
@@ -117,7 +124,7 @@ func hybridSnapshotRouter(t *testing.T, trainRunID uuid.UUID, generation, versio
 		MaxCount: 1,
 		Limits:   shardphysical.PoolLimits{MaxOpenConns: 1},
 	}, func(context.Context, string, shardphysical.PoolLimits) (shardphysical.Pool, error) {
-		return &hybridReadPool{tx: &hybridReadTx{row: hybridRow{values: []any{version}}}}, nil
+		return pool, nil
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -140,7 +147,7 @@ func hybridSnapshotRouter(t *testing.T, trainRunID uuid.UUID, generation, versio
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &hybridPhysicalRouter{resolution: shardphysical.Resolution{Route: route, Handle: handle}}
+	return &hybridPhysicalRouter{resolution: shardphysical.Resolution{Route: route, Handle: handle}}, pool, snapshotTx
 }
 
 func makeHash(value byte) []byte {

@@ -97,11 +97,13 @@ type hybridReadTx struct {
 	row       pgx.Row
 	rows      []pgx.Row
 	nextRow   int
+	query     string
 	commits   int
 	rollbacks int
 }
 
-func (tx *hybridReadTx) QueryRow(context.Context, string, ...any) pgx.Row {
+func (tx *hybridReadTx) QueryRow(_ context.Context, query string, _ ...any) pgx.Row {
+	tx.query = query
 	if tx.nextRow < len(tx.rows) {
 		row := tx.rows[tx.nextRow]
 		tx.nextRow++

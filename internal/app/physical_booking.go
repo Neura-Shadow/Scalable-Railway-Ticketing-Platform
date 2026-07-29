@@ -224,8 +224,7 @@ SELECT source_version
 FROM public.train_run_booking_snapshots
 WHERE train_run_id = $1
   AND assignment_generation = $2
-  AND active
-FOR SHARE`, trainRunID, resolved.Route.Generation().Int64()).Scan(&snapshotVersion); err != nil || snapshotVersion <= 0 {
+  AND active`, trainRunID, resolved.Route.Generation().Int64()).Scan(&snapshotVersion); err != nil || snapshotVersion <= 0 {
 		return 0, sharding.ErrShardUnavailable
 	}
 	if err := tx.Commit(ctx); err != nil {
