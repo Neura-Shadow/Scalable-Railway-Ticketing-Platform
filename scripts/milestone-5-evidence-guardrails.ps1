@@ -377,15 +377,22 @@ function Write-Milestone5JsonAtomic {
         [Parameter(Mandatory = $true)][object]$Value
     )
 
-    $candidate = "$Path.candidate-$([guid]::NewGuid().ToString('N'))"
+    $suffix = [guid]::NewGuid().ToString('N')
+    $candidate = "$Path.candidate-$suffix"
+    $backup = "$Path.backup-$suffix"
     try {
         [System.IO.File]::WriteAllText(
             $candidate,
             ($Value | ConvertTo-Json -Depth 20),
             [System.Text.UTF8Encoding]::new($false)
         )
-        Move-Item -LiteralPath $candidate -Destination $Path -ErrorAction Stop
+        if ([System.IO.File]::Exists($Path)) {
+            [System.IO.File]::Replace($candidate, $Path, $backup, $true)
+        } else {
+            [System.IO.File]::Move($candidate, $Path)
+        }
     } finally {
         if (Test-Path -LiteralPath $candidate) { Remove-Item -LiteralPath $candidate -Force }
+        if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force }
     }
 }

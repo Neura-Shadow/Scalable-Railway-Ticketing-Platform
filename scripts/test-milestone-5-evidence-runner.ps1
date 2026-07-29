@@ -202,6 +202,10 @@ try {
     New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
     $safe = Join-Path $temporaryRoot 'safe.json'
     Write-Milestone5JsonAtomic -Path $safe -Value ([ordered]@{ status = 'passed'; value = 1 })
+    Write-Milestone5JsonAtomic -Path $safe -Value ([ordered]@{ status = 'passed'; value = 2 })
+    $safeValue = Get-Content -Raw -LiteralPath $safe | ConvertFrom-Json
+    Assert-True -Condition ($safeValue.value -eq 2) `
+        -Message 'atomic JSON publication did not replace an existing status file'
     Assert-Milestone5ArtifactsSanitized -EvidenceDirectory $temporaryRoot
     $credentialShapedValue = [string]::Concat(
         'postgres', 'ql://operator:', 'synthetic@db.example.test/tickets'
