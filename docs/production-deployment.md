@@ -167,6 +167,33 @@ stable on `legacy`, all migrations are terminal, and both logical schemas are
 empty. Follow the dedicated runbook; do not use a down migration as the first
 incident response.
 
+Migration 9 adds physical-shard control metadata and command/recovery state but
+does not enable any physical shard. Apply it to the control database using the
+dedicated rollout runbook. Apply `migrations/booking-shard` independently to
+each allowlisted physical database and require clean shard schema version 1
+before enabling writes. Keep DSNs in process-specific secrets only; the control
+catalog stores fixed connection references, never endpoints or credentials.
+
+Physical cutover is an operator-controlled, single-region pilot. Disable and
+durably record the source fence, complete final journal catch-up and validation,
+enable the target at a newer generation, and only then switch the control
+assignment. The final phase includes a bounded write pause. Retain the source
+read-only. If the target has accepted a successful write, direct rollback is
+forbidden; perform a reviewed reverse migration. Do not present this workflow
+as zero downtime, automatic failover, or production certification.
+
+Physical fare, seat-booking-state and booking-policy changes are optimistic,
+durable operator commands. Read the current value through the corresponding
+operator GET, retain its `source_version`, and send that exact value with a new
+`Idempotency-Key` on PATCH. Do not retry with a changed body under the same key.
+The API reserves the control ledger before the shard write; the shard commits
+the snapshot and receipt together; the finalizer commits the control projection
+and ledger state together. Run the booking-command reconciler with access only
+to the fixed allowlisted shard connections so an interrupted finalization can
+converge without repeating a receipted write. Alert on reserved/executing/
+committed/repair command age and reconciliation failures. Route-level fare
+fanout is not supported by this endpoint.
+
 ## Health and rollout behavior
 
 - The API `/livez` is process-only and must not depend on PostgreSQL or Redis.
@@ -176,6 +203,20 @@ incident response.
   Catalog loss makes the API unready. One optional logical storage may leave
   the API ready but explicitly degraded while requests assigned there fail
   boundedly; this is logical degradation, not physical isolation.
+- In physical mode, readiness requires clean control Migration 9, a validated
+  fixed registry and compatible shard schema version 1. One unavailable shard
+  may be reported as bounded degradation while healthy shards continue; a
+  request assigned to the failed shard returns a bounded unavailable result.
+  Readiness output exposes only fixed shard IDs, never DSNs or endpoints.
+- Physical query routes receive one non-resetting request deadline inherited by
+  control routing, pool acquisition, refresh, and shard work. Each physical
+  transaction additionally sets local statement and lock timeouts. Control-only
+  routes and complete booking sagas keep their separately configured deadlines.
+- Hold expiration and outbox publication run control and physical lanes
+  concurrently with distinct budgets: `WORKER_PASS_TIMEOUT` bounds the control
+  lane and outer pass, while `PHYSICAL_WORKER_SHARD_TIMEOUT` bounds one physical
+  shard pass. A slow control database therefore cannot starve healthy physical
+  shards, and the per-statement timeout is not misused as a whole-batch limit.
 - Each worker exposes a private `WORKER_HTTP_ADDRESS` (default `:9090`) with process-only `/livez`, dependency/config `/readyz`, and its own `/metrics`. Admission-worker readiness checks PostgreSQL, Redis, migrations, and its process-owned keyring/config; queue backlog does not fail readiness. Hold-expirer `/readyz` checks PostgreSQL; a Redis Streams outbox-worker checks both PostgreSQL and Redis; a log outbox-worker checks PostgreSQL only. Each pass is bounded by `WORKER_PASS_TIMEOUT`.
 - Outbox backlog, pending consumer work, or a dead-letter item is alertable but is not by itself a readiness failure.
 - The source stream is intentionally not blind-`MAXLEN` trimmed. Alert on

@@ -1,0 +1,467 @@
+name: scalable-railway-ticketing-platform-physical-shards
+
+# Local, single-region Milestone 5 evidence topology. All credential defaults
+# below are synthetic and must never be reused outside an isolated workstation.
+x-control-dsn: &control-dsn
+  DATABASE_URL: ${CONTROL_DATABASE_URL:-postgresql://railway_control:control-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3}
+  CONTROL_DATABASE_MAX_OPEN_CONNS: 4
+
+x-physical-shard-dsns: &physical-shard-dsns
+  BOOKING_SHARD_MODE: physical
+  BOOKING_SHARD_IDS: physical-shard-0,physical-shard-1
+  BOOKING_SHARD_0_DATABASE_URL: ${BOOKING_SHARD_0_DATABASE_URL:-postgresql://railway_booking:shard-0-local-only@booking-shard-0-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
+  BOOKING_SHARD_1_DATABASE_URL: ${BOOKING_SHARD_1_DATABASE_URL:-postgresql://railway_booking:shard-1-local-only@booking-shard-1-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
+  PHYSICAL_SHARD_MAX_COUNT: 2
+  PHYSICAL_SHARD_MAX_OPEN_CONNS: 3
+  PHYSICAL_SHARD_MAX_IDLE_CONNS: 2
+  PHYSICAL_SHARD_TOTAL_POOL_BUDGET: 6
+  CONTROL_DATABASE_POOL_COUNT: 10
+  PHYSICAL_SHARD_API_REPLICA_COUNT: 3
+  PHYSICAL_SHARD_WORKER_REPLICA_COUNT: 3
+  WORKER_SHARD_CONCURRENCY: 2
+  PHYSICAL_SHARD_MIGRATION_ADMIN_RESERVE: 8
+  PHYSICAL_SHARD_OPERATIONAL_RESERVE: 16
+  POSTGRES_MAX_CONNECTIONS_LIMIT: 100
+  PHYSICAL_SHARD_CONN_MAX_LIFETIME_SECONDS: 900
+  PHYSICAL_SHARD_CONN_MAX_IDLE_TIME_SECONDS: 300
+  PHYSICAL_SHARD_CONNECT_TIMEOUT: 3s
+  PHYSICAL_SHARD_QUERY_TIMEOUT: 2s
+  PHYSICAL_WORKER_SHARD_TIMEOUT: 30s
+  BOOKING_ROUTE_CACHE_ENABLED: "true"
+  BOOKING_ROUTE_CACHE_TTL_SECONDS: 5
+  BOOKING_ROUTE_CACHE_MAX_ENTRIES: 1000
+  BOOKING_SHARD_QUERY_TIMEOUT: 2s
+
+x-app-security: &app-security
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  init: true
+  restart: unless-stopped
+  networks:
+    - backend
+
+x-api-common: &api-common
+  <<: *app-security
+  build:
+    context: .
+    target: api
+  environment: &api-environment
+    <<: [*control-dsn, *physical-shard-dsns]
+    APP_ENV: development
+    HTTP_ADDR: :8080
+    REDIS_ADDR: redis:6379
+    JWT_SECRET: ${JWT_SECRET:-local-development-secret-change-me-123456789}
+    JWT_ISSUER: scalable-railway-ticketing-platform
+    JWT_AUDIENCE: railway-api
+    ADMISSION_TOKEN_KEYRING: ${ADMISSION_TOKEN_KEYRING:-local-current=a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s}
+    ADMISSION_TOKEN_ISSUE_KEY_ID: ${ADMISSION_TOKEN_ISSUE_KEY_ID:-local-current}
+    ADMISSION_TOKEN_ACCEPT_KEY_IDS: ${ADMISSION_TOKEN_ACCEPT_KEY_IDS:-local-current}
+    RESERVATION_HOLD_TTL_SECONDS: 600
+    RESERVATION_MAX_PASSENGERS: 6
+    RESERVATION_MAX_ACTIVE_HOLDS_PER_USER: 10
+    RESERVATION_MAX_ACTIVE_HOLDS_PER_USER_PER_TRAIN_RUN: 3
+    RESERVATION_MAX_ACTIVE_PASSENGERS_PER_USER: 24
+    RESERVATION_MAX_INFLIGHT_PER_INSTANCE: 16
+    TRUSTED_PROXIES: 172.16.0.0/12
+    STATION_CACHE_ENABLED: "true"
+    STATION_CACHE_TTL_SECONDS: 300
+    STATION_CACHE_JITTER_SECONDS: 30
+    TRAIN_SEARCH_CACHE_ENABLED: "true"
+    TRAIN_SEARCH_CACHE_TTL_SECONDS: 60
+    TRAIN_SEARCH_CACHE_JITTER_SECONDS: 10
+    TRAIN_SEARCH_FALLBACK_ENABLED: "true"
+    AVAILABILITY_CACHE_ENABLED: "true"
+    AVAILABILITY_CACHE_TTL_SECONDS: 10
+    AVAILABILITY_CACHE_JITTER_SECONDS: 2
+    AVAILABILITY_CACHE_MAX_STALE_SECONDS: 10
+  depends_on: &application-dependencies
+    migrate-control:
+      condition: service_completed_successfully
+    migrate-booking-shard-0:
+      condition: service_completed_successfully
+    migrate-booking-shard-1:
+      condition: service_completed_successfully
+    bootstrap-booking-shard-0:
+      condition: service_completed_successfully
+    bootstrap-booking-shard-1:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+  networks:
+    - frontend
+    - backend
+
+x-admission-worker-common: &admission-worker-common
+  <<: *app-security
+  build:
+    context: .
+    target: admission-worker
+  environment: &admission-worker-environment
+    <<: *control-dsn
+    APP_ENV: development
+    REDIS_ADDR: redis:6379
+    ADMISSION_WORKER_ENABLED: "true"
+    ADMISSION_WORKER_BATCH_SIZE: 100
+    ADMISSION_WORKER_INTERVAL_MILLISECONDS: 250
+    ADMISSION_TOKEN_KEYRING: ${ADMISSION_TOKEN_KEYRING:-local-current=a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s}
+    ADMISSION_TOKEN_ISSUE_KEY_ID: ${ADMISSION_TOKEN_ISSUE_KEY_ID:-local-current}
+    ADMISSION_TOKEN_ACCEPT_KEY_IDS: ${ADMISSION_TOKEN_ACCEPT_KEY_IDS:-local-current}
+    WORKER_HTTP_ADDRESS: :9090
+    WORKER_PASS_TIMEOUT: 60s
+  depends_on: *application-dependencies
+
+x-read-model-worker-common: &read-model-worker-common
+  <<: *app-security
+  build:
+    context: .
+    target: read-model-worker
+  environment: &read-model-worker-environment
+    <<: *control-dsn
+    APP_ENV: development
+    REDIS_ADDR: redis:6379
+    READ_MODEL_WORKER_ENABLED: "true"
+    READ_MODEL_WORKER_BATCH_SIZE: 100
+    READ_MODEL_WORKER_INTERVAL_MILLISECONDS: 1000
+    READ_MODEL_CONSUMER_GROUP: railway-physical-read-model
+    READ_MODEL_MAX_ATTEMPTS: 5
+    READ_MODEL_CLAIM_MIN_IDLE_SECONDS: 90
+    WORKER_HTTP_ADDRESS: :9090
+    WORKER_PASS_TIMEOUT: 60s
+  depends_on: *application-dependencies
+
+services:
+  control-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: railway_control
+      POSTGRES_USER: railway_control
+      POSTGRES_PASSWORD: ${CONTROL_POSTGRES_PASSWORD:-control-local-only}
+    command:
+      - postgres
+      - -c
+      - max_connections=100
+      - -c
+      - statement_timeout=15000
+      - -c
+      - lock_timeout=3000
+      - -c
+      - idle_in_transaction_session_timeout=15000
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U railway_control -d railway_control"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    volumes:
+      - control-postgres-data:/var/lib/postgresql/data
+    networks:
+      - backend
+    restart: unless-stopped
+
+  booking-shard-0-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: railway_booking
+      POSTGRES_USER: railway_booking
+      POSTGRES_PASSWORD: ${BOOKING_SHARD_0_POSTGRES_PASSWORD:-shard-0-local-only}
+    command:
+      - postgres
+      - -c
+      - max_connections=80
+      - -c
+      - statement_timeout=10000
+      - -c
+      - lock_timeout=3000
+      - -c
+      - idle_in_transaction_session_timeout=15000
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U railway_booking -d railway_booking"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    volumes:
+      - booking-shard-0-postgres-data:/var/lib/postgresql/data
+    networks:
+      - backend
+    restart: unless-stopped
+    labels:
+      railway.failure-domain: booking-shard-0
+
+  booking-shard-1-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: railway_booking
+      POSTGRES_USER: railway_booking
+      POSTGRES_PASSWORD: ${BOOKING_SHARD_1_POSTGRES_PASSWORD:-shard-1-local-only}
+    command:
+      - postgres
+      - -c
+      - max_connections=80
+      - -c
+      - statement_timeout=10000
+      - -c
+      - lock_timeout=3000
+      - -c
+      - idle_in_transaction_session_timeout=15000
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U railway_booking -d railway_booking"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    volumes:
+      - booking-shard-1-postgres-data:/var/lib/postgresql/data
+    networks:
+      - backend
+    restart: unless-stopped
+    labels:
+      railway.failure-domain: booking-shard-1
+
+  redis:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxclients
+      - "256"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+    volumes:
+      - redis-physical-data:/data
+    networks:
+      - backend
+    restart: unless-stopped
+
+  migrate-control:
+    build:
+      context: .
+      target: migrate
+    environment:
+      DATABASE_URL: ${CONTROL_MIGRATION_DATABASE_URL:-postgresql://railway_control:control-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3}
+    command: ["up"]
+    depends_on:
+      control-postgres:
+        condition: service_healthy
+    networks:
+      - backend
+    restart: "on-failure:3"
+
+  migrate-booking-shard-0:
+    build:
+      context: .
+      target: migrate
+    entrypoint: ["/usr/local/bin/migrate", "-path", "/migrations/booking-shard"]
+    environment:
+      DATABASE_URL: ${BOOKING_SHARD_0_MIGRATION_DATABASE_URL:-postgresql://railway_booking:shard-0-local-only@booking-shard-0-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
+    command: ["up"]
+    depends_on:
+      booking-shard-0-postgres:
+        condition: service_healthy
+    networks:
+      - backend
+    restart: "on-failure:3"
+
+  migrate-booking-shard-1:
+    build:
+      context: .
+      target: migrate
+    entrypoint: ["/usr/local/bin/migrate", "-path", "/migrations/booking-shard"]
+    environment:
+      DATABASE_URL: ${BOOKING_SHARD_1_MIGRATION_DATABASE_URL:-postgresql://railway_booking:shard-1-local-only@booking-shard-1-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
+    command: ["up"]
+    depends_on:
+      booking-shard-1-postgres:
+        condition: service_healthy
+    networks:
+      - backend
+    restart: "on-failure:3"
+
+  # Migration 9 intentionally creates physical catalog entries disabled. These
+  # one-shot gates independently verify each booking-shard schema before the
+  # evidence topology enables it; no worker starts against an unbootstrapped
+  # physical catalog row.
+  bootstrap-booking-shard-0:
+    <<: *app-security
+    build:
+      context: .
+      target: physical-shard-admin
+    environment:
+      CONTROL_DATABASE_URL: ${CONTROL_DATABASE_URL:-postgresql://railway_control:control-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3}
+      BOOKING_SHARD_0_DATABASE_URL: ${BOOKING_SHARD_0_DATABASE_URL:-postgresql://railway_booking:shard-0-local-only@booking-shard-0-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
+      BOOKING_SHARD_1_DATABASE_URL: ${BOOKING_SHARD_1_DATABASE_URL:-postgresql://railway_booking:shard-1-local-only@booking-shard-1-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
+    command: ["bootstrap-shard", "--shard-id", "physical-shard-0", "--confirm", "--timeout", "30s"]
+    depends_on:
+      migrate-control:
+        condition: service_completed_successfully
+      migrate-booking-shard-0:
+        condition: service_completed_successfully
+      migrate-booking-shard-1:
+        condition: service_completed_successfully
+    restart: "no"
+
+  bootstrap-booking-shard-1:
+    <<: *app-security
+    build:
+      context: .
+      target: physical-shard-admin
+    environment:
+      CONTROL_DATABASE_URL: ${CONTROL_DATABASE_URL:-postgresql://railway_control:control-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3}
+      BOOKING_SHARD_0_DATABASE_URL: ${BOOKING_SHARD_0_DATABASE_URL:-postgresql://railway_booking:shard-0-local-only@booking-shard-0-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
+      BOOKING_SHARD_1_DATABASE_URL: ${BOOKING_SHARD_1_DATABASE_URL:-postgresql://railway_booking:shard-1-local-only@booking-shard-1-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
+    command: ["bootstrap-shard", "--shard-id", "physical-shard-1", "--confirm", "--timeout", "30s"]
+    depends_on:
+      migrate-control:
+        condition: service_completed_successfully
+      migrate-booking-shard-0:
+        condition: service_completed_successfully
+      migrate-booking-shard-1:
+        condition: service_completed_successfully
+    restart: "no"
+
+  api-1:
+    <<: *api-common
+
+  api-2:
+    <<: *api-common
+
+  api-3:
+    <<: *api-common
+
+  admission-worker-1:
+    <<: *admission-worker-common
+
+  admission-worker-2:
+    <<: *admission-worker-common
+
+  read-model-worker-1:
+    <<: *read-model-worker-common
+    environment:
+      <<: *read-model-worker-environment
+      READ_MODEL_CONSUMER_NAME: physical-read-model-1
+
+  read-model-worker-2:
+    <<: *read-model-worker-common
+    environment:
+      <<: *read-model-worker-environment
+      READ_MODEL_CONSUMER_NAME: physical-read-model-2
+
+  hold-expirer:
+    <<: *app-security
+    build:
+      context: .
+      target: hold-expirer
+    environment:
+      <<: [*control-dsn, *physical-shard-dsns]
+      APP_ENV: development
+      HOLD_EXPIRER_ENABLED: "true"
+      HOLD_EXPIRER_BATCH_SIZE: 50
+      HOLD_EXPIRER_INTERVAL_SECONDS: 30
+      WORKER_HTTP_ADDRESS: :9090
+      WORKER_PASS_TIMEOUT: 60s
+    depends_on: *application-dependencies
+
+  outbox-worker:
+    <<: *app-security
+    build:
+      context: .
+      target: outbox-worker
+    environment:
+      <<: [*control-dsn, *physical-shard-dsns]
+      APP_ENV: development
+      OUTBOX_PUBLISHER_ENABLED: "true"
+      OUTBOX_PUBLISHER: redis_stream
+      REDIS_ADDR: redis:6379
+      OUTBOX_BATCH_SIZE: 100
+      OUTBOX_POLL_INTERVAL_SECONDS: 2
+      WORKER_HTTP_ADDRESS: :9090
+      WORKER_PASS_TIMEOUT: 60s
+    depends_on: *application-dependencies
+
+  booking-command-reconciler:
+    <<: *app-security
+    build:
+      context: .
+      target: booking-command-reconciler
+    environment:
+      <<: [*control-dsn, *physical-shard-dsns]
+      APP_ENV: development
+      BOOKING_COMMAND_RECONCILER_ENABLED: "true"
+      BOOKING_COMMAND_RECONCILER_BATCH_SIZE: 50
+      BOOKING_COMMAND_RECONCILER_LEASE_TTL: 90s
+      BOOKING_COMMAND_RECONCILER_POLL_INTERVAL: 2s
+      WORKER_HTTP_ADDRESS: :9090
+      WORKER_PASS_TIMEOUT: 60s
+    depends_on: *application-dependencies
+
+  # Profile-gated operator CLI used by the disposable Milestone 5 evidence
+  # driver. It shares no host port, receives only the three internal DSNs and
+  # exits after one bounded command.
+  physical-shard-admin:
+    profiles: ["tools"]
+    <<: *app-security
+    build:
+      context: .
+      target: physical-shard-admin
+    environment:
+      CONTROL_DATABASE_URL: ${CONTROL_DATABASE_URL:-postgresql://railway_control:control-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3}
+      BOOKING_SHARD_0_DATABASE_URL: ${BOOKING_SHARD_0_DATABASE_URL:-postgresql://railway_booking:shard-0-local-only@booking-shard-0-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
+      BOOKING_SHARD_1_DATABASE_URL: ${BOOKING_SHARD_1_DATABASE_URL:-postgresql://railway_booking:shard-1-local-only@booking-shard-1-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
+    depends_on: *application-dependencies
+    restart: "no"
+
+  reverse-proxy:
+    build:
+      context: .
+      dockerfile: deploy/nginx/Dockerfile
+    image: scalable-railway-ticketing-proxy:milestone-5-local
+    user: "101:101"
+    depends_on:
+      api-1:
+        condition: service_healthy
+      api-2:
+        condition: service_healthy
+      api-3:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${PHYSICAL_SHARDS_HTTP_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:8080/livez"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:size=16m,mode=0755,uid=101,gid=101
+      - /var/run:size=1m,mode=0755,uid=101,gid=101
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - frontend
+    restart: unless-stopped
+
+networks:
+  frontend:
+  backend:
+    internal: true
+
+volumes:
+  control-postgres-data:
+  booking-shard-0-postgres-data:
+  booking-shard-1-postgres-data:
+  redis-physical-data:

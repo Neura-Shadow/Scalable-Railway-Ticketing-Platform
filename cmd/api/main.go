@@ -16,21 +16,27 @@ import (
 	admissionpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/admission/postgres"
 	admissionredis "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/admission/redis"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/app"
+	bookingcommand "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command"
+	commandphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command/physical"
+	commandpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command/postgres"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/operatorcommand"
+	operatorpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/operatorcommand/postgres"
 	bookingpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/postgres"
 	offeringpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/offering/postgres"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/clock"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
 	platformmetrics "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/metrics"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/redisx"
 	querycache "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/cache"
 	querypostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/postgres"
 	queryreadmodel "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/readmodel"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
+	shardphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physical"
 	shardingpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/postgres"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/routecache"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/transport/httpapi"
 	"github.com/gin-gonic/gin"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
@@ -80,18 +86,11 @@ func run(logger *slog.Logger) error {
 	handlerContext, cancelHandlers := context.WithCancel(context.Background())
 	defer cancelHandlers()
 
-	pool, err := pgxpool.New(signalContext, cfg.DatabaseURL)
+	pool, err := postgresx.NewBoundedPool(signalContext, cfg.DatabaseURL, cfg.ControlDatabaseMaxOpenConns)
 	if err != nil {
 		return errors.New("postgres configuration invalid")
 	}
 	defer pool.Close()
-
-	redisClient := redis.NewClient(redisx.BoundedClientOptions(
-		cfg.RedisAddress,
-		cfg.RedisPassword,
-		cfg.RedisTimeout,
-	))
-	defer func() { _ = redisClient.Close() }()
 
 	registry := prometheus.NewRegistry()
 	metrics, err := platformmetrics.New(registry)
@@ -102,6 +101,52 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return errors.New("read-model metrics initialization failed")
 	}
+
+	var physicalRegistry *shardphysical.Registry
+	var physicalRouter *shardphysical.CatalogRouter
+	var physicalRequestTimeout time.Duration
+	if cfg.BookingShardMode == config.BookingShardModePhysical {
+		physicalRequestTimeout = cfg.PhysicalShardQueryTimeout
+		connections := make(map[string]shardphysical.ConnectionConfig, len(cfg.PhysicalShardConnections))
+		for reference, dsn := range cfg.PhysicalShardConnections {
+			shardID, parseErr := sharding.ParseShardID(reference)
+			if parseErr != nil {
+				return errors.New("physical shard registry initialization failed")
+			}
+			connections[reference] = shardphysical.ConnectionConfig{ShardID: shardID, DSN: dsn}
+		}
+		physicalRegistry, err = shardphysical.NewRegistry(signalContext, shardphysical.RegistryConfig{
+			Connections: connections,
+			MaxCount:    cfg.PhysicalShardMaxCount,
+			Limits: shardphysical.PoolLimits{
+				MaxOpenConns:     cfg.PhysicalShardMaxOpenConns,
+				MaxIdleConns:     cfg.PhysicalShardMaxIdleConns,
+				MaxLifetime:      cfg.PhysicalShardConnMaxLifetime,
+				MaxIdleTime:      cfg.PhysicalShardConnMaxIdleTime,
+				ConnectTimeout:   cfg.PhysicalShardConnectTimeout,
+				StatementTimeout: cfg.PhysicalShardQueryTimeout,
+				LockTimeout:      cfg.PhysicalShardQueryTimeout,
+			},
+		}, shardphysical.OpenPGXPool)
+		if err != nil {
+			return errors.New("physical shard registry initialization failed")
+		}
+		defer physicalRegistry.Close()
+		physicalRouter, err = shardphysical.NewCatalogRouter(
+			pool, physicalRegistry, cfg.BookingRouteCacheTTL, shardphysical.WithMetrics(metrics),
+		)
+		if err != nil {
+			return errors.New("physical shard router initialization failed")
+		}
+	}
+
+	redisClient := redis.NewClient(redisx.BoundedClientOptions(
+		cfg.RedisAddress,
+		cfg.RedisPassword,
+		cfg.RedisTimeout,
+	))
+	defer func() { _ = redisClient.Close() }()
+
 	keySelection, err := cfg.ParseAdmissionTokenKeys()
 	if err != nil {
 		return errors.New("admission token keyring invalid")
@@ -161,6 +206,13 @@ func run(logger *slog.Logger) error {
 			return errors.New("sharded query store initialization failed")
 		}
 	}
+	var querySource querycache.SourceStore = queryStore
+	if physicalRouter != nil {
+		querySource, err = querypostgres.NewPhysicalStore(queryStore, physicalRouter)
+		if err != nil {
+			return errors.New("physical availability store initialization failed")
+		}
+	}
 	projectionStore, err := queryreadmodel.NewStore(pool, clock.RealClock{})
 	if err != nil {
 		return errors.New("read-model store initialization failed")
@@ -186,7 +238,7 @@ func run(logger *slog.Logger) error {
 		return errors.New("availability cache TTL configuration invalid")
 	}
 	cachedQueryStore, err := querycache.NewStore(
-		queryStore,
+		querySource,
 		projectionStore,
 		redisClient,
 		versionManager,
@@ -247,33 +299,130 @@ func run(logger *slog.Logger) error {
 			return errors.New("sharded booking reads initialization failed")
 		}
 	}
+	var physicalCommands *app.HybridReservationCommands
+	var physicalReads *app.HybridReservationReader
+	ticketQueries := app.NewTicketQueries(reads)
+	if physicalRouter != nil {
+		controlCommands, commandErr := commandpostgres.NewRepository(pool, commandpostgres.Options{
+			LeaseTTL:                   cfg.HoldTTL,
+			MaxActiveHoldsPerUser:      cfg.ReservationMaxActiveHoldsPerUser,
+			MaxActiveHoldsPerTrainRun:  cfg.ReservationMaxActiveHoldsPerUserPerTrainRun,
+			MaxActivePassengersPerUser: cfg.ReservationMaxActivePassengersPerUser,
+			Metrics:                    metrics,
+		})
+		if commandErr != nil {
+			return errors.New("physical booking control initialization failed")
+		}
+		shardExecutor, commandErr := commandphysical.NewExecutor(physicalRouter, commandphysical.Options{MaxHoldTTL: cfg.HoldTTL})
+		if commandErr != nil {
+			return errors.New("physical booking executor initialization failed")
+		}
+		observedExecutor := observedPhysicalExecutor{next: shardExecutor, metrics: metrics}
+		coordinator, commandErr := bookingcommand.NewCoordinator(controlCommands, observedExecutor)
+		if commandErr != nil {
+			return errors.New("physical booking coordinator initialization failed")
+		}
+		observedCoordinator := observedPhysicalCoordinator{next: coordinator, metrics: metrics}
+		physicalCommands, commandErr = app.NewHybridReservationCommands(
+			pool, bookingStore, observedCoordinator, physicalRouter,
+		)
+		if commandErr != nil {
+			return errors.New("hybrid booking command initialization failed")
+		}
+		physicalReads, commandErr = app.NewHybridReservationReader(pool, reads, physicalRouter)
+		if commandErr != nil {
+			return errors.New("physical booking read initialization failed")
+		}
+		physicalTickets, ticketErr := app.NewHybridTicketReader(pool, reads, physicalRouter)
+		if ticketErr != nil {
+			return errors.New("physical ticket read initialization failed")
+		}
+		ticketQueries = app.NewTicketQueries(physicalTickets)
+	}
 	rateLimitBackend, err := redisx.NewRateLimiter(redisClient, "railway-api")
 	if err != nil {
 		return errors.New("rate limiter initialization failed")
 	}
 
-	router := httpapi.New(httpapi.Dependencies{
-		Readiness:        app.NewReadinessChecker(pool, redisClient, cfg),
-		ReadinessTimeout: readinessTimeout(cfg),
-		TokenParser:      tokenParser,
-		Reservations: app.NewAdmissionProtectedReservationService(
-			bookingStore, bookingStore, queryStore, reads, policyStore, admissionControl,
+	reservationService := app.NewAdmissionProtectedReservationService(
+		bookingStore, bookingStore, queryStore, reads, policyStore, admissionControl,
+		admissionKeyring, executionSlots, passwordClock, cfg.HoldTTL,
+		cfg.MaxPassengersPerReservation, metrics,
+	).WithDatabaseCommandTimeout(cfg.DatabaseTimeout)
+	if physicalCommands != nil && physicalReads != nil {
+		reservationService = app.NewAdmissionProtectedReservationService(
+			physicalCommands, physicalCommands, queryStore, physicalReads, policyStore, admissionControl,
 			admissionKeyring, executionSlots, passwordClock, cfg.HoldTTL,
 			cfg.MaxPassengersPerReservation, metrics,
-		).WithDatabaseCommandTimeout(cfg.DatabaseTimeout),
-		WaitingRoom:         app.NewWaitingRoomService(policyStore, queryStore, admissionControl, admissionKeyring, metrics),
-		HotTrainPolicies:    app.NewHotTrainPolicyService(policyStore),
-		MaxRequestBodyBytes: maxRequestBodyBytes,
-		MaxPassengers:       cfg.MaxPassengersPerReservation,
-		HTTPMetrics:         metrics,
-		MetricsHandler:      promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
-		Offering:            app.NewOfferingQueries(cachedQueryStore),
-		Auth:                auth,
-		RateLimiter:         app.NewRateLimiter(rateLimitBackend),
-		Passengers:          passengers,
-		Tickets:             app.NewTicketQueries(reads),
-		Admin:               app.NewAdminCommands(offeringStore),
-		Operator:            app.NewOperatorCommands(offeringStore, bookingStore, metrics),
+		).WithDatabaseCommandTimeout(cfg.DatabaseTimeout)
+	}
+
+	readiness := app.NewReadinessChecker(pool, redisClient, cfg)
+	if physicalRegistry != nil {
+		readiness = app.NewReadinessChecker(pool, redisClient, cfg, physicalRegistry)
+	}
+
+	operatorCommands := app.NewOperatorCommands(offeringStore, bookingStore, metrics)
+	var operatorBookingState httpapi.OperatorBookingStateQueries
+	if physicalRouter != nil {
+		operatorExecutor, operatorErr := commandphysical.NewExecutor(physicalRouter, commandphysical.Options{MaxHoldTTL: cfg.HoldTTL})
+		if operatorErr != nil {
+			return errors.New("physical operator command initialization failed")
+		}
+		cancellation, cancellationErr := app.NewPhysicalTrainRunCancellation(pool, operatorExecutor)
+		if cancellationErr != nil {
+			return errors.New("physical operator routing initialization failed")
+		}
+		operatorStore, storeErr := operatorpostgres.NewStore(pool)
+		if storeErr != nil {
+			return errors.New("physical operator command store initialization failed")
+		}
+		fareResolver, fareErr := app.NewPostgresOperatorCommandFareResolver(pool)
+		if fareErr != nil {
+			return errors.New("physical operator fare resolver initialization failed")
+		}
+		operatorShard, shardErr := app.NewPhysicalOperatorCommandShardExecutor(physicalRouter, fareResolver, operatorExecutor)
+		if shardErr != nil {
+			return errors.New("physical operator shard adapter initialization failed")
+		}
+		durableFinalizer, finalizerErr := app.NewPostgresDurableOperatorCommandFinalizer(pool)
+		if finalizerErr != nil {
+			return errors.New("physical operator command finalizer initialization failed")
+		}
+		operatorCoordinator, coordinatorErr := operatorcommand.NewCoordinator(operatorStore, operatorShard, durableFinalizer)
+		if coordinatorErr != nil {
+			return errors.New("physical operator coordinator initialization failed")
+		}
+		snapshotMutations, mutationErr := app.NewDurablePhysicalOperatorSnapshotMutations(operatorCoordinator)
+		if mutationErr != nil {
+			return errors.New("physical operator snapshot routing initialization failed")
+		}
+		operatorCommands = app.NewPhysicalOperatorCommandsWithSnapshots(offeringStore, bookingStore, cancellation, snapshotMutations, metrics)
+		operatorBookingState, mutationErr = app.NewPhysicalOperatorBookingStateReader(pool, physicalRouter)
+		if mutationErr != nil {
+			return errors.New("physical operator state reader initialization failed")
+		}
+	}
+	router := httpapi.New(httpapi.Dependencies{
+		Readiness:              readiness,
+		ReadinessTimeout:       readinessTimeout(cfg),
+		PhysicalRequestTimeout: physicalRequestTimeout,
+		TokenParser:            tokenParser,
+		Reservations:           reservationService,
+		WaitingRoom:            app.NewWaitingRoomService(policyStore, queryStore, admissionControl, admissionKeyring, metrics),
+		HotTrainPolicies:       app.NewHotTrainPolicyService(policyStore),
+		MaxRequestBodyBytes:    maxRequestBodyBytes,
+		MaxPassengers:          cfg.MaxPassengersPerReservation,
+		HTTPMetrics:            metrics,
+		MetricsHandler:         promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
+		Offering:               app.NewOfferingQueries(cachedQueryStore),
+		Auth:                   auth,
+		RateLimiter:            app.NewRateLimiter(rateLimitBackend),
+		Passengers:             passengers,
+		Tickets:                ticketQueries,
+		Admin:                  app.NewAdminCommands(offeringStore),
+		Operator:               operatorCommands,
+		OperatorBookingState:   operatorBookingState,
 	})
 	if err := router.SetTrustedProxies(cfg.TrustedProxies); err != nil {
 		return errors.New("trusted proxy configuration invalid")

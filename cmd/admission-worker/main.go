@@ -18,6 +18,7 @@ import (
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/clock"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
 	platformmetrics "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/metrics"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/redisx"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/workerhttp"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -25,7 +26,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const admissionSchemaVersion = 8
+const admissionSchemaVersion = 9
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -58,7 +59,7 @@ func run(logger *slog.Logger) error {
 
 	rootContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	pool, err := pgxpool.New(rootContext, cfg.DatabaseURL)
+	pool, err := postgresx.NewBoundedPool(rootContext, cfg.DatabaseURL, cfg.ControlDatabaseMaxOpenConns)
 	if err != nil {
 		return errors.New("postgres configuration invalid")
 	}

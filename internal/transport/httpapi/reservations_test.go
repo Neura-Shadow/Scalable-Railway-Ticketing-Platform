@@ -121,14 +121,16 @@ func (s *tokenParserStub) ParseAccessToken(_ context.Context, raw string) (httpa
 }
 
 type reservationServiceStub struct {
-	created  httpapi.CreateReservationCommand
-	result   httpapi.ReservationView
-	err      error
-	mutation httpapi.ReservationMutationCommand
+	created           httpapi.CreateReservationCommand
+	createHadDeadline bool
+	result            httpapi.ReservationView
+	err               error
+	mutation          httpapi.ReservationMutationCommand
 }
 
-func (s *reservationServiceStub) CreateHold(_ context.Context, command httpapi.CreateReservationCommand) (httpapi.ReservationView, error) {
+func (s *reservationServiceStub) CreateHold(ctx context.Context, command httpapi.CreateReservationCommand) (httpapi.ReservationView, error) {
 	s.created = command
+	_, s.createHadDeadline = ctx.Deadline()
 	return s.result, s.err
 }
 
@@ -169,6 +171,33 @@ func TestCreateReservationUsesOwnerFromBearerClaims(t *testing.T) {
 	}
 	if reservations.created.OwnerID != "customer-from-jwt" {
 		t.Fatalf("command owner = %q, want JWT subject", reservations.created.OwnerID)
+	}
+}
+
+func TestPhysicalQueryTimeoutDoesNotCapReservationSaga(t *testing.T) {
+	t.Parallel()
+
+	parser := &tokenParserStub{identity: httpapi.Identity{Subject: "customer-from-jwt", Role: httpapi.RoleCustomer}}
+	reservations := &reservationServiceStub{result: httpapi.ReservationView{ID: "reservation-1", Status: "held"}}
+	router := httpapi.New(httpapi.Dependencies{
+		TokenParser:            parser,
+		Reservations:           reservations,
+		PhysicalRequestTimeout: time.Millisecond,
+	})
+	body := []byte(`{"train_run_id":"run-1","origin_station_code":"TPE","destination_station_code":"KHH","seat_class":"standard","passenger_ids":["passenger-1"]}`)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/reservations", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer signed-token")
+	request.Header.Set("Idempotency-Key", "reservation-request-1")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("POST reservation status = %d, body = %s", response.Code, response.Body)
+	}
+	if reservations.createHadDeadline {
+		t.Fatal("reservation saga unexpectedly received the physical shard query deadline")
 	}
 }
 

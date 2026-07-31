@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file. The project
 
 ### Added
 
+- Milestone 5 bounded single-region physical PostgreSQL pilot with one control
+  database, two fixed booking databases, allowlisted connection references,
+  bounded pools, and database-local monotonic writer fences.
+- Durable cross-database booking-command saga with conservative global quota
+  leases, repairable reservation directory, shard-local command receipts and
+  outbox events; no XA, two-phase commit, or cross-database transaction.
+- Independent booking-shard migration history, local booking snapshots,
+  source mutation journal, idempotent apply receipts, resumable online base
+  copy/catch-up, measured final quiesce, crash-safe cutover, retained source,
+  and reverse-migration controls.
+- Physical-shard Compose topology, operational runbooks, bounded failure/load
+  scenarios, and an evidence-pending benchmark report. These are not zero-
+  downtime, production-capacity, multi-region, or national-scale claims.
+
 - Milestone 4 fixed `legacy`, `shard-0`, and `shard-1` booking storages inside
   one PostgreSQL database, with explicit train-run assignments, monotonic
   writer generations, database fences, and retained-public guards.

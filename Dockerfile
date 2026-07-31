@@ -20,6 +20,8 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/read-model-admin ./cmd/read-model-admin && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/shard-admin ./cmd/shard-admin && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/reconcile ./cmd/reconcile && \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/booking-command-reconciler ./cmd/booking-command-reconciler && \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/physical-shard-admin ./cmd/physical-shard-admin && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/migrate ./cmd/migrate
 
 FROM alpine:3.22 AS runtime
@@ -34,6 +36,8 @@ COPY --from=build --chown=railway:railway /out/read-model-worker /usr/local/bin/
 COPY --from=build --chown=railway:railway /out/read-model-admin /usr/local/bin/read-model-admin
 COPY --from=build --chown=railway:railway /out/shard-admin /usr/local/bin/shard-admin
 COPY --from=build --chown=railway:railway /out/reconcile /usr/local/bin/reconcile
+COPY --from=build --chown=railway:railway /out/booking-command-reconciler /usr/local/bin/booking-command-reconciler
+COPY --from=build --chown=railway:railway /out/physical-shard-admin /usr/local/bin/physical-shard-admin
 
 USER railway:railway
 
@@ -75,10 +79,19 @@ ENTRYPOINT ["/usr/local/bin/migrate", "-path", "/migrations"]
 FROM runtime AS reconcile
 ENTRYPOINT ["/usr/local/bin/reconcile"]
 
+FROM runtime AS booking-command-reconciler
+EXPOSE 9090
+HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget -q -T 2 -O /dev/null http://127.0.0.1:9090/livez || exit 1
+ENTRYPOINT ["/usr/local/bin/booking-command-reconciler"]
+
 FROM runtime AS read-model-admin
 ENTRYPOINT ["/usr/local/bin/read-model-admin"]
 
 FROM runtime AS shard-admin
 ENTRYPOINT ["/usr/local/bin/shard-admin"]
+
+FROM runtime AS physical-shard-admin
+ENTRYPOINT ["/usr/local/bin/physical-shard-admin"]
 
 FROM api AS final

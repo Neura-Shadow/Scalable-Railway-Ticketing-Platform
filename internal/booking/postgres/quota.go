@@ -2,14 +2,11 @@ package postgres
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
 	"fmt"
 
+	bookingquota "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/quota"
 	"github.com/google/uuid"
 )
-
-const reservationQuotaLockNamespace = "railway/booking/reservation-quota/user/v1\x00"
 
 type ReservationQuotaLimits struct {
 	MaxActiveHoldsPerUser            int
@@ -46,7 +43,7 @@ func (tx *Tx) enforceReservationQuota(
 		return ErrInvalidArgument
 	}
 
-	lockKey := reservationQuotaAdvisoryKey(userID)
+	lockKey := bookingquota.UserAdvisoryLockKey(userID)
 	if _, err := tx.tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, lockKey); err != nil {
 		return fmt.Errorf("acquire reservation quota lock: %w", err)
 	}
@@ -93,12 +90,4 @@ func atOrAboveLimit(current int64, additional, limit int) bool {
 		return true
 	}
 	return int64(additional) > int64(limit)-current
-}
-
-func reservationQuotaAdvisoryKey(userID uuid.UUID) int64 {
-	digestInput := make([]byte, 0, len(reservationQuotaLockNamespace)+len(userID))
-	digestInput = append(digestInput, reservationQuotaLockNamespace...)
-	digestInput = append(digestInput, userID[:]...)
-	digest := sha256.Sum256(digestInput)
-	return int64(binary.BigEndian.Uint64(digest[:8]))
 }

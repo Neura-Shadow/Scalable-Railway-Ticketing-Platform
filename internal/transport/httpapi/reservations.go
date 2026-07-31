@@ -19,7 +19,7 @@ type createReservationRequest struct {
 func registerReservationRoutes(group *gin.RouterGroup, dependencies Dependencies) {
 	reservations := group.Group("/reservations", authenticate(dependencies.TokenParser), authorize(RoleCustomer))
 	reservations.POST("", createReservationHandler(dependencies))
-	reservations.GET("/:id", reservationActionHandler(dependencies, "get"))
+	reservations.GET("/:id", withPhysicalQueryTimeout(dependencies, reservationActionHandler(dependencies, "get"))...)
 	reservations.POST("/:id/confirm", reservationActionHandler(dependencies, "confirm"))
 	reservations.POST("/:id/cancel", reservationActionHandler(dependencies, "cancel"))
 }

@@ -206,7 +206,7 @@ func (q *OfferingQueries) SearchTrainRuns(ctx context.Context, search httpapi.Tr
 				return httpapi.TrainRunPage{}, mapQueryError(err)
 			}
 		}
-		views = append(views, httpapi.TrainRunView{ID: item.TrainRunID, TrainCode: item.TrainCode, OriginStationCode: search.OriginStationCode, DestinationStationCode: search.DestinationStationCode, DepartureAt: item.DepartureAt, ArrivalAt: item.ArrivalAt, SeatClass: item.SeatClass.String(), AvailableSeatCount: int(availability.AvailableSeats), FareMinor: item.FareAmountMinor, Currency: item.Currency})
+		views = append(views, httpapi.TrainRunView{ID: item.TrainRunID, TrainCode: item.TrainCode, OriginStationCode: search.OriginStationCode, DestinationStationCode: search.DestinationStationCode, DepartureAt: item.DepartureAt, ArrivalAt: item.ArrivalAt, SeatClass: item.SeatClass.String(), AvailableSeatCount: int(availability.AvailableSeats), FareMinor: availability.FareAmountMinor, Currency: availability.Currency})
 	}
 	return httpapi.TrainRunPage{Items: views, Page: normalizePage(search.Page.Page), Limit: normalizeLimit(search.Page.Limit), Total: int64(len(views))}, nil
 }

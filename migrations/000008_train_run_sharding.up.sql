@@ -834,11 +834,26 @@ FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
 INSERT INTO public.booking_shards (
     shard_id, storage_kind, enabled, write_enabled, state,
     minimum_fencing_protocol_version
-) VALUES
+)
+SELECT seed.shard_id,
+       seed.storage_kind,
+       seed.enabled,
+       seed.write_enabled,
+       seed.state,
+       seed.minimum_fencing_protocol_version
+FROM (VALUES
     ('legacy', 'legacy', true, true, 'active', 1),
     ('shard-0', 'schema', true, true, 'active', 1),
     ('shard-1', 'schema', true, true, 'active', 1)
-ON CONFLICT (shard_id) DO NOTHING;
+) AS seed(
+    shard_id, storage_kind, enabled, write_enabled, state,
+    minimum_fencing_protocol_version
+)
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM public.booking_shards AS existing
+    WHERE existing.shard_id = seed.shard_id
+);
 
 INSERT INTO public.train_run_shard_assignments (
     train_run_id, shard_id, assignment_generation, assignment_state,

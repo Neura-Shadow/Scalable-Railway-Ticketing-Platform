@@ -8,9 +8,34 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/transport/httpapi"
 )
+
+type deadlineOfferingStub struct {
+	done            chan error
+	stationDeadline chan bool
+}
+
+func (stub *deadlineOfferingStub) ListStations(ctx context.Context, _ httpapi.PageRequest) (httpapi.StationPage, error) {
+	if stub.stationDeadline != nil {
+		_, bounded := ctx.Deadline()
+		stub.stationDeadline <- bounded
+		return httpapi.StationPage{}, nil
+	}
+	return httpapi.StationPage{}, errors.New("unexpected call")
+}
+
+func (stub *deadlineOfferingStub) SearchTrainRuns(ctx context.Context, _ httpapi.TrainRunSearch) (httpapi.TrainRunPage, error) {
+	<-ctx.Done()
+	stub.done <- ctx.Err()
+	return httpapi.TrainRunPage{}, ctx.Err()
+}
+
+func (*deadlineOfferingStub) GetAvailability(context.Context, httpapi.AvailabilityQuery) (httpapi.AvailabilityView, error) {
+	return httpapi.AvailabilityView{}, errors.New("unexpected call")
+}
 
 func TestLivezIsProcessOnly(t *testing.T) {
 	t.Parallel()
@@ -30,6 +55,72 @@ func TestLivezIsProcessOnly(t *testing.T) {
 	}
 	if body.Status != "ok" {
 		t.Fatalf("status = %q, want ok", body.Status)
+	}
+}
+
+func TestPhysicalAPIRequestTimeoutBoundsTheWholeRequestWithoutExtendingCallerDeadline(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		parentTimeout time.Duration
+		physicalLimit time.Duration
+		maximum       time.Duration
+	}{
+		{name: "physical deadline", physicalLimit: 25 * time.Millisecond, maximum: 500 * time.Millisecond},
+		{name: "earlier caller deadline", parentTimeout: 10 * time.Millisecond, physicalLimit: time.Second, maximum: 400 * time.Millisecond},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			stub := &deadlineOfferingStub{done: make(chan error, 1)}
+			router := httpapi.New(httpapi.Dependencies{
+				Offering:               stub,
+				PhysicalRequestTimeout: test.physicalLimit,
+			})
+			request := httptest.NewRequest(http.MethodGet, "/api/v1/train-runs/search?origin_station_code=TPE&destination_station_code=KHH&service_date=2026-08-01&seat_class=standard", nil)
+			if test.parentTimeout > 0 {
+				parent, cancel := context.WithTimeout(request.Context(), test.parentTimeout)
+				defer cancel()
+				request = request.WithContext(parent)
+			}
+			response := httptest.NewRecorder()
+			started := time.Now()
+			router.ServeHTTP(response, request)
+
+			if elapsed := time.Since(started); elapsed > test.maximum {
+				t.Fatalf("bounded API request elapsed %s, want <= %s", elapsed, test.maximum)
+			}
+			select {
+			case err := <-stub.done:
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("offering context error = %v, want deadline exceeded", err)
+				}
+			default:
+				t.Fatal("offering did not observe the bounded request deadline")
+			}
+		})
+	}
+}
+
+func TestPhysicalAPIRequestTimeoutDoesNotBoundControlOnlyOfferingRoute(t *testing.T) {
+	t.Parallel()
+
+	stub := &deadlineOfferingStub{stationDeadline: make(chan bool, 1)}
+	router := httpapi.New(httpapi.Dependencies{
+		Offering:               stub,
+		PhysicalRequestTimeout: time.Millisecond,
+	})
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/stations", nil))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/stations status = %d, want 200", response.Code)
+	}
+	if bounded := <-stub.stationDeadline; bounded {
+		t.Fatal("control-only station query unexpectedly received the physical shard query deadline")
 	}
 }
 

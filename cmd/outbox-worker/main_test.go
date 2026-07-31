@@ -44,3 +44,21 @@ func TestOutboxReadinessTimeoutCoversRedisPublisher(t *testing.T) {
 		t.Fatalf("outboxReadinessTimeout() = %s, want 3s", got)
 	}
 }
+
+func TestPhysicalOutboxWorkerConfigKeepsBatchAsGlobalPassLimit(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	cfg.OutboxBatchSize = 101
+	cfg.PhysicalWorkerShardTimeout = 4 * time.Second
+	cfg.WorkerShardConcurrency = 1
+
+	got := physicalOutboxWorkerConfig(cfg, 2)
+	if got.MaxConcurrency != 1 || got.PerShardLimit != 101 || got.PassLimit != 101 || got.ShardTimeout != 4*time.Second {
+		t.Fatalf("physicalOutboxWorkerConfig() = %+v", got)
+	}
+
+	cfg.WorkerShardConcurrency = 3
+	if got := physicalOutboxWorkerConfig(cfg, 2); got.MaxConcurrency != 2 {
+		t.Fatalf("physicalOutboxWorkerConfig() capped concurrency = %d, want 2", got.MaxConcurrency)
+	}
+}

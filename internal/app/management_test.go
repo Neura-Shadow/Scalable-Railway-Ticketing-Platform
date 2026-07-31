@@ -138,3 +138,29 @@ func TestOperatorCancellationRecordsCommittedOutboxCreationOnce(t *testing.T) {
 		t.Fatalf("train-run cancellation create metrics = %d, want 1", metrics.created)
 	}
 }
+
+func TestPhysicalOperatorCancellationCommitsLocalAuthorityBeforeControl(t *testing.T) {
+	offering := &managementOfferingFake{}
+	cancellation := &physicalCancellationFake{before: func() bool { return offering.status == "" }}
+	operator := NewPhysicalOperatorCommands(offering, &inventoryFake{}, cancellation)
+	runID := uuid.New()
+	_, err := operator.ExecuteOperator(context.Background(), httpapi.OperatorCommand{
+		ActorID: "operator", Action: httpapi.OperatorUpdateTrainRunStatus, TrainRunID: runID.String(),
+		Status: &httpapi.TrainRunStatusWrite{Status: "cancelled"},
+	})
+	if err != nil || cancellation.runID != runID || !cancellation.sawBefore || offering.status != "cancelled" {
+		t.Fatalf("err=%v cancellation=%+v control_status=%q", err, cancellation, offering.status)
+	}
+}
+
+type physicalCancellationFake struct {
+	runID     uuid.UUID
+	before    func() bool
+	sawBefore bool
+}
+
+func (fake *physicalCancellationFake) CancelTrainRun(_ context.Context, id uuid.UUID) error {
+	fake.runID = id
+	fake.sawBefore = fake.before == nil || fake.before()
+	return nil
+}

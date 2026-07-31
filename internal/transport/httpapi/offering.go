@@ -16,8 +16,8 @@ const (
 
 func registerOfferingRoutes(group *gin.RouterGroup, dependencies Dependencies) {
 	group.GET("/stations", stationsHandler(dependencies))
-	group.GET("/train-runs/search", trainRunSearchHandler(dependencies))
-	group.GET("/train-runs/:id/availability", availabilityHandler(dependencies))
+	group.GET("/train-runs/search", withPhysicalQueryTimeout(dependencies, trainRunSearchHandler(dependencies))...)
+	group.GET("/train-runs/:id/availability", withPhysicalQueryTimeout(dependencies, availabilityHandler(dependencies))...)
 }
 
 func stationsHandler(dependencies Dependencies) gin.HandlerFunc {

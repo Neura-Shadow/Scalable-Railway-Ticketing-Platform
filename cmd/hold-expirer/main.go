@@ -16,15 +16,18 @@ import (
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/clock"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
 	platformmetrics "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/metrics"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/workerhttp"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/workerlane"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physicalworker"
 	shardingpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/postgres"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/routecache"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-const holdExpirerSchemaVersion = 8
+const holdExpirerSchemaVersion = 9
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -36,12 +39,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	pool, err := postgresx.NewBoundedPool(ctx, cfg.DatabaseURL, cfg.ControlDatabaseMaxOpenConns)
 	if err != nil {
 		logger.Error("hold expirer database unavailable")
 		os.Exit(1)
 	}
 	defer pool.Close()
+	var physicalRuntime *physicalworker.Runtime
+	if cfg.BookingShardMode == config.BookingShardModePhysical {
+		physicalRuntime, err = physicalworker.NewRuntime(ctx, cfg, pool)
+		if err != nil {
+			logger.Error("hold expirer physical shard runtime unavailable")
+			os.Exit(1)
+		}
+		defer physicalRuntime.Close()
+	}
 	registry := prometheus.NewRegistry()
 	metrics, err := platformmetrics.New(registry)
 	if err != nil {
@@ -49,7 +61,7 @@ func main() {
 		os.Exit(1)
 	}
 	healthServer, err := workerhttp.New(
-		cfg.WorkerHTTPAddress, registry, holdExpirerReadiness(pool, cfg), cfg.DatabaseTimeout,
+		cfg.WorkerHTTPAddress, registry, holdExpirerReadiness(pool, cfg, physicalRuntime), cfg.DatabaseTimeout,
 	)
 	if err != nil {
 		logger.Error("hold expirer health server invalid")
@@ -100,16 +112,38 @@ func main() {
 		logger.Error("hold expirer initialization failed")
 		os.Exit(1)
 	}
+	var physicalExpirer *physicalworker.Orchestrator
+	if physicalRuntime != nil {
+		processor, processorErr := physicalworker.NewHoldExpirationProcessor(physicalworker.HoldExpirationOptions{
+			StatementTimeout: cfg.PhysicalShardQueryTimeout,
+			LockTimeout:      cfg.PhysicalShardQueryTimeout,
+			Now:              clock.RealClock{}.Now,
+		})
+		if processorErr != nil {
+			logger.Error("hold expirer physical processor initialization failed")
+			os.Exit(1)
+		}
+		physicalExpirer, err = physicalworker.New(physicalRuntime.Handles(), processor, physicalWorkerConfig(cfg, len(physicalRuntime.Handles())))
+		if err != nil {
+			logger.Error("hold expirer physical orchestrator initialization failed")
+			os.Exit(1)
+		}
+	}
 
 	run := func() {
 		passContext, cancel := context.WithTimeout(ctx, cfg.WorkerPassTimeout)
 		defer cancel()
-		result, runErr := expirer.RunOnce(passContext)
-		if runErr != nil {
-			logger.Error("hold expiration pass completed with isolated failures", "expired_count", result.Expired)
+		var physical func(context.Context) (physicalworker.Result, error)
+		if physicalExpirer != nil {
+			physical = physicalExpirer.RunOnce
+		}
+		outcome, laneErr := workerlane.Run(passContext, cfg.WorkerPassTimeout,
+			cfg.PhysicalWorkerShardTimeout, expirer.RunOnce, physical)
+		if laneErr != nil || outcome.ControlErr != nil || outcome.PhysicalErr != nil {
+			logger.Error("hold expiration pass completed with isolated failures", "control_expired_count", outcome.Control.Expired, "physical_expired_count", outcome.Physical.Processed)
 			return
 		}
-		logger.Info("hold expiration pass complete", "expired_count", result.Expired)
+		logger.Info("hold expiration pass complete", "control_expired_count", outcome.Control.Expired, "physical_expired_count", outcome.Physical.Processed)
 	}
 	runInitialExpirationPass(cfg.HoldExpirerEnabled, run)
 	if !cfg.HoldExpirerEnabled {
@@ -136,7 +170,7 @@ func main() {
 	}
 }
 
-func holdExpirerReadiness(pool *pgxpool.Pool, cfg config.Config) workerhttp.ReadinessCheck {
+func holdExpirerReadiness(pool *pgxpool.Pool, cfg config.Config, physicalRuntime ...*physicalworker.Runtime) workerhttp.ReadinessCheck {
 	return func(ctx context.Context) error {
 		if pool == nil || cfg.ValidateFor(config.ProcessHoldExpirer) != nil {
 			return errors.New("hold expirer dependency unavailable")
@@ -167,7 +201,25 @@ WHERE shard_id IN ('legacy', 'shard-0', 'shard-1')`, sharding.SupportedFencingPr
 				return errors.New("hold expirer shard catalog unavailable")
 			}
 		}
+		if cfg.BookingShardMode == config.BookingShardModePhysical {
+			if len(physicalRuntime) != 1 || physicalRuntime[0] == nil || physicalRuntime[0].Ready(ctx) != nil {
+				return errors.New("hold expirer physical shard migration unavailable")
+			}
+		}
 		return nil
+	}
+}
+
+func physicalWorkerConfig(cfg config.Config, shardCount int) physicalworker.Config {
+	maxConcurrency := cfg.WorkerShardConcurrency
+	if maxConcurrency > shardCount {
+		maxConcurrency = shardCount
+	}
+	return physicalworker.Config{
+		MaxConcurrency: maxConcurrency,
+		PerShardLimit:  cfg.HoldExpirerBatchSize,
+		PassLimit:      cfg.HoldExpirerBatchSize,
+		ShardTimeout:   cfg.PhysicalWorkerShardTimeout,
 	}
 }
 

@@ -256,6 +256,7 @@ const (
 	RateLimitReservationCreate RateLimitScope = "reservation_create"
 	RateLimitPassengerCreate   RateLimitScope = "passenger_create"
 	RateLimitPolicyMutation    RateLimitScope = "hot_train_policy_mutation"
+	RateLimitOperatorBooking   RateLimitScope = "operator_booking_mutation"
 )
 
 type RateLimitRequest struct {
@@ -410,18 +411,81 @@ const (
 	OperatorCreateTrainRun       OperatorAction = "create_train_run"
 	OperatorInitializeInventory  OperatorAction = "initialize_inventory"
 	OperatorUpdateTrainRunStatus OperatorAction = "update_train_run_status"
+	OperatorInstallFareSnapshot  OperatorAction = "install_fare_snapshot"
+	OperatorSetSeatBookingState  OperatorAction = "set_seat_booking_state"
+	OperatorBumpBookingPolicy    OperatorAction = "bump_booking_policy"
 )
 
+type OperatorFareSnapshotWrite struct {
+	ExpectedSourceVersion int64  `json:"expected_source_version"`
+	FromStopIndex         int    `json:"from_stop_index"`
+	ToStopIndex           int    `json:"to_stop_index"`
+	SeatClass             string `json:"seat_class"`
+	AmountMinor           int64  `json:"amount_minor"`
+	Currency              string `json:"currency"`
+}
+
+type OperatorSeatBookingStateWrite struct {
+	ExpectedSourceVersion int64 `json:"expected_source_version"`
+	Active                bool  `json:"active"`
+}
+
+type OperatorBookingPolicyWrite struct {
+	ExpectedSourceVersion        int64 `json:"expected_source_version"`
+	ExpectedBookingPolicyVersion int64 `json:"expected_booking_policy_version"`
+}
+
 type OperatorCommand struct {
-	ActorID    string
-	Action     OperatorAction
-	TrainRunID string
-	TrainRun   *TrainRunWrite
-	Status     *TrainRunStatusWrite
+	ActorID        string
+	Action         OperatorAction
+	TrainRunID     string
+	ResourceID     string
+	IdempotencyKey string
+	TrainRun       *TrainRunWrite
+	Status         *TrainRunStatusWrite
+	FareSnapshot   *OperatorFareSnapshotWrite
+	SeatState      *OperatorSeatBookingStateWrite
+	BookingPolicy  *OperatorBookingPolicyWrite
 }
 
 type OperatorCommands interface {
 	ExecuteOperator(ctx context.Context, command OperatorCommand) (ResourceView, error)
+}
+
+type OperatorBookingStateKind string
+
+const (
+	OperatorBookingFareState   OperatorBookingStateKind = "fare"
+	OperatorBookingSeatState   OperatorBookingStateKind = "seat"
+	OperatorBookingPolicyState OperatorBookingStateKind = "booking_policy"
+)
+
+type OperatorBookingStateQuery struct {
+	Kind       OperatorBookingStateKind
+	TrainRunID string
+	ResourceID string
+}
+
+// OperatorBookingStateView exposes the authoritative physical snapshot
+// versions an operator must use for optimistic mutation commands. Pointer
+// fields distinguish false/zero values from fields that do not apply.
+type OperatorBookingStateView struct {
+	Kind                 OperatorBookingStateKind `json:"kind"`
+	TrainRunID           string                   `json:"train_run_id"`
+	ResourceID           string                   `json:"resource_id"`
+	AssignmentGeneration int64                    `json:"assignment_generation"`
+	SourceVersion        int64                    `json:"source_version"`
+	BookingPolicyVersion *int64                   `json:"booking_policy_version,omitempty"`
+	Active               *bool                    `json:"active,omitempty"`
+	FromStopIndex        *int                     `json:"from_stop_index,omitempty"`
+	ToStopIndex          *int                     `json:"to_stop_index,omitempty"`
+	SeatClass            string                   `json:"seat_class,omitempty"`
+	AmountMinor          *int64                   `json:"amount_minor,omitempty"`
+	Currency             string                   `json:"currency,omitempty"`
+}
+
+type OperatorBookingStateQueries interface {
+	GetOperatorBookingState(context.Context, OperatorBookingStateQuery) (OperatorBookingStateView, error)
 }
 
 // ReadinessCheck reports only bounded component health, never an underlying

@@ -17,15 +17,17 @@ import (
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/clock"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
 	platformmetrics "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/metrics"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/redisx"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/workerhttp"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/workerlane"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physicalworker"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 )
 
-const outboxSchemaVersion = 8
+const outboxSchemaVersion = 9
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -37,12 +39,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	pool, err := postgresx.NewBoundedPool(ctx, cfg.DatabaseURL, cfg.ControlDatabaseMaxOpenConns)
 	if err != nil {
 		logger.Error("outbox worker database unavailable")
 		os.Exit(1)
 	}
 	defer pool.Close()
+	var physicalRuntime *physicalworker.Runtime
+	if cfg.BookingShardMode == config.BookingShardModePhysical {
+		physicalRuntime, err = physicalworker.NewRuntime(ctx, cfg, pool)
+		if err != nil {
+			logger.Error("outbox physical shard runtime unavailable")
+			os.Exit(1)
+		}
+		defer physicalRuntime.Close()
+	}
 	store, err := eventpostgres.NewStore(pool)
 	if err != nil {
 		logger.Error("outbox store initialization failed")
@@ -67,7 +78,11 @@ func main() {
 		}
 		return nil
 	}
-	readiness := workerhttp.ReadinessCheck(databaseReadiness)
+	readinessChecks := []workerhttp.ReadinessCheck{databaseReadiness}
+	if physicalRuntime != nil {
+		readinessChecks = append(readinessChecks, physicalRuntime.Ready)
+	}
+	readiness := allReady(readinessChecks...)
 	if cfg.OutboxPublisherEnabled {
 		switch cfg.OutboxPublisher {
 		case "redis_stream":
@@ -88,7 +103,8 @@ func main() {
 				os.Exit(1)
 			}
 			eventPublisher, err = publisher.NewRedisStream(redisClient, "railway:outbox:v1")
-			readiness = allReady(databaseReadiness, redisReady)
+			readinessChecks = append(readinessChecks, redisReady)
+			readiness = allReady(readinessChecks...)
 		case "log":
 			if cfg.Environment == config.EnvironmentProduction {
 				logger.Warn("production log publisher override enabled", "category", "production_log_publisher_override")
@@ -134,8 +150,9 @@ func main() {
 			return
 		}
 	}
+	workerID := "outbox-" + uuid.NewString()
 	worker, err := application.NewWorker(store, eventPublisher, clock.RealClock{}, metrics, application.Config{
-		WorkerID:          "outbox-" + uuid.NewString(),
+		WorkerID:          workerID,
 		BatchSize:         cfg.OutboxBatchSize,
 		MaxAttempts:       cfg.OutboxMaxAttempts,
 		ProcessingTimeout: cfg.OutboxProcessingTimeout,
@@ -146,16 +163,43 @@ func main() {
 		logger.Error("outbox worker initialization failed")
 		os.Exit(1)
 	}
+	var physicalOutbox *physicalworker.Orchestrator
+	if physicalRuntime != nil {
+		processor, processorErr := physicalworker.NewOutboxProcessor(eventPublisher, physicalworker.OutboxOptions{
+			WorkerID:          workerID,
+			MaxAttempts:       cfg.OutboxMaxAttempts,
+			ProcessingTimeout: cfg.OutboxProcessingTimeout,
+			RetryBase:         cfg.OutboxRetryBase,
+			RetryMax:          cfg.OutboxRetryMax,
+			StatementTimeout:  cfg.PhysicalShardQueryTimeout,
+			LockTimeout:       cfg.PhysicalShardQueryTimeout,
+			Now:               clock.RealClock{}.Now,
+		})
+		if processorErr != nil {
+			logger.Error("outbox physical processor initialization failed")
+			os.Exit(1)
+		}
+		physicalOutbox, err = physicalworker.New(physicalRuntime.Handles(), processor, physicalOutboxWorkerConfig(cfg, len(physicalRuntime.Handles())))
+		if err != nil {
+			logger.Error("outbox physical orchestrator initialization failed")
+			os.Exit(1)
+		}
+	}
 
 	run := func() {
 		passContext, cancel := context.WithTimeout(ctx, cfg.WorkerPassTimeout)
 		defer cancel()
-		result, runErr := worker.RunOnce(passContext)
-		if runErr != nil {
-			logger.Error("outbox pass completed with finalize failures")
+		var physical func(context.Context) (physicalworker.Result, error)
+		if physicalOutbox != nil {
+			physical = physicalOutbox.RunOnce
+		}
+		outcome, laneErr := workerlane.Run(passContext, cfg.WorkerPassTimeout,
+			cfg.PhysicalWorkerShardTimeout, worker.RunOnce, physical)
+		if laneErr != nil || outcome.ControlErr != nil || outcome.PhysicalErr != nil {
+			logger.Error("outbox pass completed with isolated failures", "control_claimed", outcome.Control.Claimed, "physical_processed", outcome.Physical.Processed)
 			return
 		}
-		logger.Info("outbox pass complete", "claimed", result.Claimed, "published", result.Published, "retried", result.Retried, "dead_letter", result.DeadLetter)
+		logger.Info("outbox pass complete", "control_claimed", outcome.Control.Claimed, "control_published", outcome.Control.Published, "control_retried", outcome.Control.Retried, "control_dead_letter", outcome.Control.DeadLetter, "physical_processed", outcome.Physical.Processed)
 	}
 	run()
 	ticker := clock.RealClock{}.NewTicker(cfg.OutboxPollInterval)
@@ -192,6 +236,19 @@ func outboxReadinessTimeout(cfg config.Config) time.Duration {
 		timeout = cfg.RedisTimeout
 	}
 	return timeout
+}
+
+func physicalOutboxWorkerConfig(cfg config.Config, shardCount int) physicalworker.Config {
+	maxConcurrency := cfg.WorkerShardConcurrency
+	if maxConcurrency > shardCount {
+		maxConcurrency = shardCount
+	}
+	return physicalworker.Config{
+		MaxConcurrency: maxConcurrency,
+		PerShardLimit:  cfg.OutboxBatchSize,
+		PassLimit:      cfg.OutboxBatchSize,
+		ShardTimeout:   cfg.PhysicalWorkerShardTimeout,
+	}
 }
 
 func shutdownWorkerHTTP(server *http.Server, timeout time.Duration) {

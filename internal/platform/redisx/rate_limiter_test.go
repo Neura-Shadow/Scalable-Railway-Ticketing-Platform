@@ -26,6 +26,7 @@ func TestRateLimiterOperationAllowlistIncludesEveryTransportPolicy(t *testing.T)
 		"reservation_create",
 		"passenger_create",
 		"hot_train_policy_mutation",
+		"operator_booking_mutation",
 	} {
 		if normalized := normalizeOperation(operation); normalized != operation {
 			t.Fatalf("normalizeOperation(%q) = %q", operation, normalized)

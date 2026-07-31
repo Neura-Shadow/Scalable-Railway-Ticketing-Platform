@@ -28,12 +28,15 @@ const (
 	ShardLegacy ShardID = "legacy"
 	ShardZero   ShardID = "shard-0"
 	ShardOne    ShardID = "shard-1"
+	// Physical shard IDs are storage identities, never connection endpoints.
+	ShardPhysicalZero ShardID = "physical-shard-0"
+	ShardPhysicalOne  ShardID = "physical-shard-1"
 )
 
 func ParseShardID(raw string) (ShardID, error) {
 	id := ShardID(raw)
 	switch id {
-	case ShardLegacy, ShardZero, ShardOne:
+	case ShardLegacy, ShardZero, ShardOne, ShardPhysicalZero, ShardPhysicalOne:
 		return id, nil
 	default:
 		return "", ErrInvalidShardID
@@ -43,7 +46,7 @@ func ParseShardID(raw string) (ShardID, error) {
 // ParseShardIDs converts one bounded configured subset into opaque logical
 // identities. Ordering is preserved for deterministic worker traversal.
 func ParseShardIDs(raw []string) ([]ShardID, error) {
-	if len(raw) == 0 || len(raw) > 3 {
+	if len(raw) == 0 || len(raw) > 5 {
 		return nil, ErrInvalidShardID
 	}
 	result := make([]ShardID, 0, len(raw))

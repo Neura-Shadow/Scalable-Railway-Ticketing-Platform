@@ -368,7 +368,7 @@ JOIN public.booking_shards AS catalog
 WHERE reservation.status = 'held'
   AND reservation.expires_at <= clock_timestamp()
   AND NOT (reservation.id = ANY($1::uuid[]))
-  AND assignment.assignment_state IN ('stable', 'rollback_window')
+  AND assignment.assignment_state IN ('stable', 'migrating', 'rollback_window')
   AND catalog.enabled
   AND catalog.write_enabled
   AND catalog.state IN ('active', 'draining')

@@ -32,6 +32,8 @@ const (
 	BookingShardModeLegacy BookingShardMode = "legacy"
 	// BookingShardModeSchemaPOC enables the reversible same-cluster schema POC.
 	BookingShardModeSchemaPOC BookingShardMode = "schema_poc"
+	// BookingShardModePhysical enables the bounded independent-PostgreSQL pilot.
+	BookingShardModePhysical BookingShardMode = "physical"
 )
 
 // Process identifies the executable whose configuration contract is being
@@ -54,6 +56,8 @@ const (
 	maxAdmissionWorkerBatchSize = 1_000
 	maxBookingRouteCacheEntries = 100_000
 	maxBookingShardQueryTimeout = 30 * time.Second
+	maxPhysicalShardCount       = 2
+	maxPhysicalShardPoolSize    = 100
 )
 
 // Config contains the typed runtime settings used by the application and its
@@ -67,10 +71,31 @@ type Config struct {
 	// that the same-cluster schema sharding proof of concept is being enabled
 	// outside development and test environments.
 	BookingShardSchemaPOCProductionEnabled bool
-	BookingRouteCacheEnabled               bool
-	BookingRouteCacheTTL                   time.Duration
-	BookingRouteCacheMaxEntries            int
-	BookingShardQueryTimeout               time.Duration
+	PhysicalShardingProductionEnabled      bool
+	// PhysicalShardConnections contains secret DSNs keyed only by fixed
+	// connection references. Catalog rows never populate this map.
+	PhysicalShardConnections        map[string]string
+	PhysicalShardMaxCount           int
+	PhysicalShardMaxOpenConns       int
+	PhysicalShardMaxIdleConns       int
+	PhysicalShardConnMaxLifetime    time.Duration
+	PhysicalShardConnMaxIdleTime    time.Duration
+	PhysicalShardConnectTimeout     time.Duration
+	PhysicalShardQueryTimeout       time.Duration
+	PhysicalWorkerShardTimeout      time.Duration
+	PhysicalShardTotalPoolBudget    int
+	ControlDatabaseMaxOpenConns     int
+	ControlDatabasePoolCount        int
+	PhysicalShardAPIReplicaCount    int
+	PhysicalShardWorkerReplicas     int
+	WorkerShardConcurrency          int
+	PhysicalShardMigrationReserve   int
+	PhysicalShardOperationalReserve int
+	PostgresMaxConnectionsLimit     int
+	BookingRouteCacheEnabled        bool
+	BookingRouteCacheTTL            time.Duration
+	BookingRouteCacheMaxEntries     int
+	BookingShardQueryTimeout        time.Duration
 
 	HTTPAddress   string
 	DatabaseURL   string
@@ -142,6 +167,18 @@ type Config struct {
 	CORSAllowedOrigins []string
 }
 
+// String returns a deliberately small operational summary. Config contains
+// database, Redis, JWT, and admission secrets, so its default struct formatting
+// must never be used in logs or errors.
+func (c Config) String() string {
+	return fmt.Sprintf(
+		"Config{Environment:%q BookingShardMode:%q BookingShardIDs:%q PhysicalShardConnections:[redacted]}",
+		c.Environment,
+		c.BookingShardMode,
+		c.BookingShardIDs,
+	)
+}
+
 // LookupFunc matches os.LookupEnv and makes configuration loading deterministic
 // in tests.
 type LookupFunc func(key string) (string, bool)
@@ -150,22 +187,38 @@ type LookupFunc func(key string) (string, bool)
 // invent credentials, secrets, or dependency addresses.
 func Defaults() Config {
 	return Config{
-		Environment:                      EnvironmentDevelopment,
-		BookingShardMode:                 BookingShardModeLegacy,
-		BookingShardIDs:                  []string{"legacy"},
-		BookingRouteCacheEnabled:         true,
-		BookingRouteCacheTTL:             30 * time.Second,
-		BookingRouteCacheMaxEntries:      1_000,
-		BookingShardQueryTimeout:         2 * time.Second,
-		HTTPAddress:                      ":8080",
-		JWTIssuer:                        "scalable-railway-ticketing-platform",
-		JWTAudience:                      "railway-api",
-		AccessTokenTTL:                   15 * time.Minute,
-		RefreshTokenTTL:                  7 * 24 * time.Hour,
-		BcryptCost:                       12,
-		HoldTTL:                          10 * time.Minute,
-		MaxPassengersPerReservation:      6,
-		ReservationMaxActiveHoldsPerUser: 10,
+		Environment:                                 EnvironmentDevelopment,
+		BookingShardMode:                            BookingShardModeLegacy,
+		BookingShardIDs:                             []string{"legacy"},
+		PhysicalShardMaxCount:                       2,
+		PhysicalShardMaxOpenConns:                   8,
+		PhysicalShardMaxIdleConns:                   4,
+		PhysicalShardConnMaxLifetime:                30 * time.Minute,
+		PhysicalShardConnMaxIdleTime:                5 * time.Minute,
+		PhysicalShardConnectTimeout:                 3 * time.Second,
+		PhysicalShardQueryTimeout:                   2 * time.Second,
+		PhysicalWorkerShardTimeout:                  30 * time.Second,
+		PhysicalShardTotalPoolBudget:                32,
+		ControlDatabaseMaxOpenConns:                 16,
+		ControlDatabasePoolCount:                    1,
+		PhysicalShardAPIReplicaCount:                1,
+		PhysicalShardWorkerReplicas:                 0,
+		WorkerShardConcurrency:                      1,
+		PhysicalShardMigrationReserve:               4,
+		PhysicalShardOperationalReserve:             4,
+		BookingRouteCacheEnabled:                    true,
+		BookingRouteCacheTTL:                        30 * time.Second,
+		BookingRouteCacheMaxEntries:                 1_000,
+		BookingShardQueryTimeout:                    2 * time.Second,
+		HTTPAddress:                                 ":8080",
+		JWTIssuer:                                   "scalable-railway-ticketing-platform",
+		JWTAudience:                                 "railway-api",
+		AccessTokenTTL:                              15 * time.Minute,
+		RefreshTokenTTL:                             7 * 24 * time.Hour,
+		BcryptCost:                                  12,
+		HoldTTL:                                     10 * time.Minute,
+		MaxPassengersPerReservation:                 6,
+		ReservationMaxActiveHoldsPerUser:            10,
 		ReservationMaxActiveHoldsPerUserPerTrainRun: 3,
 		ReservationMaxActivePassengersPerUser:       24,
 		ReservationMaxInflightPerInstance:           32,
@@ -328,6 +381,7 @@ func (c Config) ValidateFor(process Process) error {
 			validationCheck{"HOLD_EXPIRER_BATCH_SIZE", c.HoldExpirerBatchSize > 0},
 			validationCheck{"HOLD_EXPIRER_INTERVAL_SECONDS", c.HoldExpirerInterval > 0},
 			validationCheck{"WORKER_PASS_TIMEOUT", c.WorkerPassTimeout > 0},
+			validationCheck{"PHYSICAL_WORKER_SHARD_TIMEOUT", c.PhysicalWorkerShardTimeout > 0 && c.PhysicalWorkerShardTimeout <= c.WorkerPassTimeout},
 		)
 	case ProcessOutboxWorker:
 		validateWorkerHTTP()
@@ -351,6 +405,7 @@ func (c Config) ValidateFor(process Process) error {
 			validationCheck{"OUTBOX_RETRY_BASE_SECONDS", c.OutboxRetryBase > 0},
 			validationCheck{"OUTBOX_RETRY_MAX_SECONDS", c.OutboxRetryMax >= c.OutboxRetryBase},
 			validationCheck{"WORKER_PASS_TIMEOUT", c.WorkerPassTimeout > 0},
+			validationCheck{"PHYSICAL_WORKER_SHARD_TIMEOUT", c.PhysicalWorkerShardTimeout > 0 && c.PhysicalWorkerShardTimeout <= c.WorkerPassTimeout && c.PhysicalWorkerShardTimeout < c.OutboxProcessingTimeout},
 		)
 	case ProcessAdmissionWorker:
 		validateWorkerHTTP()
@@ -668,12 +723,15 @@ func loadBookingShardSettings(lookup LookupFunc, cfg *Config) error {
 		cfg.BookingShardIDs = splitList(value)
 	} else if cfg.BookingShardMode == BookingShardModeSchemaPOC {
 		cfg.BookingShardIDs = []string{"legacy", "shard-0", "shard-1"}
+	} else if cfg.BookingShardMode == BookingShardModePhysical {
+		cfg.BookingShardIDs = []string{"physical-shard-0", "physical-shard-1"}
 	}
 	for _, item := range []struct {
 		name   string
 		target *bool
 	}{
 		{"BOOKING_SHARD_SCHEMA_POC_PRODUCTION_ENABLED", &cfg.BookingShardSchemaPOCProductionEnabled},
+		{"PHYSICAL_SHARDING_PRODUCTION_ENABLED", &cfg.PhysicalShardingProductionEnabled},
 		{"BOOKING_ROUTE_CACHE_ENABLED", &cfg.BookingRouteCacheEnabled},
 	} {
 		if err := setBool(lookup, item.name, item.target); err != nil {
@@ -685,6 +743,18 @@ func loadBookingShardSettings(lookup LookupFunc, cfg *Config) error {
 		target *int
 	}{
 		{"BOOKING_ROUTE_CACHE_MAX_ENTRIES", &cfg.BookingRouteCacheMaxEntries},
+		{"PHYSICAL_SHARD_MAX_COUNT", &cfg.PhysicalShardMaxCount},
+		{"PHYSICAL_SHARD_MAX_OPEN_CONNS", &cfg.PhysicalShardMaxOpenConns},
+		{"PHYSICAL_SHARD_MAX_IDLE_CONNS", &cfg.PhysicalShardMaxIdleConns},
+		{"PHYSICAL_SHARD_TOTAL_POOL_BUDGET", &cfg.PhysicalShardTotalPoolBudget},
+		{"CONTROL_DATABASE_MAX_OPEN_CONNS", &cfg.ControlDatabaseMaxOpenConns},
+		{"CONTROL_DATABASE_POOL_COUNT", &cfg.ControlDatabasePoolCount},
+		{"PHYSICAL_SHARD_API_REPLICA_COUNT", &cfg.PhysicalShardAPIReplicaCount},
+		{"PHYSICAL_SHARD_WORKER_REPLICA_COUNT", &cfg.PhysicalShardWorkerReplicas},
+		{"WORKER_SHARD_CONCURRENCY", &cfg.WorkerShardConcurrency},
+		{"PHYSICAL_SHARD_MIGRATION_ADMIN_RESERVE", &cfg.PhysicalShardMigrationReserve},
+		{"PHYSICAL_SHARD_OPERATIONAL_RESERVE", &cfg.PhysicalShardOperationalReserve},
+		{"POSTGRES_MAX_CONNECTIONS_LIMIT", &cfg.PostgresMaxConnectionsLimit},
 	} {
 		if err := setInt(lookup, item.name, item.target); err != nil {
 			return err
@@ -693,22 +763,68 @@ func loadBookingShardSettings(lookup LookupFunc, cfg *Config) error {
 	if err := setSeconds(lookup, "BOOKING_ROUTE_CACHE_TTL_SECONDS", &cfg.BookingRouteCacheTTL); err != nil {
 		return err
 	}
-	return setDuration(lookup, "BOOKING_SHARD_QUERY_TIMEOUT", &cfg.BookingShardQueryTimeout)
+	if err := setDuration(lookup, "BOOKING_SHARD_QUERY_TIMEOUT", &cfg.BookingShardQueryTimeout); err != nil {
+		return err
+	}
+	for _, item := range []struct {
+		name   string
+		target *time.Duration
+	}{
+		{"PHYSICAL_SHARD_CONN_MAX_LIFETIME_SECONDS", &cfg.PhysicalShardConnMaxLifetime},
+		{"PHYSICAL_SHARD_CONN_MAX_IDLE_TIME_SECONDS", &cfg.PhysicalShardConnMaxIdleTime},
+	} {
+		if err := setSeconds(lookup, item.name, item.target); err != nil {
+			return err
+		}
+	}
+	for _, item := range []struct {
+		name   string
+		target *time.Duration
+	}{
+		{"PHYSICAL_SHARD_CONNECT_TIMEOUT", &cfg.PhysicalShardConnectTimeout},
+		{"PHYSICAL_SHARD_QUERY_TIMEOUT", &cfg.PhysicalShardQueryTimeout},
+		{"PHYSICAL_WORKER_SHARD_TIMEOUT", &cfg.PhysicalWorkerShardTimeout},
+	} {
+		if err := setDuration(lookup, item.name, item.target); err != nil {
+			return err
+		}
+	}
+	if cfg.BookingShardMode == BookingShardModePhysical {
+		cfg.PhysicalShardConnections = make(map[string]string, 2)
+		for _, item := range []struct {
+			ref string
+			env string
+		}{
+			{"physical-shard-0", "BOOKING_SHARD_0_DATABASE_URL"},
+			{"physical-shard-1", "BOOKING_SHARD_1_DATABASE_URL"},
+		} {
+			if value, ok := lookup(item.env); ok {
+				cfg.PhysicalShardConnections[item.ref] = strings.TrimSpace(value)
+			}
+		}
+	}
+	return nil
 }
 
 func validateBookingShardConfig(c Config) error {
-	if c.BookingShardMode != BookingShardModeLegacy && c.BookingShardMode != BookingShardModeSchemaPOC {
-		return errors.New("BOOKING_SHARD_MODE must be legacy or schema_poc")
+	if c.BookingShardMode != BookingShardModeLegacy && c.BookingShardMode != BookingShardModeSchemaPOC && c.BookingShardMode != BookingShardModePhysical {
+		return errors.New("BOOKING_SHARD_MODE must be legacy, schema_poc, or physical")
 	}
 	if c.BookingShardMode == BookingShardModeSchemaPOC && c.Environment == EnvironmentProduction && !c.BookingShardSchemaPOCProductionEnabled {
 		return errors.New("BOOKING_SHARD_SCHEMA_POC_PRODUCTION_ENABLED must be true when BOOKING_SHARD_MODE=schema_poc in production")
 	}
+	if c.BookingShardMode == BookingShardModePhysical && c.Environment == EnvironmentProduction && !c.PhysicalShardingProductionEnabled {
+		return errors.New("PHYSICAL_SHARDING_PRODUCTION_ENABLED must be true when BOOKING_SHARD_MODE=physical in production")
+	}
 
 	known := map[string]struct{}{"legacy": {}, "shard-0": {}, "shard-1": {}}
+	if c.BookingShardMode == BookingShardModePhysical {
+		known = map[string]struct{}{"physical-shard-0": {}, "physical-shard-1": {}}
+	}
 	seen := make(map[string]struct{}, len(c.BookingShardIDs))
 	for _, shardID := range c.BookingShardIDs {
 		if _, ok := known[shardID]; !ok {
-			return errors.New("BOOKING_SHARD_IDS must contain only known logical shard IDs, not database schema identifiers")
+			return errors.New("BOOKING_SHARD_IDS must contain only known bounded shard IDs, not database identifiers")
 		}
 		if _, duplicate := seen[shardID]; duplicate {
 			return errors.New("BOOKING_SHARD_IDS must not contain duplicates")
@@ -721,6 +837,46 @@ func validateBookingShardConfig(c Config) error {
 		}
 		return nil
 	}
+	if c.BookingShardMode == BookingShardModePhysical {
+		if c.PhysicalShardMaxCount < 1 || c.PhysicalShardMaxCount > maxPhysicalShardCount ||
+			len(c.BookingShardIDs) < 1 || len(c.BookingShardIDs) > c.PhysicalShardMaxCount {
+			return errors.New("PHYSICAL_SHARD_MAX_COUNT must bound the fixed configured physical shards")
+		}
+		if c.PhysicalShardMaxOpenConns < 1 || c.PhysicalShardMaxOpenConns > maxPhysicalShardPoolSize ||
+			c.PhysicalShardMaxIdleConns < 0 || c.PhysicalShardMaxIdleConns > c.PhysicalShardMaxOpenConns {
+			return errors.New("physical shard pool limits are invalid")
+		}
+		if c.PhysicalShardConnMaxLifetime <= 0 || c.PhysicalShardConnMaxIdleTime <= 0 ||
+			c.PhysicalShardConnectTimeout <= 0 || c.PhysicalShardConnectTimeout > maxBookingShardQueryTimeout ||
+			c.PhysicalShardQueryTimeout <= 0 || c.PhysicalShardQueryTimeout > maxBookingShardQueryTimeout {
+			return errors.New("physical shard connection and query timeouts must be positive and bounded")
+		}
+		if len(c.PhysicalShardConnections) != len(c.BookingShardIDs) {
+			return errors.New("every configured physical shard requires one allowlisted connection secret")
+		}
+		seenDSNs := make(map[string]struct{}, len(c.BookingShardIDs))
+		for _, shardID := range c.BookingShardIDs {
+			dsn, ok := c.PhysicalShardConnections[shardID]
+			if !ok || validateDatabaseURL(dsn) != nil {
+				return errors.New("every configured physical shard requires a valid postgres connection secret")
+			}
+			if _, duplicate := seenDSNs[dsn]; duplicate {
+				return errors.New("physical shard connection secrets must resolve to distinct databases")
+			}
+			seenDSNs[dsn] = struct{}{}
+		}
+		if c.PhysicalShardTotalPoolBudget < len(c.BookingShardIDs)*c.PhysicalShardMaxOpenConns {
+			return errors.New("PHYSICAL_SHARD_TOTAL_POOL_BUDGET is smaller than the configured per-shard maximum")
+		}
+		budget, err := c.PhysicalShardConnectionBudget()
+		if err != nil {
+			return err
+		}
+		if c.PostgresMaxConnectionsLimit > 0 && budget > c.PostgresMaxConnectionsLimit {
+			return errors.New("POSTGRES_MAX_CONNECTIONS_LIMIT is smaller than the configured deployment connection budget")
+		}
+		return nil
+	}
 	if len(c.BookingShardIDs) < 2 {
 		return errors.New("BOOKING_SHARD_IDS must include legacy and at least one schema_poc target")
 	}
@@ -728,6 +884,37 @@ func validateBookingShardConfig(c Config) error {
 		return errors.New("BOOKING_SHARD_IDS must include legacy")
 	}
 	return nil
+}
+
+// PhysicalShardConnectionBudget returns the configured deployment-wide upper
+// bound. It is a capacity guard, not an observed connection count. Control
+// pools, API shard pools, every worker shard pool, and both reserves are
+// included explicitly so a catalog row can never create unbudgeted pools.
+func (c Config) PhysicalShardConnectionBudget() (int, error) {
+	values := []int{
+		c.ControlDatabaseMaxOpenConns, c.ControlDatabasePoolCount,
+		c.PhysicalShardAPIReplicaCount, c.PhysicalShardWorkerReplicas,
+		c.WorkerShardConcurrency, c.PhysicalShardMigrationReserve,
+		c.PhysicalShardOperationalReserve, c.PostgresMaxConnectionsLimit,
+	}
+	for _, value := range values {
+		if value < 0 || value > 10_000 {
+			return 0, errors.New("physical shard deployment connection budget values must be bounded")
+		}
+	}
+	if c.ControlDatabaseMaxOpenConns < 1 || c.ControlDatabasePoolCount < 1 ||
+		c.PhysicalShardAPIReplicaCount < 1 || c.PhysicalShardWorkerReplicas < 1 ||
+		c.WorkerShardConcurrency < 1 {
+		return 0, errors.New("physical shard deployment connection budget requires positive pool and concurrency values")
+	}
+	control := int64(c.ControlDatabaseMaxOpenConns) * int64(c.ControlDatabasePoolCount)
+	api := int64(c.PhysicalShardAPIReplicaCount) * int64(len(c.BookingShardIDs)) * int64(c.PhysicalShardMaxOpenConns)
+	workers := int64(c.PhysicalShardWorkerReplicas) * int64(len(c.BookingShardIDs)) * int64(c.PhysicalShardMaxOpenConns)
+	total := control + api + workers + int64(c.PhysicalShardMigrationReserve) + int64(c.PhysicalShardOperationalReserve)
+	if total <= 0 || total > int64(math.MaxInt) {
+		return 0, errors.New("physical shard deployment connection budget overflows")
+	}
+	return int(total), nil
 }
 
 func loadAPISettings(lookup LookupFunc, cfg *Config) error {

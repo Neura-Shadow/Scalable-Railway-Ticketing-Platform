@@ -211,6 +211,7 @@ SELECT shard_id,
        state,
        minimum_fencing_protocol_version
 FROM public.booking_shards
+WHERE storage_kind <> 'postgres'
 ORDER BY shard_id
 LIMIT $1`, limit+1)
 	if err != nil {
@@ -561,7 +562,7 @@ FROM (
 		activeMigrations = maxRowCap
 	}
 	result.ActiveMigrationsObserved = activeMigrations
-	result.Ready = result.SchemaVersion == 8 && !result.SchemaDirty && complete &&
+	result.Ready = result.SchemaVersion == 9 && !result.SchemaDirty && complete &&
 		result.ShardCatalogEntries == maxShardLimit && result.WritableActiveShards == maxShardLimit &&
 		!result.ActiveMigrationsTruncated
 	if !result.Ready {
@@ -856,10 +857,16 @@ func validShardSummary(summary shardSummary) bool {
 	if err != nil || summary.MinimumFencingProtocolVersion <= 0 {
 		return false
 	}
-	if summary.StorageKind != "legacy" && summary.StorageKind != "schema" {
-		return false
-	}
-	if (shardID == sharding.ShardLegacy) != (summary.StorageKind == "legacy") {
+	switch shardID {
+	case sharding.ShardLegacy:
+		if summary.StorageKind != "legacy" && summary.StorageKind != "legacy_schema" {
+			return false
+		}
+	case sharding.ShardZero, sharding.ShardOne:
+		if summary.StorageKind != "schema" && summary.StorageKind != "logical_schema" {
+			return false
+		}
+	default:
 		return false
 	}
 	switch summary.State {

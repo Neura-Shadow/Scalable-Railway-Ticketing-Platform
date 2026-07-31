@@ -871,6 +871,25 @@ func TestBeginTrainRunWriteAllowsAuthoritativeRollbackWindowTarget(t *testing.T)
 	}
 }
 
+func TestBeginTrainRunWriteAllowsFencedSourceDuringOnlineMigration(t *testing.T) {
+	trainRunID := uuid.New()
+	route := mustRoute(t, trainRunID, sharding.ShardLegacy, 3)
+	tx := fakeAuthorityTx("legacy", 3, true, "active", "migrating", true, 3, true)
+	db := &fakeDB{beginTx: func(context.Context, pgx.TxOptions) (pgx.Tx, error) { return tx, nil }}
+	router, err := NewRouter(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := router.BeginTrainRunWrite(context.Background(), route)
+	if err != nil {
+		t.Fatalf("BeginTrainRunWrite() error = %v", err)
+	}
+	if got.PGXTx() != tx || got.Route() != route {
+		t.Fatal("online-migration source was not returned as the fenced authority")
+	}
+}
+
 type fakeDB struct {
 	queryRow func(context.Context, string, ...any) pgx.Row
 	query    func(context.Context, string, ...any) (pgx.Rows, error)

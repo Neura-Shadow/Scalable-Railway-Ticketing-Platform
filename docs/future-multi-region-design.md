@@ -1,16 +1,15 @@
 # Future Multi-Region Design
 
-This document records direction only. Milestone 4 implements none of these
-multi-region capabilities. Its logical schemas are an extraction seam, not
-physical shards or regional ownership.
+This document records direction only. Milestone 5 implements none of these
+multi-region capabilities. Its two physical booking databases are a bounded
+single-region extraction pilot, not regional ownership.
 
 ## Current truth
 
 - The system is single-region.
-- One PostgreSQL primary is authoritative for all train-run seat writes.
-- `legacy`, `shard-0`, and `shard-1` are fixed schemas in that one database.
-  They share locks, transactions, foreign keys, disk, connections, and the
-  physical failure domain.
+- A control PostgreSQL and up to two fixed physical booking PostgreSQL instances
+  may be configured. Exactly one database-local fence is writable per train
+  run; legacy/logical storage remains compatible.
 - One positive monotonic assignment generation and a local PostgreSQL fence
   reject stale logical routes. This is same-database serialization, not
   distributed consensus or a cross-region epoch service.
@@ -20,11 +19,12 @@ physical shards or regional ownership.
   or continuous across independent regional Redis deployments.
 - No multi-region active-active seat writes or global strong consistency exist.
 
-Milestone 4 may run multiple API, admission-worker, and read-model-worker
+Milestone 5 may run multiple API, admission-worker, and read-model-worker
 replicas inside that one region. Redis Lua scripts make policy-generation
-operations atomic, while PostgreSQL remains authoritative for routing, fencing,
-quotas, idempotency, reservations, and seat inventory. This replica topology
-must not be described as regional or physical-shard failover.
+operations atomic, while the control database remains authoritative for route
+intent and global leases and the selected booking PostgreSQL remains seat
+authority. The command protocol is a saga, not a distributed transaction. This
+topology must not be described as regional failover or active-active writes.
 
 ## Potential read architecture
 
@@ -58,10 +58,9 @@ Independent regional allocation with eventual conflict repair is invalid because
 
 ## Physical-shard extraction seam
 
-The next eligible design is a bounded **Physical PostgreSQL Shard Pilot and
-Online Rebalancing**, still in one region and on synthetic/selected train runs.
-It cannot reuse Milestone 4's same-database atomicity without replacement
-protocols for:
+Milestone 5 implements a bounded **Physical PostgreSQL Shard Pilot and Online
+Rebalancing**, still in one region and on synthetic/selected train runs. It
+replaces Milestone 4's same-database atomicity with explicit protocols for:
 
 - global idempotency-key uniqueness and synchronized expiry;
 - active-hold quota claims;
@@ -74,9 +73,10 @@ protocols for:
   without one transaction; and
 - per-shard credentials, pools, topology rollout, backup/PITR, RTO, and RPO.
 
-The pilot must not add source/target dual writes or infer online rebalancing from
-the bounded quiesced logical migration. Any coordinator proposal must state its
-partial-failure, blocking, restart, and repair behavior explicitly.
+The pilot does not add source/target dual writes. It uses online base copy and
+journal catch-up, then a bounded final pause; target-era writes require reverse
+migration. These mechanics are not evidence for multi-region consensus,
+zero-downtime operation, or production capacity.
 
 ## Evidence needed before implementation
 
