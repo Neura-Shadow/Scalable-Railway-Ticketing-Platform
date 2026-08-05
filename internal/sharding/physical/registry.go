@@ -52,6 +52,23 @@ type Pool interface {
 	Close()
 }
 
+// PoolSnapshot contains only bounded pgx pressure counters. It intentionally
+// excludes network endpoints and connection configuration.
+type PoolSnapshot struct {
+	TotalConnections      int32
+	AcquiredConnections   int32
+	IdleConnections       int32
+	MaxConnections        int32
+	AcquireCount          int64
+	AcquireDuration       time.Duration
+	EmptyAcquireCount     int64
+	CancelledAcquireCount int64
+}
+
+type poolSnapshotSource interface {
+	PoolSnapshot() PoolSnapshot
+}
+
 // PoolFactory creates a pool only for an already validated configuration
 // entry. Catalog values are never passed as DSNs.
 type PoolFactory func(context.Context, string, PoolLimits) (Pool, error)
@@ -194,6 +211,27 @@ func (r *Registry) Resolve(entry CatalogEntry) (Handle, error) {
 		healthState:     entry.HealthState,
 		writeEnabled:    entry.WriteEnabled,
 	}, nil
+}
+
+// PoolSnapshots returns one observation for each configured adapter that
+// exposes stats. The map key is the fixed shard allowlist identity, never a
+// catalog connection reference.
+func (r *Registry) PoolSnapshots() map[sharding.ShardID]PoolSnapshot {
+	result := make(map[sharding.ShardID]PoolSnapshot, 2)
+	if r == nil {
+		return result
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed {
+		return result
+	}
+	for _, connection := range r.connections {
+		if source, ok := connection.pool.(poolSnapshotSource); ok {
+			result[connection.shardID] = source.PoolSnapshot()
+		}
+	}
+	return result
 }
 
 func (r *Registry) Close() {

@@ -1,13 +1,15 @@
 package metrics
 
 import (
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
 
 var (
-	allowedPhysicalShardIDs   = set("physical-shard-0", "physical-shard-1")
+	allowedPhysicalShardIDs   = set("none", "physical-shard-0", "physical-shard-1")
+	allowedDatabaseRoles      = set("control", "booking_shard")
 	allowedStorageKinds       = set("legacy_schema", "logical_schema", "postgres")
 	allowedPhysicalOperations = set(
 		"create", "confirm", "cancel", "finalize", "recover", "release", "repair", "resolve",
@@ -56,6 +58,31 @@ type physicalMetrics struct {
 	rollback               *prometheus.CounterVec
 	reverse                *prometheus.CounterVec
 	reconciliation         *prometheus.CounterVec
+	poolAcquired           *prometheus.GaugeVec
+	poolIdle               *prometheus.GaugeVec
+	poolTotal              *prometheus.GaugeVec
+	poolMax                *prometheus.GaugeVec
+	poolAcquireCount       *prometheus.GaugeVec
+	poolAcquireDuration    *prometheus.GaugeVec
+	poolEmptyAcquire       *prometheus.GaugeVec
+	poolCancelledAcquire   *prometheus.GaugeVec
+	poolPeakAcquired       *prometheus.GaugeVec
+	poolMu                 sync.Mutex
+	poolPeaks              map[string]float64
+}
+
+// DatabasePoolSnapshot is a cumulative pgx pool observation. Values are
+// exported with bounded topology labels only; it deliberately contains no
+// endpoint, credential, or business identity.
+type DatabasePoolSnapshot struct {
+	TotalConnections      int32
+	AcquiredConnections   int32
+	IdleConnections       int32
+	MaxConnections        int32
+	AcquireCount          int64
+	AcquireDuration       time.Duration
+	EmptyAcquireCount     int64
+	CancelledAcquireCount int64
 }
 
 func newPhysicalMetrics() *physicalMetrics {
@@ -64,6 +91,9 @@ func newPhysicalMetrics() *physicalMetrics {
 	}
 	histogram := func(name, help string, labels ...string) *prometheus.HistogramVec {
 		return prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: name, Help: help, Buckets: prometheus.DefBuckets}, labels)
+	}
+	gauge := func(name, help string, labels ...string) *prometheus.GaugeVec {
+		return prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: name, Help: help}, labels)
 	}
 	return &physicalMetrics{
 		bookingCommand:         counter("booking_command_total", "Durable physical booking commands.", "operation", "result", "reason"),
@@ -88,6 +118,16 @@ func newPhysicalMetrics() *physicalMetrics {
 		rollback:               counter("physical_migration_rollback_total", "Physical migration rollback outcomes.", "result", "reason", "shard_id"),
 		reverse:                counter("physical_migration_reverse_total", "Physical reverse-migration outcomes.", "result", "reason", "shard_id"),
 		reconciliation:         counter("physical_shard_reconciliation_mismatch_total", "Detected physical shard reconciliation mismatches.", "reason", "shard_id"),
+		poolAcquired:           gauge("database_pool_acquired_connections", "Current acquired PostgreSQL connections.", "database_role", "shard_id"),
+		poolIdle:               gauge("database_pool_idle_connections", "Current idle PostgreSQL connections.", "database_role", "shard_id"),
+		poolTotal:              gauge("database_pool_total_connections", "Current total PostgreSQL connections.", "database_role", "shard_id"),
+		poolMax:                gauge("database_pool_max_connections", "Configured maximum PostgreSQL connections.", "database_role", "shard_id"),
+		poolAcquireCount:       gauge("database_pool_acquire_total", "Cumulative PostgreSQL pool acquire attempts reported by pgx.", "database_role", "shard_id"),
+		poolAcquireDuration:    gauge("database_pool_acquire_duration_seconds", "Cumulative time spent acquiring PostgreSQL connections reported by pgx.", "database_role", "shard_id"),
+		poolEmptyAcquire:       gauge("database_pool_empty_acquire_total", "Cumulative PostgreSQL acquires that waited for a connection.", "database_role", "shard_id"),
+		poolCancelledAcquire:   gauge("database_pool_cancelled_acquire_total", "Cumulative cancelled PostgreSQL connection acquires.", "database_role", "shard_id"),
+		poolPeakAcquired:       gauge("database_pool_peak_acquired_connections", "Peak acquired PostgreSQL connections observed by this process.", "database_role", "shard_id"),
+		poolPeaks:              make(map[string]float64, 6),
 	}
 }
 
@@ -98,11 +138,17 @@ func (m *physicalMetrics) collectors() []prometheus.Collector {
 		m.requestDuration, m.poolFailure, m.migration, m.baseCopyRows,
 		m.baseCopyDuration, m.journalLag, m.journalReplay, m.validationFailure,
 		m.writePause, m.cutover, m.rollback, m.reverse, m.reconciliation,
+		m.poolAcquired, m.poolIdle, m.poolTotal, m.poolMax,
+		m.poolAcquireCount, m.poolAcquireDuration, m.poolEmptyAcquire,
+		m.poolCancelledAcquire, m.poolPeakAcquired,
 	}
 }
 
 func normalizePhysicalShardID(value string) string {
 	return normalize(value, allowedPhysicalShardIDs, "unknown")
+}
+func normalizeDatabaseRole(value string) string {
+	return normalize(value, allowedDatabaseRoles, "unknown")
 }
 func normalizeStorageKind(value string) string {
 	return normalize(value, allowedStorageKinds, "unknown")
@@ -214,4 +260,37 @@ func (m *Metrics) AddPhysicalReconciliationMismatches(reason, shardID string, co
 	if count > 0 {
 		m.physical.reconciliation.WithLabelValues(normalizePhysicalReason(reason), normalizePhysicalShardID(shardID)).Add(float64(count))
 	}
+}
+
+// RecordDatabasePoolSnapshot publishes one bounded pool observation and keeps
+// the in-process peak acquired value monotonic for the lifetime of Metrics.
+func (m *Metrics) RecordDatabasePoolSnapshot(databaseRole, shardID string, snapshot DatabasePoolSnapshot) {
+	role := normalizeDatabaseRole(databaseRole)
+	shard := normalizePhysicalShardID(shardID)
+	labels := []string{role, shard}
+	m.physical.poolAcquired.WithLabelValues(labels...).Set(nonNegativeFloat(int64(snapshot.AcquiredConnections)))
+	m.physical.poolIdle.WithLabelValues(labels...).Set(nonNegativeFloat(int64(snapshot.IdleConnections)))
+	m.physical.poolTotal.WithLabelValues(labels...).Set(nonNegativeFloat(int64(snapshot.TotalConnections)))
+	m.physical.poolMax.WithLabelValues(labels...).Set(nonNegativeFloat(int64(snapshot.MaxConnections)))
+	m.physical.poolAcquireCount.WithLabelValues(labels...).Set(nonNegativeFloat(snapshot.AcquireCount))
+	m.physical.poolAcquireDuration.WithLabelValues(labels...).Set(nonNegativeSeconds(snapshot.AcquireDuration))
+	m.physical.poolEmptyAcquire.WithLabelValues(labels...).Set(nonNegativeFloat(snapshot.EmptyAcquireCount))
+	m.physical.poolCancelledAcquire.WithLabelValues(labels...).Set(nonNegativeFloat(snapshot.CancelledAcquireCount))
+
+	acquired := nonNegativeFloat(int64(snapshot.AcquiredConnections))
+	key := role + "\x00" + shard
+	m.physical.poolMu.Lock()
+	if acquired > m.physical.poolPeaks[key] {
+		m.physical.poolPeaks[key] = acquired
+	}
+	peak := m.physical.poolPeaks[key]
+	m.physical.poolPeakAcquired.WithLabelValues(labels...).Set(peak)
+	m.physical.poolMu.Unlock()
+}
+
+func nonNegativeFloat(value int64) float64 {
+	if value < 0 {
+		return 0
+	}
+	return float64(value)
 }

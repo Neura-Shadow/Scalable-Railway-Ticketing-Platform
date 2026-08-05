@@ -48,6 +48,7 @@ const (
 	defaultIdleTimeout                = 60 * time.Second
 	projectionLagObservationInterval  = 5 * time.Second
 	reconciliationObservationInterval = time.Minute
+	databasePoolObservationInterval   = time.Second
 )
 
 type readModelOperationalStore interface {
@@ -139,6 +140,10 @@ func run(logger *slog.Logger) error {
 			return errors.New("physical shard router initialization failed")
 		}
 	}
+	stopDatabasePoolObserver := startDatabasePoolObserver(
+		signalContext, metrics, pool, physicalRegistry, databasePoolObservationInterval,
+	)
+	defer stopDatabasePoolObserver()
 
 	redisClient := redis.NewClient(redisx.BoundedClientOptions(
 		cfg.RedisAddress,

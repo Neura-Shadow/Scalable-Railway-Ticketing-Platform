@@ -121,3 +121,57 @@ func TestPhysicalBookingCommandOperationsRemainBoundedAndDistinct(t *testing.T) 
 		t.Fatalf("bounded booking operations collapsed to unknown: %v", operations)
 	}
 }
+
+func TestDatabasePoolSnapshotExposesBoundedPressureAndPeak(t *testing.T) {
+	t.Parallel()
+	registry := prometheus.NewRegistry()
+	recorder, err := metrics.New(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder.RecordDatabasePoolSnapshot("control", "none", metrics.DatabasePoolSnapshot{
+		TotalConnections: 8, AcquiredConnections: 5, IdleConnections: 3,
+		MaxConnections: 12, AcquireCount: 21, AcquireDuration: 250 * time.Millisecond,
+		EmptyAcquireCount: 2, CancelledAcquireCount: 1,
+	})
+	recorder.RecordDatabasePoolSnapshot("control", "none", metrics.DatabasePoolSnapshot{
+		TotalConnections: 7, AcquiredConnections: 3, IdleConnections: 4,
+		MaxConnections: 12, AcquireCount: 22, AcquireDuration: 300 * time.Millisecond,
+		EmptyAcquireCount: 2, CancelledAcquireCount: 1,
+	})
+
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]float64{
+		"database_pool_acquired_connections":      3,
+		"database_pool_idle_connections":          4,
+		"database_pool_total_connections":         7,
+		"database_pool_max_connections":           12,
+		"database_pool_acquire_total":             22,
+		"database_pool_acquire_duration_seconds":  0.3,
+		"database_pool_empty_acquire_total":       2,
+		"database_pool_cancelled_acquire_total":   1,
+		"database_pool_peak_acquired_connections": 5,
+	}
+	for _, family := range families {
+		name := family.GetName()
+		value, required := want[name]
+		if !required {
+			continue
+		}
+		if len(family.GetMetric()) != 1 {
+			t.Fatalf("%s sample count = %d, want 1", name, len(family.GetMetric()))
+		}
+		metric := family.GetMetric()[0]
+		got := metric.GetGauge().GetValue()
+		if got != value {
+			t.Fatalf("%s = %v, want %v", name, got, value)
+		}
+		delete(want, name)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing database pool metrics: %v", want)
+	}
+}
