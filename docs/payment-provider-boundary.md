@@ -95,6 +95,9 @@ Only a bounded hosted-session reference and normalized state may be returned.
 Provider raw errors, request IDs, operation IDs, payment secrets, response
 bodies, signatures, and topology remain internal. A hosted-session reference
 is not payment proof; only verified webhook/status evidence advances the saga.
+The disposable sandbox keeps its synthetic token inside the provider boundary:
+the hosted action endpoint returns only `processing`, then emits the same signed
+webhook/current-status evidence used by every other authorization path.
 
 ## Future adapter gate
 

@@ -1,20 +1,24 @@
 # Production Deployment
 
-This guide describes a conservative single-region deployment. It does not turn
-Milestone 4's same-cluster logical schemas into independent physical shards, a
-multi-region system, or a nationally sized platform.
+This guide describes a conservative single-region deployment. Milestone 5's
+physical PostgreSQL pilot and Milestone 6's payment saga remain bounded
+deployment seams, not a multi-region or nationally sized platform.
 
 Deploying these artifacts adds explicit train-run routing, monotonic database
 fencing, bounded quiesced migration controls, disposable read projections/
-caches, and a hot-train waiting-room control plane. It does not add payment, a
-complete anti-bot platform, physical shard isolation, zero-downtime
-rebalancing, multi-region active-active writes, national-scale capacity
-evidence, or real passenger identity verification. Cached availability is a
-hint and admission permits an attempt, not a seat.
+caches, a hot-train waiting-room control plane, and a sandbox-backed payment
+saga with durable ticket issuance. It does not add a live production gateway,
+settlement, a complete anti-bot platform, zero-downtime rebalancing,
+multi-region active-active writes, national-scale capacity evidence, or real
+passenger identity verification. Cached availability is a hint and admission
+permits an attempt, not a seat.
 
 ## Authority and topology
 
-- One regional PostgreSQL primary is authoritative for train-run status, seat occupancy, reservations, tickets, durable idempotency, and outbox rows.
+- One regional control PostgreSQL plus the allowlisted physical booking
+  PostgreSQL instances form the supported pilot. Control owns payment intents,
+  sagas, operations, webhook evidence and global locators; exactly one current
+  fenced booking shard owns reservation/inventory/ticket/receipt mutations.
 - The fixed `legacy`, `shard-0`, and `shard-1` booking storages are schemas in
   that same database. Exactly one storage owns a train run's writes in stable
   state; assignment generation and a local fence are checked in the mutation
@@ -34,11 +38,20 @@ Create the referenced `railway-runtime-secrets` object out of band. Never commit
 
 Required keys, scoped to the process that consumes them:
 
-- `database-url`: TLS-enabled PostgreSQL URL required by the API, admission-worker, read-model-worker, hold-expirer, and outbox-worker; a production overlay should replace the baseline shared reference with process-specific least-privilege roles where their grants differ;
+- `database-url`: TLS-enabled control PostgreSQL URL required by the API,
+  admission-worker, read-model-worker, hold-expirer, outbox-worker,
+  payment-worker, payment-reconciler and payment-admin; a production overlay
+  should replace the baseline shared reference with process-specific
+  least-privilege roles where their grants differ;
 - `redis-address`: regional Redis `host:port` endpoint used by the API, admission-worker, read-model-worker, and Redis Streams outbox-worker;
 - `redis-password`: Redis credential, if authentication is enabled, used only by those Redis clients; and
 - `jwt-secret`: at least 32 random bytes, managed and rotated through the deployment secret system and mounted only into the API; and
-- `admission-token-keyring`: one to eight `key-id=base64url` entries whose decoded material is exactly 32 bytes, mounted only into APIs and admission workers with separately configured issue and accept key IDs.
+- `admission-token-keyring`: one to eight `key-id=base64url` entries whose decoded material is exactly 32 bytes, mounted only into APIs and admission workers with separately configured issue and accept key IDs;
+- payment provider API credentials, mounted only into payment workers,
+  reconciler/admin as needed; and
+- payment webhook HMAC keyring plus accepted key IDs, mounted only into
+  payment-enabled APIs, workers/reconciler/admin. Never reuse these keys for
+  JWT, admission, database, Redis, or sandbox fault control.
 
 Admission derivation keys are not JWT keys and must not be reused for database,
 Redis, TLS, or publisher credentials. Rotate API accept sets before a worker
@@ -63,6 +76,17 @@ Set `APP_ENV=production` and validate process-owned settings:
 - hold-expirer: PostgreSQL, expiration batch/interval, worker health, pass timeout, and lifecycle settings, with no JWT or Redis secret;
 - log outbox-worker: PostgreSQL, outbox loop, worker health, pass timeout, and lifecycle settings, with no JWT or Redis secret;
 - Redis Streams outbox-worker: the log-worker settings plus only its Redis publisher address/credential;
+- payment-enabled API: fixed provider type/base URL, bounded transport/body
+  limits, webhook keyring, processing/review/uncertainty deadlines, physical
+  mode, and no provider credential in public output;
+- payment-worker: explicit enablement, bounded batch/lease/retry/pass settings,
+  control schema v10, booking-shard schema v2, provider and configured-shard
+  readiness;
+- payment-reconciler: detect-only scope/batch/interval/timeout with bounded
+  control/current-shard/provider reads;
+- payment-admin: private audited operator/superuser database role. The shipped
+  runtime rejects mutation/repair because no reviewed recorded-command replayer
+  is wired;
 - trusted proxy CIDRs and explicit CORS origins; and
 - request, dependency, and shutdown timeouts.
 
@@ -76,6 +100,14 @@ are bounded per `shard-admin` invocation by `--timeout`, `--batch-size`, and
 `BOOKING_SHARD_SCHEMA_POC_PRODUCTION_ENABLED=true`; that acknowledgement does
 not replace Migration 8, writer-version drain, reconciliation, or operator
 approval. Never configure schema names where logical shard IDs are expected.
+
+The deterministic sandbox and `docker-compose.payment.yml` are disposable
+test/development evidence only. Production validation rejects sandbox by
+default, private/loopback provider targets, and plain HTTP. A future live
+adapter requires separate TLS/egress/SSRF, secret, webhook rotation,
+settlement, privacy/compliance, incident, and independent security review. The
+Kubernetes baseline does not automatically deploy payment services or grant
+their database roles; a reviewed production overlay must add them explicitly.
 
 Production configuration validation rejects the committed local Compose database password, the development JWT default, and universal trusted-proxy CIDRs. Terminate TLS at a trusted ingress/load balancer, use TLS to managed dependencies where supported, replace the baseline loopback-only proxy trust with only the exact ingress addresses or narrow topology-specific CIDRs, and keep CORS disabled unless explicit origins are required.
 

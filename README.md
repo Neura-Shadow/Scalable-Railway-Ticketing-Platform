@@ -4,14 +4,16 @@ A production-minded, single-region Go backend for railway booking with explicit
 train-run routing, monotonic PostgreSQL writer fencing, a bounded physical-
 PostgreSQL shard pilot, a disposable journey read model, versioned Redis read
 caches, Redis-backed hot-train admission, and authoritative route-segment
-allocation under concurrency.
+allocation under concurrency. Milestone 6 adds a provider-neutral payment saga,
+signed durable webhook inbox, deterministic sandbox provider, idempotent
+capture/full-refund operations, and physical-shard-local ticket issuance.
 
 Milestone 4 is intentionally bounded. `legacy`, `shard-0`, and `shard-1` are
 logical schemas in one PostgreSQL database, not independent physical shards.
 Migration uses a bounded quiesced cutover, may reject writes for the selected
 train run, never dual writes, and retains the source for a rollback window.
 This is not a zero-downtime, multi-region, production-capacity, or national-
-scale claim and does not implement payment. See
+scale claim. See
 [Milestone 4 limitations](docs/milestone-4-limitations.md).
 
 Milestone 5 adds an opt-in three-database pilot: one control PostgreSQL and two
@@ -25,6 +27,16 @@ source, and requires reverse migration after target-era writes. The pilot is
 single-region, not zero-downtime or production-capacity certification. See
 [the physical topology](docs/physical-shard-topology.md) and
 [Milestone 5 limitations](docs/milestone-5-limitations.md).
+
+Milestone 6 coordinates payment across control PostgreSQL, one configured
+provider, and exactly one current physical booking shard without a distributed
+transaction. The local sandbox provides hosted synthetic checkout and
+deterministic faults only; it is not a live gateway. Browser redirects are not
+authority, raw card data is never accepted, ambiguous financial outcomes are
+queried before retry, and inventory is retained until a void/full refund and
+local compensation are proven. See the
+[payment PRD](docs/prd/milestone-6-payment-ticket-issuance.md) and
+[Milestone 6 limitations](docs/milestone-6-limitations.md).
 
 ## Architecture
 
@@ -56,6 +68,7 @@ allocates a seat or selects a write owner; booking always rechecks PostgreSQL.
 | Sharding | Fixed catalog, locator routing, fenced transactions, bounded migration, cutover, and rollback controls |
 | Query | Journey projection, source fallback, versioned station/search caches, and short-lived availability hints |
 | Event Relay | Outbox claim, publish, retry, stale-lease recovery, and finalize |
+| Payment | Intent/saga coordination, provider operations, verified webhook inbox, current-shard issuance/compensation, and detect-first reconciliation |
 | Platform | Configuration, pools, metrics, clock, middleware, and process lifecycle |
 
 Booking owns each reservation transaction. Event Relay delivers already committed events and never decides booking state. Domain packages do not depend on Gin, pgx, Redis, Prometheus, Docker, or HTTP status codes.
@@ -99,14 +112,16 @@ See [segment-inventory.md](docs/segment-inventory.md) and [high-concurrency-desi
 ## Reservation lifecycle
 
 ```text
-held -> confirmed
+held -> payment_pending -> confirmed
 held -> expired
 held -> cancelled
-confirmed -> cancelled
+confirmed -> refund_pending -> cancelled
 ```
 
 - A hold snapshots the route interval, passengers, physical seats, fare minor units, currency, expiry, and exact masks.
-- Confirmation keeps inventory occupied and creates one ticket order plus tickets. It is domain confirmation only; no payment authorization occurs.
+- With payment enabled, direct confirmation is disabled. A durable captured
+  operation authorizes one fenced shard-local issuance transaction that
+  confirms the reservation and creates one ticket per reserved seat.
 - Cancellation releases the immutable masks once and cancels ticket artifacts when present.
 - Expiration workers claim due holds with `FOR UPDATE SKIP LOCKED`; every reservation is processed in its own transaction so one failed item does not roll back the rest of a batch.
 - Confirm/expire and cancel/confirm races serialize on the reservation row and finish in a valid state.
@@ -140,6 +155,11 @@ The API is versioned under `/api/v1`. Customer reservation routes derive ownersh
 | `GET` | `/api/v1/reservations/:id` | Read an owned reservation |
 | `POST` | `/api/v1/reservations/:id/confirm` | Confirm an owned hold |
 | `POST` | `/api/v1/reservations/:id/cancel` | Cancel an owned held/confirmed reservation |
+| `POST` | `/api/v1/reservations/:id/payment-intents` | Create/replay an owner-scoped payment intent from server-derived money |
+| `GET` | `/api/v1/payment-intents/:id` | Read bounded owned payment/session state |
+| `POST` | `/api/v1/payment-intents/:id/cancel` | Request/replay void or full-refund compensation |
+| `POST` | `/webhooks/payments/:provider` | Authenticate and durably deduplicate a provider webhook; no financial/shard effect in HTTP |
+| `GET` | `/api/v1/tickets/:id` | Read one owned ticket through its control locator and current physical shard |
 | `POST` | `/api/v1/admin/routes` | Create a named, timezone-bound route with ordered station codes and arrival/departure offsets |
 | `GET/PATCH` | `/api/v1/operator/train-runs/:id/fares/:resource_id` | Read authoritative physical fare version or submit an idempotent train-run fare update |
 | `GET/PATCH` | `/api/v1/operator/train-runs/:id/seats/:resource_id/booking-state` | Read or idempotently change shard-local seat booking eligibility |
@@ -164,7 +184,7 @@ The focused registration/login response contract is recorded in [docs/openapi.ya
 
 ## Health and metrics
 
-The API `/livez` does not call PostgreSQL or Redis. API `/readyz` checks PostgreSQL, Redis, migration version, and required production configuration with short timeouts and structured, sanitized component states. Each worker has a private `:9090` `/livez`, `/readyz`, and `/metrics` surface. Admission-worker readiness checks PostgreSQL, Redis, schema version, and its process-owned keyring/configuration; queue backlog alone does not fail readiness. Hold-expirer readiness checks only PostgreSQL; Redis Streams outbox readiness checks PostgreSQL and Redis, while log publishing checks only PostgreSQL. Worker pass duration is capped. Outbox backlog and dead-letter conditions are metrics/alert signals rather than direct readiness failures.
+The API `/livez` does not call PostgreSQL or Redis. API `/readyz` checks PostgreSQL, Redis, migration version, and required production configuration with short timeouts and structured, sanitized component states. Each worker has a private `:9090` `/livez`, `/readyz`, and `/metrics` surface. Admission-worker readiness checks PostgreSQL, Redis, schema version, and its process-owned keyring/configuration; queue backlog alone does not fail readiness. Hold-expirer readiness checks only PostgreSQL; Redis Streams outbox readiness checks PostgreSQL and Redis, while log publishing checks only PostgreSQL. Payment-worker readiness checks control v10, every configured physical schema v2 shard, and provider readiness; payment-reconciler readiness checks its bounded control/current-shard/provider dependencies. Worker pass duration is capped. Backlog, uncertainty and manual-review conditions are metrics/alert signals rather than direct readiness failures.
 
 Prometheus labels use bounded operations, normalized route templates, result/status classes, and bounded reasons. User, passenger, reservation, train-run, seat, ticket, event, and arbitrary input values are excluded from labels.
 
@@ -202,6 +222,14 @@ evidence. Physical booking databases use the independent migration history at
 `migrations/booking-shard`, starting at version 1. Catalog rows never contain a
 DSN. Follow [the control rollout](docs/migrations/migration-9-control-plane-rollout.md)
 and [the booking-shard rollout](docs/migrations/booking-shard-v1-rollout.md).
+
+Migration 10 adds payment intents, sagas, provider operations, webhook/conflict
+evidence, reconciliation checkpoints, manual-review cases, payment-aware
+logical compatibility layouts, and physical catalog schema version 2. Physical
+booking databases independently apply booking-shard Migration 2 for payment
+receipts, refund/compensation state, tickets, outbox and migration-journal
+coverage. Follow the [control rollout](docs/migrations/migration-10-payment-control-rollout.md)
+and [booking-shard v2 rollout](docs/migrations/booking-shard-v2-payment-rollout.md).
 
 ## Read-only reconciliation
 
@@ -350,14 +378,20 @@ correctness gates. [benchmark-report-milestone-4.md](docs/benchmark-report-miles
 records every Milestone 4 result as pending until a controlled run is accepted.
 A smoke run is not physical-shard, production, or national-scale evidence.
 
+Milestone 6 adds ten bounded payment correctness/recovery scripts. Their
+committed benchmark report remains `not_run` until a sanitized canonical bundle
+and post-run provider/control/shard invariants exist; scripts alone cannot prove
+no duplicate charge, refund, ticket, or production capacity. See
+[Milestone 6 load testing](docs/milestone-6-load-testing.md).
+
 ## Deployment
 
 [production-deployment.md](docs/production-deployment.md) defines the single-region release, migration, secret, health, monitoring, backup, and rollback contract. `deploy/kubernetes/base` supplies a hardened baseline that requires a production overlay and externally managed secrets.
 
 ## Current limitations
 
-- Single-region PostgreSQL primary for all authoritative writes; logical
-  schemas share one physical failure domain.
+- Single-region control and current-shard PostgreSQL primaries; the optional
+  logical-schema mode still shares one physical failure domain.
 - Quiesced train-run migration may reject writes and does not claim zero
   downtime. Source and target are never dual writable.
 - Source retention increases disk/backup scope. After any target write, direct
@@ -367,17 +401,19 @@ A smoke run is not physical-shard, production, or national-scale evidence.
 - Redis AOF reduces loss risk but does not guarantee waiting-room continuity; hot-run Redis loss fails closed.
 - Admission does not guarantee a seat and token delivery is at-most-once.
 - Projection lag and cache staleness are possible; availability remains hint-only and cache loss increases PostgreSQL read load.
-- No real payment authorization/capture/refund integration.
+- Only the deterministic sandbox payment provider is implemented; there is no
+  live gateway, settlement, dispute, partial-refund, PCI-certification, or
+  production-capacity evidence.
 - No complete anti-bot/fraud system or real identity proof; account quotas do not prevent Sybil identities.
 - No multi-region active-active booking writes.
 - No accepted sustained benchmark or national-scale capacity claim.
 - No government-ID or real passenger identity verification.
 
 The complete list is in
-[milestone-4-limitations.md](docs/milestone-4-limitations.md). Future physical-
-shard and multi-region ideas are design direction only in
+[milestone-6-limitations.md](docs/milestone-6-limitations.md). Multi-region
+ideas are design direction only in
 [future-multi-region-design.md](docs/future-multi-region-design.md); none are
-implemented in Milestone 4.
+implemented in Milestone 6.
 
 ## License
 

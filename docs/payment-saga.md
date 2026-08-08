@@ -87,12 +87,14 @@ it enters review and is queried.
 
 ## Control finalization repair
 
-The reconciler may repair control state from a verified current-shard receipt:
+The reconciliation interface permits only replaying an already recorded
+command after validating a current-shard receipt:
 load the current assignment, validate generation, command fingerprint, payment
 intent, reservation, amount/currency, order, and issued-ticket count, then
 complete control in one transaction. It never creates tickets or mutates
 inventory directly. A stale or conflicting receipt becomes a mismatch, not a
-repair.
+repair. The shipped runtime has no repairer and therefore reports/escalates the
+finding and returns `safe_replay_unavailable` for requested mutation.
 
 ## Bounded customer behavior
 

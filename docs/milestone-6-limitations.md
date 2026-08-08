@@ -22,7 +22,12 @@ sandbox, fixtures, fault schedule, tool versions, and workload.
   inventory cost and requires alerting and staffed manual review.
 - Automatic reconciliation is bounded and detect-first. It does not directly
   repair inventory, mint/cancel tickets, charge, refund, or bypass a shard
-  command. Some mismatches require explicit operator judgment.
+  command. The current CLI has no recorded-command replayer and rejects every
+  mutation/safe-repair request. Some mismatches require explicit operator
+  judgment.
+- Ticket-code duplicate detection is authoritative within the intent's current
+  shard only. A cross-shard global proof needs a control-plane code directory
+  or index; reconciliation deliberately does not scan unrelated shards.
 - Milestone 6 supports full capture and full refund only. It omits partial
   capture/refund, split tender, installments, cancellation fees, FX, tax,
   invoices, accounting ledgers, disputes, chargebacks, and settlement matching.

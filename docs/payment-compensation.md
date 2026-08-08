@@ -38,9 +38,10 @@ is merely unknown cannot authorize compensation or seat release.
    amount/currency and receipt, cancels reservation/order/tickets, releases the
    exact seat masks once, writes compensation/refund receipts and bounded
    events, and commits.
-7. Control finalizes the intent `refunded` and saga `compensated` from the shard
-   receipt. A finalize failure is repairable without repeating refund or local
-   cancellation.
+7. Control records provider `refunded`, then finalizes the customer intent as
+   `cancelled` and saga `compensated` from the shard receipt while preserving
+   immutable completion evidence. A finalize failure is recoverable without
+   repeating refund or local cancellation.
 
 ## Invariants
 

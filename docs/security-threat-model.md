@@ -233,6 +233,25 @@ flowchart LR
 | TM-069 | Remote burst, provider outage or one failed shard | Claims are held during network I/O, worksets/retries are unbounded or one shard monopolizes workers | Exhaust connections, goroutines, inbox storage or retry budget and starve healthy work | Payment/ticket availability loss and long repair time | Worker/pool capacity, inbox, saga availability | Existing workers use bounded batches, `SKIP LOCKED`, timeouts and failed-shard isolation patterns (`internal/eventrelay/`, `internal/sharding/physicalworker/`) | M6 worker fairness, leases, backoff and quotas are absent | Short claim/CAS transactions; external I/O outside transaction; expiring leases; capped exponential backoff/jitter; bounded webhook body/rate/storage; fair shard/provider queues; graceful shutdown without leaked leases/connections | Queue depth/age, retry/manual-review counts, provider latency, pgx pool acquired/empty/cancelled/acquire duration by bounded labels | high | medium | high |
 | TM-070 | Runtime defect or observability consumer | Secrets, IDs, URLs or unbounded values enter logs/labels/admin output | Exfiltrate payment metadata or create telemetry cardinality denial | Confidentiality loss and monitoring outage | Secrets, references, logs/metrics | Existing safe errors and bounded physical metric normalization (`internal/platform/safeerror/`, `internal/platform/metrics/physical.go`) | M6 redaction/cardinality tests absent | Allow only finite provider/state/result/reason labels and allowlisted `shard_id`; never label IDs, DSNs, host/port, `connection_ref`, request body, signature, token or operation key; sanitize admin output and evidence | Cardinality budget tests; synthetic sentinel scan across logs/artifacts; telemetry scrape size alert | medium | medium | medium |
 
+## Milestone 6 implementation status
+
+The “gaps” column above records the pre-implementation threat review. The
+current source now implements the designed controls: strict payment DTOs and
+schema deny boundaries; bounded HMAC/timestamp/key-ID verification before
+durable webhook deduplication; immutable event-hash conflicts; a fixed no-
+redirect bounded provider client; stable provider operation identities with
+query-before-retry uncertainty; fenced payment/issuance/refund/compensation
+receipts; schema-v2 migration/reverse coverage; owner-scoped ticket locators;
+detect-first reconciliation; operator-gated bounded admin output; and finite
+payment metrics. The sandbox remains test-only and production-rejected.
+
+Residual gates are direct runtime, failure, concurrency, secret-scan,
+vulnerability, container and CI evidence. A clean source review does not prove
+live-provider behavior, PCI certification, settlement correctness, global
+cross-shard ticket-code uniqueness, multi-region resilience or production
+capacity. The shipped admin/reconciler has no recorded-command repairer and
+fails closed on all mutation/repair requests.
+
 ### Inherited physical-sharding threats
 
 Milestone 6 does not supersede the Milestone 5 register. These threats remain

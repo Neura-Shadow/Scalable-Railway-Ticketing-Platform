@@ -4,8 +4,10 @@
 
 Reconciliation is detect-only by default. It compares durable provider,
 control-plane, directory, current-shard, reservation, ticket, receipt, and
-financial-operation state. It may repair a proven control finalization through
-an explicit safe path, but it never directly changes seat masks, mints tickets,
+financial-operation state. The core accepts only replay of an already recorded
+command through an explicit safe path, but the shipped reconciler/admin runtime
+intentionally wires no repairer and rejects every `--repair`/mutation as
+`safe_replay_unavailable`. It never directly changes seat masks, mints tickets,
 blindly charges, blindly refunds, bypasses a shard fence, or treats an
 unreachable dependency as proof of absence.
 
@@ -52,8 +54,10 @@ unbounded shard set or scan shards when the global directory is missing.
 - Completed intent maps to an issued order; the order has one issuance receipt;
   that receipt references the same payment intent, reservation, capture, amount
   and currency.
-- Confirmed reservation has exactly one active ticket per reserved seat and no
-  duplicate ticket code across the configured physical shard set.
+- An issued order has exactly one active ticket per reservation seat on its one
+  current shard. Ticket-code duplicate checks are current-shard-local. A global
+  cross-shard duplicate proof requires a future control-plane ticket-code
+  directory/index, because the reconciler must not scan unbound shards.
 - Refunded payment has `refund_pending`/cancelled tickets according to saga
   progress; no active ticket remains after completed compensation.
 - Shard command/issuance/refund fingerprints agree with control intent and
@@ -83,9 +87,11 @@ not local failure. Contradiction enters manual review.
 | refunded with active ticket | report/escalate | enqueue existing local compensation command after proof |
 | inventory mismatch | report Critical/High as classified | no automatic repair |
 
-Every selected repair is idempotent, audited, expected-state guarded, and
-bounded. Administration requires current operator authorization and explicit
-confirmation for provider-side or mutating actions.
+These rows define the only admissible future repair shape. The current runtime
+performs none of them. A future selected repair must be idempotent, audited,
+expected-state guarded, and bounded. Administration already requires current
+operator authorization and explicit confirmation for provider-side or mutating
+actions, then fails closed until a reviewed recorded-command replayer exists.
 
 ## Results and metrics
 
