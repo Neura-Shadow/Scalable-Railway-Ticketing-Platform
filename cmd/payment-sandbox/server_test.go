@@ -31,6 +31,14 @@ func TestHTTPCheckoutUsesBoundedStrictSyntheticContract(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &checkout); err != nil || !strings.HasPrefix(checkout.SyntheticToken, "tok_sandbox_") {
 		t.Fatalf("checkout response = %#v, %v", checkout, err)
 	}
+	hosted := serveJSON(handler, http.MethodPost, "/hosted/checkouts/"+checkout.ProviderPaymentID+"/authorize", ``, "")
+	if hosted.Code != http.StatusAccepted || strings.Contains(hosted.Body.String(), "tok_sandbox_") {
+		t.Fatalf("hosted checkout status = %d, body = %s", hosted.Code, hosted.Body.String())
+	}
+	status := serveJSON(handler, http.MethodGet, "/v1/payments/"+checkout.ProviderPaymentID, ``, "")
+	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"status":"authorized"`) {
+		t.Fatalf("hosted checkout provider status = %d, body = %s", status.Code, status.Body.String())
+	}
 
 	forbiddenField := "ca" + "rd_number"
 	for name, body := range map[string]string{

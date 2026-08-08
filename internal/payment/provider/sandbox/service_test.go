@@ -43,6 +43,24 @@ func TestCreateCheckoutReplaysSameResultAndRejectsFingerprintConflict(t *testing
 	}
 }
 
+func TestHostedCheckoutAuthorizesWithoutExposingSyntheticToken(t *testing.T) {
+	t.Parallel()
+
+	service := newService(t, nil)
+	checkout := createCheckout(t, service)
+	first, err := service.CompleteHostedCheckout(context.Background(), checkout.HostedReference)
+	if err != nil || first.Status != provider.StatusAuthorized {
+		t.Fatalf("complete hosted checkout = %#v, %v", first, err)
+	}
+	replayed, err := service.CompleteHostedCheckout(context.Background(), checkout.HostedReference)
+	if err != nil || replayed != first {
+		t.Fatalf("replay hosted checkout = %#v, %v; want %#v", replayed, err, first)
+	}
+	if _, err := service.CompleteHostedCheckout(context.Background(), "sandbox-checkout:missing"); err == nil {
+		t.Fatal("missing hosted checkout unexpectedly succeeded")
+	}
+}
+
 func TestAuthorizeCaptureAndFullRefundAreIdempotent(t *testing.T) {
 	t.Parallel()
 

@@ -41,6 +41,7 @@ type Config struct {
 
 type paymentRecord struct {
 	id        string
+	intentID  string
 	token     string
 	status    provider.Status
 	amount    int64
@@ -160,13 +161,40 @@ func (s *Service) CreateCheckout(ctx context.Context, request provider.CreateChe
 	id := fmt.Sprintf("pay_sandbox_%012d", s.nextPayment)
 	token := fmt.Sprintf("tok_sandbox_%012d", s.nextPayment)
 	checkout := provider.Checkout{ProviderPaymentID: id, HostedReference: "sandbox-checkout:" + id, SyntheticToken: token, Status: provider.StatusCreated, AmountMinor: request.AmountMinor, Currency: normalizeCurrency(request.Currency)}
-	s.payments[id] = &paymentRecord{id: id, token: token, status: provider.StatusCreated, amount: request.AmountMinor, currency: checkout.Currency, updatedAt: s.now().UTC()}
+	s.payments[id] = &paymentRecord{id: id, intentID: request.PaymentIntentID, token: token, status: provider.StatusCreated, amount: request.AmountMinor, currency: checkout.Currency, updatedAt: s.now().UTC()}
 	s.idempotency[request.IdempotencyKey] = idempotentResult{fingerprint: fingerprint, checkout: checkout}
 	s.enqueueWebhook(s.payments[id], provider.EventCheckoutCreated, fault)
 	if err := afterFault(OperationCreateCheckout, fault); err != nil {
 		return provider.Checkout{}, err
 	}
 	return checkout, nil
+}
+
+// CompleteHostedCheckout models a customer completing the sandbox-hosted
+// payment page. The opaque synthetic token remains inside the provider
+// boundary; callers receive only the normal provider status/webhook journey.
+func (s *Service) CompleteHostedCheckout(ctx context.Context, hostedReference string) (provider.OperationResult, error) {
+	const prefix = "sandbox-checkout:"
+	if !strings.HasPrefix(hostedReference, prefix) {
+		return provider.OperationResult{}, validationError(OperationAuthorize, "hosted checkout reference is invalid")
+	}
+	paymentID := strings.TrimPrefix(hostedReference, prefix)
+	if !validIdentifier(paymentID) {
+		return provider.OperationResult{}, validationError(OperationAuthorize, "hosted checkout reference is invalid")
+	}
+	s.mu.Lock()
+	record, ok := s.payments[paymentID]
+	if !ok {
+		s.mu.Unlock()
+		return provider.OperationResult{}, validationError(OperationAuthorize, "provider payment was not found")
+	}
+	request := provider.AuthorizeRequest{
+		PaymentIntentID: record.intentID, ProviderPaymentID: record.id,
+		SyntheticToken: record.token, AmountMinor: record.amount, Currency: record.currency,
+		IdempotencyKey: "hosted-authorize:" + record.id + ":v1",
+	}
+	s.mu.Unlock()
+	return s.Authorize(ctx, request)
 }
 
 func (s *Service) GetPaymentStatus(ctx context.Context, paymentID string) (provider.Payment, error) {

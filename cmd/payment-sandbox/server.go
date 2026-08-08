@@ -55,6 +55,14 @@ func newHandler(service *sandbox.Service, config handlerConfig) (http.Handler, e
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
+	mux.HandleFunc("POST /hosted/checkouts/{payment_id}/authorize", func(w http.ResponseWriter, r *http.Request) {
+		_, err := service.CompleteHostedCheckout(r.Context(), "sandbox-checkout:"+r.PathValue("payment_id"))
+		if err != nil {
+			writeProviderError(w, err, config.maxBodyBytes)
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": "processing"})
+	})
 	mux.HandleFunc("POST /v1/payments/{payment_id}/authorize", func(w http.ResponseWriter, r *http.Request) {
 		var request provider.AuthorizeRequest
 		if !decodeJSON(w, r, config.maxBodyBytes, &request) {
