@@ -42,6 +42,11 @@ var allowedPaths = map[string]string{
 	"/api/v1/passengers/:id":                         "/api/v1/passengers/:passenger_id",
 	"/api/v1/ticket-orders":                          "/api/v1/ticket-orders",
 	"/api/v1/ticket-orders/:id":                      "/api/v1/ticket-orders/:ticket_order_id",
+	"/api/v1/tickets/:id":                            "/api/v1/tickets/:ticket_id",
+	"/api/v1/payment-intents/:id":                    "/api/v1/payment-intents/:payment_intent_id",
+	"/api/v1/payment-intents/:id/cancel":             "/api/v1/payment-intents/:payment_intent_id/cancel",
+	"/api/v1/reservations/:id/payment-intents":       "/api/v1/reservations/:reservation_id/payment-intents",
+	"/webhooks/payments/:provider":                   "/webhooks/payments/:provider",
 	"/api/v1/admin/stations":                         "/api/v1/admin/stations",
 	"/api/v1/admin/routes":                           "/api/v1/admin/routes",
 	"/api/v1/admin/trains":                           "/api/v1/admin/trains",
@@ -147,6 +152,7 @@ type Metrics struct {
 	admission           *admissionMetrics
 	sharding            *shardingMetrics
 	physical            *physicalMetrics
+	payment             *paymentMetrics
 }
 
 // New registers the platform's bounded metric families.
@@ -158,6 +164,7 @@ func New(registerer prometheus.Registerer) (*Metrics, error) {
 	admission := newAdmissionMetrics()
 	sharding := newShardingMetrics()
 	physical := newPhysicalMetrics()
+	payment := newPaymentMetrics()
 	m := &Metrics{
 		httpRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "http_requests_total",
@@ -183,6 +190,7 @@ func New(registerer prometheus.Registerer) (*Metrics, error) {
 		admission: admission,
 		sharding:  sharding,
 		physical:  physical,
+		payment:   payment,
 	}
 
 	for _, collector := range []prometheus.Collector{
@@ -229,6 +237,11 @@ func New(registerer prometheus.Registerer) (*Metrics, error) {
 	for _, collector := range m.physical.collectors() {
 		if err := registerer.Register(collector); err != nil {
 			return nil, fmt.Errorf("metrics: register physical collector: %w", err)
+		}
+	}
+	for _, collector := range m.payment.collectors() {
+		if err := registerer.Register(collector); err != nil {
+			return nil, fmt.Errorf("metrics: register payment collector: %w", err)
 		}
 	}
 	return m, nil
