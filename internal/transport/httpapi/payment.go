@@ -24,7 +24,12 @@ func registerPaymentRoutes(group *gin.RouterGroup, dependencies Dependencies) {
 }
 
 func registerPaymentWebhookRoutes(router *gin.Engine, dependencies Dependencies) {
-	router.POST("/webhooks/payments/:provider", paymentWebhookHandler(dependencies))
+	handler := paymentWebhookHandler(dependencies)
+	if dependencies.PaymentWebhookTimeout > 0 {
+		router.POST("/webhooks/payments/:provider", requestTimeout(dependencies.PaymentWebhookTimeout), handler)
+		return
+	}
+	router.POST("/webhooks/payments/:provider", handler)
 }
 
 func createPaymentIntentHandler(dependencies Dependencies) gin.HandlerFunc {

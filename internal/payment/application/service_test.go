@@ -19,7 +19,8 @@ func TestCreateIntentDerivesFinancialsAndSecuresReservationOnce(t *testing.T) {
 		ID: reservationID, OwnerID: owner, TrainRunID: trainRunID, Status: "held",
 		AmountMinor: 12500, Currency: "TWD", ExpiresAt: now.Add(10 * time.Minute),
 	}}
-	service := application.NewService(store, reservations, func() time.Time { return now }, uuid.New)
+	service := application.NewService(store, reservations, func() time.Time { return now }, uuid.New).
+		WithProcessingGrace(2 * time.Minute)
 
 	first, err := service.CreateIntent(context.Background(), application.CreateIntentCommand{
 		OwnerID: owner, ReservationID: reservationID, IdempotencyKey: "payment-key-123",
@@ -41,6 +42,9 @@ func TestCreateIntentDerivesFinancialsAndSecuresReservationOnce(t *testing.T) {
 	}
 	if reservations.lastBegin.PaymentIntentID != first.ID || reservations.lastBegin.AmountMinor != 12500 || reservations.lastBegin.Currency != "TWD" {
 		t.Fatalf("begin command = %#v", reservations.lastBegin)
+	}
+	if !reservations.lastBegin.GraceExpiresAt.Equal(now.Add(2 * time.Minute)) {
+		t.Fatalf("grace expiry = %s", reservations.lastBegin.GraceExpiresAt)
 	}
 	if store.lastReserve.IdempotencyKeyHash == [32]byte{} || store.lastReserve.RequestFingerprint == [32]byte{} {
 		t.Fatal("raw idempotency identity was not reduced to bounded hashes")

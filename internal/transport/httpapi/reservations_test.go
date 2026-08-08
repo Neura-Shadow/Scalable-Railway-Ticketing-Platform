@@ -253,3 +253,23 @@ func TestConfirmRequiresIdempotencyKeyAndPassesClaimsIdentity(t *testing.T) {
 		t.Fatalf("confirm command = %+v", reservations.mutation)
 	}
 }
+
+func TestDirectReservationConfirmationIsDisabledWhenPaymentIsRequired(t *testing.T) {
+	t.Parallel()
+	parser := &tokenParserStub{identity: httpapi.Identity{Subject: "customer-1", Role: httpapi.RoleCustomer}}
+	reservations := &reservationServiceStub{}
+	router := httpapi.New(httpapi.Dependencies{
+		TokenParser: parser, Reservations: reservations, PaymentRequiredForConfirm: true,
+	})
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/reservations/reservation-1/confirm", nil)
+	request.Header.Set("Authorization", "Bearer signed-token")
+	request.Header.Set("Idempotency-Key", "confirm-request-1")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if reservations.mutation.OwnerID != "" {
+		t.Fatalf("legacy confirm was invoked: %#v", reservations.mutation)
+	}
+}

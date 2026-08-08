@@ -68,6 +68,7 @@ type IntentRecord struct {
 	State             string
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
+	CompletedAt       *time.Time
 }
 
 type ReserveIntentRequest struct {
@@ -180,6 +181,16 @@ func NewService(store IntentStore, reservations ReservationGateway, now func() t
 		store: store, reservations: reservations, now: now, newID: newID,
 		grace: 15 * time.Minute, provider: defaultProvider,
 	}
+}
+
+// WithProcessingGrace applies the bounded reservation protection window used
+// while provider outcome is being established. Invalid values retain the safe
+// default and can never create an unbounded inventory hold.
+func (service *Service) WithProcessingGrace(grace time.Duration) *Service {
+	if service != nil && grace > 0 && grace <= 24*time.Hour {
+		service.grace = grace
+	}
+	return service
 }
 
 // CreateIntent is deliberately split into control reserve, shard mutation,

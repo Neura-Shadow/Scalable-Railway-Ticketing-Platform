@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"time"
 
 	paymentapp "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/application"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/transport/httpapi"
@@ -86,10 +87,15 @@ func parsePaymentIDs(left, right string) (uuid.UUID, uuid.UUID, error) {
 }
 
 func paymentIntentView(record paymentapp.IntentRecord) httpapi.PaymentIntentView {
+	var completedAt *time.Time
+	if record.CompletedAt != nil {
+		value := record.CompletedAt.UTC()
+		completedAt = &value
+	}
 	return httpapi.PaymentIntentView{
 		ID: record.ID.String(), ReservationID: record.ReservationID.String(), State: record.State,
 		AmountMinor: record.AmountMinor, Currency: record.Currency, HostedSessionRef: record.HostedSessionRef,
-		CreatedAt: record.CreatedAt.UTC(), UpdatedAt: record.UpdatedAt.UTC(),
+		CreatedAt: record.CreatedAt.UTC(), UpdatedAt: record.UpdatedAt.UTC(), CompletedAt: completedAt,
 	}
 }
 

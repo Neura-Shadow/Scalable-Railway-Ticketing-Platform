@@ -1251,6 +1251,9 @@ func TestLoadPaymentWorkerUsesBoundedProcessOwnedSettings(t *testing.T) {
 		"PAYMENT_WORKER_MAX_ATTEMPTS":          "9",
 		"PAYMENT_WORKER_RETRY_BASE_SECONDS":    "2",
 		"PAYMENT_WORKER_LEASE_SECONDS":         "40",
+		"PAYMENT_PROCESSING_GRACE_SECONDS":     "600",
+		"PAYMENT_MANUAL_REVIEW_AFTER_SECONDS":  "1800",
+		"PAYMENT_MAX_UNCERTAIN_SECONDS":        "7200",
 		"JWT_SECRET":                           "unused-malformed",
 	}
 	cfg, err := config.LoadFromFor(func(key string) (string, bool) {
@@ -1263,7 +1266,8 @@ func TestLoadPaymentWorkerUsesBoundedProcessOwnedSettings(t *testing.T) {
 	if !cfg.PaymentEnabled || cfg.PaymentProviderType != config.PaymentProviderSandbox ||
 		cfg.PaymentWorkerBatchSize != 17 || cfg.PaymentWorkerInterval != 400*time.Millisecond ||
 		cfg.PaymentWorkerMaxAttempts != 9 || cfg.PaymentWorkerRetryBase != 2*time.Second ||
-		cfg.PaymentWorkerLease != 40*time.Second {
+		cfg.PaymentWorkerLease != 40*time.Second || cfg.PaymentProcessingGrace != 10*time.Minute ||
+		cfg.PaymentManualReviewAfter != 30*time.Minute || cfg.PaymentMaxUncertain != 2*time.Hour {
 		t.Fatalf("payment worker settings = %+v", cfg)
 	}
 	keys, err := cfg.ParsePaymentWebhookKeys()

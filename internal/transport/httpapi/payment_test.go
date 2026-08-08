@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/transport/httpapi"
 )
@@ -101,6 +102,24 @@ func TestPaymentWebhookIsUnauthenticatedButBoundedAndContentTyped(t *testing.T) 
 	}
 }
 
+func TestPaymentWebhookEnforcesConfiguredRequestTimeout(t *testing.T) {
+	webhooks := &webhookServiceStub{waitForCancellation: true}
+	router := httpapi.New(httpapi.Dependencies{
+		PaymentWebhooks: webhooks, PaymentWebhookMaxBodyBytes: 64,
+		PaymentWebhookTimeout: time.Millisecond,
+	})
+	request := httptest.NewRequest(http.MethodPost, "/webhooks/payments/sandbox", strings.NewReader(`{"id":"evt-1"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Payment-Key-ID", "test-key")
+	request.Header.Set("X-Payment-Timestamp", "1786161600")
+	request.Header.Set("X-Payment-Signature", "synthetic-signature")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized || !webhooks.contextCancelled {
+		t.Fatalf("status=%d cancelled=%t body=%s", response.Code, webhooks.contextCancelled, response.Body.String())
+	}
+}
+
 type paymentServiceStub struct {
 	create   httpapi.CreatePaymentIntentCommand
 	cancel   httpapi.CancelPaymentIntentCommand
@@ -126,12 +145,19 @@ func (stub *paymentServiceStub) CancelPaymentIntent(_ context.Context, command h
 }
 
 type webhookServiceStub struct {
-	request httpapi.PaymentWebhookRequest
-	result  httpapi.PaymentWebhookDisposition
-	err     error
+	request             httpapi.PaymentWebhookRequest
+	result              httpapi.PaymentWebhookDisposition
+	err                 error
+	waitForCancellation bool
+	contextCancelled    bool
 }
 
-func (stub *webhookServiceStub) IngestPaymentWebhook(_ context.Context, request httpapi.PaymentWebhookRequest) (httpapi.PaymentWebhookDisposition, error) {
+func (stub *webhookServiceStub) IngestPaymentWebhook(ctx context.Context, request httpapi.PaymentWebhookRequest) (httpapi.PaymentWebhookDisposition, error) {
 	stub.request = request
+	if stub.waitForCancellation {
+		<-ctx.Done()
+		stub.contextCancelled = true
+		return "", httpapi.ErrWebhookInvalid
+	}
 	return stub.result, stub.err
 }

@@ -365,7 +365,7 @@ SELECT intent.payment_intent_id,saga.saga_id,intent.reservation_id,
        COALESCE(intent.provider_payment_id,''),
        COALESCE(intent.hosted_session_ref,''),intent.amount_minor,
        intent.currency,intent.state,intent.request_fingerprint,
-       intent.created_at,intent.updated_at
+       intent.created_at,intent.updated_at,intent.completed_at
 FROM public.payment_intents AS intent
 JOIN public.payment_sagas AS saga
   ON saga.payment_intent_id=intent.payment_intent_id `
@@ -379,7 +379,7 @@ func scanIntent(row pgx.Row) (paymentapp.IntentRecord, [sha256.Size]byte, error)
 		&record.ID, &record.SagaID, &record.ReservationID, &record.TrainRunID,
 		&record.OwnerID, &record.Provider, &record.ProviderPaymentID,
 		&record.HostedSessionRef, &record.AmountMinor, &record.Currency,
-		&record.State, &fingerprint, &record.CreatedAt, &record.UpdatedAt,
+		&record.State, &fingerprint, &record.CreatedAt, &record.UpdatedAt, &record.CompletedAt,
 	)
 	if err != nil {
 		return paymentapp.IntentRecord{}, [sha256.Size]byte{}, err

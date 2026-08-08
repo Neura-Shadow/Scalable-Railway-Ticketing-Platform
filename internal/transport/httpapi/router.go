@@ -22,6 +22,8 @@ type Dependencies struct {
 	Payments                   PaymentService
 	PaymentWebhooks            PaymentWebhookService
 	PaymentWebhookMaxBodyBytes int64
+	PaymentWebhookTimeout      time.Duration
+	PaymentRequiredForConfirm  bool
 	WaitingRoom                WaitingRoomService
 	HotTrainPolicies           HotTrainPolicyService
 	MaxRequestBodyBytes        int64

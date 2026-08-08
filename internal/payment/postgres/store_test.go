@@ -251,7 +251,7 @@ func intentRow(intent paymentapp.IntentRecord) pgx.Row {
 		intent.ID, intent.SagaID, intent.ReservationID, intent.TrainRunID,
 		intent.OwnerID, intent.Provider, intent.ProviderPaymentID,
 		intent.HostedSessionRef, intent.AmountMinor, intent.Currency,
-		intent.State, fixtureFingerprint[:], intent.CreatedAt, intent.UpdatedAt,
+		intent.State, fixtureFingerprint[:], intent.CreatedAt, intent.UpdatedAt, intent.CompletedAt,
 	}}
 }
 

@@ -180,6 +180,9 @@ type Config struct {
 	PaymentProviderMaxResponseBytes                   int
 	PaymentWebhookMaxBodyBytes                        int
 	PaymentWebhookClockSkew                           time.Duration
+	PaymentProcessingGrace                            time.Duration
+	PaymentManualReviewAfter                          time.Duration
+	PaymentMaxUncertain                               time.Duration
 	PaymentSagaWorkerEnabled                          bool
 	PaymentReconcilerEnabled                          bool
 	PaymentWorkerEnabled                              bool
@@ -261,6 +264,9 @@ func Defaults() Config {
 		PaymentProviderMaxResponseBytes:             64 << 10,
 		PaymentWebhookMaxBodyBytes:                  64 << 10,
 		PaymentWebhookClockSkew:                     5 * time.Minute,
+		PaymentProcessingGrace:                      15 * time.Minute,
+		PaymentManualReviewAfter:                    time.Hour,
+		PaymentMaxUncertain:                         24 * time.Hour,
 		PaymentWorkerBatchSize:                      25,
 		PaymentWorkerInterval:                       250 * time.Millisecond,
 		PaymentWorkerMaxAttempts:                    8,
@@ -574,6 +580,15 @@ func validatePaymentConfig(c Config, worker, reconciler bool) error {
 	}
 	if c.PaymentWebhookClockSkew <= 0 || c.PaymentWebhookClockSkew > time.Hour {
 		problems = append(problems, errors.New("PAYMENT_WEBHOOK_CLOCK_SKEW_SECONDS must be positive and bounded"))
+	}
+	if c.PaymentProcessingGrace <= 0 || c.PaymentProcessingGrace > 24*time.Hour {
+		problems = append(problems, errors.New("PAYMENT_PROCESSING_GRACE_SECONDS must be positive and bounded"))
+	}
+	if c.PaymentManualReviewAfter < c.PaymentProcessingGrace || c.PaymentManualReviewAfter > 7*24*time.Hour {
+		problems = append(problems, errors.New("PAYMENT_MANUAL_REVIEW_AFTER_SECONDS must be bounded and no shorter than processing grace"))
+	}
+	if c.PaymentMaxUncertain < c.PaymentManualReviewAfter || c.PaymentMaxUncertain > 30*24*time.Hour {
+		problems = append(problems, errors.New("PAYMENT_MAX_UNCERTAIN_SECONDS must be bounded and no shorter than manual review"))
 	}
 	if worker && !c.PaymentWorkerEnabled {
 		problems = append(problems, errors.New("PAYMENT_WORKER_ENABLED must be true for the payment-worker process"))
@@ -927,6 +942,18 @@ func loadPaymentSettings(lookup LookupFunc, cfg *Config) error {
 	}
 	if err := setSeconds(lookup, "PAYMENT_WEBHOOK_CLOCK_SKEW_SECONDS", &cfg.PaymentWebhookClockSkew); err != nil {
 		return err
+	}
+	for _, item := range []struct {
+		name   string
+		target *time.Duration
+	}{
+		{"PAYMENT_PROCESSING_GRACE_SECONDS", &cfg.PaymentProcessingGrace},
+		{"PAYMENT_MANUAL_REVIEW_AFTER_SECONDS", &cfg.PaymentManualReviewAfter},
+		{"PAYMENT_MAX_UNCERTAIN_SECONDS", &cfg.PaymentMaxUncertain},
+	} {
+		if err := setSeconds(lookup, item.name, item.target); err != nil {
+			return err
+		}
 	}
 	for _, item := range []struct {
 		name   string

@@ -23,6 +23,13 @@ import (
 	operatorpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/operatorcommand/postgres"
 	bookingpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/postgres"
 	offeringpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/offering/postgres"
+	paymentapp "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/application"
+	paymentpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/postgres"
+	providerhttp "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider/httpclient"
+	paymentshard "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/shard"
+	paymentshardpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/shard/postgres"
+	paymentwebhook "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/webhook"
+	webhookpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/webhook/postgres"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/clock"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
 	platformmetrics "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/metrics"
@@ -37,6 +44,7 @@ import (
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/routecache"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/transport/httpapi"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
@@ -408,26 +416,86 @@ func run(logger *slog.Logger) error {
 			return errors.New("physical operator state reader initialization failed")
 		}
 	}
+	var (
+		paymentService  httpapi.PaymentService
+		paymentWebhooks httpapi.PaymentWebhookService
+	)
+	if cfg.PaymentEnabled {
+		if physicalRouter == nil {
+			return errors.New("payment requires physical booking shards")
+		}
+		controlStore, paymentErr := paymentpostgres.NewStore(pool)
+		if paymentErr != nil {
+			return errors.New("payment control initialization failed")
+		}
+		directory, paymentErr := paymentshardpostgres.NewDirectory(pool)
+		if paymentErr != nil {
+			return errors.New("payment directory initialization failed")
+		}
+		shardStore, paymentErr := paymentshardpostgres.NewStore(physicalRouter)
+		if paymentErr != nil {
+			return errors.New("payment shard store initialization failed")
+		}
+		shardGateway, paymentErr := paymentshard.NewGateway(directory, shardStore)
+		if paymentErr != nil {
+			return errors.New("payment shard gateway initialization failed")
+		}
+		useCases := paymentapp.NewService(controlStore, shardGateway, time.Now, uuid.New).
+			WithProcessingGrace(cfg.PaymentProcessingGrace)
+		paymentService = app.NewPaymentService(useCases)
+
+		webhookKeys, paymentErr := cfg.ParsePaymentWebhookKeys()
+		if paymentErr != nil {
+			return errors.New("payment webhook keyring invalid")
+		}
+		providerClient, paymentErr := providerhttp.New(providerhttp.Config{
+			BaseURL: cfg.PaymentProviderBaseURL, ConnectTimeout: cfg.PaymentProviderConnectTimeout,
+			RequestTimeout:      cfg.PaymentProviderRequestTimeout,
+			MaxResponseBytes:    int64(cfg.PaymentProviderMaxResponseBytes),
+			MaxWebhookBodyBytes: int64(cfg.PaymentWebhookMaxBodyBytes), WebhookKeys: webhookKeys,
+			WebhookClockSkew: cfg.PaymentWebhookClockSkew,
+		})
+		if paymentErr != nil {
+			return errors.New("payment provider initialization failed")
+		}
+		webhookRepository, paymentErr := webhookpostgres.NewRepository(pool)
+		if paymentErr != nil {
+			return errors.New("payment webhook repository initialization failed")
+		}
+		paymentWebhooks, paymentErr = paymentwebhook.NewService(paymentwebhook.Config{
+			Providers:  map[string]paymentwebhook.Verifier{"sandbox": providerClient},
+			Repository: webhookRepository, MaxBodyBytes: cfg.PaymentWebhookMaxBodyBytes,
+			Now: time.Now, NewID: uuid.New,
+		})
+		if paymentErr != nil {
+			return errors.New("payment webhook initialization failed")
+		}
+	}
 	router := httpapi.New(httpapi.Dependencies{
-		Readiness:              readiness,
-		ReadinessTimeout:       readinessTimeout(cfg),
-		PhysicalRequestTimeout: physicalRequestTimeout,
-		TokenParser:            tokenParser,
-		Reservations:           reservationService,
-		WaitingRoom:            app.NewWaitingRoomService(policyStore, queryStore, admissionControl, admissionKeyring, metrics),
-		HotTrainPolicies:       app.NewHotTrainPolicyService(policyStore),
-		MaxRequestBodyBytes:    maxRequestBodyBytes,
-		MaxPassengers:          cfg.MaxPassengersPerReservation,
-		HTTPMetrics:            metrics,
-		MetricsHandler:         promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
-		Offering:               app.NewOfferingQueries(cachedQueryStore),
-		Auth:                   auth,
-		RateLimiter:            app.NewRateLimiter(rateLimitBackend),
-		Passengers:             passengers,
-		Tickets:                ticketQueries,
-		Admin:                  app.NewAdminCommands(offeringStore),
-		Operator:               operatorCommands,
-		OperatorBookingState:   operatorBookingState,
+		Readiness:                  readiness,
+		ReadinessTimeout:           readinessTimeout(cfg),
+		PhysicalRequestTimeout:     physicalRequestTimeout,
+		TokenParser:                tokenParser,
+		Reservations:               reservationService,
+		Payments:                   paymentService,
+		PaymentWebhooks:            paymentWebhooks,
+		PaymentWebhookMaxBodyBytes: int64(cfg.PaymentWebhookMaxBodyBytes),
+		PaymentWebhookTimeout:      cfg.DatabaseTimeout,
+		PaymentRequiredForConfirm:  cfg.PaymentEnabled,
+		WaitingRoom:                app.NewWaitingRoomService(policyStore, queryStore, admissionControl, admissionKeyring, metrics),
+		HotTrainPolicies:           app.NewHotTrainPolicyService(policyStore),
+		MaxRequestBodyBytes:        maxRequestBodyBytes,
+		MaxPassengers:              cfg.MaxPassengersPerReservation,
+		HTTPMetrics:                metrics,
+		MetricsHandler:             promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
+		Offering:                   app.NewOfferingQueries(cachedQueryStore),
+		Auth:                       auth,
+		RateLimiter:                app.NewRateLimiter(rateLimitBackend),
+		Passengers:                 passengers,
+		Tickets:                    ticketQueries,
+		Admin:                      app.NewAdminCommands(offeringStore),
+		Operator:                   operatorCommands,
+		OperatorBookingState:       operatorBookingState,
 	})
 	if err := router.SetTrustedProxies(cfg.TrustedProxies); err != nil {
 		return errors.New("trusted proxy configuration invalid")

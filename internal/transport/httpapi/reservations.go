@@ -92,6 +92,10 @@ func reservationActionHandler(dependencies Dependencies, action string) gin.Hand
 		case "get":
 			result, err = dependencies.Reservations.GetReservation(c.Request.Context(), identity.Subject, reservationID)
 		case "confirm":
+			if dependencies.PaymentRequiredForConfirm {
+				writeError(c, ErrReservationNotPayable)
+				return
+			}
 			result, err = dependencies.Reservations.ConfirmReservation(c.Request.Context(), ReservationMutationCommand{OwnerID: identity.Subject, ReservationID: reservationID, IdempotencyKey: idempotencyKey})
 		case "cancel":
 			result, err = dependencies.Reservations.CancelReservation(c.Request.Context(), ReservationMutationCommand{OwnerID: identity.Subject, ReservationID: reservationID, IdempotencyKey: idempotencyKey})
