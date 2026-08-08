@@ -14,17 +14,143 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// ReverseAdapter migrates a physical booking-shard v1 source back into one of
-// the three fixed control-database booking layouts. The physical-only snapshot,
-// fare-snapshot, seat-catalog and command-receipt tables have no version-8
-// target equivalent; the adapter validates and copies the authoritative
-// version-8 booking rows and the control outbox instead.
+// ReverseAdapter migrates a physical booking-shard v2 source back into one of
+// the three fixed control-database booking layouts after control migration 10
+// has installed payment-compatible columns and durable receipt relations.
 type ReverseAdapter struct {
 	targetID  string
 	source    physicalpostgres.DB
 	control   physicalpostgres.DB
 	sourceOps *physicalpostgres.Shards
 }
+
+const reverseSourcePreflightSQL = `
+SELECT current_setting('server_version_num')::integer >= 160000
+   AND EXISTS (
+       SELECT 1 FROM public.schema_migrations WHERE version=2 AND NOT dirty
+   )
+   AND to_regclass('public.train_run_booking_snapshots') IS NOT NULL
+   AND to_regclass('public.train_run_mutation_journal') IS NOT NULL
+   AND to_regclass('public.migration_capture_state') IS NOT NULL
+   AND to_regclass('public.booking_command_receipts') IS NOT NULL
+   AND to_regclass('public.payment_command_receipts') IS NOT NULL
+   AND to_regclass('public.ticket_issuance_receipts') IS NOT NULL
+   AND to_regclass('public.payment_refund_receipts') IS NOT NULL
+   AND to_regclass('public.payment_compensation_receipts') IS NOT NULL
+   AND NOT EXISTS (
+       SELECT 1 FROM (VALUES
+           ('train_run_booking_snapshots_capture_mutation'),
+           ('booking_seat_catalog_capture_mutation'),
+           ('booking_fare_snapshots_capture_mutation'),
+           ('seat_inventory_capture_mutation'),
+           ('reservations_capture_mutation'),
+           ('reservation_seats_capture_mutation'),
+           ('ticket_orders_capture_mutation'),
+           ('tickets_capture_mutation'),
+           ('idempotency_records_capture_mutation'),
+           ('booking_command_receipts_capture_mutation'),
+           ('payment_command_receipts_capture_mutation'),
+           ('ticket_issuance_receipts_capture_mutation'),
+           ('payment_refund_receipts_capture_mutation'),
+           ('payment_compensation_receipts_capture_mutation')
+       ) AS required(trigger_name)
+       WHERE NOT EXISTS (
+           SELECT 1 FROM pg_catalog.pg_trigger
+           WHERE tgname=required.trigger_name AND NOT tgisinternal
+       )
+   )
+   AND EXISTS (
+       SELECT 1 FROM public.train_run_booking_snapshots
+       WHERE train_run_id=$1 AND assignment_generation=$2
+   )
+   AND EXISTS (
+       SELECT 1 FROM public.train_run_write_fences
+       WHERE train_run_id=$1 AND assignment_generation=$2
+         AND state='active' AND write_enabled
+   )`
+
+const reverseTargetPreflightSQL = `
+SELECT current_setting('server_version_num')::integer >= 160000
+   AND EXISTS (SELECT 1 FROM public.schema_migrations WHERE version=10 AND NOT dirty)
+   AND to_regclass('public.physical_control_target_apply_receipts') IS NOT NULL
+   AND to_regprocedure('public.guard_control_booking_receipt_write()') IS NOT NULL
+   AND to_regprocedure('public.capture_physical_source_receipt_mutation()') IS NOT NULL
+   AND CASE $5
+       WHEN 'legacy' THEN
+           to_regclass('public.booking_command_receipts') IS NOT NULL
+           AND to_regclass('public.payment_command_receipts') IS NOT NULL
+           AND to_regclass('public.ticket_issuance_receipts') IS NOT NULL
+           AND to_regclass('public.payment_refund_receipts') IS NOT NULL
+           AND to_regclass('public.payment_compensation_receipts') IS NOT NULL
+       WHEN 'shard-0' THEN
+           to_regclass('booking_shard_0.booking_command_receipts') IS NOT NULL
+           AND to_regclass('booking_shard_0.payment_command_receipts') IS NOT NULL
+           AND to_regclass('booking_shard_0.ticket_issuance_receipts') IS NOT NULL
+           AND to_regclass('booking_shard_0.payment_refund_receipts') IS NOT NULL
+           AND to_regclass('booking_shard_0.payment_compensation_receipts') IS NOT NULL
+       WHEN 'shard-1' THEN
+           to_regclass('booking_shard_1.booking_command_receipts') IS NOT NULL
+           AND to_regclass('booking_shard_1.payment_command_receipts') IS NOT NULL
+           AND to_regclass('booking_shard_1.ticket_issuance_receipts') IS NOT NULL
+           AND to_regclass('booking_shard_1.payment_refund_receipts') IS NOT NULL
+           AND to_regclass('booking_shard_1.payment_compensation_receipts') IS NOT NULL
+       ELSE false
+   END
+   AND NOT EXISTS (
+       SELECT 1
+       FROM (VALUES
+           ('booking_command_receipts'), ('payment_command_receipts'),
+           ('ticket_issuance_receipts'), ('payment_refund_receipts'),
+           ('payment_compensation_receipts')
+       ) AS required_table(table_name)
+       CROSS JOIN (VALUES
+           ('physical_target_write_guard'), ('physical_source_capture')
+       ) AS required_trigger(trigger_name)
+       WHERE NOT EXISTS (
+           SELECT 1
+           FROM pg_catalog.pg_trigger AS trigger_row
+           JOIN pg_catalog.pg_class AS table_row ON table_row.oid=trigger_row.tgrelid
+           JOIN pg_catalog.pg_namespace AS schema_row ON schema_row.oid=table_row.relnamespace
+           WHERE NOT trigger_row.tgisinternal
+             AND schema_row.nspname=CASE $5
+                 WHEN 'legacy' THEN 'public'
+                 WHEN 'shard-0' THEN 'booking_shard_0'
+                 WHEN 'shard-1' THEN 'booking_shard_1'
+             END
+             AND table_row.relname=required_table.table_name
+             AND trigger_row.tgname=required_trigger.trigger_name
+       )
+   )
+   AND NOT EXISTS (
+       SELECT 1 FROM (VALUES
+           ('reservations','reservations_guard_payment_snapshot'),
+           ('ticket_orders','ticket_orders_guard_payment_snapshot')
+       ) AS required(table_name,trigger_name)
+       WHERE NOT EXISTS (
+           SELECT 1
+           FROM pg_catalog.pg_trigger AS trigger_row
+           JOIN pg_catalog.pg_class AS table_row ON table_row.oid=trigger_row.tgrelid
+           JOIN pg_catalog.pg_namespace AS schema_row ON schema_row.oid=table_row.relnamespace
+           WHERE NOT trigger_row.tgisinternal
+             AND schema_row.nspname=CASE $5
+                 WHEN 'legacy' THEN 'public'
+                 WHEN 'shard-0' THEN 'booking_shard_0'
+                 WHEN 'shard-1' THEN 'booking_shard_1'
+             END
+             AND table_row.relname=required.table_name
+             AND trigger_row.tgname=required.trigger_name
+       )
+   )
+   AND assignment.shard_id=$2
+   AND assignment.assignment_generation=$3
+   AND assignment.active_physical_migration_id=$4
+   AND shard.storage_kind='postgres'
+   AND target.storage_kind IN ('legacy_schema','logical_schema')
+   AND target.enabled AND target.write_enabled
+FROM public.train_run_shard_assignments AS assignment
+JOIN public.booking_shards AS shard ON shard.shard_id=assignment.shard_id
+JOIN public.booking_shards AS target ON target.shard_id=$5
+WHERE assignment.train_run_id=$1`
 
 func NewReverse(control, source physicalpostgres.DB, targetID string) (*ReverseAdapter, error) {
 	if control == nil || source == nil || !validSource(targetID) {
@@ -38,45 +164,19 @@ func NewReverse(control, source physicalpostgres.DB, targetID string) (*ReverseA
 }
 
 func (adapter *ReverseAdapter) Preflight(ctx context.Context, record physicalmigration.Record) error {
-	// Physical schema v2 contains payment state and durable receipts that the
-	// version-8 control layouts cannot represent. Keep this path pinned to v1
-	// so an operator cannot silently down-convert or discard payment evidence.
 	if adapter == nil || !record.ReverseMigration || record.TargetShardID != adapter.targetID ||
-		record.SourceProtocolVersion != 1 || record.SourceSchemaVersion != 1 ||
+		record.SourceProtocolVersion != 1 || record.SourceSchemaVersion != 2 ||
 		record.TargetProtocolVersion != 1 || record.TargetSchemaVersion != 8 {
 		return physicalmigration.ErrCheckpointConflict
 	}
 	var sourceReady bool
-	if err := adapter.source.QueryRow(ctx, `
-SELECT current_setting('server_version_num')::integer >= 160000
-   AND to_regclass('public.train_run_booking_snapshots') IS NOT NULL
-   AND to_regclass('public.train_run_mutation_journal') IS NOT NULL
-   AND to_regclass('public.migration_capture_state') IS NOT NULL
-   AND EXISTS (
-       SELECT 1 FROM public.train_run_booking_snapshots
-       WHERE train_run_id=$1 AND assignment_generation=$2
-   )
-   AND EXISTS (
-       SELECT 1 FROM public.train_run_write_fences
-       WHERE train_run_id=$1 AND assignment_generation=$2
-         AND state='active' AND write_enabled
-   )`, record.TrainRunID, record.SourceGeneration).Scan(&sourceReady); err != nil || !sourceReady {
+	if err := adapter.source.QueryRow(ctx, reverseSourcePreflightSQL,
+		record.TrainRunID, record.SourceGeneration).Scan(&sourceReady); err != nil || !sourceReady {
 		return physicalmigration.ErrCheckpointConflict
 	}
 	var targetReady bool
-	if err := adapter.control.QueryRow(ctx, `
-SELECT current_setting('server_version_num')::integer >= 160000
-   AND to_regclass('public.physical_control_target_apply_receipts') IS NOT NULL
-   AND assignment.shard_id=$2
-   AND assignment.assignment_generation=$3
-   AND assignment.active_physical_migration_id=$4
-   AND shard.storage_kind='postgres'
-   AND target.storage_kind IN ('legacy_schema','logical_schema')
-   AND target.enabled AND target.write_enabled
-FROM public.train_run_shard_assignments AS assignment
-JOIN public.booking_shards AS shard ON shard.shard_id=assignment.shard_id
-JOIN public.booking_shards AS target ON target.shard_id=$5
-WHERE assignment.train_run_id=$1`, record.TrainRunID, record.SourceShardID,
+	if err := adapter.control.QueryRow(ctx, reverseTargetPreflightSQL,
+		record.TrainRunID, record.SourceShardID,
 		record.SourceGeneration, record.MigrationID, adapter.targetID).Scan(&targetReady); err != nil || !targetReady {
 		return physicalmigration.ErrCheckpointConflict
 	}
@@ -352,7 +452,13 @@ WHERE train_run_id=$1 AND shard_id=$2 AND assignment_generation=$3`, record.Trai
 }
 
 func (adapter *ReverseAdapter) Validate(ctx context.Context, request physicalmigration.ValidationRequest) (physicalmigration.ValidationResult, error) {
-	tables := []string{"seat_inventory", "reservations", "reservation_seats", "ticket_orders", "tickets", "idempotency_records", "outbox_events"}
+	tables := []string{
+		"train_run_booking_snapshots", "booking_seat_catalog", "booking_fare_snapshots",
+		"seat_inventory", "reservations", "reservation_seats", "ticket_orders", "tickets",
+		"idempotency_records", "booking_command_receipts", "payment_command_receipts",
+		"ticket_issuance_receipts", "payment_refund_receipts",
+		"payment_compensation_receipts", "outbox_events",
+	}
 	if request.MaxRows <= 0 || request.MaxTables < len(tables) {
 		return physicalmigration.ValidationResult{}, physicalmigration.ErrInvalidInput
 	}
@@ -364,8 +470,13 @@ func (adapter *ReverseAdapter) Validate(ctx context.Context, request physicalmig
 		if err != nil {
 			return physicalmigration.ValidationResult{}, err
 		}
-		targetRows, err := adapter.reverseValidationRows(ctx, adapter.control,
-			reverseTargetValidationSQL(adapter.targetID, table), request.Migration, table, remaining+1, false)
+		var targetRows []canonicalRow
+		if reverseIgnoredTable(table) {
+			targetRows, err = adapter.reverseDerivedTargetRows(ctx, request.Migration, table, remaining+1)
+		} else {
+			targetRows, err = adapter.reverseValidationRows(ctx, adapter.control,
+				reverseTargetValidationSQL(adapter.targetID, table), request.Migration, table, remaining+1, false)
+		}
 		if err != nil {
 			return physicalmigration.ValidationResult{}, err
 		}
@@ -380,6 +491,36 @@ func (adapter *ReverseAdapter) Validate(ctx context.Context, request physicalmig
 		if digestRows(sourceRows) != digestRows(targetRows) {
 			result.Passed = false
 		}
+	}
+	return result, nil
+}
+
+func (adapter *ReverseAdapter) reverseDerivedTargetRows(ctx context.Context, record physicalmigration.Record,
+	table string, limit int) ([]canonicalRow, error) {
+	query, ok := sourceQuery(table)
+	if !ok || !reverseIgnoredTable(table) || limit <= 0 {
+		return nil, physicalmigration.ErrInvalidInput
+	}
+	rows, err := adapter.control.Query(ctx, query, record.TrainRunID, adapter.targetID,
+		record.TargetGeneration, uuid.Nil, nil, limit)
+	if err != nil {
+		return nil, fmt.Errorf("%w: derive reverse validation target", physicalpostgres.ErrShardOperation)
+	}
+	defer rows.Close()
+	result := make([]canonicalRow, 0)
+	for rows.Next() {
+		var row canonicalRow
+		if err := rows.Scan(&row.ID, &row.Data); err != nil {
+			return nil, fmt.Errorf("%w: scan reverse derived target", physicalpostgres.ErrShardOperation)
+		}
+		row.Data, err = reverseCanonicalJSON(row.Data, table)
+		if err != nil {
+			return nil, physicalmigration.ErrInvalidBatch
+		}
+		result = append(result, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%w: iterate reverse derived target", physicalpostgres.ErrShardOperation)
 	}
 	return result, nil
 }
@@ -618,7 +759,9 @@ func reverseBaseFingerprint(payload physicalpostgres.BasePayload) [32]byte {
 func reverseSupportedTable(table string) bool {
 	switch table {
 	case "seat_inventory", "reservations", "reservation_seats", "ticket_orders",
-		"tickets", "idempotency_records", "outbox_events":
+		"tickets", "idempotency_records", "booking_command_receipts",
+		"payment_command_receipts", "ticket_issuance_receipts",
+		"payment_refund_receipts", "payment_compensation_receipts", "outbox_events":
 		return true
 	default:
 		return false
@@ -627,7 +770,7 @@ func reverseSupportedTable(table string) bool {
 
 func reverseIgnoredTable(table string) bool {
 	switch table {
-	case "train_run_booking_snapshots", "booking_seat_catalog", "booking_fare_snapshots", "booking_command_receipts":
+	case "train_run_booking_snapshots", "booking_seat_catalog", "booking_fare_snapshots":
 		return true
 	default:
 		return false

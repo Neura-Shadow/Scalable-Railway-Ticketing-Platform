@@ -20,12 +20,67 @@ func sourceQuery(table string) (string, bool) {
 		return sourceTicketSQL, true
 	case "idempotency_records":
 		return sourceIdempotencySQL, true
+	case "booking_command_receipts":
+		return sourceBookingCommandReceiptSQL, true
+	case "payment_command_receipts":
+		return sourcePaymentCommandReceiptSQL, true
+	case "ticket_issuance_receipts":
+		return sourceTicketIssuanceReceiptSQL, true
+	case "payment_refund_receipts":
+		return sourcePaymentRefundReceiptSQL, true
+	case "payment_compensation_receipts":
+		return sourcePaymentCompensationReceiptSQL, true
 	case "outbox_events":
 		return sourceOutboxSQL, true
 	default:
 		return "", false
 	}
 }
+
+const sourceBookingCommandReceiptSQL = `
+SELECT receipt.id,
+       (to_jsonb(receipt) - 'source_shard_id') ||
+       jsonb_build_object('assignment_generation',$3::bigint)
+FROM public.physical_source_booking_command_receipt_rows AS receipt
+WHERE receipt.train_run_id=$1 AND receipt.source_shard_id=$2
+  AND (($5::uuid IS NULL AND receipt.id>$4) OR receipt.id=$5)
+ORDER BY receipt.id LIMIT $6`
+
+const sourcePaymentCommandReceiptSQL = `
+SELECT receipt.id,
+       (to_jsonb(receipt) - 'source_shard_id') ||
+       jsonb_build_object('assignment_generation',$3::bigint)
+FROM public.physical_source_payment_command_receipt_rows AS receipt
+WHERE receipt.train_run_id=$1 AND receipt.source_shard_id=$2
+  AND (($5::uuid IS NULL AND receipt.id>$4) OR receipt.id=$5)
+ORDER BY receipt.id LIMIT $6`
+
+const sourceTicketIssuanceReceiptSQL = `
+SELECT receipt.id,
+       (to_jsonb(receipt) - 'source_shard_id') ||
+       jsonb_build_object('assignment_generation',$3::bigint)
+FROM public.physical_source_ticket_issuance_receipt_rows AS receipt
+WHERE receipt.train_run_id=$1 AND receipt.source_shard_id=$2
+  AND (($5::uuid IS NULL AND receipt.id>$4) OR receipt.id=$5)
+ORDER BY receipt.id LIMIT $6`
+
+const sourcePaymentRefundReceiptSQL = `
+SELECT receipt.id,
+       (to_jsonb(receipt) - 'source_shard_id') ||
+       jsonb_build_object('assignment_generation',$3::bigint)
+FROM public.physical_source_payment_refund_receipt_rows AS receipt
+WHERE receipt.train_run_id=$1 AND receipt.source_shard_id=$2
+  AND (($5::uuid IS NULL AND receipt.id>$4) OR receipt.id=$5)
+ORDER BY receipt.id LIMIT $6`
+
+const sourcePaymentCompensationReceiptSQL = `
+SELECT receipt.id,
+       (to_jsonb(receipt) - 'source_shard_id') ||
+       jsonb_build_object('assignment_generation',$3::bigint)
+FROM public.physical_source_payment_compensation_receipt_rows AS receipt
+WHERE receipt.train_run_id=$1 AND receipt.source_shard_id=$2
+  AND (($5::uuid IS NULL AND receipt.id>$4) OR receipt.id=$5)
+ORDER BY receipt.id LIMIT $6`
 
 const sourceSnapshotSQL = `
 WITH transformed AS (
@@ -160,6 +215,8 @@ WITH transformed AS (
            reservation.from_stop_index,reservation.to_stop_index,
            reservation.seat_class,reservation.status,reservation.expires_at,
            reservation.total_amount_minor,reservation.currency,
+           reservation.payment_intent_id,reservation.payment_amount_minor,
+           reservation.payment_currency,reservation.payment_grace_expires_at,
            reservation.created_at,reservation.updated_at
     FROM public.physical_source_reservation_rows AS reservation
     JOIN public.train_run_shard_assignments AS assignment
@@ -196,6 +253,9 @@ WITH transformed AS (
     SELECT orders.id,orders.reservation_id,orders.user_id,orders.train_run_id,
            assignment.assignment_generation,orders.status,
            orders.total_amount_minor,orders.currency,
+           orders.payment_intent_id,orders.payment_currency,
+           orders.authorized_amount_minor,orders.captured_amount_minor,
+           orders.refunded_amount_minor,
            orders.created_at,orders.updated_at
     FROM public.physical_source_ticket_order_rows AS orders
     JOIN public.train_run_shard_assignments AS assignment
@@ -284,6 +344,14 @@ func targetQuery(table string) (string, bool) {
 		return `SELECT id,to_jsonb(row_value) FROM (SELECT * FROM public.idempotency_records WHERE train_run_id=$1 AND assignment_generation=$2 ORDER BY id LIMIT $3) AS row_value`, true
 	case "booking_command_receipts":
 		return `SELECT id,to_jsonb(row_value) FROM (SELECT * FROM public.booking_command_receipts WHERE train_run_id=$1 AND assignment_generation=$2 ORDER BY id LIMIT $3) AS row_value`, true
+	case "payment_command_receipts":
+		return `SELECT id,to_jsonb(row_value) FROM (SELECT * FROM public.payment_command_receipts WHERE train_run_id=$1 AND assignment_generation=$2 ORDER BY id LIMIT $3) AS row_value`, true
+	case "ticket_issuance_receipts":
+		return `SELECT id,to_jsonb(row_value) FROM (SELECT * FROM public.ticket_issuance_receipts WHERE train_run_id=$1 AND assignment_generation=$2 ORDER BY id LIMIT $3) AS row_value`, true
+	case "payment_refund_receipts":
+		return `SELECT id,to_jsonb(row_value) FROM (SELECT * FROM public.payment_refund_receipts WHERE train_run_id=$1 AND assignment_generation=$2 ORDER BY id LIMIT $3) AS row_value`, true
+	case "payment_compensation_receipts":
+		return `SELECT id,to_jsonb(row_value) FROM (SELECT * FROM public.payment_compensation_receipts WHERE train_run_id=$1 AND assignment_generation=$2 ORDER BY id LIMIT $3) AS row_value`, true
 	case "outbox_events":
 		return `SELECT id,to_jsonb(row_value) FROM (SELECT * FROM public.outbox_events WHERE train_run_id=$1 AND assignment_generation=$2 ORDER BY id LIMIT $3) AS row_value`, true
 	default:

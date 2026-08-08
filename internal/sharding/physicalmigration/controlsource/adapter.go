@@ -36,6 +36,10 @@ var tableOrder = []string{
 	"tickets",
 	"idempotency_records",
 	"booking_command_receipts",
+	"payment_command_receipts",
+	"ticket_issuance_receipts",
+	"payment_refund_receipts",
+	"payment_compensation_receipts",
 	"outbox_events",
 }
 
@@ -72,8 +76,36 @@ func (adapter *Adapter) Preflight(ctx context.Context, record physicalmigration.
 	var sourceReady bool
 	if err := adapter.control.QueryRow(ctx, `
 SELECT current_setting('server_version_num')::integer >= 160000
+   AND EXISTS (SELECT 1 FROM public.schema_migrations WHERE version=10 AND NOT dirty)
    AND to_regclass('public.physical_source_migration_capture_state') IS NOT NULL
    AND to_regclass('public.physical_source_train_run_mutation_journal') IS NOT NULL
+   AND to_regclass('public.physical_source_booking_command_receipt_rows') IS NOT NULL
+   AND to_regclass('public.physical_source_payment_command_receipt_rows') IS NOT NULL
+   AND to_regclass('public.physical_source_ticket_issuance_receipt_rows') IS NOT NULL
+   AND to_regclass('public.physical_source_payment_refund_receipt_rows') IS NOT NULL
+   AND to_regclass('public.physical_source_payment_compensation_receipt_rows') IS NOT NULL
+   AND NOT EXISTS (
+       SELECT 1
+       FROM (VALUES
+           ('booking_command_receipts'), ('payment_command_receipts'),
+           ('ticket_issuance_receipts'), ('payment_refund_receipts'),
+           ('payment_compensation_receipts')
+       ) AS required(table_name)
+       WHERE NOT EXISTS (
+           SELECT 1
+           FROM pg_catalog.pg_trigger AS trigger_row
+           JOIN pg_catalog.pg_class AS table_row ON table_row.oid=trigger_row.tgrelid
+           JOIN pg_catalog.pg_namespace AS schema_row ON schema_row.oid=table_row.relnamespace
+           WHERE NOT trigger_row.tgisinternal
+             AND schema_row.nspname=CASE $2
+                 WHEN 'legacy' THEN 'public'
+                 WHEN 'shard-0' THEN 'booking_shard_0'
+                 WHEN 'shard-1' THEN 'booking_shard_1'
+             END
+             AND table_row.relname=required.table_name
+             AND trigger_row.tgname='physical_source_capture'
+       )
+   )
    AND assignment.shard_id = $2
    AND assignment.assignment_generation = $3
    AND assignment.assignment_state = 'migrating'
@@ -101,12 +133,23 @@ SELECT current_setting('server_version_num')::integer >= 160000
    AND to_regclass('public.train_run_booking_snapshots') IS NOT NULL
    AND to_regclass('public.migration_apply_receipts') IS NOT NULL
    AND to_regclass('public.outbox_events') IS NOT NULL
+	AND to_regclass('public.booking_command_receipts') IS NOT NULL
 	AND to_regclass('public.payment_command_receipts') IS NOT NULL
 	AND to_regclass('public.ticket_issuance_receipts') IS NOT NULL
 	AND to_regclass('public.payment_refund_receipts') IS NOT NULL
 	AND to_regclass('public.payment_compensation_receipts') IS NOT NULL
 	AND NOT EXISTS (
 	    SELECT 1 FROM (VALUES
+	        ('train_run_booking_snapshots_capture_mutation'),
+	        ('booking_seat_catalog_capture_mutation'),
+	        ('booking_fare_snapshots_capture_mutation'),
+	        ('seat_inventory_capture_mutation'),
+	        ('reservations_capture_mutation'),
+	        ('reservation_seats_capture_mutation'),
+	        ('ticket_orders_capture_mutation'),
+	        ('tickets_capture_mutation'),
+	        ('idempotency_records_capture_mutation'),
+	        ('booking_command_receipts_capture_mutation'),
 	        ('payment_command_receipts_capture_mutation'),
 	        ('ticket_issuance_receipts_capture_mutation'),
 	        ('payment_refund_receipts_capture_mutation'),
@@ -206,11 +249,6 @@ func (adapter *Adapter) ReadBaseBatch(ctx context.Context, request physicalmigra
 	}
 	for index < len(tableOrder) {
 		table := tableOrder[index]
-		if table == "booking_command_receipts" {
-			index++
-			after = uuid.Nil
-			continue
-		}
 		batch, err := adapter.readRows(ctx, request.Migration, table, after, uuid.Nil, request.Limit)
 		if err != nil {
 			return physicalmigration.BaseBatch{}, err
@@ -273,7 +311,7 @@ LIMIT $7`, request.Migration.MigrationID, request.Migration.TrainRunID,
 			&entry.EntityID, &entry.PrimaryKey, &entry.Metadata); err != nil {
 			return physicalmigration.JournalBatch{}, fmt.Errorf("%w: scan control-source journal", physicalpostgres.ErrShardOperation)
 		}
-		if !knownTable(entry.TableName) || entry.TableName == "booking_command_receipts" {
+		if !knownTable(entry.TableName) {
 			return physicalmigration.JournalBatch{}, physicalmigration.ErrInvalidBatch
 		}
 		entry.ApplyFingerprint = entryFingerprint(entry)
@@ -674,9 +712,6 @@ type canonicalRow struct {
 }
 
 func (adapter *Adapter) allSourceRows(ctx context.Context, record physicalmigration.Record, table string, limit int) ([]canonicalRow, error) {
-	if table == "booking_command_receipts" {
-		return nil, nil
-	}
 	batch, err := adapter.readRows(ctx, record, table, uuid.Nil, uuid.Nil, limit)
 	if err != nil {
 		return nil, err

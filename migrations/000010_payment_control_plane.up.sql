@@ -26,6 +26,878 @@ WHERE shard_id IN ('physical-shard-0', 'physical-shard-1')
   AND storage_kind = 'postgres'
   AND schema_version = 1;
 
+-- A reverse physical migration can make any of the three fixed control-local
+-- booking layouts authoritative again. Extend all three layouts before the
+-- payment control plane is enabled so captured, issued, refund-pending and
+-- refunded rows can be copied without lossy down-conversion. These columns
+-- contain provider-neutral identifiers, amounts and digests only.
+DROP VIEW public.physical_source_ticket_rows;
+DROP VIEW public.physical_source_ticket_order_rows;
+DROP VIEW public.physical_source_reservation_rows;
+
+ALTER TABLE public.reservations
+    DROP CONSTRAINT reservations_status_check,
+    ADD COLUMN payment_intent_id uuid,
+    ADD COLUMN payment_amount_minor bigint,
+    ADD COLUMN payment_currency text,
+    ADD COLUMN payment_grace_expires_at timestamptz,
+    ADD CONSTRAINT reservations_status_check CHECK (
+        status IN (
+            'held', 'payment_pending', 'payment_review', 'confirmed',
+            'refund_pending', 'expired', 'cancelled'
+        )
+    ),
+    ADD CONSTRAINT reservations_payment_snapshot_check CHECK (
+        (payment_intent_id IS NULL
+         AND payment_amount_minor IS NULL
+         AND payment_currency IS NULL
+         AND payment_grace_expires_at IS NULL
+         AND status NOT IN ('payment_pending', 'payment_review', 'refund_pending'))
+        OR
+        (payment_intent_id IS NOT NULL
+         AND status IN (
+             'payment_pending', 'payment_review', 'confirmed',
+             'refund_pending', 'cancelled'
+         )
+         AND payment_amount_minor = total_amount_minor
+         AND payment_amount_minor >= 0
+         AND payment_currency = currency
+         AND payment_currency ~ '^[A-Z]{3}$'
+         AND payment_grace_expires_at > created_at)
+    ),
+    ADD CONSTRAINT reservations_payment_authority_unique UNIQUE (
+        id, train_run_id, payment_intent_id, total_amount_minor, currency
+    );
+
+ALTER TABLE booking_shard_0.reservations
+    DROP CONSTRAINT reservations_status_check,
+    ADD COLUMN payment_intent_id uuid,
+    ADD COLUMN payment_amount_minor bigint,
+    ADD COLUMN payment_currency text,
+    ADD COLUMN payment_grace_expires_at timestamptz,
+    ADD CONSTRAINT reservations_status_check CHECK (
+        status IN (
+            'held', 'payment_pending', 'payment_review', 'confirmed',
+            'refund_pending', 'expired', 'cancelled'
+        )
+    ),
+    ADD CONSTRAINT reservations_payment_snapshot_check CHECK (
+        (payment_intent_id IS NULL
+         AND payment_amount_minor IS NULL
+         AND payment_currency IS NULL
+         AND payment_grace_expires_at IS NULL
+         AND status NOT IN ('payment_pending', 'payment_review', 'refund_pending'))
+        OR
+        (payment_intent_id IS NOT NULL
+         AND status IN (
+             'payment_pending', 'payment_review', 'confirmed',
+             'refund_pending', 'cancelled'
+         )
+         AND payment_amount_minor = total_amount_minor
+         AND payment_amount_minor >= 0
+         AND payment_currency = currency
+         AND payment_currency ~ '^[A-Z]{3}$'
+         AND payment_grace_expires_at > created_at)
+    ),
+    ADD CONSTRAINT reservations_payment_authority_unique UNIQUE (
+        id, train_run_id, payment_intent_id, total_amount_minor, currency
+    );
+
+ALTER TABLE booking_shard_1.reservations
+    DROP CONSTRAINT reservations_status_check,
+    ADD COLUMN payment_intent_id uuid,
+    ADD COLUMN payment_amount_minor bigint,
+    ADD COLUMN payment_currency text,
+    ADD COLUMN payment_grace_expires_at timestamptz,
+    ADD CONSTRAINT reservations_status_check CHECK (
+        status IN (
+            'held', 'payment_pending', 'payment_review', 'confirmed',
+            'refund_pending', 'expired', 'cancelled'
+        )
+    ),
+    ADD CONSTRAINT reservations_payment_snapshot_check CHECK (
+        (payment_intent_id IS NULL
+         AND payment_amount_minor IS NULL
+         AND payment_currency IS NULL
+         AND payment_grace_expires_at IS NULL
+         AND status NOT IN ('payment_pending', 'payment_review', 'refund_pending'))
+        OR
+        (payment_intent_id IS NOT NULL
+         AND status IN (
+             'payment_pending', 'payment_review', 'confirmed',
+             'refund_pending', 'cancelled'
+         )
+         AND payment_amount_minor = total_amount_minor
+         AND payment_amount_minor >= 0
+         AND payment_currency = currency
+         AND payment_currency ~ '^[A-Z]{3}$'
+         AND payment_grace_expires_at > created_at)
+    ),
+    ADD CONSTRAINT reservations_payment_authority_unique UNIQUE (
+        id, train_run_id, payment_intent_id, total_amount_minor, currency
+    );
+
+ALTER TABLE public.ticket_orders
+    DROP CONSTRAINT ticket_orders_status_check,
+    ADD COLUMN payment_intent_id uuid,
+    ADD COLUMN payment_currency text,
+    ADD COLUMN authorized_amount_minor bigint NOT NULL DEFAULT 0,
+    ADD COLUMN captured_amount_minor bigint NOT NULL DEFAULT 0,
+    ADD COLUMN refunded_amount_minor bigint NOT NULL DEFAULT 0,
+    ADD CONSTRAINT ticket_orders_status_check CHECK (
+        status IN (
+            'confirmed', 'payment_pending', 'payment_authorized',
+            'payment_captured', 'issuance_pending', 'issued',
+            'refund_pending', 'refunded', 'cancelled', 'manual_review'
+        )
+    ),
+    ADD CONSTRAINT ticket_orders_payment_snapshot_check CHECK (
+        (payment_intent_id IS NULL AND payment_currency IS NULL
+         AND authorized_amount_minor = 0 AND captured_amount_minor = 0
+         AND refunded_amount_minor = 0 AND status IN ('confirmed', 'cancelled'))
+        OR
+        (payment_intent_id IS NOT NULL AND status <> 'confirmed'
+         AND payment_currency = currency AND payment_currency ~ '^[A-Z]{3}$')
+    ),
+    ADD CONSTRAINT ticket_orders_payment_amounts_check CHECK (
+        authorized_amount_minor IN (0, total_amount_minor)
+        AND captured_amount_minor IN (0, authorized_amount_minor)
+        AND refunded_amount_minor IN (0, captured_amount_minor)
+        AND 0 <= refunded_amount_minor
+        AND refunded_amount_minor <= captured_amount_minor
+        AND captured_amount_minor <= authorized_amount_minor
+        AND authorized_amount_minor <= total_amount_minor
+    ),
+    ADD CONSTRAINT ticket_orders_payment_state_check CHECK (
+        (status <> 'payment_authorized' OR authorized_amount_minor = total_amount_minor)
+        AND (status NOT IN (
+            'payment_captured', 'issuance_pending', 'issued',
+            'refund_pending', 'refunded'
+        ) OR captured_amount_minor = total_amount_minor)
+        AND (status <> 'refunded' OR refunded_amount_minor = captured_amount_minor)
+        AND (status <> 'cancelled' OR captured_amount_minor = 0
+             OR refunded_amount_minor = captured_amount_minor)
+    ),
+    ADD CONSTRAINT ticket_orders_payment_authority_unique UNIQUE (
+        id, payment_intent_id, total_amount_minor, currency
+    );
+
+ALTER TABLE booking_shard_0.ticket_orders
+    DROP CONSTRAINT ticket_orders_status_check,
+    ADD COLUMN payment_intent_id uuid,
+    ADD COLUMN payment_currency text,
+    ADD COLUMN authorized_amount_minor bigint NOT NULL DEFAULT 0,
+    ADD COLUMN captured_amount_minor bigint NOT NULL DEFAULT 0,
+    ADD COLUMN refunded_amount_minor bigint NOT NULL DEFAULT 0,
+    ADD CONSTRAINT ticket_orders_status_check CHECK (
+        status IN (
+            'confirmed', 'payment_pending', 'payment_authorized',
+            'payment_captured', 'issuance_pending', 'issued',
+            'refund_pending', 'refunded', 'cancelled', 'manual_review'
+        )
+    ),
+    ADD CONSTRAINT ticket_orders_payment_snapshot_check CHECK (
+        (payment_intent_id IS NULL AND payment_currency IS NULL
+         AND authorized_amount_minor = 0 AND captured_amount_minor = 0
+         AND refunded_amount_minor = 0 AND status IN ('confirmed', 'cancelled'))
+        OR
+        (payment_intent_id IS NOT NULL AND status <> 'confirmed'
+         AND payment_currency = currency AND payment_currency ~ '^[A-Z]{3}$')
+    ),
+    ADD CONSTRAINT ticket_orders_payment_amounts_check CHECK (
+        authorized_amount_minor IN (0, total_amount_minor)
+        AND captured_amount_minor IN (0, authorized_amount_minor)
+        AND refunded_amount_minor IN (0, captured_amount_minor)
+        AND 0 <= refunded_amount_minor
+        AND refunded_amount_minor <= captured_amount_minor
+        AND captured_amount_minor <= authorized_amount_minor
+        AND authorized_amount_minor <= total_amount_minor
+    ),
+    ADD CONSTRAINT ticket_orders_payment_state_check CHECK (
+        (status <> 'payment_authorized' OR authorized_amount_minor = total_amount_minor)
+        AND (status NOT IN (
+            'payment_captured', 'issuance_pending', 'issued',
+            'refund_pending', 'refunded'
+        ) OR captured_amount_minor = total_amount_minor)
+        AND (status <> 'refunded' OR refunded_amount_minor = captured_amount_minor)
+        AND (status <> 'cancelled' OR captured_amount_minor = 0
+             OR refunded_amount_minor = captured_amount_minor)
+    ),
+    ADD CONSTRAINT ticket_orders_payment_authority_unique UNIQUE (
+        id, payment_intent_id, total_amount_minor, currency
+    );
+
+ALTER TABLE booking_shard_1.ticket_orders
+    DROP CONSTRAINT ticket_orders_status_check,
+    ADD COLUMN payment_intent_id uuid,
+    ADD COLUMN payment_currency text,
+    ADD COLUMN authorized_amount_minor bigint NOT NULL DEFAULT 0,
+    ADD COLUMN captured_amount_minor bigint NOT NULL DEFAULT 0,
+    ADD COLUMN refunded_amount_minor bigint NOT NULL DEFAULT 0,
+    ADD CONSTRAINT ticket_orders_status_check CHECK (
+        status IN (
+            'confirmed', 'payment_pending', 'payment_authorized',
+            'payment_captured', 'issuance_pending', 'issued',
+            'refund_pending', 'refunded', 'cancelled', 'manual_review'
+        )
+    ),
+    ADD CONSTRAINT ticket_orders_payment_snapshot_check CHECK (
+        (payment_intent_id IS NULL AND payment_currency IS NULL
+         AND authorized_amount_minor = 0 AND captured_amount_minor = 0
+         AND refunded_amount_minor = 0 AND status IN ('confirmed', 'cancelled'))
+        OR
+        (payment_intent_id IS NOT NULL AND status <> 'confirmed'
+         AND payment_currency = currency AND payment_currency ~ '^[A-Z]{3}$')
+    ),
+    ADD CONSTRAINT ticket_orders_payment_amounts_check CHECK (
+        authorized_amount_minor IN (0, total_amount_minor)
+        AND captured_amount_minor IN (0, authorized_amount_minor)
+        AND refunded_amount_minor IN (0, captured_amount_minor)
+        AND 0 <= refunded_amount_minor
+        AND refunded_amount_minor <= captured_amount_minor
+        AND captured_amount_minor <= authorized_amount_minor
+        AND authorized_amount_minor <= total_amount_minor
+    ),
+    ADD CONSTRAINT ticket_orders_payment_state_check CHECK (
+        (status <> 'payment_authorized' OR authorized_amount_minor = total_amount_minor)
+        AND (status NOT IN (
+            'payment_captured', 'issuance_pending', 'issued',
+            'refund_pending', 'refunded'
+        ) OR captured_amount_minor = total_amount_minor)
+        AND (status <> 'refunded' OR refunded_amount_minor = captured_amount_minor)
+        AND (status <> 'cancelled' OR captured_amount_minor = 0
+             OR refunded_amount_minor = captured_amount_minor)
+    ),
+    ADD CONSTRAINT ticket_orders_payment_authority_unique UNIQUE (
+        id, payment_intent_id, total_amount_minor, currency
+    );
+
+ALTER TABLE public.tickets
+    DROP CONSTRAINT tickets_status_check,
+    ADD CONSTRAINT tickets_status_check CHECK (
+        status IN ('pending', 'active', 'refund_pending', 'cancelled')
+    ),
+    ADD CONSTRAINT tickets_opaque_code_check CHECK (
+        ticket_code ~ '^[A-Za-z0-9_-]{16,64}$'
+    );
+ALTER TABLE booking_shard_0.tickets
+    DROP CONSTRAINT tickets_status_check,
+    ADD CONSTRAINT tickets_status_check CHECK (
+        status IN ('pending', 'active', 'refund_pending', 'cancelled')
+    ),
+    ADD CONSTRAINT tickets_opaque_code_check CHECK (
+        ticket_code ~ '^[A-Za-z0-9_-]{16,64}$'
+    );
+ALTER TABLE booking_shard_1.tickets
+    DROP CONSTRAINT tickets_status_check,
+    ADD CONSTRAINT tickets_status_check CHECK (
+        status IN ('pending', 'active', 'refund_pending', 'cancelled')
+    ),
+    ADD CONSTRAINT tickets_opaque_code_check CHECK (
+        ticket_code ~ '^[A-Za-z0-9_-]{16,64}$'
+    );
+
+CREATE UNIQUE INDEX reservations_payment_intent_unique_idx
+    ON public.reservations(payment_intent_id)
+    WHERE payment_intent_id IS NOT NULL;
+CREATE UNIQUE INDEX reservations_payment_intent_unique_idx
+    ON booking_shard_0.reservations(payment_intent_id)
+    WHERE payment_intent_id IS NOT NULL;
+CREATE UNIQUE INDEX reservations_payment_intent_unique_idx
+    ON booking_shard_1.reservations(payment_intent_id)
+    WHERE payment_intent_id IS NOT NULL;
+CREATE UNIQUE INDEX ticket_orders_payment_intent_unique_idx
+    ON public.ticket_orders(payment_intent_id)
+    WHERE payment_intent_id IS NOT NULL;
+CREATE UNIQUE INDEX ticket_orders_payment_intent_unique_idx
+    ON booking_shard_0.ticket_orders(payment_intent_id)
+    WHERE payment_intent_id IS NOT NULL;
+CREATE UNIQUE INDEX ticket_orders_payment_intent_unique_idx
+    ON booking_shard_1.ticket_orders(payment_intent_id)
+    WHERE payment_intent_id IS NOT NULL;
+
+CREATE FUNCTION public.guard_control_booking_payment_snapshot()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $control_booking_payment_guard$
+BEGIN
+    IF TG_TABLE_NAME = 'reservations' AND OLD.payment_intent_id IS NOT NULL
+       AND (NEW.payment_intent_id IS DISTINCT FROM OLD.payment_intent_id
+            OR NEW.payment_amount_minor IS DISTINCT FROM OLD.payment_amount_minor
+            OR NEW.payment_currency IS DISTINCT FROM OLD.payment_currency
+            OR NEW.payment_grace_expires_at IS DISTINCT FROM OLD.payment_grace_expires_at
+            OR NEW.total_amount_minor IS DISTINCT FROM OLD.total_amount_minor
+            OR NEW.currency IS DISTINCT FROM OLD.currency) THEN
+        RAISE EXCEPTION 'reservation payment snapshot is immutable'
+            USING ERRCODE = '23514';
+    END IF;
+    IF TG_TABLE_NAME = 'ticket_orders' THEN
+        IF OLD.payment_intent_id IS NOT NULL
+           AND (NEW.payment_intent_id IS DISTINCT FROM OLD.payment_intent_id
+                OR NEW.payment_currency IS DISTINCT FROM OLD.payment_currency
+                OR NEW.total_amount_minor IS DISTINCT FROM OLD.total_amount_minor
+                OR NEW.currency IS DISTINCT FROM OLD.currency) THEN
+            RAISE EXCEPTION 'ticket-order payment snapshot is immutable'
+                USING ERRCODE = '23514';
+        END IF;
+        IF NEW.authorized_amount_minor < OLD.authorized_amount_minor
+           OR NEW.captured_amount_minor < OLD.captured_amount_minor
+           OR NEW.refunded_amount_minor < OLD.refunded_amount_minor THEN
+            RAISE EXCEPTION 'ticket-order payment totals cannot decrease'
+                USING ERRCODE = '23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$control_booking_payment_guard$;
+
+CREATE TRIGGER reservations_guard_payment_snapshot BEFORE UPDATE ON public.reservations
+FOR EACH ROW EXECUTE FUNCTION public.guard_control_booking_payment_snapshot();
+CREATE TRIGGER ticket_orders_guard_payment_snapshot BEFORE UPDATE ON public.ticket_orders
+FOR EACH ROW EXECUTE FUNCTION public.guard_control_booking_payment_snapshot();
+CREATE TRIGGER reservations_guard_payment_snapshot BEFORE UPDATE ON booking_shard_0.reservations
+FOR EACH ROW EXECUTE FUNCTION public.guard_control_booking_payment_snapshot();
+CREATE TRIGGER ticket_orders_guard_payment_snapshot BEFORE UPDATE ON booking_shard_0.ticket_orders
+FOR EACH ROW EXECUTE FUNCTION public.guard_control_booking_payment_snapshot();
+CREATE TRIGGER reservations_guard_payment_snapshot BEFORE UPDATE ON booking_shard_1.reservations
+FOR EACH ROW EXECUTE FUNCTION public.guard_control_booking_payment_snapshot();
+CREATE TRIGGER ticket_orders_guard_payment_snapshot BEFORE UPDATE ON booking_shard_1.ticket_orders
+FOR EACH ROW EXECUTE FUNCTION public.guard_control_booking_payment_snapshot();
+
+CREATE TABLE public.booking_command_receipts (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    command_id uuid NOT NULL UNIQUE,
+    train_run_id uuid NOT NULL REFERENCES public.train_runs(id) ON DELETE RESTRICT,
+    command_type text NOT NULL CHECK (length(command_type) BETWEEN 1 AND 64),
+    request_fingerprint bytea NOT NULL CHECK (octet_length(request_fingerprint) = 32),
+    status text NOT NULL CHECK (status IN ('started', 'succeeded', 'rejected')),
+    result_type text,
+    result_id uuid,
+    result_source_version bigint,
+    result_booking_policy_version bigint,
+    error_code text,
+    started_at timestamptz NOT NULL,
+    completed_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE TABLE public.payment_command_receipts (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    command_id uuid NOT NULL UNIQUE,
+    payment_intent_id uuid NOT NULL,
+    reservation_id uuid NOT NULL REFERENCES public.reservations(id) ON DELETE RESTRICT,
+    train_run_id uuid NOT NULL REFERENCES public.train_runs(id) ON DELETE RESTRICT,
+    operation text NOT NULL CHECK (operation IN (
+        'reservation.payment_begin', 'payment.authorization_recorded',
+        'payment.capture_recorded', 'reservation.payment_review',
+        'reservation.refund_pending', 'reservation.payment_cancelled'
+    )),
+    request_fingerprint bytea NOT NULL CHECK (octet_length(request_fingerprint) = 32),
+    amount_minor bigint NOT NULL CHECK (amount_minor >= 0),
+    currency text NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
+    status text NOT NULL CHECK (status IN ('started', 'succeeded', 'rejected')),
+    result_resource_id uuid,
+    result_status text,
+    error_code text,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    committed_at timestamptz,
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    UNIQUE (payment_intent_id, operation, request_fingerprint),
+    FOREIGN KEY (
+        reservation_id, train_run_id, payment_intent_id, amount_minor, currency
+    ) REFERENCES public.reservations(
+        id, train_run_id, payment_intent_id, total_amount_minor, currency
+    ) ON DELETE RESTRICT
+);
+
+CREATE TABLE public.ticket_issuance_receipts (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    issuance_id uuid NOT NULL UNIQUE,
+    payment_intent_id uuid NOT NULL UNIQUE,
+    reservation_id uuid NOT NULL UNIQUE REFERENCES public.reservations(id) ON DELETE RESTRICT,
+    payment_operation_id uuid NOT NULL UNIQUE,
+    ticket_order_id uuid NOT NULL UNIQUE REFERENCES public.ticket_orders(id) ON DELETE RESTRICT,
+    train_run_id uuid NOT NULL REFERENCES public.train_runs(id) ON DELETE RESTRICT,
+    capture_proof_hash bytea NOT NULL CHECK (octet_length(capture_proof_hash) = 32),
+    amount_minor bigint NOT NULL CHECK (amount_minor >= 0),
+    currency text NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
+    issued_ticket_count integer NOT NULL CHECK (issued_ticket_count > 0),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE TABLE public.payment_refund_receipts (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    refund_operation_id uuid NOT NULL UNIQUE,
+    payment_intent_id uuid NOT NULL UNIQUE,
+    reservation_id uuid NOT NULL UNIQUE REFERENCES public.reservations(id) ON DELETE RESTRICT,
+    ticket_order_id uuid NOT NULL UNIQUE REFERENCES public.ticket_orders(id) ON DELETE RESTRICT,
+    train_run_id uuid NOT NULL REFERENCES public.train_runs(id) ON DELETE RESTRICT,
+    refund_proof_hash bytea NOT NULL CHECK (octet_length(refund_proof_hash) = 32),
+    captured_amount_minor bigint NOT NULL CHECK (captured_amount_minor > 0),
+    refunded_amount_minor bigint NOT NULL CHECK (refunded_amount_minor = captured_amount_minor),
+    currency text NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
+    refunded_at timestamptz NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE TABLE public.payment_compensation_receipts (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    compensation_id uuid NOT NULL UNIQUE,
+    payment_intent_id uuid NOT NULL UNIQUE,
+    reservation_id uuid NOT NULL UNIQUE REFERENCES public.reservations(id) ON DELETE RESTRICT,
+    ticket_order_id uuid NOT NULL UNIQUE REFERENCES public.ticket_orders(id) ON DELETE RESTRICT,
+    refund_receipt_id uuid NOT NULL UNIQUE
+        REFERENCES public.payment_refund_receipts(id) ON DELETE RESTRICT,
+    train_run_id uuid NOT NULL REFERENCES public.train_runs(id) ON DELETE RESTRICT,
+    released_seat_count integer NOT NULL CHECK (released_seat_count > 0),
+    cancelled_ticket_count integer NOT NULL CHECK (cancelled_ticket_count >= 0),
+    applied_at timestamptz NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE TABLE booking_shard_0.booking_command_receipts
+    (LIKE public.booking_command_receipts INCLUDING ALL,
+     FOREIGN KEY (train_run_id) REFERENCES public.train_runs(id) ON DELETE RESTRICT);
+CREATE TABLE booking_shard_1.booking_command_receipts
+    (LIKE public.booking_command_receipts INCLUDING ALL,
+     FOREIGN KEY (train_run_id) REFERENCES public.train_runs(id) ON DELETE RESTRICT);
+
+CREATE TABLE booking_shard_0.payment_command_receipts
+    (LIKE public.payment_command_receipts INCLUDING ALL,
+     FOREIGN KEY (reservation_id) REFERENCES booking_shard_0.reservations(id) ON DELETE RESTRICT,
+     FOREIGN KEY (train_run_id) REFERENCES public.train_runs(id) ON DELETE RESTRICT,
+     FOREIGN KEY (reservation_id, train_run_id, payment_intent_id, amount_minor, currency)
+       REFERENCES booking_shard_0.reservations(id, train_run_id, payment_intent_id, total_amount_minor, currency)
+       ON DELETE RESTRICT);
+CREATE TABLE booking_shard_1.payment_command_receipts
+    (LIKE public.payment_command_receipts INCLUDING ALL,
+     FOREIGN KEY (reservation_id) REFERENCES booking_shard_1.reservations(id) ON DELETE RESTRICT,
+     FOREIGN KEY (train_run_id) REFERENCES public.train_runs(id) ON DELETE RESTRICT,
+     FOREIGN KEY (reservation_id, train_run_id, payment_intent_id, amount_minor, currency)
+       REFERENCES booking_shard_1.reservations(id, train_run_id, payment_intent_id, total_amount_minor, currency)
+       ON DELETE RESTRICT);
+
+CREATE TABLE booking_shard_0.ticket_issuance_receipts
+    (LIKE public.ticket_issuance_receipts INCLUDING ALL,
+     FOREIGN KEY (reservation_id) REFERENCES booking_shard_0.reservations(id) ON DELETE RESTRICT,
+     FOREIGN KEY (ticket_order_id) REFERENCES booking_shard_0.ticket_orders(id) ON DELETE RESTRICT,
+     FOREIGN KEY (train_run_id) REFERENCES public.train_runs(id) ON DELETE RESTRICT);
+CREATE TABLE booking_shard_1.ticket_issuance_receipts
+    (LIKE public.ticket_issuance_receipts INCLUDING ALL,
+     FOREIGN KEY (reservation_id) REFERENCES booking_shard_1.reservations(id) ON DELETE RESTRICT,
+     FOREIGN KEY (ticket_order_id) REFERENCES booking_shard_1.ticket_orders(id) ON DELETE RESTRICT,
+     FOREIGN KEY (train_run_id) REFERENCES public.train_runs(id) ON DELETE RESTRICT);
+
+CREATE TABLE booking_shard_0.payment_refund_receipts
+    (LIKE public.payment_refund_receipts INCLUDING ALL,
+     FOREIGN KEY (reservation_id) REFERENCES booking_shard_0.reservations(id) ON DELETE RESTRICT,
+     FOREIGN KEY (ticket_order_id) REFERENCES booking_shard_0.ticket_orders(id) ON DELETE RESTRICT,
+     FOREIGN KEY (train_run_id) REFERENCES public.train_runs(id) ON DELETE RESTRICT);
+CREATE TABLE booking_shard_1.payment_refund_receipts
+    (LIKE public.payment_refund_receipts INCLUDING ALL,
+     FOREIGN KEY (reservation_id) REFERENCES booking_shard_1.reservations(id) ON DELETE RESTRICT,
+     FOREIGN KEY (ticket_order_id) REFERENCES booking_shard_1.ticket_orders(id) ON DELETE RESTRICT,
+     FOREIGN KEY (train_run_id) REFERENCES public.train_runs(id) ON DELETE RESTRICT);
+
+CREATE TABLE booking_shard_0.payment_compensation_receipts
+    (LIKE public.payment_compensation_receipts INCLUDING ALL,
+     FOREIGN KEY (reservation_id) REFERENCES booking_shard_0.reservations(id) ON DELETE RESTRICT,
+     FOREIGN KEY (ticket_order_id) REFERENCES booking_shard_0.ticket_orders(id) ON DELETE RESTRICT,
+     FOREIGN KEY (refund_receipt_id) REFERENCES booking_shard_0.payment_refund_receipts(id) ON DELETE RESTRICT,
+     FOREIGN KEY (train_run_id) REFERENCES public.train_runs(id) ON DELETE RESTRICT);
+CREATE TABLE booking_shard_1.payment_compensation_receipts
+    (LIKE public.payment_compensation_receipts INCLUDING ALL,
+     FOREIGN KEY (reservation_id) REFERENCES booking_shard_1.reservations(id) ON DELETE RESTRICT,
+     FOREIGN KEY (ticket_order_id) REFERENCES booking_shard_1.ticket_orders(id) ON DELETE RESTRICT,
+     FOREIGN KEY (refund_receipt_id) REFERENCES booking_shard_1.payment_refund_receipts(id) ON DELETE RESTRICT,
+     FOREIGN KEY (train_run_id) REFERENCES public.train_runs(id) ON DELETE RESTRICT);
+
+CREATE VIEW public.physical_source_reservation_rows AS
+SELECT 'legacy'::text AS source_shard_id, reservation.* FROM public.reservations AS reservation
+UNION ALL
+SELECT 'shard-0'::text, reservation.* FROM booking_shard_0.reservations AS reservation
+UNION ALL
+SELECT 'shard-1'::text, reservation.* FROM booking_shard_1.reservations AS reservation;
+
+CREATE VIEW public.physical_source_ticket_order_rows AS
+SELECT 'legacy'::text AS source_shard_id, orders.*, reservation.train_run_id
+FROM public.ticket_orders AS orders JOIN public.reservations AS reservation ON reservation.id=orders.reservation_id
+UNION ALL
+SELECT 'shard-0'::text, orders.*, reservation.train_run_id
+FROM booking_shard_0.ticket_orders AS orders JOIN booking_shard_0.reservations AS reservation ON reservation.id=orders.reservation_id
+UNION ALL
+SELECT 'shard-1'::text, orders.*, reservation.train_run_id
+FROM booking_shard_1.ticket_orders AS orders JOIN booking_shard_1.reservations AS reservation ON reservation.id=orders.reservation_id;
+
+CREATE VIEW public.physical_source_ticket_rows AS
+SELECT 'legacy'::text AS source_shard_id, ticket.*, reservation.train_run_id
+FROM public.tickets AS ticket JOIN public.ticket_orders AS orders ON orders.id=ticket.ticket_order_id
+JOIN public.reservations AS reservation ON reservation.id=orders.reservation_id
+UNION ALL
+SELECT 'shard-0'::text, ticket.*, reservation.train_run_id
+FROM booking_shard_0.tickets AS ticket JOIN booking_shard_0.ticket_orders AS orders ON orders.id=ticket.ticket_order_id
+JOIN booking_shard_0.reservations AS reservation ON reservation.id=orders.reservation_id
+UNION ALL
+SELECT 'shard-1'::text, ticket.*, reservation.train_run_id
+FROM booking_shard_1.tickets AS ticket JOIN booking_shard_1.ticket_orders AS orders ON orders.id=ticket.ticket_order_id
+JOIN booking_shard_1.reservations AS reservation ON reservation.id=orders.reservation_id;
+
+CREATE VIEW public.physical_source_booking_command_receipt_rows AS
+SELECT 'legacy'::text AS source_shard_id, receipt.* FROM public.booking_command_receipts AS receipt
+UNION ALL SELECT 'shard-0'::text, receipt.* FROM booking_shard_0.booking_command_receipts AS receipt
+UNION ALL SELECT 'shard-1'::text, receipt.* FROM booking_shard_1.booking_command_receipts AS receipt;
+CREATE VIEW public.physical_source_payment_command_receipt_rows AS
+SELECT 'legacy'::text AS source_shard_id, receipt.* FROM public.payment_command_receipts AS receipt
+UNION ALL SELECT 'shard-0'::text, receipt.* FROM booking_shard_0.payment_command_receipts AS receipt
+UNION ALL SELECT 'shard-1'::text, receipt.* FROM booking_shard_1.payment_command_receipts AS receipt;
+CREATE VIEW public.physical_source_ticket_issuance_receipt_rows AS
+SELECT 'legacy'::text AS source_shard_id, receipt.* FROM public.ticket_issuance_receipts AS receipt
+UNION ALL SELECT 'shard-0'::text, receipt.* FROM booking_shard_0.ticket_issuance_receipts AS receipt
+UNION ALL SELECT 'shard-1'::text, receipt.* FROM booking_shard_1.ticket_issuance_receipts AS receipt;
+CREATE VIEW public.physical_source_payment_refund_receipt_rows AS
+SELECT 'legacy'::text AS source_shard_id, receipt.* FROM public.payment_refund_receipts AS receipt
+UNION ALL SELECT 'shard-0'::text, receipt.* FROM booking_shard_0.payment_refund_receipts AS receipt
+UNION ALL SELECT 'shard-1'::text, receipt.* FROM booking_shard_1.payment_refund_receipts AS receipt;
+CREATE VIEW public.physical_source_payment_compensation_receipt_rows AS
+SELECT 'legacy'::text AS source_shard_id, receipt.* FROM public.payment_compensation_receipts AS receipt
+UNION ALL SELECT 'shard-0'::text, receipt.* FROM booking_shard_0.payment_compensation_receipts AS receipt
+UNION ALL SELECT 'shard-1'::text, receipt.* FROM booking_shard_1.payment_compensation_receipts AS receipt;
+
+ALTER TABLE public.outbox_events
+    DROP CONSTRAINT outbox_events_event_pair_check,
+    DROP CONSTRAINT outbox_events_aggregate_type_check,
+    DROP CONSTRAINT outbox_events_event_type_check,
+    ADD CONSTRAINT outbox_events_aggregate_type_check CHECK (
+        aggregate_type IN (
+            'reservation', 'ticket_order', 'ticket', 'payment', 'train_run',
+            'hot_train_policy', 'station', 'route', 'train', 'coach', 'seat',
+            'fare', 'booking_command', 'physical_shard_migration'
+        )
+    ),
+    ADD CONSTRAINT outbox_events_event_type_check CHECK (
+        event_type IN (
+            'reservation.held', 'reservation.payment_pending',
+            'reservation.confirmed', 'reservation.refund_pending',
+            'reservation.expired', 'reservation.cancelled',
+            'ticket.created', 'ticket.issued', 'ticket.cancelled',
+            'ticket_order.issued', 'payment.compensation_applied',
+            'trainrun.created', 'trainrun.updated', 'trainrun.cancelled',
+            'hot_train_policy.created', 'hot_train_policy.updated',
+            'hot_train_policy.disabled', 'station.created', 'station.updated',
+            'station.disabled', 'route.created', 'route.updated',
+            'route.disabled', 'train.updated', 'coach.updated', 'seat.updated',
+            'fare.created', 'fare.updated', 'fare.disabled',
+            'booking_command.finalized', 'booking_command.repaired',
+            'booking_command.failed', 'physical_shard_migration.cutover',
+            'physical_shard_migration.rolled_back',
+            'physical_shard_migration.reverse_cutover',
+            'physical_shard_migration.completed'
+        )
+    ),
+    ADD CONSTRAINT outbox_events_event_pair_check CHECK (
+        (aggregate_type = 'reservation' AND event_type IN (
+            'reservation.held', 'reservation.payment_pending',
+            'reservation.confirmed', 'reservation.refund_pending',
+            'reservation.expired', 'reservation.cancelled'
+        ))
+        OR (aggregate_type = 'ticket_order' AND event_type = 'ticket_order.issued')
+        OR (aggregate_type = 'ticket' AND event_type IN (
+            'ticket.created', 'ticket.issued', 'ticket.cancelled'
+        ))
+        OR (aggregate_type = 'payment' AND event_type = 'payment.compensation_applied')
+        OR (aggregate_type = 'train_run' AND event_type IN (
+            'trainrun.created', 'trainrun.updated', 'trainrun.cancelled'
+        ))
+        OR (aggregate_type = 'hot_train_policy' AND event_type IN (
+            'hot_train_policy.created', 'hot_train_policy.updated',
+            'hot_train_policy.disabled'
+        ))
+        OR (aggregate_type = 'station' AND event_type IN (
+            'station.created', 'station.updated', 'station.disabled'
+        ))
+        OR (aggregate_type = 'route' AND event_type IN (
+            'route.created', 'route.updated', 'route.disabled'
+        ))
+        OR (aggregate_type = 'train' AND event_type = 'train.updated')
+        OR (aggregate_type = 'coach' AND event_type = 'coach.updated')
+        OR (aggregate_type = 'seat' AND event_type = 'seat.updated')
+        OR (aggregate_type = 'fare' AND event_type IN (
+            'fare.created', 'fare.updated', 'fare.disabled'
+        ))
+        OR (aggregate_type = 'booking_command' AND event_type IN (
+            'booking_command.finalized', 'booking_command.repaired',
+            'booking_command.failed'
+        ))
+        OR (aggregate_type = 'physical_shard_migration' AND event_type IN (
+            'physical_shard_migration.cutover',
+            'physical_shard_migration.rolled_back',
+            'physical_shard_migration.reverse_cutover',
+            'physical_shard_migration.completed'
+        ))
+    );
+
+ALTER TABLE public.physical_source_train_run_mutation_journal
+    DROP CONSTRAINT physical_source_train_run_mutation_journal_table_name_check,
+    ADD CONSTRAINT physical_source_train_run_mutation_journal_table_name_check CHECK (
+        table_name IN (
+            'train_run_booking_snapshots', 'booking_seat_catalog',
+            'booking_fare_snapshots', 'seat_inventory', 'reservations',
+            'reservation_seats', 'ticket_orders', 'tickets',
+            'idempotency_records', 'booking_command_receipts',
+            'payment_command_receipts', 'ticket_issuance_receipts',
+            'payment_refund_receipts', 'payment_compensation_receipts',
+            'outbox_events'
+        )
+    );
+
+CREATE OR REPLACE FUNCTION public.append_physical_source_mutation(
+    selected_train_run_id uuid,
+    selected_source_shard_id text,
+    target_table_name text,
+    mutation_operation text,
+    target_entity_id uuid,
+    bounded_primary_key jsonb
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $m6_append_physical_source_mutation$
+DECLARE
+    capture_migration_id uuid;
+    capture_generation bigint;
+    allocated_sequence bigint;
+BEGIN
+    IF selected_train_run_id IS NULL
+       OR selected_source_shard_id NOT IN ('legacy', 'shard-0', 'shard-1')
+       OR target_table_name NOT IN (
+           'train_run_booking_snapshots', 'booking_seat_catalog',
+           'booking_fare_snapshots', 'seat_inventory', 'reservations',
+           'reservation_seats', 'ticket_orders', 'tickets',
+           'idempotency_records', 'booking_command_receipts',
+           'payment_command_receipts', 'ticket_issuance_receipts',
+           'payment_refund_receipts', 'payment_compensation_receipts',
+           'outbox_events'
+       )
+       OR mutation_operation NOT IN ('INSERT', 'UPDATE', 'DELETE')
+       OR target_entity_id IS NULL
+       OR jsonb_typeof(bounded_primary_key) <> 'object'
+       OR octet_length(bounded_primary_key::text) > 512 THEN
+        RAISE EXCEPTION 'invalid physical source mutation capture input'
+            USING ERRCODE = '22023';
+    END IF;
+
+    UPDATE public.physical_source_migration_capture_state AS capture
+    SET next_sequence = capture.next_sequence + 1
+    FROM public.train_run_shard_assignments AS assignment
+    WHERE capture.train_run_id = selected_train_run_id
+      AND capture.source_shard_id = selected_source_shard_id
+      AND capture.capture_enabled
+      AND assignment.train_run_id = capture.train_run_id
+      AND assignment.shard_id = capture.source_shard_id
+      AND assignment.assignment_generation = capture.source_generation
+      AND assignment.assignment_state IN ('stable', 'draining', 'migrating')
+    RETURNING capture.migration_id, capture.source_generation,
+              capture.next_sequence
+    INTO capture_migration_id, capture_generation, allocated_sequence;
+
+    IF capture_migration_id IS NULL THEN
+        RETURN;
+    END IF;
+
+    INSERT INTO public.physical_source_train_run_mutation_journal (
+        migration_id, train_run_id, source_shard_id, source_generation,
+        mutation_sequence, table_name, operation, entity_id,
+        primary_key, metadata
+    ) VALUES (
+        capture_migration_id, selected_train_run_id,
+        selected_source_shard_id, capture_generation, allocated_sequence,
+        target_table_name, mutation_operation, target_entity_id,
+        bounded_primary_key,
+        jsonb_build_object('source_shard_id', selected_source_shard_id)
+    );
+END;
+$m6_append_physical_source_mutation$;
+
+CREATE FUNCTION public.capture_physical_source_receipt_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $capture_physical_source_receipt_mutation$
+DECLARE
+    source_shard_id text;
+    affected_train_run_id uuid;
+    affected_id uuid;
+BEGIN
+    source_shard_id := CASE TG_TABLE_SCHEMA
+        WHEN 'public' THEN 'legacy'
+        WHEN 'booking_shard_0' THEN 'shard-0'
+        WHEN 'booking_shard_1' THEN 'shard-1'
+        ELSE NULL
+    END;
+    IF source_shard_id IS NULL OR TG_TABLE_NAME NOT IN (
+        'booking_command_receipts', 'payment_command_receipts',
+        'ticket_issuance_receipts', 'payment_refund_receipts',
+        'payment_compensation_receipts'
+    ) THEN
+        RAISE EXCEPTION 'unapproved physical source receipt relation'
+            USING ERRCODE = '22023';
+    END IF;
+    affected_train_run_id := CASE WHEN TG_OP='DELETE' THEN OLD.train_run_id ELSE NEW.train_run_id END;
+    affected_id := CASE WHEN TG_OP='DELETE' THEN OLD.id ELSE NEW.id END;
+    PERFORM public.append_physical_source_mutation(
+        affected_train_run_id, source_shard_id, TG_TABLE_NAME, TG_OP,
+        affected_id, jsonb_build_object('source_id', affected_id)
+    );
+    RETURN COALESCE(NEW, OLD);
+END;
+$capture_physical_source_receipt_mutation$;
+
+CREATE FUNCTION public.guard_control_booking_receipt_write()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog
+AS $guard_control_booking_receipt_write$
+DECLARE
+    selected_train_run_id uuid;
+    selected_shard_id text;
+    assignment_generation bigint;
+    assignment_state text;
+    catalog_enabled boolean;
+    catalog_write_enabled boolean;
+    fence_generation bigint;
+    fence_write_enabled boolean;
+BEGIN
+    selected_train_run_id := CASE WHEN TG_OP='DELETE' THEN OLD.train_run_id ELSE NEW.train_run_id END;
+    selected_shard_id := CASE TG_TABLE_SCHEMA
+        WHEN 'public' THEN 'legacy'
+        WHEN 'booking_shard_0' THEN 'shard-0'
+        WHEN 'booking_shard_1' THEN 'shard-1'
+        ELSE NULL
+    END;
+    IF selected_shard_id IS NULL THEN
+        RAISE EXCEPTION 'unapproved booking receipt schema' USING ERRCODE='22023';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+        FROM public.physical_control_target_apply_authorizations AS apply_auth
+        JOIN public.physical_shard_migrations AS migration
+          ON migration.migration_id=apply_auth.migration_id
+        WHERE apply_auth.transaction_id=txid_current()
+          AND apply_auth.train_run_id=selected_train_run_id
+          AND apply_auth.target_shard_id=selected_shard_id
+          AND migration.reverse_migration
+          AND migration.source_shard_id IN ('physical-shard-0','physical-shard-1')
+          AND migration.target_shard_id=selected_shard_id
+          AND migration.state IN (
+              'preparing_target','capture_enabled','base_copying','catching_up',
+              'validating_online','draining','source_fenced','final_catchup',
+              'final_validating'
+          )
+    ) THEN
+        RETURN COALESCE(NEW,OLD);
+    END IF;
+    SELECT assignment.assignment_generation, assignment.assignment_state,
+           shard.enabled, shard.write_enabled
+    INTO assignment_generation, assignment_state,
+         catalog_enabled, catalog_write_enabled
+    FROM public.train_run_shard_assignments AS assignment
+    JOIN public.booking_shards AS shard ON shard.shard_id=assignment.shard_id
+    WHERE assignment.train_run_id=selected_train_run_id
+      AND assignment.shard_id=selected_shard_id
+    FOR UPDATE OF assignment;
+    IF selected_shard_id='legacy' THEN
+        SELECT fence.assignment_generation,fence.write_enabled
+        INTO fence_generation,fence_write_enabled
+        FROM public.train_run_write_fences AS fence
+        WHERE fence.train_run_id=selected_train_run_id FOR UPDATE;
+    ELSIF selected_shard_id='shard-0' THEN
+        SELECT fence.assignment_generation,fence.write_enabled
+        INTO fence_generation,fence_write_enabled
+        FROM booking_shard_0.train_run_write_fences AS fence
+        WHERE fence.train_run_id=selected_train_run_id FOR UPDATE;
+    ELSE
+        SELECT fence.assignment_generation,fence.write_enabled
+        INTO fence_generation,fence_write_enabled
+        FROM booking_shard_1.train_run_write_fences AS fence
+        WHERE fence.train_run_id=selected_train_run_id FOR UPDATE;
+    END IF;
+    IF assignment_generation IS NULL OR assignment_state <> 'stable'
+       OR NOT catalog_enabled OR NOT catalog_write_enabled
+       OR fence_generation IS DISTINCT FROM assignment_generation
+       OR fence_write_enabled IS DISTINCT FROM true THEN
+        RAISE EXCEPTION 'booking receipt write is fenced' USING ERRCODE='55000';
+    END IF;
+    RETURN COALESCE(NEW, OLD);
+END;
+$guard_control_booking_receipt_write$;
+
+CREATE TRIGGER physical_target_write_guard BEFORE INSERT OR UPDATE OR DELETE ON public.booking_command_receipts
+FOR EACH ROW EXECUTE FUNCTION public.guard_control_booking_receipt_write();
+CREATE TRIGGER physical_target_write_guard BEFORE INSERT OR UPDATE OR DELETE ON public.payment_command_receipts
+FOR EACH ROW EXECUTE FUNCTION public.guard_control_booking_receipt_write();
+CREATE TRIGGER physical_target_write_guard BEFORE INSERT OR UPDATE OR DELETE ON public.ticket_issuance_receipts
+FOR EACH ROW EXECUTE FUNCTION public.guard_control_booking_receipt_write();
+CREATE TRIGGER physical_target_write_guard BEFORE INSERT OR UPDATE OR DELETE ON public.payment_refund_receipts
+FOR EACH ROW EXECUTE FUNCTION public.guard_control_booking_receipt_write();
+CREATE TRIGGER physical_target_write_guard BEFORE INSERT OR UPDATE OR DELETE ON public.payment_compensation_receipts
+FOR EACH ROW EXECUTE FUNCTION public.guard_control_booking_receipt_write();
+CREATE TRIGGER physical_target_write_guard BEFORE INSERT OR UPDATE OR DELETE ON booking_shard_0.booking_command_receipts
+FOR EACH ROW EXECUTE FUNCTION public.guard_control_booking_receipt_write();
+CREATE TRIGGER physical_target_write_guard BEFORE INSERT OR UPDATE OR DELETE ON booking_shard_0.payment_command_receipts
+FOR EACH ROW EXECUTE FUNCTION public.guard_control_booking_receipt_write();
+CREATE TRIGGER physical_target_write_guard BEFORE INSERT OR UPDATE OR DELETE ON booking_shard_0.ticket_issuance_receipts
+FOR EACH ROW EXECUTE FUNCTION public.guard_control_booking_receipt_write();
+CREATE TRIGGER physical_target_write_guard BEFORE INSERT OR UPDATE OR DELETE ON booking_shard_0.payment_refund_receipts
+FOR EACH ROW EXECUTE FUNCTION public.guard_control_booking_receipt_write();
+CREATE TRIGGER physical_target_write_guard BEFORE INSERT OR UPDATE OR DELETE ON booking_shard_0.payment_compensation_receipts
+FOR EACH ROW EXECUTE FUNCTION public.guard_control_booking_receipt_write();
+CREATE TRIGGER physical_target_write_guard BEFORE INSERT OR UPDATE OR DELETE ON booking_shard_1.booking_command_receipts
+FOR EACH ROW EXECUTE FUNCTION public.guard_control_booking_receipt_write();
+CREATE TRIGGER physical_target_write_guard BEFORE INSERT OR UPDATE OR DELETE ON booking_shard_1.payment_command_receipts
+FOR EACH ROW EXECUTE FUNCTION public.guard_control_booking_receipt_write();
+CREATE TRIGGER physical_target_write_guard BEFORE INSERT OR UPDATE OR DELETE ON booking_shard_1.ticket_issuance_receipts
+FOR EACH ROW EXECUTE FUNCTION public.guard_control_booking_receipt_write();
+CREATE TRIGGER physical_target_write_guard BEFORE INSERT OR UPDATE OR DELETE ON booking_shard_1.payment_refund_receipts
+FOR EACH ROW EXECUTE FUNCTION public.guard_control_booking_receipt_write();
+CREATE TRIGGER physical_target_write_guard BEFORE INSERT OR UPDATE OR DELETE ON booking_shard_1.payment_compensation_receipts
+FOR EACH ROW EXECUTE FUNCTION public.guard_control_booking_receipt_write();
+
+CREATE TRIGGER physical_source_capture AFTER INSERT OR UPDATE OR DELETE ON public.booking_command_receipts
+FOR EACH ROW EXECUTE FUNCTION public.capture_physical_source_receipt_mutation();
+CREATE TRIGGER physical_source_capture AFTER INSERT OR UPDATE OR DELETE ON public.payment_command_receipts
+FOR EACH ROW EXECUTE FUNCTION public.capture_physical_source_receipt_mutation();
+CREATE TRIGGER physical_source_capture AFTER INSERT OR UPDATE OR DELETE ON public.ticket_issuance_receipts
+FOR EACH ROW EXECUTE FUNCTION public.capture_physical_source_receipt_mutation();
+CREATE TRIGGER physical_source_capture AFTER INSERT OR UPDATE OR DELETE ON public.payment_refund_receipts
+FOR EACH ROW EXECUTE FUNCTION public.capture_physical_source_receipt_mutation();
+CREATE TRIGGER physical_source_capture AFTER INSERT OR UPDATE OR DELETE ON public.payment_compensation_receipts
+FOR EACH ROW EXECUTE FUNCTION public.capture_physical_source_receipt_mutation();
+CREATE TRIGGER physical_source_capture AFTER INSERT OR UPDATE OR DELETE ON booking_shard_0.booking_command_receipts
+FOR EACH ROW EXECUTE FUNCTION public.capture_physical_source_receipt_mutation();
+CREATE TRIGGER physical_source_capture AFTER INSERT OR UPDATE OR DELETE ON booking_shard_0.payment_command_receipts
+FOR EACH ROW EXECUTE FUNCTION public.capture_physical_source_receipt_mutation();
+CREATE TRIGGER physical_source_capture AFTER INSERT OR UPDATE OR DELETE ON booking_shard_0.ticket_issuance_receipts
+FOR EACH ROW EXECUTE FUNCTION public.capture_physical_source_receipt_mutation();
+CREATE TRIGGER physical_source_capture AFTER INSERT OR UPDATE OR DELETE ON booking_shard_0.payment_refund_receipts
+FOR EACH ROW EXECUTE FUNCTION public.capture_physical_source_receipt_mutation();
+CREATE TRIGGER physical_source_capture AFTER INSERT OR UPDATE OR DELETE ON booking_shard_0.payment_compensation_receipts
+FOR EACH ROW EXECUTE FUNCTION public.capture_physical_source_receipt_mutation();
+CREATE TRIGGER physical_source_capture AFTER INSERT OR UPDATE OR DELETE ON booking_shard_1.booking_command_receipts
+FOR EACH ROW EXECUTE FUNCTION public.capture_physical_source_receipt_mutation();
+CREATE TRIGGER physical_source_capture AFTER INSERT OR UPDATE OR DELETE ON booking_shard_1.payment_command_receipts
+FOR EACH ROW EXECUTE FUNCTION public.capture_physical_source_receipt_mutation();
+CREATE TRIGGER physical_source_capture AFTER INSERT OR UPDATE OR DELETE ON booking_shard_1.ticket_issuance_receipts
+FOR EACH ROW EXECUTE FUNCTION public.capture_physical_source_receipt_mutation();
+CREATE TRIGGER physical_source_capture AFTER INSERT OR UPDATE OR DELETE ON booking_shard_1.payment_refund_receipts
+FOR EACH ROW EXECUTE FUNCTION public.capture_physical_source_receipt_mutation();
+CREATE TRIGGER physical_source_capture AFTER INSERT OR UPDATE OR DELETE ON booking_shard_1.payment_compensation_receipts
+FOR EACH ROW EXECUTE FUNCTION public.capture_physical_source_receipt_mutation();
+
 -- Payment orchestration is durable in the control database. The authoritative
 -- reservation and ticket mutations remain shard-local and are represented here
 -- only by globally unique identities and bounded fingerprints. No provider
