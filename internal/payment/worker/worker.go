@@ -63,7 +63,6 @@ func (worker *Worker) RunOnce(ctx context.Context) (Result, error) {
 	operations, err := worker.store.ClaimOperations(ctx, options)
 	if err != nil {
 		failures = append(failures, fmt.Errorf("claim payment operations: %w", err))
-		worker.record("operation", "claim", "failure", "database")
 	} else {
 		result.OperationsClaimed = len(operations)
 		for _, claim := range operations {
@@ -76,7 +75,6 @@ func (worker *Worker) RunOnce(ctx context.Context) (Result, error) {
 	webhooks, err := worker.store.ClaimWebhooks(ctx, options)
 	if err != nil {
 		failures = append(failures, fmt.Errorf("claim payment webhooks: %w", err))
-		worker.record("webhook", "claim", "failure", "database")
 	} else {
 		result.WebhooksClaimed = len(webhooks)
 		for _, claim := range webhooks {
@@ -89,7 +87,6 @@ func (worker *Worker) RunOnce(ctx context.Context) (Result, error) {
 	actions, err := worker.store.ClaimActions(ctx, options)
 	if err != nil {
 		failures = append(failures, fmt.Errorf("claim payment actions: %w", err))
-		worker.record("action", "claim", "failure", "database")
 	} else {
 		result.ActionsClaimed = len(actions)
 		for _, claim := range actions {
@@ -103,8 +100,9 @@ func (worker *Worker) RunOnce(ctx context.Context) (Result, error) {
 }
 
 func (worker *Worker) processOperation(ctx context.Context, now time.Time, claim OperationClaim, result *Result) error {
+	started := time.Now()
 	if err := validateOperationClaim(claim, worker.config.WorkerID); err != nil {
-		return worker.failInvalidOperation(ctx, now, claim, result)
+		return worker.failInvalidOperation(ctx, now, started, claim, result)
 	}
 	var (
 		evidence OperationEvidence
@@ -112,13 +110,13 @@ func (worker *Worker) processOperation(ctx context.Context, now time.Time, claim
 	)
 	if claim.PreviousState != domain.OperationUncertain {
 		if err = worker.store.BeginOperation(ctx, claim); err != nil {
-			worker.record("operation", string(claim.Type), "failure", "lease")
+			worker.record(operationObservation(claim, "failure", "lease", time.Since(started), false))
 			return fmt.Errorf("begin payment operation: %w", err)
 		}
 	}
 	client, ok := worker.providers.Provider(claim.Provider)
 	if !ok {
-		return worker.failOperation(ctx, now, claim, "provider_unavailable", true, result)
+		return worker.failOperation(ctx, now, started, claim, "provider_unavailable", true, result)
 	}
 	if claim.PreviousState == domain.OperationUncertain {
 		// An uncertain side effect is never issued again until a read-only
@@ -136,36 +134,36 @@ func (worker *Worker) processOperation(ctx context.Context, now time.Time, claim
 		// retryability. They remain uncertain until a status query (or the
 		// stable-key checkout replay below) supplies definitive evidence.
 		review := !uncertain && (!retryable || claim.Attempts >= worker.config.MaxAttempts)
-		return worker.failOperationWithUncertainty(ctx, now, claim, category, review, uncertain, result)
+		return worker.failOperationWithUncertainty(ctx, now, started, claim, category, review, uncertain, result)
 	}
 	if capturedInsteadOfVoided(claim, evidence) {
 		if err := worker.store.SupersedeVoidWithRefund(ctx, claim, evidence); err != nil {
-			worker.record("operation", string(claim.Type), "failure", "database")
+			worker.record(operationObservation(claim, "failure", "database", time.Since(started), false))
 			return fmt.Errorf("supersede void with refund: %w", err)
 		}
 		result.OperationsDone++
-		worker.record("operation", string(claim.Type), "superseded", "captured")
+		worker.record(operationObservation(claim, "superseded", "captured", time.Since(started), false))
 		return nil
 	}
 	if claim.Type == domain.OperationVoid && claim.PreviousState == domain.OperationUncertain &&
 		evidence.Status == provider.StatusUnknown {
-		return worker.failOperation(ctx, now, claim, "provider_outcome_unknown", true, result)
+		return worker.failOperation(ctx, now, started, claim, "provider_outcome_unknown", true, result)
 	}
 	switch evidence.Disposition {
 	case DispositionApplied:
 		if err := worker.store.CompleteOperation(ctx, claim, evidence); err != nil {
-			worker.record("operation", string(claim.Type), "failure", "database")
+			worker.record(operationObservation(claim, "failure", "database", time.Since(started), false))
 			return fmt.Errorf("complete payment operation: %w", err)
 		}
 		result.OperationsDone++
-		worker.record("operation", string(claim.Type), "success", "none")
+		worker.record(operationObservation(claim, "success", "none", time.Since(started), false))
 		return nil
 	case DispositionNotApplied:
-		return worker.failOperation(ctx, now, claim, "provider_not_applied", claim.Attempts >= worker.config.MaxAttempts, result)
+		return worker.failOperation(ctx, now, started, claim, "provider_not_applied", claim.Attempts >= worker.config.MaxAttempts, result)
 	case DispositionConflict:
-		return worker.failOperation(ctx, now, claim, "provider_state_conflict", true, result)
+		return worker.failOperation(ctx, now, started, claim, "provider_state_conflict", true, result)
 	default:
-		return worker.failOperation(ctx, now, claim, "provider_outcome_unknown", claim.Attempts >= worker.config.MaxAttempts, result)
+		return worker.failOperation(ctx, now, started, claim, "provider_outcome_unknown", claim.Attempts >= worker.config.MaxAttempts, result)
 	}
 }
 
@@ -177,7 +175,7 @@ func capturedInsteadOfVoided(claim OperationClaim, evidence OperationEvidence) b
 		evidence.ResponseFingerprint != [sha256.Size]byte{}
 }
 
-func (worker *Worker) failInvalidOperation(ctx context.Context, now time.Time, claim OperationClaim, result *Result) error {
+func (worker *Worker) failInvalidOperation(ctx context.Context, now, started time.Time, claim OperationClaim, result *Result) error {
 	if claim.OperationID == uuid.Nil || claim.LeaseOwner == "" {
 		return errors.New("invalid claimed payment operation")
 	}
@@ -186,54 +184,57 @@ func (worker *Worker) failInvalidOperation(ctx context.Context, now time.Time, c
 			return fmt.Errorf("begin invalid payment operation: %w", err)
 		}
 	}
-	return worker.failOperation(ctx, now, claim, "invalid_claim", true, result)
+	return worker.failOperation(ctx, now, started, claim, "invalid_claim", true, result)
 }
 
-func (worker *Worker) failOperation(ctx context.Context, now time.Time, claim OperationClaim, category string, review bool, result *Result) error {
-	return worker.failOperationWithUncertainty(ctx, now, claim, category, review, false, result)
+func (worker *Worker) failOperation(ctx context.Context, now, started time.Time, claim OperationClaim, category string, review bool, result *Result) error {
+	return worker.failOperationWithUncertainty(ctx, now, started, claim, category, review, false, result)
 }
 
-func (worker *Worker) failOperationWithUncertainty(ctx context.Context, now time.Time, claim OperationClaim, category string, review, uncertain bool, result *Result) error {
+func (worker *Worker) failOperationWithUncertainty(ctx context.Context, now, started time.Time, claim OperationClaim, category string, review, uncertain bool, result *Result) error {
 	failure := Failure{Category: boundedCategory(category), ManualReview: review, Uncertain: uncertain}
 	if !review {
 		failure.NextAttemptAt = now.Add(retryDelay(claim.OperationID, claim.Attempts, worker.config.RetryBase, worker.config.RetryMax))
 	}
 	if err := worker.store.FailOperation(ctx, claim, failure); err != nil {
-		worker.record("operation", string(claim.Type), "failure", "database")
+		worker.record(operationObservation(claim, "failure", "database", time.Since(started), false))
 		return fmt.Errorf("fail payment operation: %w", err)
 	}
 	if review {
 		result.ManualReview++
-		worker.record("operation", string(claim.Type), "manual_review", failure.Category)
+		worker.record(operationObservation(claim, "manual_review", failure.Category, time.Since(started), failure.Uncertain))
 	} else {
 		result.Retried++
-		worker.record("operation", string(claim.Type), "retry", failure.Category)
+		persistedUncertain := failure.Uncertain || claim.PreviousState == domain.OperationUncertain && failure.Category == "provider_outcome_unknown"
+		worker.record(operationObservation(claim, "retry", failure.Category, time.Since(started), persistedUncertain))
 	}
 	return nil
 }
 
 func (worker *Worker) processWebhook(ctx context.Context, now time.Time, claim WebhookClaim, result *Result) error {
+	started := time.Now()
 	if !validWebhookClaim(claim, worker.config.WorkerID) {
-		return worker.failWebhook(ctx, now, claim, "invalid_claim", true, result)
+		return worker.failWebhook(ctx, now, started, claim, "invalid_claim", true, result)
 	}
 	if claim.EventType == provider.EventUnknown || !knownEvent(claim.EventType) {
 		if err := worker.store.IgnoreWebhook(ctx, claim); err != nil {
+			worker.record(webhookObservation(now, started, claim, "failure", "database"))
 			return fmt.Errorf("ignore payment webhook: %w", err)
 		}
 		result.WebhooksDone++
-		worker.record("webhook", string(claim.EventType), "ignored", "unknown_event")
+		worker.record(webhookObservation(now, started, claim, "ignored", "unknown_event"))
 		return nil
 	}
 	client, ok := worker.providers.Provider(claim.Provider)
 	if !ok {
-		return worker.failWebhook(ctx, now, claim, "provider_unavailable", true, result)
+		return worker.failWebhook(ctx, now, started, claim, "provider_unavailable", true, result)
 	}
 	// Event time and event order are not authoritative. A current provider
 	// read confirms every recognized event before durable state advancement.
 	payment, err := client.GetPaymentStatus(ctx, claim.ProviderPaymentID)
 	if err != nil {
 		category, retryable, uncertain := classifyProviderError(err)
-		return worker.failWebhook(ctx, now, claim, category, !retryable && !uncertain || claim.Attempts >= worker.config.MaxAttempts, result)
+		return worker.failWebhook(ctx, now, started, claim, category, !retryable && !uncertain || claim.Attempts >= worker.config.MaxAttempts, result)
 	}
 	evidence := WebhookEvidence{
 		Status: payment.Status, AmountMinor: payment.AmountMinor, Currency: payment.Currency,
@@ -241,16 +242,15 @@ func (worker *Worker) processWebhook(ctx context.Context, now time.Time, claim W
 		ProviderUpdated: payment.ProviderUpdatedAt.UTC(),
 	}
 	if err := worker.store.CompleteWebhook(ctx, claim, evidence); err != nil {
-		worker.record("webhook", string(claim.EventType), "failure", "database")
-		failureErr := worker.failWebhook(ctx, now, claim, "database_finalize_failed", claim.Attempts >= worker.config.MaxAttempts, result)
+		failureErr := worker.failWebhook(ctx, now, started, claim, "database_finalize_failed", claim.Attempts >= worker.config.MaxAttempts, result)
 		return errors.Join(fmt.Errorf("complete payment webhook: %w", err), failureErr)
 	}
 	result.WebhooksDone++
-	worker.record("webhook", string(claim.EventType), "success", "provider_confirmed")
+	worker.record(webhookObservation(now, started, claim, "success", "provider_confirmed"))
 	return nil
 }
 
-func (worker *Worker) failWebhook(ctx context.Context, now time.Time, claim WebhookClaim, category string, review bool, result *Result) error {
+func (worker *Worker) failWebhook(ctx context.Context, now, started time.Time, claim WebhookClaim, category string, review bool, result *Result) error {
 	if claim.InboxID == uuid.Nil || claim.LeaseOwner == "" {
 		return errors.New("invalid claimed payment webhook")
 	}
@@ -259,19 +259,23 @@ func (worker *Worker) failWebhook(ctx context.Context, now time.Time, claim Webh
 		failure.NextAttemptAt = now.Add(retryDelay(claim.InboxID, claim.Attempts, worker.config.RetryBase, worker.config.RetryMax))
 	}
 	if err := worker.store.FailWebhook(ctx, claim, failure); err != nil {
+		worker.record(webhookObservation(now, started, claim, "failure", "database"))
 		return fmt.Errorf("fail payment webhook: %w", err)
 	}
 	if review {
 		result.ManualReview++
+		worker.record(webhookObservation(now, started, claim, "manual_review", failure.Category))
 	} else {
 		result.Retried++
+		worker.record(webhookObservation(now, started, claim, "retry", failure.Category))
 	}
 	return nil
 }
 
 func (worker *Worker) processAction(ctx context.Context, now time.Time, claim ActionClaim, result *Result) error {
+	started := time.Now()
 	if !validActionClaim(claim, worker.config.WorkerID) {
-		return worker.failAction(ctx, now, claim, "invalid_claim", true, result)
+		return worker.failAction(ctx, now, started, claim, "invalid_claim", true, result)
 	}
 	var (
 		evidence ActionEvidence
@@ -287,26 +291,25 @@ func (worker *Worker) processAction(ctx context.Context, now time.Time, claim Ac
 	case ActionCompensate:
 		evidence.Compensation, err = worker.shards.ApplyRefundCompensation(ctx, claim.Compensation)
 	default:
-		return worker.failAction(ctx, now, claim, "invalid_action", true, result)
+		return worker.failAction(ctx, now, started, claim, "invalid_action", true, result)
 	}
 	if err != nil {
 		review := claim.Attempts >= worker.config.MaxAttempts || permanentShardError(err)
-		return worker.failAction(ctx, now, claim, "shard_command_failed", review, result)
+		return worker.failAction(ctx, now, started, claim, "shard_command_failed", review, result)
 	}
 	if !validActionEvidence(claim, evidence) {
-		return worker.failAction(ctx, now, claim, "shard_receipt_conflict", true, result)
+		return worker.failAction(ctx, now, started, claim, "shard_receipt_conflict", true, result)
 	}
 	if err := worker.store.CompleteAction(ctx, claim, evidence); err != nil {
-		worker.record("action", string(claim.Type), "failure", "database")
-		failureErr := worker.failAction(ctx, now, claim, "database_finalize_failed", claim.Attempts >= worker.config.MaxAttempts, result)
+		failureErr := worker.failAction(ctx, now, started, claim, "database_finalize_failed", claim.Attempts >= worker.config.MaxAttempts, result)
 		return errors.Join(fmt.Errorf("complete payment action: %w", err), failureErr)
 	}
 	result.ActionsDone++
-	worker.record("action", string(claim.Type), "success", "none")
+	worker.record(actionObservation(claim, "success", "none", time.Since(started)))
 	return nil
 }
 
-func (worker *Worker) failAction(ctx context.Context, now time.Time, claim ActionClaim, category string, review bool, result *Result) error {
+func (worker *Worker) failAction(ctx context.Context, now, started time.Time, claim ActionClaim, category string, review bool, result *Result) error {
 	if claim.SagaID == uuid.Nil || claim.LeaseOwner == "" {
 		return errors.New("invalid claimed payment action")
 	}
@@ -316,14 +319,18 @@ func (worker *Worker) failAction(ctx context.Context, now time.Time, claim Actio
 		failure.NextAttemptAt = now.Add(retryDelay(claim.SagaID, claim.Attempts, worker.config.RetryBase, worker.config.RetryMax))
 	}
 	if err := worker.store.FailAction(ctx, claim, failure); err != nil {
+		worker.record(actionObservation(claim, "failure", "database", time.Since(started)))
 		return fmt.Errorf("fail payment action: %w", err)
 	}
 	if compensate {
 		result.Compensating++
+		worker.record(actionObservation(claim, "failure", failure.Category, time.Since(started)))
 	} else if review {
 		result.ManualReview++
+		worker.record(actionObservation(claim, "manual_review", failure.Category, time.Since(started)))
 	} else {
 		result.Retried++
+		worker.record(actionObservation(claim, "retry", failure.Category, time.Since(started)))
 	}
 	return nil
 }
@@ -559,7 +566,7 @@ func validateOperationClaim(claim OperationClaim, workerID string) error {
 
 func validWebhookClaim(claim WebhookClaim, workerID string) bool {
 	validIdentity := claim.InboxID != uuid.Nil && claim.Provider != "" && claim.ProviderEventID != "" &&
-		claim.Attempts > 0 && claim.LeaseOwner == workerID && !claim.LeaseUntil.IsZero()
+		!claim.EventCreatedAt.IsZero() && claim.Attempts > 0 && claim.LeaseOwner == workerID && !claim.LeaseUntil.IsZero()
 	return validIdentity && (!knownEvent(claim.EventType) || claim.ProviderPaymentID != "")
 }
 
@@ -645,8 +652,34 @@ func boundedCategory(value string) string {
 	return bounded
 }
 
-func (worker *Worker) record(lane, operation, result, reason string) {
+func operationObservation(claim OperationClaim, result, reason string, duration time.Duration, uncertain bool) MetricObservation {
+	return MetricObservation{
+		Lane: "operation", Provider: claim.Provider, Operation: string(claim.Type),
+		Result: result, Reason: reason, Duration: duration, Uncertain: uncertain,
+	}
+}
+
+func webhookObservation(now, started time.Time, claim WebhookClaim, result, reason string) MetricObservation {
+	var lag time.Duration
+	if !claim.EventCreatedAt.IsZero() && now.After(claim.EventCreatedAt) {
+		lag = now.Sub(claim.EventCreatedAt)
+	}
+	return MetricObservation{
+		Lane: "webhook", Provider: claim.Provider, Operation: string(claim.EventType),
+		Result: result, Reason: reason, Duration: time.Since(started), Lag: lag,
+	}
+}
+
+func actionObservation(claim ActionClaim, result, reason string, duration time.Duration) MetricObservation {
+	return MetricObservation{
+		Lane: "action", Provider: claim.Provider, Operation: string(claim.Type),
+		Result: result, Reason: reason, Duration: duration,
+	}
+}
+
+func (worker *Worker) record(observation MetricObservation) {
 	if worker.metrics != nil {
-		worker.metrics.RecordPaymentWorker(lane, operation, result, boundedCategory(reason))
+		observation.Reason = boundedCategory(observation.Reason)
+		worker.metrics.RecordPaymentWorker(observation)
 	}
 }

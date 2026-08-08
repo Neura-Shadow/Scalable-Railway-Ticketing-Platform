@@ -532,6 +532,48 @@ func TestRetryDelayIsBoundedAndDeterministic(t *testing.T) {
 	}
 }
 
+func TestRunOnceRecordsMeasuredWebhookLagAndDurableUncertainty(t *testing.T) {
+	t.Parallel()
+	webhookClaim := validWebhook(provider.EventCaptured)
+	operationClaim := validOperation(domain.OperationCapture)
+	metrics := &metricsFake{}
+	store := &storeFake{operations: []OperationClaim{operationClaim}, webhooks: []WebhookClaim{webhookClaim}}
+	client := &providerFake{
+		err:       &provider.Error{Category: provider.ErrorTimeoutUnknown, Retryable: true, Uncertain: true},
+		onCapture: func() { time.Sleep(2 * time.Millisecond) },
+		onStatus:  func() { time.Sleep(2 * time.Millisecond) },
+	}
+	value, err := New(store, Providers{"sandbox": client}, &shardFake{}, metrics, Config{
+		WorkerID: "payment-test", BatchSize: 10, MaxAttempts: 4,
+		LeaseTTL: time.Minute, RetryBase: time.Second, RetryMax: time.Minute,
+		Interval: time.Second, Now: func() time.Time { return fixedNow },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = value.RunOnce(context.Background())
+
+	var operation, webhook MetricObservation
+	for _, observation := range metrics.observations {
+		switch observation.Lane {
+		case "operation":
+			if observation.Operation == string(domain.OperationCapture) {
+				operation = observation
+			}
+		case "webhook":
+			if observation.Operation == string(provider.EventCaptured) {
+				webhook = observation
+			}
+		}
+	}
+	if operation.Result != "retry" || !operation.Uncertain || operation.Duration <= 0 {
+		t.Fatalf("operation observation = %#v", operation)
+	}
+	if webhook.Lag != 2*time.Minute || webhook.Duration <= 0 {
+		t.Fatalf("webhook observation = %#v", webhook)
+	}
+}
+
 func newTestWorker(t *testing.T, store Store, client provider.Client, shards ShardGateway, maxAttempts int) *Worker {
 	t.Helper()
 	value, err := New(store, Providers{"sandbox": client}, shards, nil, Config{
@@ -558,9 +600,15 @@ func validOperation(kind domain.OperationType) OperationClaim {
 func validWebhook(kind provider.EventType) WebhookClaim {
 	return WebhookClaim{
 		InboxID: uuid.New(), Provider: "sandbox", ProviderEventID: "evt-1", EventType: kind,
-		ProviderPaymentID: "pay-1", Attempts: 1, LeaseOwner: "payment-test",
+		ProviderPaymentID: "pay-1", EventCreatedAt: fixedNow.Add(-2 * time.Minute), Attempts: 1, LeaseOwner: "payment-test",
 		LeaseUntil: fixedNow.Add(time.Minute),
 	}
+}
+
+type metricsFake struct{ observations []MetricObservation }
+
+func (fake *metricsFake) RecordPaymentWorker(observation MetricObservation) {
+	fake.observations = append(fake.observations, observation)
 }
 
 type storeFake struct {
@@ -652,6 +700,7 @@ type providerFake struct {
 	captureCalls int
 	refundCalls  int
 	onCapture    func()
+	onStatus     func()
 }
 
 func (fake *providerFake) CreateCheckout(context.Context, provider.CreateCheckoutRequest) (provider.Checkout, error) {
@@ -659,6 +708,9 @@ func (fake *providerFake) CreateCheckout(context.Context, provider.CreateCheckou
 }
 func (fake *providerFake) GetPaymentStatus(context.Context, string) (provider.Payment, error) {
 	fake.statusCalls++
+	if fake.onStatus != nil {
+		fake.onStatus()
+	}
 	return fake.payment, fake.err
 }
 func (fake *providerFake) Authorize(context.Context, provider.AuthorizeRequest) (provider.OperationResult, error) {

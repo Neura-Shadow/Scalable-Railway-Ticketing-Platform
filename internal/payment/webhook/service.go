@@ -63,12 +63,17 @@ type Repository interface {
 	StoreVerified(context.Context, Record) (StoreResult, error)
 }
 
+type Metrics interface {
+	RecordPaymentWebhookInvalid(provider string)
+}
+
 type Config struct {
 	Providers    map[string]Verifier
 	Repository   Repository
 	MaxBodyBytes int
 	Now          func() time.Time
 	NewID        func() uuid.UUID
+	Metrics      Metrics
 }
 
 type Service struct {
@@ -77,6 +82,7 @@ type Service struct {
 	maxBodyBytes int
 	now          func() time.Time
 	newID        func() uuid.UUID
+	metrics      Metrics
 }
 
 func NewService(config Config) (*Service, error) {
@@ -99,7 +105,7 @@ func NewService(config Config) (*Service, error) {
 	}
 	return &Service{
 		providers: providers, repository: config.Repository,
-		maxBodyBytes: maxBodyBytes, now: config.Now, newID: config.NewID,
+		maxBodyBytes: maxBodyBytes, now: config.Now, newID: config.NewID, metrics: config.Metrics,
 	}, nil
 }
 
@@ -112,6 +118,7 @@ func (service *Service) IngestPaymentWebhook(ctx context.Context, request httpap
 		!validVisibleHeader(request.Timestamp, maximumTimestampLen) ||
 		!validVisibleHeader(request.Signature, maximumSignatureLen) ||
 		len(request.Body) == 0 || len(request.Body) > service.maxBodyBytes {
+		service.recordInvalid(request.Provider)
 		return "", httpapi.ErrWebhookInvalid
 	}
 	body := append([]byte(nil), request.Body...)
@@ -120,6 +127,7 @@ func (service *Service) IngestPaymentWebhook(ctx context.Context, request httpap
 		KeyID: request.KeyID, Timestamp: request.Timestamp, Signature: request.Signature,
 	}, verificationBody)
 	if err != nil {
+		service.recordInvalid(request.Provider)
 		return "", httpapi.ErrWebhookInvalid
 	}
 	now := service.now().UTC()
@@ -131,6 +139,7 @@ func (service *Service) IngestPaymentWebhook(ctx context.Context, request httpap
 	if now.IsZero() || !validIdentifier(event.ProviderEventID, 128, false) ||
 		!validIdentifier(eventType, 128, false) ||
 		!validIdentifier(event.ProviderPaymentID, 128, true) || event.OccurredAt.IsZero() {
+		service.recordInvalid(request.Provider)
 		return "", httpapi.ErrWebhookInvalid
 	}
 	id := service.newID()
@@ -161,6 +170,12 @@ func (service *Service) IngestPaymentWebhook(ctx context.Context, request httpap
 		return "", httpapi.ErrWebhookConflict
 	default:
 		return "", ErrPersistence
+	}
+}
+
+func (service *Service) recordInvalid(providerName string) {
+	if service != nil && service.metrics != nil {
+		service.metrics.RecordPaymentWebhookInvalid(providerName)
 	}
 }
 

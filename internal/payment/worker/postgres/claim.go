@@ -203,7 +203,7 @@ WITH candidates AS (
  RETURNING inbox.*
 )
 SELECT inbox_id,provider,provider_event_id,event_type,
-       COALESCE(provider_payment_id,''),attempts,lease_owner,lease_until
+	   COALESCE(provider_payment_id,''),event_created_at,attempts,lease_owner,lease_until
 FROM claimed ORDER BY next_attempt_at,received_at,inbox_id`,
 		options.Now, options.BatchSize, options.WorkerID, options.LeaseTTL.Milliseconds())
 	if err != nil {
@@ -214,7 +214,7 @@ FROM claimed ORDER BY next_attempt_at,received_at,inbox_id`,
 		var claim worker.WebhookClaim
 		var eventType string
 		if err := rows.Scan(&claim.InboxID, &claim.Provider, &claim.ProviderEventID,
-			&eventType, &claim.ProviderPaymentID, &claim.Attempts,
+			&eventType, &claim.ProviderPaymentID, &claim.EventCreatedAt, &claim.Attempts,
 			&claim.LeaseOwner, &claim.LeaseUntil); err != nil {
 			return nil, worker.ErrStoreUnavailable
 		}

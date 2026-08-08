@@ -17,10 +17,21 @@ type paymentUseCases interface {
 	CancelReservation(context.Context, paymentapp.CancelReservationCommand) (paymentapp.IntentRecord, error)
 }
 
-type PaymentService struct{ useCases paymentUseCases }
+type paymentIntentMetrics interface {
+	RecordPaymentIntent(state, result string, duration time.Duration)
+}
 
-func NewPaymentService(useCases paymentUseCases) *PaymentService {
-	return &PaymentService{useCases: useCases}
+type PaymentService struct {
+	useCases paymentUseCases
+	metrics  paymentIntentMetrics
+}
+
+func NewPaymentService(useCases paymentUseCases, metrics ...paymentIntentMetrics) *PaymentService {
+	service := &PaymentService{useCases: useCases}
+	if len(metrics) > 0 {
+		service.metrics = metrics[0]
+	}
+	return service
 }
 
 func (service *PaymentService) CreatePaymentIntent(ctx context.Context, command httpapi.CreatePaymentIntentCommand) (httpapi.PaymentIntentView, error) {
@@ -31,16 +42,33 @@ func (service *PaymentService) CreatePaymentIntent(ctx context.Context, command 
 	if service == nil || service.useCases == nil {
 		return httpapi.PaymentIntentView{}, httpapi.ErrPaymentNotEnabled
 	}
+	started := time.Now()
 	record, useCaseErr := service.useCases.CreateIntent(ctx, paymentapp.CreateIntentCommand{
 		OwnerID: owner, ReservationID: reservation, IdempotencyKey: command.IdempotencyKey,
 	})
 	if useCaseErr != nil {
 		if record.ID != uuid.Nil && (errors.Is(useCaseErr, paymentapp.ErrControlFinalizationDeferred) || errors.Is(useCaseErr, paymentapp.ErrShardPaymentCommandDeferred)) {
+			service.recordIntent(record.State, "success", time.Since(started))
 			return paymentIntentView(record), nil
 		}
+		service.recordIntent(record.State, paymentIntentResult(useCaseErr), time.Since(started))
 		return httpapi.PaymentIntentView{}, mapPaymentError(useCaseErr)
 	}
+	service.recordIntent(record.State, "success", time.Since(started))
 	return paymentIntentView(record), nil
+}
+
+func (service *PaymentService) recordIntent(state, result string, duration time.Duration) {
+	if service != nil && service.metrics != nil {
+		service.metrics.RecordPaymentIntent(state, result, duration)
+	}
+}
+
+func paymentIntentResult(err error) string {
+	if errors.Is(err, paymentapp.ErrPaymentConflict) || errors.Is(err, paymentapp.ErrReservationNotPayable) {
+		return "conflict"
+	}
+	return "failure"
 }
 
 func (service *PaymentService) GetPaymentIntent(ctx context.Context, ownerID, paymentIntentID string) (httpapi.PaymentIntentView, error) {

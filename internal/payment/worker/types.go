@@ -102,6 +102,7 @@ type WebhookClaim struct {
 	ProviderEventID   string
 	EventType         provider.EventType
 	ProviderPaymentID string
+	EventCreatedAt    time.Time
 	Attempts          int
 	LeaseOwner        string
 	LeaseUntil        time.Time
@@ -176,8 +177,17 @@ type ShardGateway interface {
 	ApplyRefundCompensation(context.Context, shard.ApplyRefundCompensationCommand) (shard.ApplyRefundCompensationReceipt, error)
 }
 
+// MetricObservation contains only bounded dimensions and timing information.
+// It deliberately excludes payment, reservation, provider-operation, and
+// customer identifiers so metrics cannot become a correlation-data sink.
+type MetricObservation struct {
+	Lane, Provider, Operation, Result, Reason string
+	Duration, Lag                             time.Duration
+	Uncertain, Replay                         bool
+}
+
 type Metrics interface {
-	RecordPaymentWorker(lane, operation, result, reason string)
+	RecordPaymentWorker(MetricObservation)
 }
 
 type Result struct {

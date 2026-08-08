@@ -442,7 +442,7 @@ func run(logger *slog.Logger) error {
 		}
 		useCases := paymentapp.NewService(controlStore, shardGateway, time.Now, uuid.New).
 			WithProcessingGrace(cfg.PaymentProcessingGrace)
-		paymentService = app.NewPaymentService(useCases)
+		paymentService = app.NewPaymentService(useCases, metrics)
 
 		webhookKeys, paymentErr := cfg.ParsePaymentWebhookKeys()
 		if paymentErr != nil {
@@ -465,7 +465,7 @@ func run(logger *slog.Logger) error {
 		paymentWebhooks, paymentErr = paymentwebhook.NewService(paymentwebhook.Config{
 			Providers:  map[string]paymentwebhook.Verifier{"sandbox": providerClient},
 			Repository: webhookRepository, MaxBodyBytes: cfg.PaymentWebhookMaxBodyBytes,
-			Now: time.Now, NewID: uuid.New,
+			Now: time.Now, NewID: uuid.New, Metrics: metrics,
 		})
 		if paymentErr != nil {
 			return errors.New("payment webhook initialization failed")

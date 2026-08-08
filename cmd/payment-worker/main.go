@@ -296,24 +296,61 @@ func shutdownHealthServer(server *http.Server, timeout time.Duration) {
 
 type paymentMetrics struct{ metrics *platformmetrics.Metrics }
 
-func (metrics paymentMetrics) RecordPaymentWorker(lane, operation, result, reason string) {
+func (metrics paymentMetrics) RecordPaymentWorker(observation paymentworker.MetricObservation) {
 	if metrics.metrics == nil {
 		return
 	}
-	switch lane {
+	switch observation.Lane {
 	case "operation":
-		metrics.metrics.RecordPaymentOperation("sandbox", operation, result, 0, result == "uncertain")
-		if result == "manual_review" {
-			metrics.metrics.RecordPaymentSagaFailure(reason, true)
+		metrics.metrics.RecordPaymentOperation(observation.Provider, observation.Operation, observation.Result, observation.Duration, observation.Uncertain)
+		if observation.Result == "success" {
+			recordOperationTransitions(metrics.metrics, observation.Operation)
+		} else if observation.Result == "superseded" {
+			metrics.metrics.RecordPaymentSagaTransition("compensating", "refunding")
+		}
+		if observation.Result == "manual_review" {
+			metrics.metrics.RecordPaymentSagaFailure(observation.Reason, true)
 		}
 	case "webhook":
-		metrics.metrics.RecordPaymentWebhook("sandbox", operation, result, 0, 0)
+		metrics.metrics.RecordPaymentWebhook(observation.Provider, observation.Operation, observation.Result, observation.Duration, observation.Lag)
 	case "action":
-		if operation == string(paymentworker.ActionIssueTickets) {
-			metrics.metrics.RecordTicketIssuance(result, reason, 0, false)
-		} else if result == "manual_review" {
-			metrics.metrics.RecordPaymentSagaFailure(reason, true)
+		if observation.Operation == string(paymentworker.ActionIssueTickets) {
+			metrics.metrics.RecordTicketIssuance(observation.Result, observation.Reason, observation.Duration, observation.Replay)
 		}
+		if observation.Result == "success" {
+			recordActionTransition(metrics.metrics, observation.Operation)
+		} else if observation.Result == "failure" && observation.Operation == string(paymentworker.ActionIssueTickets) {
+			metrics.metrics.RecordPaymentSagaFailure(observation.Reason, false)
+			metrics.metrics.RecordPaymentSagaTransition("issuing_tickets", "compensating")
+		} else if observation.Result == "manual_review" {
+			metrics.metrics.RecordPaymentSagaFailure(observation.Reason, true)
+		}
+	}
+}
+
+func recordOperationTransitions(metrics *platformmetrics.Metrics, operation string) {
+	switch operation {
+	case "create_checkout":
+		metrics.RecordPaymentSagaTransition("reservation_secured", "checkout_created")
+		metrics.RecordPaymentSagaTransition("checkout_created", "awaiting_provider")
+	case "authorize":
+		metrics.RecordPaymentSagaTransition("awaiting_provider", "authorized")
+	case "capture":
+		metrics.RecordPaymentSagaTransition("capturing", "captured")
+		metrics.RecordPaymentSagaTransition("captured", "issuing_tickets")
+	}
+}
+
+func recordActionTransition(metrics *platformmetrics.Metrics, action string) {
+	switch action {
+	case string(paymentworker.ActionIssueTickets):
+		metrics.RecordPaymentSagaTransition("issuing_tickets", "completed")
+	case string(paymentworker.ActionMarkRefundPending):
+		metrics.RecordPaymentSagaTransition("compensating", "refunding")
+	case string(paymentworker.ActionCancelVoided):
+		metrics.RecordPaymentSagaTransition("compensating", "compensated")
+	case string(paymentworker.ActionCompensate):
+		metrics.RecordPaymentSagaTransition("refunding", "compensated")
 	}
 }
 

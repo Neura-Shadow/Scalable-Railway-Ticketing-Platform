@@ -62,6 +62,9 @@ func TestClaimsUseShortReadCommittedSkipLockedTransactions(t *testing.T) {
 				!strings.Contains(joined, "lease_until") {
 				t.Fatalf("claim SQL does not contain lock/lease controls:\n%s", joined)
 			}
+			if test.name == "webhooks" && !strings.Contains(joined, "event_created_at") {
+				t.Fatalf("webhook claim does not load immutable provider event time:\n%s", joined)
+			}
 		})
 	}
 }

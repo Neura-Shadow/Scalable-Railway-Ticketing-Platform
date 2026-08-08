@@ -51,6 +51,25 @@ func TestPaymentServiceReturnsStableResourceForDeferredFinalization(t *testing.T
 	}
 }
 
+func TestPaymentServiceRecordsMeasuredCreateIntentOutcome(t *testing.T) {
+	t.Parallel()
+	owner, reservationID := uuid.New(), uuid.New()
+	metrics := &paymentIntentMetricsFake{}
+	useCases := &paymentUseCasesFake{delay: 2 * time.Millisecond, record: paymentapp.IntentRecord{
+		ID: uuid.New(), OwnerID: owner, ReservationID: reservationID,
+		State: "reservation_securing", Currency: "TWD",
+	}}
+	_, err := NewPaymentService(useCases, metrics).CreatePaymentIntent(context.Background(), httpapi.CreatePaymentIntentCommand{
+		OwnerID: owner.String(), ReservationID: reservationID.String(), IdempotencyKey: "payment-request-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metrics.calls != 1 || metrics.state != "reservation_securing" || metrics.result != "success" || metrics.duration <= 0 {
+		t.Fatalf("metrics = calls %d state %q result %q duration %s", metrics.calls, metrics.state, metrics.result, metrics.duration)
+	}
+}
+
 func TestPaymentServiceMapsBoundedErrors(t *testing.T) {
 	t.Parallel()
 	owner, intentID := uuid.New(), uuid.New()
@@ -81,10 +100,25 @@ type paymentUseCasesFake struct {
 	reservationCancelled paymentapp.CancelReservationCommand
 	record               paymentapp.IntentRecord
 	err                  error
+	delay                time.Duration
+}
+
+type paymentIntentMetricsFake struct {
+	state, result string
+	duration      time.Duration
+	calls         int
+}
+
+func (fake *paymentIntentMetricsFake) RecordPaymentIntent(state, result string, duration time.Duration) {
+	fake.calls++
+	fake.state, fake.result, fake.duration = state, result, duration
 }
 
 func (fake *paymentUseCasesFake) CreateIntent(_ context.Context, command paymentapp.CreateIntentCommand) (paymentapp.IntentRecord, error) {
 	fake.created = command
+	if fake.delay > 0 {
+		time.Sleep(fake.delay)
+	}
 	return fake.record, fake.err
 }
 

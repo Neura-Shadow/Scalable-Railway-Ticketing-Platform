@@ -6,10 +6,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+const maximumPaymentMetricDuration = 30 * 24 * time.Hour
+
 var (
 	allowedPaymentProviders  = set("disabled", "sandbox")
 	allowedPaymentOperations = set("create_checkout", "query_status", "authorize", "capture", "void", "refund", "issue_tickets", "compensate", "process_webhook")
-	allowedPaymentResults    = set("success", "failure", "conflict", "duplicate", "ignored", "retry", "uncertain", "manual_review", "replay", "skipped")
+	allowedPaymentResults    = set("success", "failure", "conflict", "duplicate", "ignored", "retry", "uncertain", "manual_review", "replay", "skipped", "superseded")
 	allowedPaymentStates     = set(
 		"created", "reservation_securing", "checkout_pending", "awaiting_customer",
 		"authorization_pending", "authorized", "capture_pending", "captured",
@@ -23,6 +25,9 @@ var (
 		"authentication", "provider_unavailable", "rate_limited", "conflict",
 		"inconsistent_response", "database", "shard_unavailable", "receipt_conflict",
 		"lease_expired", "attempts_exhausted", "invariant_mismatch",
+		"provider_outcome_unknown", "provider_not_applied", "provider_state_conflict",
+		"database_finalize_failed", "invalid_claim", "invalid_action",
+		"shard_command_failed", "shard_receipt_conflict",
 	)
 	allowedPaymentEvents = set(
 		"payment.checkout_created", "payment.authorized", "payment.captured",
@@ -67,7 +72,7 @@ func newPaymentMetrics() *paymentMetrics {
 		webhookDuplicate:       counter("payment_webhook_duplicate_total", "Duplicate verified payment webhooks.", "provider"),
 		webhookInvalid:         counter("payment_webhook_invalid_signature_total", "Rejected payment webhook signatures.", "provider"),
 		webhookConflict:        counter("payment_webhook_conflict_total", "Provider event identity conflicts.", "provider"),
-		webhookDuration:        histogram("payment_webhook_processing_duration_seconds", "Payment webhook ingress duration.", "provider", "result"),
+		webhookDuration:        histogram("payment_webhook_processing_duration_seconds", "Durable payment webhook processing duration.", "provider", "result"),
 		webhookLag:             histogram("payment_webhook_lag_seconds", "Lag between provider event creation and processing.", "provider", "event_type"),
 		ticketIssuanceTotal:    counter("ticket_issuance_total", "Ticket issuance outcomes.", "result"),
 		ticketIssuanceFailure:  counter("ticket_issuance_failure_total", "Ticket issuance failures.", "error_category"),
@@ -93,7 +98,7 @@ func (m *Metrics) RecordPaymentIntent(state, result string, duration time.Durati
 	state = normalize(state, allowedPaymentStates, "unknown")
 	result = normalize(result, allowedPaymentResults, "unknown")
 	m.payment.intentTotal.WithLabelValues(state, result).Inc()
-	m.payment.intentDuration.WithLabelValues(result).Observe(nonNegativeSeconds(duration))
+	m.payment.intentDuration.WithLabelValues(result).Observe(boundedPaymentSeconds(duration))
 }
 
 func (m *Metrics) RecordPaymentSagaTransition(from, to string) {
@@ -115,7 +120,7 @@ func (m *Metrics) RecordPaymentOperation(provider, operation, result string, dur
 	operation = normalize(operation, allowedPaymentOperations, "unknown")
 	result = normalize(result, allowedPaymentResults, "unknown")
 	m.payment.operationTotal.WithLabelValues(provider, operation, result).Inc()
-	m.payment.operationDuration.WithLabelValues(provider, operation, result).Observe(nonNegativeSeconds(duration))
+	m.payment.operationDuration.WithLabelValues(provider, operation, result).Observe(boundedPaymentSeconds(duration))
 	if uncertain {
 		m.payment.operationUncertain.WithLabelValues(provider, operation).Inc()
 	}
@@ -134,8 +139,8 @@ func (m *Metrics) RecordPaymentWebhook(provider, eventType, result string, durat
 	eventType = normalize(eventType, allowedPaymentEvents, "unknown")
 	result = normalize(result, allowedPaymentResults, "unknown")
 	m.payment.webhookTotal.WithLabelValues(provider, eventType, result).Inc()
-	m.payment.webhookDuration.WithLabelValues(provider, result).Observe(nonNegativeSeconds(duration))
-	m.payment.webhookLag.WithLabelValues(provider, eventType).Observe(nonNegativeSeconds(lag))
+	m.payment.webhookDuration.WithLabelValues(provider, result).Observe(boundedPaymentSeconds(duration))
+	m.payment.webhookLag.WithLabelValues(provider, eventType).Observe(boundedPaymentSeconds(lag))
 	switch result {
 	case "duplicate":
 		m.payment.webhookDuplicate.WithLabelValues(provider).Inc()
@@ -151,13 +156,23 @@ func (m *Metrics) RecordPaymentWebhookInvalid(provider string) {
 func (m *Metrics) RecordTicketIssuance(result, category string, duration time.Duration, replay bool) {
 	result = normalize(result, allowedPaymentResults, "unknown")
 	m.payment.ticketIssuanceTotal.WithLabelValues(result).Inc()
-	m.payment.ticketIssuanceDuration.WithLabelValues(result).Observe(nonNegativeSeconds(duration))
+	m.payment.ticketIssuanceDuration.WithLabelValues(result).Observe(boundedPaymentSeconds(duration))
 	if result == "failure" {
 		m.payment.ticketIssuanceFailure.WithLabelValues(normalize(category, allowedPaymentErrors, "unknown")).Inc()
 	}
 	if replay {
 		m.payment.ticketReplay.WithLabelValues(result).Inc()
 	}
+}
+
+func boundedPaymentSeconds(duration time.Duration) float64 {
+	if duration <= 0 {
+		return 0
+	}
+	if duration > maximumPaymentMetricDuration {
+		duration = maximumPaymentMetricDuration
+	}
+	return duration.Seconds()
 }
 
 func (m *Metrics) RecordPaymentReconciliation(kind, result string, mismatch, repair bool) {

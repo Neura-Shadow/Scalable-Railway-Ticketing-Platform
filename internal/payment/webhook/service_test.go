@@ -53,10 +53,11 @@ func TestVerifiedWebhookIsStoredAsBoundedNormalizedEvidence(t *testing.T) {
 func TestInvalidSignatureMapsToBoundedWebhookErrorWithoutPersistence(t *testing.T) {
 	t.Parallel()
 	store := &repositoryFake{}
+	metrics := &webhookMetricsFake{}
 	service := newTestService(t, verifierFake{err: &provider.Error{
 		Category: provider.ErrorAuthentication, Operation: "verify_webhook",
 		Message: "provider detail that must not escape",
-	}}, store)
+	}}, store, metrics)
 
 	disposition, err := service.IngestPaymentWebhook(context.Background(), validRequest([]byte(`{}`)))
 	if disposition != "" || !errors.Is(err, httpapi.ErrWebhookInvalid) {
@@ -64,6 +65,9 @@ func TestInvalidSignatureMapsToBoundedWebhookErrorWithoutPersistence(t *testing.
 	}
 	if store.calls != 0 {
 		t.Fatalf("repository calls = %d, want 0", store.calls)
+	}
+	if metrics.invalidCalls != 1 || metrics.provider != "sandbox" {
+		t.Fatalf("invalid metrics = calls %d provider %q", metrics.invalidCalls, metrics.provider)
 	}
 }
 
@@ -226,17 +230,34 @@ func (fake *repositoryFake) StoreVerified(_ context.Context, record webhook.Reco
 	return fake.result, fake.err
 }
 
-func newTestService(t *testing.T, verifier webhook.Verifier, store webhook.Repository) *webhook.Service {
+func newTestService(t *testing.T, verifier webhook.Verifier, store webhook.Repository, metrics ...webhook.Metrics) *webhook.Service {
 	t.Helper()
 	service, err := webhook.NewService(webhook.Config{
 		Providers: map[string]webhook.Verifier{"sandbox": verifier}, Repository: store,
 		Now:   func() time.Time { return time.Date(2026, time.August, 8, 10, 0, 0, 0, time.UTC) },
-		NewID: uuid.New,
+		NewID: uuid.New, Metrics: firstMetrics(metrics),
 	})
 	if err != nil {
 		t.Fatalf("new service: %v", err)
 	}
 	return service
+}
+
+func firstMetrics(values []webhook.Metrics) webhook.Metrics {
+	if len(values) == 0 {
+		return nil
+	}
+	return values[0]
+}
+
+type webhookMetricsFake struct {
+	provider     string
+	invalidCalls int
+}
+
+func (fake *webhookMetricsFake) RecordPaymentWebhookInvalid(providerName string) {
+	fake.provider = providerName
+	fake.invalidCalls++
 }
 
 func validRequest(body []byte) httpapi.PaymentWebhookRequest {

@@ -79,3 +79,29 @@ func TestPaymentMetricLabelsCollapseCallerControlledValues(t *testing.T) {
 	}
 	t.Fatal("payment_operation_total was not gathered")
 }
+
+func TestPaymentMetricDurationsAreNonNegativeAndCapped(t *testing.T) {
+	t.Parallel()
+	registry := prometheus.NewRegistry()
+	metrics, err := platformmetrics.New(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics.RecordPaymentWebhook("sandbox", "payment.captured", "success", -time.Second, 90*24*time.Hour)
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		switch family.GetName() {
+		case "payment_webhook_processing_duration_seconds":
+			if got := family.Metric[0].GetHistogram().GetSampleSum(); got != 0 {
+				t.Fatalf("negative duration sample sum = %v", got)
+			}
+		case "payment_webhook_lag_seconds":
+			if got, want := family.Metric[0].GetHistogram().GetSampleSum(), (30 * 24 * time.Hour).Seconds(); got != want {
+				t.Fatalf("lag sample sum = %v, want %v", got, want)
+			}
+		}
+	}
+}
