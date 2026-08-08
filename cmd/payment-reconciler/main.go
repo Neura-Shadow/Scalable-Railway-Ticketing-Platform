@@ -167,15 +167,10 @@ func openRunner(ctx context.Context, lookup func(string) (string, bool), command
 		}
 		return nil, func() {}, errRuntimeWiring
 	}
-	keys, err := cfg.ParsePaymentWebhookKeys()
-	if err != nil {
-		return fail()
-	}
 	providerClient, err := providerhttp.New(providerhttp.Config{
 		BaseURL: cfg.PaymentProviderBaseURL, APIKey: cfg.PaymentProviderAPIKey,
 		ConnectTimeout: cfg.PaymentProviderConnectTimeout, RequestTimeout: cfg.PaymentProviderRequestTimeout,
-		MaxResponseBytes: int64(cfg.PaymentProviderMaxResponseBytes), MaxWebhookBodyBytes: int64(cfg.PaymentWebhookMaxBodyBytes),
-		WebhookKeys: keys, WebhookClockSkew: cfg.PaymentWebhookClockSkew, Now: time.Now,
+		MaxResponseBytes: int64(cfg.PaymentProviderMaxResponseBytes), Now: time.Now,
 	})
 	if err != nil {
 		return fail()
