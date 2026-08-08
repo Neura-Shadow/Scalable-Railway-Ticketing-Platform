@@ -328,6 +328,8 @@ func checkShard(scope Scope, control ControlSnapshot, shard ShardSnapshot, add f
 	}
 	if shard.ReservationState == "confirmed" && shard.ActiveTicketCount == 0 {
 		add("confirmed_reservation_without_active_ticket", false)
+	} else if shard.TicketOrderState == "issued" && shard.ActiveTicketCount != shard.ReservationSeatCount {
+		add("ticket_count_mismatch", false)
 	}
 	if refunded && shard.ActiveTicketCount > 0 {
 		add("fully_refunded_payment_with_active_ticket", false)

@@ -69,6 +69,21 @@ func TestReconcileAllIsReadOnlyAndDurablyEscalatesBoundedFindings(t *testing.T) 
 	}
 }
 
+func TestInspectPaymentDetectsPartialTicketIssuance(t *testing.T) {
+	id := uuid.MustParse("23232323-2323-4232-8232-232323232323")
+	store := healthyStore(id)
+	store.shard.ReservationSeatCount = 2
+	reconciler := newTestReconciler(t, store, fakeRegistry{client: &fakeProvider{payment: healthyProviderPayment()}}, nil)
+
+	report, err := reconciler.InspectPayment(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := findingCodes(report); !reflect.DeepEqual(got, []string{"ticket_count_mismatch"}) {
+		t.Fatalf("findings = %v", got)
+	}
+}
+
 func TestSafeRepairRequiresConfirmationAndReplaysOnlyStoredIdentity(t *testing.T) {
 	id := uuid.MustParse("33333333-3333-4333-8333-333333333333")
 	commandID := uuid.MustParse("44444444-4444-4444-8444-444444444444")
@@ -160,7 +175,7 @@ func healthyStore(id uuid.UUID) *fakeStore {
 			Saga:       Saga{ID: uuid.New(), State: "completed", ActiveCount: 1},
 			Operations: []Operation{{ID: uuid.New(), Type: "capture", State: "succeeded", ProviderOperationID: "op_capture", AmountMinor: 700, Currency: "TWD"}},
 		},
-		shard: ShardSnapshot{Found: true, DirectoryResolved: true, ReservationState: "confirmed", ReservationAmountMinor: 700, ReservationCurrency: "TWD", TicketOrderFound: true, TicketOrderState: "issued", TicketOrderAmountMinor: 700, TicketOrderCurrency: "TWD", IssuanceReceiptFound: true, IssuancePaymentIntentID: id, ActiveTicketCount: 1},
+		shard: ShardSnapshot{Found: true, DirectoryResolved: true, ReservationState: "confirmed", ReservationAmountMinor: 700, ReservationCurrency: "TWD", ReservationSeatCount: 1, TicketOrderFound: true, TicketOrderState: "issued", TicketOrderAmountMinor: 700, TicketOrderCurrency: "TWD", IssuanceReceiptFound: true, IssuancePaymentIntentID: id, ActiveTicketCount: 1},
 	}
 }
 

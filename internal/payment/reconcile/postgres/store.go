@@ -250,10 +250,16 @@ func (s *Store) LoadShardSnapshot(ctx context.Context, intentID uuid.UUID) (snap
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 	generation := resolution.Route.Generation().Int64()
 	err = tx.QueryRow(ctx, `
-SELECT status,total_amount_minor,currency
-FROM public.reservations
-WHERE payment_intent_id=$1 AND train_run_id=$2 AND assignment_generation=$3`, intentID, trainRunID, generation).Scan(
+SELECT reservation.status,reservation.total_amount_minor,reservation.currency,
+       (SELECT count(*)::integer
+        FROM public.reservation_seats AS reservation_seat
+        WHERE reservation_seat.reservation_id=reservation.id)
+FROM public.reservations AS reservation
+WHERE reservation.payment_intent_id=$1
+  AND reservation.train_run_id=$2
+  AND reservation.assignment_generation=$3`, intentID, trainRunID, generation).Scan(
 		&snapshot.ReservationState, &snapshot.ReservationAmountMinor, &snapshot.ReservationCurrency,
+		&snapshot.ReservationSeatCount,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if err := tx.Commit(ctx); err != nil {

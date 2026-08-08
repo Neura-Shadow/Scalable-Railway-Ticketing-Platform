@@ -103,6 +103,7 @@ type ShardSnapshot struct {
 	ReservationState         string
 	ReservationAmountMinor   int64
 	ReservationCurrency      string
+	ReservationSeatCount     int
 	TicketOrderFound         bool
 	TicketOrderID            uuid.UUID
 	TicketOrderState         string
