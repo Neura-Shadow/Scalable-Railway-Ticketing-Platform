@@ -35,7 +35,7 @@ func TestHybridReservationReaderReadsExactlyDirectorySelectedPhysicalShard(t *te
 	t.Cleanup(registry.Close)
 	handle, err := registry.Resolve(shardphysical.CatalogEntry{
 		ShardID: sharding.ShardPhysicalZero, StorageKind: shardphysical.StoragePostgres,
-		ConnectionRef: "physical-shard-0", ProtocolVersion: 1, SchemaVersion: 1,
+		ConnectionRef: "physical-shard-0", ProtocolVersion: 1, SchemaVersion: shardphysical.SupportedSchemaVersion,
 		Enabled: true, WriteEnabled: true, HealthState: shardphysical.HealthHealthy,
 		State: shardphysical.StateActive,
 	})
