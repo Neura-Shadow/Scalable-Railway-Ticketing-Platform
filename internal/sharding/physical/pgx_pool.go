@@ -24,6 +24,14 @@ func (pool *pgxPoolAdapter) BeginTx(ctx context.Context, options pgx.TxOptions) 
 	return pool.pool.BeginTx(ctx, options)
 }
 
+func (pool *pgxPoolAdapter) Query(ctx context.Context, query string, arguments ...any) (pgx.Rows, error) {
+	return pool.pool.Query(ctx, query, arguments...)
+}
+
+func (pool *pgxPoolAdapter) QueryRow(ctx context.Context, query string, arguments ...any) pgx.Row {
+	return pool.pool.QueryRow(ctx, query, arguments...)
+}
+
 func (pool *pgxPoolAdapter) Close() { pool.pool.Close() }
 
 func (pool *pgxPoolAdapter) PoolSnapshot() PoolSnapshot {
