@@ -16,6 +16,8 @@ import (
 	providerhttp "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider/httpclient"
 	paymentreconcile "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/reconcile"
 	reconcilepostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/reconcile/postgres"
+	paymentshard "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/shard"
+	paymentshardpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/shard/postgres"
 	platformconfig "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
@@ -78,7 +80,7 @@ type backend interface {
 	Execute(context.Context, request) (outcome, error)
 }
 
-type backendFactory func(context.Context, func(string) (string, bool)) (backend, func(), error)
+type backendFactory func(context.Context, func(string) (string, bool), request) (backend, func(), error)
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -99,7 +101,7 @@ func run(parent context.Context, args []string, lookup func(string) (string, boo
 	}
 	ctx, cancel := context.WithTimeout(parent, req.Timeout)
 	defer cancel()
-	service, closeService, err := factory(ctx, lookup)
+	service, closeService, err := factory(ctx, lookup, req)
 	if err != nil {
 		_ = writeJSON(stdout, envelope{Command: req.Command, Status: "failed", ReadOnly: requestReadOnly(req), Error: "startup_failed"})
 		fmt.Fprintln(stderr, "payment-admin: startup failed")
@@ -253,7 +255,7 @@ func safeName(value string) string {
 	return value
 }
 
-func openBackend(ctx context.Context, lookup func(string) (string, bool)) (backend, func(), error) {
+func openBackend(ctx context.Context, lookup func(string) (string, bool), req request) (backend, func(), error) {
 	cfg, err := platformconfig.LoadFromFor(lookup, platformconfig.ProcessPaymentReconciler)
 	if err != nil || cfg.BookingShardMode != platformconfig.BookingShardModePhysical {
 		return nil, func() {}, errRuntimeWiring
@@ -272,15 +274,10 @@ func openBackend(ctx context.Context, lookup func(string) (string, bool)) (backe
 	if err := requireOperatorRole(ctx, control); err != nil {
 		return fail()
 	}
-	keys, err := cfg.ParsePaymentWebhookKeys()
-	if err != nil {
-		return fail()
-	}
 	providerClient, err := providerhttp.New(providerhttp.Config{
 		BaseURL: cfg.PaymentProviderBaseURL, APIKey: cfg.PaymentProviderAPIKey,
 		ConnectTimeout: cfg.PaymentProviderConnectTimeout, RequestTimeout: cfg.PaymentProviderRequestTimeout,
-		MaxResponseBytes: int64(cfg.PaymentProviderMaxResponseBytes), MaxWebhookBodyBytes: int64(cfg.PaymentWebhookMaxBodyBytes),
-		WebhookKeys: keys, WebhookClockSkew: cfg.PaymentWebhookClockSkew, Now: time.Now,
+		MaxResponseBytes: int64(cfg.PaymentProviderMaxResponseBytes), Now: time.Now,
 	})
 	if err != nil {
 		return fail()
@@ -299,7 +296,26 @@ func openBackend(ctx context.Context, lookup func(string) (string, bool)) (backe
 	if err != nil {
 		return fail()
 	}
-	reconciler, err := paymentreconcile.New(store, adminProviderRegistry{"sandbox": providerClient}, nil, paymentreconcile.Config{
+	var repairer *reconcilepostgres.Repairer
+	if (isMutation(req.Command) || req.Repair) && req.Confirm && !req.DryRun {
+		directory, err := paymentshardpostgres.NewDirectory(control)
+		if err != nil {
+			return fail()
+		}
+		shardStore, err := paymentshardpostgres.NewStore(router)
+		if err != nil {
+			return fail()
+		}
+		gateway, err := paymentshard.NewGateway(directory, shardStore)
+		if err != nil {
+			return fail()
+		}
+		repairer, err = reconcilepostgres.NewRepairer(control, gateway, store)
+		if err != nil {
+			return fail()
+		}
+	}
+	reconciler, err := paymentreconcile.New(store, adminProviderRegistry{"sandbox": providerClient}, repairer, paymentreconcile.Config{
 		BatchSize: defaultLimit, StaleAfter: cfg.PaymentProcessingGrace,
 		ReviewDue: cfg.PaymentManualReviewAfter, Now: time.Now,
 	})
@@ -311,7 +327,11 @@ func openBackend(ctx context.Context, lookup func(string) (string, bool)) (backe
 			cleanup[index]()
 		}
 	}
-	return &runtimeBackend{store: store, reconciler: reconciler, provider: providerClient}, closeAll, nil
+	var operator adminOperator
+	if repairer != nil {
+		operator = repairer
+	}
+	return &runtimeBackend{store: store, reconciler: reconciler, provider: providerClient, operator: operator}, closeAll, nil
 }
 
 type queryRower interface {
@@ -343,6 +363,7 @@ type runtimeBackend struct {
 	store      adminStore
 	reconciler adminReconciler
 	provider   paymentreconcile.StatusQuerier
+	operator   adminOperator
 }
 
 type adminStore interface {
@@ -353,16 +374,32 @@ type adminStore interface {
 type adminReconciler interface {
 	InspectPayment(context.Context, uuid.UUID) (paymentreconcile.Report, error)
 	ReconcilePayment(context.Context, uuid.UUID) (paymentreconcile.Result, error)
+	RepairPayment(context.Context, uuid.UUID) (paymentreconcile.Result, error)
+}
+
+type adminOperator interface {
+	RetrySaga(context.Context, uuid.UUID) error
+	ResumeTicketIssuance(context.Context, uuid.UUID) error
+	RetryProviderOperation(context.Context, uuid.UUID, uuid.UUID, string) error
+	MarkManualReview(context.Context, uuid.UUID) error
 }
 
 func (b *runtimeBackend) Execute(ctx context.Context, req request) (outcome, error) {
 	if b == nil || b.store == nil || b.reconciler == nil || b.provider == nil {
 		return outcome{}, errRuntimeWiring
 	}
-	if isMutation(req.Command) || req.Repair {
-		// This backend has no shard-command replayer. It rejects every mutation
-		// instead of approximating a repair with direct SQL or provider calls.
-		return outcome{}, errSafeReplayUnavailable
+	if (isMutation(req.Command) || req.Repair) && !req.DryRun && !req.Confirm {
+		return outcome{}, errConfirmation
+	}
+	if req.DryRun {
+		report, err := b.reconciler.InspectPayment(ctx, req.PaymentIntentID)
+		if req.Command == "retry-saga" {
+			return outcome{Items: []item{{ResourceID: req.SagaID, Kind: "payment_saga", State: "recorded_replay_preview"}}, Count: 1}, nil
+		}
+		if err != nil {
+			return outcome{}, err
+		}
+		return reconciliationOutcome(paymentreconcile.Result{MismatchCount: len(report.Findings), Reports: []paymentreconcile.Report{report}}, req.Limit), nil
 	}
 	switch req.Command {
 	case "inspect-intent":
@@ -370,8 +407,42 @@ func (b *runtimeBackend) Execute(ctx context.Context, req request) (outcome, err
 	case "inspect-provider-status":
 		return b.inspectProvider(ctx, req.PaymentIntentID)
 	case "reconcile-intent":
+		if req.Repair {
+			result, err := b.reconciler.RepairPayment(ctx, req.PaymentIntentID)
+			return reconciliationOutcome(result, req.Limit), err
+		}
 		result, err := b.reconciler.ReconcilePayment(ctx, req.PaymentIntentID)
 		return reconciliationOutcome(result, req.Limit), err
+	case "retry-saga":
+		if b.operator == nil {
+			return outcome{}, errSafeReplayUnavailable
+		}
+		err := b.operator.RetrySaga(ctx, req.SagaID)
+		return mutationOutcome(req.SagaID, "payment_saga_replay", err)
+	case "resume-ticket-issuance":
+		if b.operator == nil {
+			return outcome{}, errSafeReplayUnavailable
+		}
+		err := b.operator.ResumeTicketIssuance(ctx, req.PaymentIntentID)
+		return mutationOutcome(req.PaymentIntentID, "ticket_issuance_replay", err)
+	case "request-void":
+		if b.operator == nil {
+			return outcome{}, errSafeReplayUnavailable
+		}
+		err := b.operator.RetryProviderOperation(ctx, req.PaymentIntentID, req.OperationID, "void")
+		return mutationOutcome(req.OperationID, "payment_operation_void", err)
+	case "request-refund":
+		if b.operator == nil {
+			return outcome{}, errSafeReplayUnavailable
+		}
+		err := b.operator.RetryProviderOperation(ctx, req.PaymentIntentID, req.OperationID, "refund")
+		return mutationOutcome(req.OperationID, "payment_operation_refund", err)
+	case "mark-manual-review":
+		if b.operator == nil {
+			return outcome{}, errSafeReplayUnavailable
+		}
+		err := b.operator.MarkManualReview(ctx, req.PaymentIntentID)
+		return mutationOutcome(req.PaymentIntentID, "manual_review", err)
 	case "inspect-financial-operations":
 		return b.inspectFinancial(ctx, req.PaymentIntentID, req.Limit)
 	case "inspect-ticket-issuance":
@@ -379,6 +450,13 @@ func (b *runtimeBackend) Execute(ctx context.Context, req request) (outcome, err
 	default:
 		return outcome{}, errRuntimeWiring
 	}
+}
+
+func mutationOutcome(id uuid.UUID, kind string, err error) (outcome, error) {
+	if err != nil {
+		return outcome{}, err
+	}
+	return outcome{Items: []item{{ResourceID: id, Kind: kind, State: "scheduled"}}, Count: 1}, nil
 }
 
 func (b *runtimeBackend) inspectIntent(ctx context.Context, id uuid.UUID, limit int) (outcome, error) {

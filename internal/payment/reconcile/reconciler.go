@@ -20,6 +20,8 @@ type Reconciler struct {
 	config    Config
 }
 
+const providerQueryTimeout = 200 * time.Millisecond
+
 func New(store Store, providers ProviderRegistry, repairer Repairer, config Config) (*Reconciler, error) {
 	if store == nil || config.BatchSize < 1 || config.BatchSize > MaxBatchSize ||
 		config.StaleAfter <= 0 || config.ReviewDue <= 0 || config.Now == nil {
@@ -41,6 +43,17 @@ func (r *Reconciler) ReconcilePayment(ctx context.Context, paymentIntentID uuid.
 		return Result{}, ErrInvalidRequest
 	}
 	return r.reconcileIDs(ctx, ScopeAll, []uuid.UUID{paymentIntentID}, false, false, false)
+}
+
+// RepairPayment runs the same bounded inspection as ReconcilePayment, but may
+// replay only a command identity recovered from durable control/shard evidence.
+// Callers must enforce their operator authorization and explicit confirmation
+// boundary before invoking it.
+func (r *Reconciler) RepairPayment(ctx context.Context, paymentIntentID uuid.UUID) (Result, error) {
+	if r == nil || r.repairer == nil || ctx == nil || paymentIntentID == uuid.Nil {
+		return Result{}, ErrRepairUnavailable
+	}
+	return r.reconcileIDs(ctx, ScopeAll, []uuid.UUID{paymentIntentID}, false, true, true)
 }
 
 func (r *Reconciler) ReconcileAll(ctx context.Context, options Options) (Result, error) {
@@ -114,7 +127,9 @@ func (r *Reconciler) reconcileIDs(ctx context.Context, scope Scope, ids []uuid.U
 			return result, fmt.Errorf("inspect payment intent: %w", err)
 		}
 		result.RowsExamined += report.RowsExamined
-		result.MismatchCount += len(report.Findings)
+		if len(report.Findings) > 0 {
+			result.MismatchCount++
+		}
 		replayedCommands := make(map[uuid.UUID]struct{}, len(report.Findings))
 		for index := range report.Findings {
 			finding := &report.Findings[index]
@@ -127,11 +142,14 @@ func (r *Reconciler) reconcileIDs(ctx context.Context, scope Scope, ids []uuid.U
 							return result, err
 						}
 						if err := r.repairer.ReplayRecordedCommand(ctx, id, command); err != nil {
-							return result, fmt.Errorf("replay recorded payment command: %w", err)
+							created, escalationErr := r.store.EscalateManualReview(ctx, checkpoint.ID, id, "safe_replay_failed", now.Add(r.config.ReviewDue))
+							if created {
+								result.ManualReviews++
+							}
+							return result, errors.Join(fmt.Errorf("replay recorded payment command: %w", err), escalationErr)
 						}
 						replayedCommands[command.ID] = struct{}{}
 						report.RepairsApplied++
-						result.RepairCount++
 					}
 					finding.CommandID = command.ID
 					repaired = true
@@ -147,6 +165,9 @@ func (r *Reconciler) reconcileIDs(ctx context.Context, scope Scope, ids []uuid.U
 			if created {
 				result.ManualReviews++
 			}
+		}
+		if report.RepairsApplied > 0 {
+			result.RepairCount++
 		}
 		result.Reports = append(result.Reports, report)
 	}
@@ -188,7 +209,9 @@ func (r *Reconciler) inspect(ctx context.Context, id uuid.UUID, scope Scope) (Re
 	checkShard(scope, control, shard, add)
 	if shouldQueryProvider(scope, control) {
 		report.ProviderQueried = true
-		checkProvider(ctx, r.providers, control, add)
+		providerCtx, cancel := context.WithTimeout(ctx, providerQueryTimeout)
+		checkProvider(providerCtx, r.providers, control, add)
+		cancel()
 	}
 	for i := range report.Findings {
 		if command, ok := matchingRecordedCommand(report.Findings[i].Code, shard.RecordedCommands); ok {
@@ -198,9 +221,6 @@ func (r *Reconciler) inspect(ctx context.Context, id uuid.UUID, scope Scope) (Re
 		}
 	}
 	sort.Slice(report.Findings, func(i, j int) bool { return report.Findings[i].Code < report.Findings[j].Code })
-	if report.RowsExamined < len(report.Findings) {
-		report.RowsExamined = len(report.Findings)
-	}
 	return report, nil
 }
 
@@ -231,7 +251,7 @@ func checkControl(scope Scope, snapshot ControlSnapshot, add func(string, bool))
 		return
 	}
 	captured, refunded := int64(0), int64(0)
-	captures, refunds := 0, 0
+	captures, refunds, succeededCaptures := 0, 0, 0
 	providerOperations := map[string]struct{}{}
 	uncertain := false
 	for _, operation := range snapshot.Operations {
@@ -248,6 +268,7 @@ func checkControl(scope Scope, snapshot ControlSnapshot, add func(string, bool))
 		case "capture":
 			captures++
 			if operation.State == "succeeded" {
+				succeededCaptures++
 				captured += operation.AmountMinor
 			}
 		case "refund":
@@ -263,13 +284,13 @@ func checkControl(scope Scope, snapshot ControlSnapshot, add func(string, bool))
 	if refunds > 1 {
 		add("duplicate_refund_operation", false)
 	}
-	if captures > 0 && captured != snapshot.Intent.AmountMinor {
+	if succeededCaptures > 0 && captured != snapshot.Intent.AmountMinor {
 		add("captured_amount_mismatch", false)
 	}
 	if refunded > captured {
 		add("refund_exceeds_capture", false)
 	}
-	if snapshot.Saga.State == "completed" && (captures != 1 || captured != snapshot.Intent.AmountMinor) {
+	if snapshot.Saga.State == "completed" && (succeededCaptures != 1 || captured != snapshot.Intent.AmountMinor) {
 		add("completed_saga_without_full_capture", false)
 	}
 	if uncertain && snapshot.ActiveReconciliationCases == 0 {
@@ -297,6 +318,14 @@ func checkShard(scope Scope, control ControlSnapshot, shard ShardSnapshot, add f
 	}
 	captured := hasSucceeded(control.Operations, "capture")
 	refunded := hasSucceeded(control.Operations, "refund")
+	voided := hasSucceeded(control.Operations, "void")
+	if (scope == ScopeIntents || scope == ScopeAll) && control.Intent.State == "reservation_securing" && shard.BeginReceiptFound {
+		if shard.ReceiptFingerprint == control.Intent.Fingerprint {
+			add("begin_payment_shard_committed_control_incomplete", false)
+		} else {
+			add("begin_payment_shard_receipt_mismatch", false)
+		}
+	}
 	if scope == ScopeIntents || scope == ScopeAll {
 		if captured && shard.ReservationState != "payment_pending" && shard.ReservationState != "confirmed" && shard.ReservationState != "refund_pending" && shard.ReservationState != "cancelled" {
 			add("captured_payment_reservation_state_mismatch", false)
@@ -308,7 +337,7 @@ func checkShard(scope Scope, control ControlSnapshot, shard ShardSnapshot, add f
 	if control.Intent.State == "completed" && (!shard.TicketOrderFound || shard.TicketOrderState != "issued") {
 		add("completed_payment_without_issued_ticket_order", false)
 	}
-	if captured && (!shard.TicketOrderFound || shard.TicketOrderState != "issued") {
+	if capturedRequiresIssuedTickets(control, refunded, voided) && (!shard.TicketOrderFound || shard.TicketOrderState != "issued") {
 		add("captured_payment_without_ticket", false)
 	}
 	if !captured && (shard.TicketOrderState == "issued" || shard.ActiveTicketCount > 0) {
@@ -326,6 +355,19 @@ func checkShard(scope Scope, control ControlSnapshot, shard ShardSnapshot, add f
 	if shard.IssuanceReceiptFound && shard.IssuancePaymentIntentID != control.Intent.ID {
 		add("issuance_receipt_intent_mismatch", false)
 	}
+	if shard.IssuanceReceiptFound && controlFinalizeIncomplete(control, "ticket_issue_pending", "issuing_tickets", "issue_tickets", true) {
+		add("issuance_receipt_control_not_finalized", false)
+	}
+	if shard.RefundPendingReceiptFound && controlFinalizeIncomplete(control, "refund_pending", "compensating", "refund", true) {
+		add("refund_pending_receipt_control_not_finalized", false)
+	}
+	if refunded && shard.CompensationReceiptFound && controlFinalizeIncomplete(control, "refunded", "refunding", "compensate", false) {
+		add("refund_receipt_control_not_finalized", false)
+	}
+	if voided && shard.CancellationReceiptFound && !shard.CompensationReceiptFound &&
+		controlFinalizeIncomplete(control, "voided", "compensating", "compensate", false) {
+		add("void_receipt_control_not_finalized", false)
+	}
 	if shard.ReservationState == "confirmed" && shard.ActiveTicketCount == 0 {
 		add("confirmed_reservation_without_active_ticket", false)
 	} else if shard.TicketOrderState == "issued" && shard.ActiveTicketCount != shard.ReservationSeatCount {
@@ -333,6 +375,9 @@ func checkShard(scope Scope, control ControlSnapshot, shard ShardSnapshot, add f
 	}
 	if refunded && shard.ActiveTicketCount > 0 {
 		add("fully_refunded_payment_with_active_ticket", false)
+	}
+	if voided && shard.ReservationState != "cancelled" {
+		add("voided_payment_with_live_reservation", false)
 	}
 	if shard.CancelledTicketCount > 0 && captured && !refunded && control.Intent.State != "refund_pending" {
 		add("cancelled_ticket_without_required_refund", false)
@@ -343,6 +388,29 @@ func checkShard(scope Scope, control ControlSnapshot, shard ShardSnapshot, add f
 	if shard.IssuanceReceiptFound && shard.ReceiptFingerprint != ([sha256.Size]byte{}) && shard.ReceiptFingerprint != control.Intent.Fingerprint {
 		add("shard_control_fingerprint_mismatch", false)
 	}
+}
+
+func capturedRequiresIssuedTickets(control ControlSnapshot, refunded, voided bool) bool {
+	if refunded || voided {
+		return false
+	}
+	switch control.Intent.State {
+	case "refund_pending", "refunded", "voided", "cancelled":
+		return false
+	case "manual_review":
+		return !(control.Saga.Step == "refund" && control.Saga.ErrorCategory == "database_finalize_failed")
+	default:
+		return true
+	}
+}
+
+func controlFinalizeIncomplete(control ControlSnapshot, intentState, sagaState, step string, intentMayBeManual bool) bool {
+	if control.Intent.State == intentState && control.Saga.State == sagaState && control.Saga.Step == step {
+		return true
+	}
+	intentMatches := control.Intent.State == intentState || intentMayBeManual && control.Intent.State == "manual_review"
+	return intentMatches && control.Saga.State == "manual_review" && control.Saga.Step == step &&
+		control.Saga.ErrorCategory == "database_finalize_failed"
 }
 
 func checkProvider(ctx context.Context, registry ProviderRegistry, control ControlSnapshot, add func(string, bool)) {
@@ -407,10 +475,16 @@ func succeededAmount(operations []Operation, kind string) int64 {
 func matchingRecordedCommand(code string, commands []RecordedCommand) (RecordedCommand, bool) {
 	wanted := ""
 	switch code {
-	case "captured_payment_without_ticket", "completed_payment_without_issued_ticket_order", "issued_ticket_order_without_receipt", "confirmed_reservation_without_active_ticket":
+	case "begin_payment_shard_committed_control_incomplete":
+		wanted = "finalize_reservation_begin"
+	case "issuance_receipt_control_not_finalized":
 		wanted = "issue_tickets"
-	case "fully_refunded_payment_with_active_ticket":
+	case "refund_pending_receipt_control_not_finalized":
+		wanted = "mark_refund_pending"
+	case "refund_receipt_control_not_finalized":
 		wanted = "apply_refund_compensation"
+	case "void_receipt_control_not_finalized":
+		wanted = "cancel_voided_reservation"
 	}
 	for _, command := range commands {
 		if command.Kind == wanted && validateRecordedCommand(command) == nil {
@@ -429,17 +503,25 @@ func commandForFinding(finding Finding) (RecordedCommand, bool) {
 
 func repairKind(code string) string {
 	switch code {
-	case "captured_payment_without_ticket", "completed_payment_without_issued_ticket_order", "issued_ticket_order_without_receipt", "confirmed_reservation_without_active_ticket":
+	case "begin_payment_shard_committed_control_incomplete":
+		return "finalize_reservation_begin"
+	case "issuance_receipt_control_not_finalized":
 		return "issue_tickets"
-	case "fully_refunded_payment_with_active_ticket":
+	case "refund_pending_receipt_control_not_finalized":
+		return "mark_refund_pending"
+	case "refund_receipt_control_not_finalized":
 		return "apply_refund_compensation"
+	case "void_receipt_control_not_finalized":
+		return "cancel_voided_reservation"
 	default:
 		return ""
 	}
 }
 
 func validateRecordedCommand(command RecordedCommand) error {
-	if command.ID == uuid.Nil || (command.Kind != "issue_tickets" && command.Kind != "apply_refund_compensation") || command.Fingerprint == ([sha256.Size]byte{}) {
+	if command.ID == uuid.Nil ||
+		(command.Kind != "finalize_reservation_begin" && command.Kind != "issue_tickets" && command.Kind != "mark_refund_pending" && command.Kind != "apply_refund_compensation" && command.Kind != "cancel_voided_reservation") ||
+		command.Fingerprint == ([sha256.Size]byte{}) {
 		return ErrInvalidRequest
 	}
 	return nil

@@ -33,8 +33,8 @@ func TestInspectPaymentDetectsCrossBoundaryAndProviderMismatches(t *testing.T) {
 	}
 	want := []string{
 		"captured_payment_without_ticket", "completed_payment_without_issued_ticket_order",
-		"completed_saga_without_full_capture", "duplicate_capture_operation",
-		"provider_capture_mismatch", "uncertain_operation_without_reconciliation",
+		"duplicate_capture_operation", "provider_capture_mismatch",
+		"uncertain_operation_without_reconciliation",
 	}
 	if got := findingCodes(report); !reflect.DeepEqual(got, want) {
 		t.Fatalf("findings = %v, want %v", got, want)
@@ -69,6 +69,25 @@ func TestReconcileAllIsReadOnlyAndDurablyEscalatesBoundedFindings(t *testing.T) 
 	}
 }
 
+func TestRowsAndMismatchCountersCountIntentsNotFindings(t *testing.T) {
+	id := uuid.New()
+	store := healthyStore(id)
+	store.candidates = []uuid.UUID{id}
+	store.shard.TicketOrderFound = false
+	store.shard.TicketOrderState = ""
+	store.shard.IssuanceReceiptFound = false
+	store.shard.ActiveTicketCount = 0
+	reconciler := newTestReconciler(t, store, fakeRegistry{client: &fakeProvider{payment: healthyProviderPayment()}}, nil)
+
+	result, err := reconciler.ReconcileAll(context.Background(), Options{Scope: ScopeAll, Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Reports) != 1 || len(result.Reports[0].Findings) < 2 || result.RowsExamined != 1 || result.MismatchCount != 1 {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
 func TestInspectPaymentDetectsPartialTicketIssuance(t *testing.T) {
 	id := uuid.MustParse("23232323-2323-4232-8232-232323232323")
 	store := healthyStore(id)
@@ -84,13 +103,169 @@ func TestInspectPaymentDetectsPartialTicketIssuance(t *testing.T) {
 	}
 }
 
+func TestCheckShardDetectsCommittedReceiptsBeforeControlFinalization(t *testing.T) {
+	intentID := uuid.New()
+	cases := []struct {
+		name    string
+		control ControlSnapshot
+		shard   ShardSnapshot
+		want    string
+	}{
+		{
+			name: "begin payment",
+			control: ControlSnapshot{Intent: Intent{ID: intentID, State: "reservation_securing", AmountMinor: 700, Currency: "TWD",
+				Fingerprint: sha256.Sum256([]byte("begin"))}, Saga: Saga{State: "created"}},
+			shard: ShardSnapshot{Found: true, DirectoryResolved: true, ReservationState: "payment_pending", ReservationAmountMinor: 700,
+				ReservationCurrency: "TWD", BeginReceiptFound: true, ReceiptFingerprint: sha256.Sum256([]byte("begin"))},
+			want: "begin_payment_shard_committed_control_incomplete",
+		},
+		{
+			name: "issuance",
+			control: ControlSnapshot{Intent: Intent{ID: intentID, State: "ticket_issue_pending", AmountMinor: 700, Currency: "TWD"},
+				Saga: Saga{State: "issuing_tickets", Step: "issue_tickets"}, Operations: []Operation{{Type: "capture", State: "succeeded"}}},
+			shard: ShardSnapshot{Found: true, DirectoryResolved: true, ReservationState: "confirmed", ReservationAmountMinor: 700, ReservationCurrency: "TWD",
+				ReservationSeatCount: 1, TicketOrderFound: true, TicketOrderState: "issued", TicketOrderAmountMinor: 700, TicketOrderCurrency: "TWD",
+				IssuanceReceiptFound: true, IssuancePaymentIntentID: intentID, ActiveTicketCount: 1},
+			want: "issuance_receipt_control_not_finalized",
+		},
+		{
+			name: "refund",
+			control: ControlSnapshot{Intent: Intent{ID: intentID, State: "refunded", AmountMinor: 700, Currency: "TWD"},
+				Saga: Saga{State: "refunding", Step: "compensate"}, Operations: []Operation{{Type: "capture", State: "succeeded"}, {Type: "refund", State: "succeeded"}}},
+			shard: ShardSnapshot{Found: true, DirectoryResolved: true, ReservationState: "cancelled", ReservationAmountMinor: 700, ReservationCurrency: "TWD",
+				ReservationSeatCount: 1, TicketOrderFound: true, TicketOrderState: "cancelled", TicketOrderAmountMinor: 700, TicketOrderCurrency: "TWD",
+				IssuanceReceiptFound: true, IssuancePaymentIntentID: intentID, CancelledTicketCount: 1, CancellationReceiptFound: true, CompensationReceiptFound: true},
+			want: "refund_receipt_control_not_finalized",
+		},
+		{
+			name: "void without ticket locator",
+			control: ControlSnapshot{Intent: Intent{ID: intentID, State: "voided", AmountMinor: 700, Currency: "TWD"},
+				Saga: Saga{State: "compensating", Step: "compensate"}, Operations: []Operation{{Type: "void", State: "succeeded"}}},
+			shard: ShardSnapshot{Found: true, DirectoryResolved: true, ReservationState: "cancelled", ReservationAmountMinor: 700, ReservationCurrency: "TWD",
+				ReservationSeatCount: 1, CancellationReceiptFound: true},
+			want: "void_receipt_control_not_finalized",
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			var findings []string
+			checkShard(ScopeAll, test.control, test.shard, func(code string, _ bool) { findings = append(findings, code) })
+			if !containsString(findings, test.want) {
+				t.Fatalf("findings=%v, want %s", findings, test.want)
+			}
+		})
+	}
+}
+
+func TestCheckShardAcceptsHealthyRefundedTerminalStateWithRetainedReceipts(t *testing.T) {
+	intentID := uuid.New()
+	control := ControlSnapshot{
+		Intent: Intent{ID: intentID, State: "cancelled", AmountMinor: 700, Currency: "TWD"},
+		Saga:   Saga{State: "compensated", Step: "done"},
+		Operations: []Operation{
+			{Type: "capture", State: "succeeded", AmountMinor: 700, Currency: "TWD"},
+			{Type: "refund", State: "succeeded", AmountMinor: 700, Currency: "TWD"},
+		},
+	}
+	shard := ShardSnapshot{
+		Found: true, DirectoryResolved: true, ReservationState: "cancelled",
+		ReservationAmountMinor: 700, ReservationCurrency: "TWD", ReservationSeatCount: 1,
+		TicketOrderFound: true, TicketOrderState: "cancelled", TicketOrderAmountMinor: 700, TicketOrderCurrency: "TWD",
+		IssuanceReceiptFound: true, IssuancePaymentIntentID: intentID, RefundPendingReceiptFound: true,
+		CompensationReceiptFound: true, CancellationReceiptFound: true, CancelledTicketCount: 1,
+	}
+	var findings []string
+	checkShard(ScopeAll, control, shard, func(code string, _ bool) { findings = append(findings, code) })
+	if len(findings) != 0 {
+		t.Fatalf("healthy terminal refund findings=%v", findings)
+	}
+}
+
+func TestControlFinalizeIncompleteRequiresExactStepOrBoundedManualReview(t *testing.T) {
+	base := ControlSnapshot{Intent: Intent{State: "ticket_issue_pending"}, Saga: Saga{State: "issuing_tickets", Step: "issue_tickets"}}
+	if !controlFinalizeIncomplete(base, "ticket_issue_pending", "issuing_tickets", "issue_tickets", true) {
+		t.Fatal("exact pre-finalize state was not detected")
+	}
+	base.Saga.Step = "refund"
+	if controlFinalizeIncomplete(base, "ticket_issue_pending", "issuing_tickets", "issue_tickets", true) {
+		t.Fatal("wrong saga step was accepted")
+	}
+	base.Intent.State = "manual_review"
+	base.Saga = Saga{State: "manual_review", Step: "issue_tickets", ErrorCategory: "database_finalize_failed"}
+	if !controlFinalizeIncomplete(base, "ticket_issue_pending", "issuing_tickets", "issue_tickets", true) {
+		t.Fatal("bounded database-finalize review was not detected")
+	}
+	base.Saga.ErrorCategory = "provider_outcome_unknown"
+	if controlFinalizeIncomplete(base, "ticket_issue_pending", "issuing_tickets", "issue_tickets", true) {
+		t.Fatal("unrelated manual review was accepted")
+	}
+}
+
+func TestCapturedManualReviewWithoutTicketStillProducesFinding(t *testing.T) {
+	control := ControlSnapshot{
+		Intent:     Intent{ID: uuid.New(), State: "manual_review", AmountMinor: 700, Currency: "TWD"},
+		Saga:       Saga{State: "manual_review", Step: "await_provider", ErrorCategory: "operator_requested"},
+		Operations: []Operation{{Type: "capture", State: "succeeded", AmountMinor: 700, Currency: "TWD"}},
+	}
+	shard := ShardSnapshot{Found: true, DirectoryResolved: true, ReservationState: "payment_pending", ReservationAmountMinor: 700,
+		ReservationCurrency: "TWD", ReservationSeatCount: 1}
+	var findings []string
+	checkShard(ScopeAll, control, shard, func(code string, _ bool) { findings = append(findings, code) })
+	if !containsString(findings, "captured_payment_without_ticket") {
+		t.Fatalf("findings=%v", findings)
+	}
+
+	control.Saga = Saga{State: "manual_review", Step: "refund", ErrorCategory: "database_finalize_failed"}
+	findings = nil
+	checkShard(ScopeAll, control, shard, func(code string, _ bool) { findings = append(findings, code) })
+	if containsString(findings, "captured_payment_without_ticket") {
+		t.Fatalf("mark-refund finalize window was misclassified: %v", findings)
+	}
+}
+
+func TestBeginReceiptFingerprintMismatchIsNotRepairable(t *testing.T) {
+	control := ControlSnapshot{Intent: Intent{ID: uuid.New(), State: "reservation_securing", AmountMinor: 700, Currency: "TWD", Fingerprint: sha256.Sum256([]byte("control"))}}
+	shard := ShardSnapshot{Found: true, DirectoryResolved: true, ReservationState: "payment_pending", ReservationAmountMinor: 700,
+		ReservationCurrency: "TWD", BeginReceiptFound: true, ReceiptFingerprint: sha256.Sum256([]byte("shard")),
+		RecordedCommands: []RecordedCommand{{ID: uuid.New(), Kind: "finalize_reservation_begin", Fingerprint: sha256.Sum256([]byte("shard"))}}}
+	var findings []Finding
+	checkShard(ScopeAll, control, shard, func(code string, repairable bool) {
+		findings = append(findings, Finding{Code: code, Repairable: repairable})
+	})
+	if len(findings) == 0 || findings[0].Code != "begin_payment_shard_receipt_mismatch" || findings[0].Repairable {
+		t.Fatalf("findings=%+v", findings)
+	}
+}
+
+func TestBeginReceiptFindingUsesOnlyRecordedFinalizeIdentity(t *testing.T) {
+	command := RecordedCommand{ID: uuid.New(), Kind: "finalize_reservation_begin", Fingerprint: sha256.Sum256([]byte("receipt"))}
+	got, ok := matchingRecordedCommand("begin_payment_shard_committed_control_incomplete", []RecordedCommand{command})
+	if !ok || got != command {
+		t.Fatalf("command=%+v ok=%v", got, ok)
+	}
+	if _, ok := matchingRecordedCommand("begin_payment_shard_receipt_mismatch", []RecordedCommand{command}); ok {
+		t.Fatal("mismatched receipt became repairable")
+	}
+}
+
+func containsString(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
+
 func TestSafeRepairRequiresConfirmationAndReplaysOnlyStoredIdentity(t *testing.T) {
 	id := uuid.MustParse("33333333-3333-4333-8333-333333333333")
 	commandID := uuid.MustParse("44444444-4444-4444-8444-444444444444")
 	fingerprint := sha256.Sum256([]byte("durable receipt fingerprint"))
 	store := healthyStore(id)
 	store.candidates = []uuid.UUID{id}
-	store.shard.ActiveTicketCount = 0
+	store.control.Intent.State = "ticket_issue_pending"
+	store.control.Saga.State = "issuing_tickets"
+	store.control.Saga.Step = "issue_tickets"
 	store.shard.RecordedCommands = []RecordedCommand{{ID: commandID, Kind: "issue_tickets", Fingerprint: fingerprint}}
 	repairer := &fakeRepairer{}
 	reconciler := newTestReconciler(t, store, fakeRegistry{client: &fakeProvider{payment: healthyProviderPayment()}}, repairer)
@@ -111,6 +286,27 @@ func TestSafeRepairRequiresConfirmationAndReplaysOnlyStoredIdentity(t *testing.T
 	}
 	if len(store.escalations) != 0 {
 		t.Fatal("successfully repaired finding must not be escalated")
+	}
+}
+
+func TestSafeReplayFailureFailsClosedIntoManualReview(t *testing.T) {
+	id := uuid.New()
+	commandID := uuid.New()
+	store := healthyStore(id)
+	store.candidates = []uuid.UUID{id}
+	store.control.Intent.State = "ticket_issue_pending"
+	store.control.Saga.State = "issuing_tickets"
+	store.control.Saga.Step = "issue_tickets"
+	store.shard.RecordedCommands = []RecordedCommand{{ID: commandID, Kind: "issue_tickets", Fingerprint: sha256.Sum256([]byte("recorded"))}}
+	repairer := &fakeRepairer{err: ErrRepairUnavailable}
+	reconciler := newTestReconciler(t, store, fakeRegistry{client: &fakeProvider{payment: healthyProviderPayment()}}, repairer)
+
+	result, err := reconciler.ReconcileAll(context.Background(), Options{Scope: ScopeTickets, Limit: 1, Repair: true, ConfirmRepair: true})
+	if !errors.Is(err, ErrRepairUnavailable) || result.RepairCount != 0 || result.ManualReviews != 1 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if len(store.escalations) != 1 || store.escalations[0].reason != "safe_replay_failed" {
+		t.Fatalf("escalations=%+v", store.escalations)
 	}
 }
 
@@ -152,6 +348,26 @@ func TestReconcileAllPersistsOneIntentBoundCheckpointPerCandidate(t *testing.T) 
 	}
 	if len(store.checkpoints) != 2 || store.checkpoints[0].PaymentIntentID != first || store.checkpoints[1].PaymentIntentID != second {
 		t.Fatalf("checkpoints=%+v", store.checkpoints)
+	}
+}
+
+func TestProviderQueriesUsePerItemBudgetAndContinueBatch(t *testing.T) {
+	first := uuid.MustParse("91919191-9191-4919-8919-919191919191")
+	store := healthyStore(first)
+	store.candidates = []uuid.UUID{first, uuid.New(), uuid.New()}
+	client := &blockingProvider{}
+	reconciler := newTestReconciler(t, store, fakeRegistry{client: client}, nil)
+
+	started := time.Now()
+	result, err := reconciler.ReconcileAll(context.Background(), Options{Scope: ScopeAll, Limit: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed >= 2*time.Second {
+		t.Fatalf("provider batch exceeded bounded budget: %s", elapsed)
+	}
+	if result.RowsExamined != 3 || len(result.Reports) != 3 || client.calls != 3 {
+		t.Fatalf("result=%+v provider calls=%d", result, client.calls)
 	}
 }
 
@@ -237,14 +453,25 @@ type fakeProvider struct {
 	calls   int
 }
 
+type blockingProvider struct{ calls int }
+
+func (p *blockingProvider) GetPaymentStatus(ctx context.Context, _ string) (provider.Payment, error) {
+	p.calls++
+	<-ctx.Done()
+	return provider.Payment{}, ctx.Err()
+}
+
 func (p *fakeProvider) GetPaymentStatus(context.Context, string) (provider.Payment, error) {
 	p.calls++
 	return p.payment, p.err
 }
 
-type fakeRepairer struct{ commands []RecordedCommand }
+type fakeRepairer struct {
+	commands []RecordedCommand
+	err      error
+}
 
 func (r *fakeRepairer) ReplayRecordedCommand(_ context.Context, _ uuid.UUID, command RecordedCommand) error {
 	r.commands = append(r.commands, command)
-	return nil
+	return r.err
 }

@@ -141,7 +141,7 @@ func (s *Store) LoadControlSnapshot(ctx context.Context, intentID uuid.UUID) (pa
 		&snapshot.Intent.ID, &snapshot.Intent.ReservationID, &snapshot.Intent.TrainRunID,
 		&snapshot.Intent.Provider, &snapshot.Intent.ProviderPaymentID, &snapshot.Intent.State,
 		&snapshot.Intent.AmountMinor, &snapshot.Intent.Currency, &fingerprint,
-		&activeIntents, &sagaIDText, &snapshot.Saga.State,
+		&activeIntents, &sagaIDText, &snapshot.Saga.State, &snapshot.Saga.Step, &snapshot.Saga.ErrorCategory,
 		&activeSagas, &duplicateEvents, &conflicts, &openReviews,
 		&activeReconciliations,
 	)
@@ -166,7 +166,7 @@ func (s *Store) LoadControlSnapshot(ctx context.Context, intentID uuid.UUID) (pa
 	snapshot.ActiveReconciliationCases = boundedCount(activeReconciliations)
 
 	rows, err := s.control.Query(ctx, `
-SELECT operation_id,operation_type,state,COALESCE(provider_operation_id,''),amount_minor,currency
+SELECT operation_id,operation_type,state,COALESCE(provider_operation_id,''),amount_minor,currency,response_fingerprint
 FROM public.payment_operations
 WHERE payment_intent_id=$1
 ORDER BY created_at,operation_id
@@ -180,9 +180,14 @@ LIMIT 1001`, intentID)
 			return paymentreconcile.ControlSnapshot{}, errors.New("payment operation observation exceeded bound")
 		}
 		var operation paymentreconcile.Operation
-		if err := rows.Scan(&operation.ID, &operation.Type, &operation.State, &operation.ProviderOperationID, &operation.AmountMinor, &operation.Currency); err != nil {
+		var evidence []byte
+		if err := rows.Scan(&operation.ID, &operation.Type, &operation.State, &operation.ProviderOperationID, &operation.AmountMinor, &operation.Currency, &evidence); err != nil {
 			return paymentreconcile.ControlSnapshot{}, err
 		}
+		if len(evidence) != 0 && len(evidence) != sha256.Size {
+			return paymentreconcile.ControlSnapshot{}, errors.New("invalid payment operation evidence")
+		}
+		copy(operation.EvidenceHash[:], evidence)
 		snapshot.Operations = append(snapshot.Operations, operation)
 	}
 	if err := rows.Err(); err != nil {
@@ -202,6 +207,12 @@ SELECT intent.payment_intent_id,intent.reservation_id,intent.train_run_id,
                  WHERE payment_intent_id=intent.payment_intent_id
                  ORDER BY created_at,saga_id LIMIT 1),''),
        COALESCE((SELECT state FROM public.payment_sagas
+                 WHERE payment_intent_id=intent.payment_intent_id
+                 ORDER BY created_at,saga_id LIMIT 1),''),
+       COALESCE((SELECT current_step FROM public.payment_sagas
+                 WHERE payment_intent_id=intent.payment_intent_id
+                 ORDER BY created_at,saga_id LIMIT 1),''),
+       COALESCE((SELECT bounded_error_category FROM public.payment_sagas
                  WHERE payment_intent_id=intent.payment_intent_id
                  ORDER BY created_at,saga_id LIMIT 1),''),
        (SELECT count(*) FROM public.payment_sagas
@@ -293,12 +304,26 @@ WHERE payment_intent_id=$1 AND train_run_id=$2 AND assignment_generation=$3`, in
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return snapshot, err
 	}
+	if err := tx.QueryRow(ctx, `SELECT
+ EXISTS(SELECT 1 FROM public.payment_command_receipts
+        WHERE payment_intent_id=$1 AND train_run_id=$2 AND assignment_generation=$3
+          AND operation='reservation.payment_cancelled' AND status='succeeded'),
+ EXISTS(SELECT 1 FROM public.payment_compensation_receipts
+        WHERE payment_intent_id=$1 AND train_run_id=$2 AND assignment_generation=$3),
+ EXISTS(SELECT 1 FROM public.payment_command_receipts
+        WHERE payment_intent_id=$1 AND train_run_id=$2 AND assignment_generation=$3
+          AND operation='reservation.refund_pending' AND status='succeeded')`,
+		intentID, trainRunID, generation).Scan(&snapshot.CancellationReceiptFound, &snapshot.CompensationReceiptFound, &snapshot.RefundPendingReceiptFound); err != nil {
+		return snapshot, err
+	}
 	var receiptFingerprint []byte
 	err = tx.QueryRow(ctx, `
-SELECT request_fingerprint
+SELECT command_id,request_fingerprint
 FROM public.payment_command_receipts
-WHERE payment_intent_id=$1 AND operation='reservation.payment_begin' AND status='succeeded'`, intentID).Scan(&receiptFingerprint)
+WHERE payment_intent_id=$1 AND train_run_id=$2 AND assignment_generation=$3
+  AND operation='reservation.payment_begin' AND status='succeeded'`, intentID, trainRunID, generation).Scan(&snapshot.BeginCommandID, &receiptFingerprint)
 	if err == nil {
+		snapshot.BeginReceiptFound = true
 		if len(receiptFingerprint) != sha256.Size {
 			return snapshot, errors.New("invalid shard payment fingerprint")
 		}
@@ -323,6 +348,24 @@ WHERE ticket_order_id=$1 AND train_run_id=$2 AND assignment_generation=$3`, snap
 	if err := tx.Commit(ctx); err != nil {
 		return snapshot, err
 	}
+	commands, err := s.loadRecordedCommands(ctx, intentID)
+	if err != nil {
+		return snapshot, err
+	}
+	if snapshot.BeginReceiptFound {
+		var sagaID uuid.UUID
+		err := s.control.QueryRow(ctx, `SELECT saga_id FROM public.payment_sagas
+WHERE payment_intent_id=$1 AND state='created' AND current_step='secure_reservation'`, intentID).Scan(&sagaID)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return snapshot, err
+		}
+		if err == nil && snapshot.BeginCommandID == beginPaymentCommandID(sagaID) {
+			commands = append(commands, paymentreconcile.RecordedCommand{
+				ID: snapshot.BeginCommandID, Kind: "finalize_reservation_begin", Fingerprint: snapshot.ReceiptFingerprint,
+			})
+		}
+	}
+	snapshot.RecordedCommands = commands
 	return snapshot, nil
 }
 
@@ -444,6 +487,68 @@ func boundedCategory(value string) string {
 		}
 	}
 	return value
+}
+
+// VerifyBeginPaymentReceipt re-resolves the current booking shard and proves
+// that the immutable begin-payment receipt and its resulting reservation/order
+// state still match the control-plane financial identity.
+func (s *Store) VerifyBeginPaymentReceipt(ctx context.Context, intentID, commandID uuid.UUID, fingerprint [sha256.Size]byte) error {
+	if s == nil || s.control == nil || s.resolver == nil || ctx == nil || intentID == uuid.Nil || commandID == uuid.Nil || fingerprint == ([sha256.Size]byte{}) {
+		return paymentreconcile.ErrRepairUnavailable
+	}
+	var reservationID, trainRunID, ownerID uuid.UUID
+	var amountMinor int64
+	var currency string
+	if err := s.control.QueryRow(ctx, `SELECT reservation_id,train_run_id,owner_user_id,amount_minor,currency
+FROM public.payment_intents WHERE payment_intent_id=$1`, intentID).Scan(
+		&reservationID, &trainRunID, &ownerID, &amountMinor, &currency); err != nil {
+		return paymentreconcile.ErrRepairUnavailable
+	}
+	resolution, err := s.resolver.Resolve(ctx, trainRunID, false)
+	if err != nil {
+		return paymentreconcile.ErrRepairUnavailable
+	}
+	tx, err := resolution.Handle.Pool().BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return paymentreconcile.ErrRepairUnavailable
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	var storedFingerprint []byte
+	var receiptAmount, reservationAmount, orderAmount int64
+	var receiptCurrency, reservationCurrency, orderCurrency, resultStatus, reservationState, orderState string
+	var receiptReservation, receiptTrain, receiptResult, reservationIntent, orderID, orderIntent, orderOwner uuid.UUID
+	var generation int64
+	err = tx.QueryRow(ctx, `SELECT receipt.request_fingerprint,receipt.reservation_id,receipt.train_run_id,
+ receipt.assignment_generation,receipt.amount_minor,receipt.currency,receipt.result_resource_id,receipt.result_status,
+ reservation.status,reservation.payment_intent_id,reservation.total_amount_minor,reservation.currency,
+ orders.id,orders.status,orders.payment_intent_id,orders.user_id,orders.total_amount_minor,orders.currency
+FROM public.payment_command_receipts AS receipt
+JOIN public.reservations AS reservation
+  ON reservation.id=receipt.reservation_id AND reservation.train_run_id=receipt.train_run_id
+ AND reservation.assignment_generation=receipt.assignment_generation
+JOIN public.ticket_orders AS orders
+  ON orders.reservation_id=reservation.id AND orders.payment_intent_id=receipt.payment_intent_id
+ AND orders.train_run_id=receipt.train_run_id AND orders.assignment_generation=receipt.assignment_generation
+WHERE receipt.command_id=$1 AND receipt.payment_intent_id=$2
+  AND receipt.operation='reservation.payment_begin' AND receipt.status='succeeded'`, commandID, intentID).Scan(
+		&storedFingerprint, &receiptReservation, &receiptTrain, &generation, &receiptAmount, &receiptCurrency, &receiptResult, &resultStatus,
+		&reservationState, &reservationIntent, &reservationAmount, &reservationCurrency,
+		&orderID, &orderState, &orderIntent, &orderOwner, &orderAmount, &orderCurrency)
+	if err != nil || len(storedFingerprint) != sha256.Size || generation != resolution.Route.Generation().Int64() ||
+		receiptReservation != reservationID || receiptTrain != trainRunID || receiptResult != reservationID || resultStatus != "payment_pending" || receiptAmount != amountMinor || receiptCurrency != currency ||
+		reservationState != "payment_pending" || reservationIntent != intentID || reservationAmount != amountMinor || reservationCurrency != currency ||
+		orderID != uuid.NewSHA1(intentID, []byte("ticket-order")) || orderState != "payment_pending" || orderIntent != intentID || orderOwner != ownerID || orderAmount != amountMinor || orderCurrency != currency {
+		return paymentreconcile.ErrRepairUnavailable
+	}
+	var stored [sha256.Size]byte
+	copy(stored[:], storedFingerprint)
+	if stored != fingerprint {
+		return paymentreconcile.ErrRepairUnavailable
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return paymentreconcile.ErrRepairUnavailable
+	}
+	return nil
 }
 
 func (s *Store) Ready(ctx context.Context) error {

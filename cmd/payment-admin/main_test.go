@@ -19,7 +19,7 @@ func TestInspectIntentIsReadOnlyAndBounded(t *testing.T) {
 	service := &fakeBackend{result: outcome{Count: 3, Items: []item{{Kind: "intent"}, {Kind: "saga"}, {Kind: "operation"}}}}
 	var stdout, stderr bytes.Buffer
 	code := run(context.Background(), []string{"inspect-intent", "--payment-intent-id", testIntent, "--limit", "2"}, noEnv, &stdout, &stderr,
-		func(context.Context, func(string) (string, bool)) (backend, func(), error) {
+		func(context.Context, func(string) (string, bool), request) (backend, func(), error) {
 			return service, func() {}, nil
 		})
 	if code != 0 || !strings.Contains(stdout.String(), `"read_only":true`) || !strings.Contains(stdout.String(), `"truncated":true`) {
@@ -70,7 +70,7 @@ func TestBackendErrorIsRedacted(t *testing.T) {
 	service := &fakeBackend{err: errors.New("card data and postgres://secret")}
 	var stdout, stderr bytes.Buffer
 	code := run(context.Background(), []string{"inspect-intent", "--payment-intent-id", testIntent}, noEnv, &stdout, &stderr,
-		func(context.Context, func(string) (string, bool)) (backend, func(), error) {
+		func(context.Context, func(string) (string, bool), request) (backend, func(), error) {
 			return service, func() {}, nil
 		})
 	if code != 1 || strings.Contains(stdout.String(), "secret") || strings.Contains(stderr.String(), "secret") || !strings.Contains(stdout.String(), "operation_failed") {
@@ -82,7 +82,7 @@ func TestBackendItemTextIsBoundedAndRedacted(t *testing.T) {
 	service := &fakeBackend{result: outcome{Items: []item{{Kind: "intent secret", State: "postgres://dsn", Code: strings.Repeat("x", 65)}}}}
 	var stdout, stderr bytes.Buffer
 	code := run(context.Background(), []string{"inspect-intent", "--payment-intent-id", testIntent}, noEnv, &stdout, &stderr,
-		func(context.Context, func(string) (string, bool)) (backend, func(), error) {
+		func(context.Context, func(string) (string, bool), request) (backend, func(), error) {
 			return service, func() {}, nil
 		})
 	if code != 0 || strings.Contains(stdout.String(), "secret") || strings.Contains(stdout.String(), "postgres") || !strings.Contains(stdout.String(), `"kind":"resource"`) {
@@ -90,10 +90,20 @@ func TestBackendItemTextIsBoundedAndRedacted(t *testing.T) {
 	}
 }
 
-func TestRuntimeBackendRejectsMutationWithoutReplayer(t *testing.T) {
+func TestRuntimeBackendReplaysOnlyRecordedRefundOperation(t *testing.T) {
 	backend := runtimeTestBackend()
-	_, err := backend.Execute(context.Background(), request{Command: "request-refund", PaymentIntentID: uuid.MustParse(testIntent), Confirm: true})
-	if !errors.Is(err, errSafeReplayUnavailable) {
+	operationID := uuid.New()
+	backend.operator.(*fakeAdminOperator).operationID = operationID
+	result, err := backend.Execute(context.Background(), request{Command: "request-refund", PaymentIntentID: uuid.MustParse(testIntent), OperationID: operationID, Confirm: true})
+	if err != nil || len(result.Items) != 1 || result.Items[0].State != "scheduled" {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+}
+
+func TestRuntimeBackendRejectsMutationWithoutConfirmedBoundary(t *testing.T) {
+	backend := runtimeTestBackend()
+	_, err := backend.Execute(context.Background(), request{Command: "request-refund", PaymentIntentID: uuid.MustParse(testIntent), OperationID: uuid.New()})
+	if !errors.Is(err, errConfirmation) {
 		t.Fatalf("error=%v", err)
 	}
 }
@@ -138,7 +148,7 @@ func runtimeTestBackend() *runtimeBackend {
 		},
 		shard: paymentreconcile.ShardSnapshot{TicketOrderFound: true, TicketOrderID: uuid.New(), TicketOrderState: "issued", IssuanceReceiptFound: true},
 	}
-	return &runtimeBackend{store: store, reconciler: fakeAdminReconciler{}, provider: fakeStatusProvider{}}
+	return &runtimeBackend{store: store, reconciler: fakeAdminReconciler{}, provider: fakeStatusProvider{}, operator: &fakeAdminOperator{}}
 }
 
 type fakeAdminStore struct {
@@ -161,6 +171,21 @@ func (fakeAdminReconciler) InspectPayment(context.Context, uuid.UUID) (paymentre
 func (fakeAdminReconciler) ReconcilePayment(context.Context, uuid.UUID) (paymentreconcile.Result, error) {
 	return paymentreconcile.Result{}, nil
 }
+func (fakeAdminReconciler) RepairPayment(context.Context, uuid.UUID) (paymentreconcile.Result, error) {
+	return paymentreconcile.Result{ReadOnly: false, RepairCount: 1}, nil
+}
+
+type fakeAdminOperator struct{ operationID uuid.UUID }
+
+func (*fakeAdminOperator) RetrySaga(context.Context, uuid.UUID) error            { return nil }
+func (*fakeAdminOperator) ResumeTicketIssuance(context.Context, uuid.UUID) error { return nil }
+func (operator *fakeAdminOperator) RetryProviderOperation(_ context.Context, _ uuid.UUID, operationID uuid.UUID, _ string) error {
+	if operator.operationID != uuid.Nil && operationID != operator.operationID {
+		return errSafeReplayUnavailable
+	}
+	return nil
+}
+func (*fakeAdminOperator) MarkManualReview(context.Context, uuid.UUID) error { return nil }
 
 type fakeStatusProvider struct{}
 
