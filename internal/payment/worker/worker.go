@@ -132,7 +132,11 @@ func (worker *Worker) processOperation(ctx context.Context, now time.Time, claim
 		if uncertain {
 			category = "provider_outcome_unknown"
 		}
-		return worker.failOperationWithUncertainty(ctx, now, claim, category, !retryable || claim.Attempts >= worker.config.MaxAttempts, uncertain, result)
+		// Unknown mutation outcomes are never made permanent from transport
+		// retryability. They remain uncertain until a status query (or the
+		// stable-key checkout replay below) supplies definitive evidence.
+		review := !uncertain && (!retryable || claim.Attempts >= worker.config.MaxAttempts)
+		return worker.failOperationWithUncertainty(ctx, now, claim, category, review, uncertain, result)
 	}
 	if capturedInsteadOfVoided(claim, evidence) {
 		if err := worker.store.SupersedeVoidWithRefund(ctx, claim, evidence); err != nil {
@@ -394,6 +398,30 @@ func invokeProvider(ctx context.Context, client provider.Client, claim Operation
 }
 
 func queryUncertain(ctx context.Context, client provider.Client, claim OperationClaim) (OperationEvidence, error) {
+	if claim.Type == domain.OperationCreateCheckout && claim.ProviderPaymentID == "" {
+		// Checkout response loss may leave us without a provider payment ID to
+		// query. Replaying the exact server-derived identity and idempotency key
+		// is safe; generating a new key here would create a second checkout.
+		value, err := client.CreateCheckout(ctx, provider.CreateCheckoutRequest{
+			PaymentIntentID: claim.PaymentIntentID.String(), MerchantReference: claim.PaymentIntentID.String(),
+			AmountMinor: claim.AmountMinor, Currency: claim.Currency,
+			IdempotencyKey: claim.ProviderIdempotencyKey,
+			Metadata: provider.Metadata{
+				"payment_intent_id": claim.PaymentIntentID.String(),
+				"operation_id":      claim.OperationID.String(),
+			},
+		})
+		if err != nil {
+			return OperationEvidence{}, err
+		}
+		evidence := OperationEvidence{
+			ProviderPaymentID: value.ProviderPaymentID, HostedSessionRef: value.HostedReference,
+			Status: value.Status, AmountMinor: value.AmountMinor, Currency: value.Currency,
+		}
+		evidence.Disposition = expectedDisposition(claim.Type, evidence.Status)
+		evidence.ResponseFingerprint = fingerprintEvidence(evidence)
+		return evidence, nil
+	}
 	if claim.ProviderPaymentID == "" {
 		return OperationEvidence{Disposition: DispositionUnknown}, nil
 	}

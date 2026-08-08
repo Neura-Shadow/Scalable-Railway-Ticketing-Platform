@@ -87,6 +87,31 @@ func TestOperationClaimRecoversInFlightAsUncertainNotRetryable(t *testing.T) {
 	}
 }
 
+func TestUnknownMutationFailurePersistsUncertainRegardlessOfRetryability(t *testing.T) {
+	t.Parallel()
+	tx := &recordingTx{}
+	store, err := New(&recordingDB{tx: tx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := worker.OperationClaim{
+		OperationID: uuid.New(), PaymentIntentID: uuid.New(), Type: domain.OperationCapture,
+		PreviousState: domain.OperationPending, LeaseOwner: "payment-test",
+	}
+	if err := store.FailOperation(context.Background(), claim, worker.Failure{
+		Category: "provider_outcome_unknown", Uncertain: true, NextAttemptAt: time.Now().Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("FailOperation() error = %v", err)
+	}
+	if len(tx.execArgs) == 0 || len(tx.execArgs[0]) < 4 || tx.execArgs[0][3] != "uncertain" || !tx.committed {
+		t.Fatalf("finalize args=%v committed=%v, want durable uncertain state", tx.execArgs, tx.committed)
+	}
+	joined := strings.ToLower(strings.Join(tx.execs, "\n"))
+	if strings.Contains(joined, "payment_manual_review_cases") {
+		t.Fatalf("unknown outcome opened manual review:\n%s", joined)
+	}
+}
+
 func TestCompleteTicketIssuanceWritesAllLocatorsInSameControlTransaction(t *testing.T) {
 	t.Parallel()
 	trainRunID, ownerID := uuid.New(), uuid.New()
@@ -330,6 +355,7 @@ type recordingTx struct {
 	pgx.Tx
 	options    pgx.TxOptions
 	execs      []string
+	execArgs   [][]any
 	queries    []string
 	committed  bool
 	rolledBack bool
@@ -338,8 +364,9 @@ type recordingTx struct {
 	rowIndex   int
 }
 
-func (tx *recordingTx) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+func (tx *recordingTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	tx.execs = append(tx.execs, sql)
+	tx.execArgs = append(tx.execArgs, append([]any(nil), args...))
 	return pgconn.NewCommandTag("UPDATE 1"), nil
 }
 

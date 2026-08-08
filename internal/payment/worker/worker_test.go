@@ -2,13 +2,19 @@ package worker
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/domain"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider/httpclient"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider/sandbox"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/shard"
 	"github.com/google/uuid"
 )
@@ -161,6 +167,152 @@ func TestRunOnceUnknownProviderOutcomeNeverBlindlyRetries(t *testing.T) {
 	}
 	if result.Retried != 1 {
 		t.Fatalf("result = %+v, want one scheduled reconciliation", result)
+	}
+}
+
+func TestSandboxCommittedMutationLossQueriesBeforeDecision(t *testing.T) {
+	t.Parallel()
+	for _, kind := range []domain.OperationType{domain.OperationCapture, domain.OperationVoid, domain.OperationRefund} {
+		for _, fault := range []sandbox.FaultKind{sandbox.FaultResponseLoss, sandbox.FaultTimeoutAfterCommit} {
+			kind, fault := kind, fault
+			t.Run(string(kind)+"_"+string(fault), func(t *testing.T) {
+				t.Parallel()
+				script := sandbox.NewScript()
+				service := newWorkerSandbox(t, script)
+				claim := validOperation(kind)
+				checkout, err := service.CreateCheckout(context.Background(), provider.CreateCheckoutRequest{
+					PaymentIntentID: claim.PaymentIntentID.String(), MerchantReference: claim.PaymentIntentID.String(),
+					AmountMinor: claim.AmountMinor, Currency: claim.Currency, IdempotencyKey: "setup-checkout-" + string(kind),
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = service.Authorize(context.Background(), provider.AuthorizeRequest{
+					PaymentIntentID: claim.PaymentIntentID.String(), ProviderPaymentID: checkout.ProviderPaymentID,
+					SyntheticToken: checkout.SyntheticToken, AmountMinor: claim.AmountMinor, Currency: claim.Currency,
+					IdempotencyKey: "setup-authorize-" + string(kind),
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if kind == domain.OperationRefund {
+					if _, err := service.Capture(context.Background(), provider.CaptureRequest{
+						PaymentIntentID: claim.PaymentIntentID.String(), ProviderPaymentID: checkout.ProviderPaymentID,
+						AmountMinor: claim.AmountMinor, Currency: claim.Currency, IdempotencyKey: "setup-capture-refund",
+					}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				claim.ProviderPaymentID = checkout.ProviderPaymentID
+				operation := sandbox.Operation(kind)
+				if !script.Push(operation, sandbox.Fault{Kind: fault}) {
+					t.Fatal("push sandbox fault")
+				}
+				client := &countingProvider{Client: service}
+				store := &storeFake{operations: []OperationClaim{claim}}
+				value := newTestWorker(t, store, client, &shardFake{}, 1)
+				first, err := value.RunOnce(context.Background())
+				if err != nil || first.Retried != 1 || first.ManualReview != 0 ||
+					len(store.operationFailures) != 1 || !store.operationFailures[0].Uncertain ||
+					store.operationFailures[0].ManualReview {
+					t.Fatalf("first=%+v err=%v failures=%+v", first, err, store.operationFailures)
+				}
+				claim.PreviousState = domain.OperationUncertain
+				claim.Attempts++
+				store.operations = []OperationClaim{claim}
+				store.operationFailures = nil
+				second, err := value.RunOnce(context.Background())
+				if err != nil || second.OperationsDone != 1 || store.completeOperationCalls != 1 || client.statusCalls.Load() != 1 {
+					t.Fatalf("second=%+v err=%v complete=%d status=%d", second, err, store.completeOperationCalls, client.statusCalls.Load())
+				}
+				if got := client.mutationCalls(kind); got != 1 {
+					t.Fatalf("%s mutation calls = %d, want no replay before status", kind, got)
+				}
+			})
+		}
+	}
+}
+
+func TestSandboxCheckoutAmbiguityReplaysExactStableKey(t *testing.T) {
+	t.Parallel()
+	script := sandbox.NewScript()
+	if !script.Push(sandbox.OperationCreateCheckout, sandbox.Fault{Kind: sandbox.FaultResponseLoss}) {
+		t.Fatal("push checkout fault")
+	}
+	service := newWorkerSandbox(t, script)
+	client := &countingProvider{Client: service}
+	claim := validOperation(domain.OperationCreateCheckout)
+	claim.ProviderPaymentID = ""
+	store := &storeFake{operations: []OperationClaim{claim}}
+	value := newTestWorker(t, store, client, &shardFake{}, 1)
+	first, err := value.RunOnce(context.Background())
+	if err != nil || first.Retried != 1 || first.ManualReview != 0 ||
+		len(store.operationFailures) != 1 || !store.operationFailures[0].Uncertain {
+		t.Fatalf("first=%+v err=%v failures=%+v", first, err, store.operationFailures)
+	}
+	claim.PreviousState = domain.OperationUncertain
+	claim.Attempts++
+	store.operations = []OperationClaim{claim}
+	store.operationFailures = nil
+	second, err := value.RunOnce(context.Background())
+	if err != nil || second.OperationsDone != 1 || store.operationEvidence.ProviderPaymentID != "pay_sandbox_000000000001" {
+		t.Fatalf("second=%+v err=%v evidence=%+v", second, err, store.operationEvidence)
+	}
+	if client.checkoutCalls.Load() != 2 || client.statusCalls.Load() != 0 || len(client.checkoutKeys) != 2 ||
+		client.checkoutKeys[0] != claim.ProviderIdempotencyKey || client.checkoutKeys[1] != claim.ProviderIdempotencyKey {
+		t.Fatalf("checkout calls=%d status=%d keys=%v", client.checkoutCalls.Load(), client.statusCalls.Load(), client.checkoutKeys)
+	}
+}
+
+func TestHTTPAdapterNonRetryableUncertainCaptureQueriesBeforeFinalize(t *testing.T) {
+	t.Parallel()
+	var posts, gets atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/payments/pay-1/capture":
+			posts.Add(1)
+			connection, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				_ = connection.Close()
+			}
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/payments/pay-1":
+			gets.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(provider.Payment{
+				ProviderPaymentID: "pay-1", Status: provider.StatusCaptured,
+				AmountMinor: 2500, Currency: "TWD", CapturedMinor: 2500, ProviderUpdatedAt: fixedNow,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := httpclient.New(httpclient.Config{
+		BaseURL: server.URL, RequestTimeout: time.Second, ConnectTimeout: time.Second,
+		MaxResponseBytes: 4096, MaxWebhookBodyBytes: 4096,
+		WebhookKeys:      map[string][]byte{"test": []byte("0123456789abcdef0123456789abcdef")},
+		WebhookClockSkew: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	claim := validOperation(domain.OperationCapture)
+	claim.ProviderPaymentID = "pay-1"
+	store := &storeFake{operations: []OperationClaim{claim}}
+	value := newTestWorker(t, store, client, &shardFake{}, 1)
+	first, err := value.RunOnce(context.Background())
+	if err != nil || first.Retried != 1 || first.ManualReview != 0 ||
+		len(store.operationFailures) != 1 || !store.operationFailures[0].Uncertain || store.operationFailures[0].ManualReview {
+		t.Fatalf("first=%+v err=%v failures=%+v", first, err, store.operationFailures)
+	}
+	claim.PreviousState = domain.OperationUncertain
+	claim.Attempts++
+	store.operations = []OperationClaim{claim}
+	store.operationFailures = nil
+	second, err := value.RunOnce(context.Background())
+	if err != nil || second.OperationsDone != 1 || posts.Load() != 1 || gets.Load() != 1 {
+		t.Fatalf("second=%+v err=%v posts=%d gets=%d", second, err, posts.Load(), gets.Load())
 	}
 }
 
@@ -421,6 +573,8 @@ type storeFake struct {
 	beginCalls             int
 	completeOperationCalls int
 	supersedeVoidCalls     int
+	operationEvidence      OperationEvidence
+	completedOperation     OperationClaim
 	completeWebhookCalls   int
 	ignoreWebhookCalls     int
 	completeActionCalls    int
@@ -443,8 +597,10 @@ func (store *storeFake) BeginOperation(context.Context, OperationClaim) error {
 	store.beginActive = false
 	return nil
 }
-func (store *storeFake) CompleteOperation(context.Context, OperationClaim, OperationEvidence) error {
+func (store *storeFake) CompleteOperation(_ context.Context, claim OperationClaim, evidence OperationEvidence) error {
 	store.completeOperationCalls++
+	store.completedOperation = claim
+	store.operationEvidence = evidence
 	if store.onCompleteOperation != nil {
 		store.onCompleteOperation()
 	}
@@ -524,6 +680,68 @@ func (fake *providerFake) Refund(context.Context, provider.RefundRequest) (provi
 }
 func (fake *providerFake) VerifyWebhook(context.Context, provider.WebhookHeaders, []byte) (provider.WebhookEvent, error) {
 	return provider.WebhookEvent{}, errors.New("not used")
+}
+
+type countingProvider struct {
+	provider.Client
+	checkoutCalls atomic.Int32
+	statusCalls   atomic.Int32
+	captureCalls  atomic.Int32
+	voidCalls     atomic.Int32
+	refundCalls   atomic.Int32
+	checkoutKeys  []string
+}
+
+func (client *countingProvider) CreateCheckout(ctx context.Context, request provider.CreateCheckoutRequest) (provider.Checkout, error) {
+	client.checkoutCalls.Add(1)
+	client.checkoutKeys = append(client.checkoutKeys, request.IdempotencyKey)
+	return client.Client.CreateCheckout(ctx, request)
+}
+
+func (client *countingProvider) GetPaymentStatus(ctx context.Context, paymentID string) (provider.Payment, error) {
+	client.statusCalls.Add(1)
+	return client.Client.GetPaymentStatus(ctx, paymentID)
+}
+
+func (client *countingProvider) Capture(ctx context.Context, request provider.CaptureRequest) (provider.OperationResult, error) {
+	client.captureCalls.Add(1)
+	return client.Client.Capture(ctx, request)
+}
+
+func (client *countingProvider) Void(ctx context.Context, request provider.VoidRequest) (provider.OperationResult, error) {
+	client.voidCalls.Add(1)
+	return client.Client.Void(ctx, request)
+}
+
+func (client *countingProvider) Refund(ctx context.Context, request provider.RefundRequest) (provider.OperationResult, error) {
+	client.refundCalls.Add(1)
+	return client.Client.Refund(ctx, request)
+}
+
+func (client *countingProvider) mutationCalls(kind domain.OperationType) int32 {
+	switch kind {
+	case domain.OperationCapture:
+		return client.captureCalls.Load()
+	case domain.OperationVoid:
+		return client.voidCalls.Load()
+	case domain.OperationRefund:
+		return client.refundCalls.Load()
+	default:
+		return 0
+	}
+}
+
+func newWorkerSandbox(t *testing.T, faults sandbox.FaultPlan) *sandbox.Service {
+	t.Helper()
+	key := sha256.Sum256([]byte("worker-sandbox-test-key"))
+	service, err := sandbox.New(sandbox.Config{
+		Environment: "test", Now: func() time.Time { return fixedNow },
+		WebhookKeys: map[string][]byte{"test": key[:]}, IssueKeyID: "test", Faults: faults,
+	})
+	if err != nil {
+		t.Fatalf("new sandbox: %v", err)
+	}
+	return service
 }
 
 type shardFake struct {
