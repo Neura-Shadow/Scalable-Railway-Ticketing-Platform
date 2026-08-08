@@ -350,7 +350,7 @@ func faultProviderError(kind FaultKind, category provider.ErrorCategory, operati
 }
 
 func validateCommon(intentID, reference string, amount int64, currency, idempotencyKey string, metadata provider.Metadata) error {
-	if !validIdentifier(intentID) && !validIdentifier(reference) {
+	if !validIdentifier(intentID) || !validIdentifier(reference) {
 		return validationError(OperationCreateCheckout, "payment intent identity is invalid")
 	}
 	if !validIdentifier(idempotencyKey) || amount <= 0 || normalizeCurrency(currency) == "" {

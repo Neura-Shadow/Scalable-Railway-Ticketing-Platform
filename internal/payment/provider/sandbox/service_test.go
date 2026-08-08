@@ -16,6 +16,7 @@ func TestCreateCheckoutReplaysSameResultAndRejectsFingerprintConflict(t *testing
 
 	service := newService(t, nil)
 	request := provider.CreateCheckoutRequest{
+		PaymentIntentID:   "intent-123",
 		MerchantReference: "intent-123",
 		AmountMinor:       12500,
 		Currency:          "TWD",
@@ -302,7 +303,7 @@ func TestSandboxRejectsProductionAndSensitiveMetadata(t *testing.T) {
 		t.Fatal("production sandbox unexpectedly enabled")
 	}
 	service := newService(t, nil)
-	_, err = service.CreateCheckout(context.Background(), provider.CreateCheckoutRequest{MerchantReference: "intent-123", AmountMinor: 12500, Currency: "TWD", IdempotencyKey: "checkout:intent-123:v1", Metadata: provider.Metadata{"ca" + "rd_number": "not-accepted"}})
+	_, err = service.CreateCheckout(context.Background(), provider.CreateCheckoutRequest{PaymentIntentID: "intent-123", MerchantReference: "intent-123", AmountMinor: 12500, Currency: "TWD", IdempotencyKey: "checkout:intent-123:v1", Metadata: provider.Metadata{"ca" + "rd_number": "not-accepted"}})
 	var providerErr *provider.Error
 	if !errors.As(err, &providerErr) || providerErr.Category != provider.ErrorPermanentValidation {
 		t.Fatalf("sensitive metadata error = %v, want permanent validation", err)
