@@ -480,6 +480,69 @@ func TestShardReceiptMismatchEscalatesWithoutControlFinalization(t *testing.T) {
 	}
 }
 
+func TestCommittedIssuanceControlFinalizeFailureNeverStartsRefund(t *testing.T) {
+	t.Parallel()
+	claim := ActionClaim{
+		SagaID: uuid.New(), Type: ActionIssueTickets, Provider: "sandbox", Attempts: 1,
+		LeaseOwner: "payment-test", LeaseUntil: fixedNow.Add(time.Minute),
+		Issue: shard.IssueTicketsCommand{
+			CommandID: uuid.New(), IssuanceID: uuid.New(), PaymentIntentID: uuid.New(),
+			ReservationID: uuid.New(), AmountMinor: 100, Currency: "TWD",
+		},
+	}
+	ticketID := uuid.New()
+	shards := &shardFake{issueReceipt: shard.IssueTicketsReceipt{
+		CommandID: claim.Issue.CommandID, IssuanceID: claim.Issue.IssuanceID,
+		PaymentIntentID: claim.Issue.PaymentIntentID, ReservationID: claim.Issue.ReservationID,
+		TicketOrderID: uuid.New(), TicketIDs: []uuid.UUID{ticketID}, AmountMinor: 100,
+		Currency: "TWD", IssuedAt: fixedNow,
+	}}
+	store := &storeFake{actions: []ActionClaim{claim}, completeActionErr: errors.New("control commit failed")}
+	value := newTestWorker(t, store, &providerFake{}, shards, 1)
+	result, err := value.RunOnce(context.Background())
+	if err == nil || result.ManualReview != 1 || len(store.actionFailures) != 1 {
+		t.Fatalf("result=%+v err=%v failures=%+v", result, err, store.actionFailures)
+	}
+	failure := store.actionFailures[0]
+	if failure.Compensate || !failure.ManualReview || failure.Category != "database_finalize_failed" {
+		t.Fatalf("failure=%+v", failure)
+	}
+}
+
+func TestRefundActionReceiptsRequireOrderAndReleasedSeats(t *testing.T) {
+	t.Parallel()
+	mark := ActionClaim{Type: ActionMarkRefundPending, MarkRefund: shard.MarkRefundPendingCommand{
+		CommandID: uuid.New(), PaymentIntentID: uuid.New(), ReservationID: uuid.New(),
+	}}
+	markEvidence := ActionEvidence{MarkRefund: shard.MarkRefundPendingReceipt{
+		CommandID: mark.MarkRefund.CommandID, PaymentIntentID: mark.MarkRefund.PaymentIntentID,
+		ReservationID: mark.MarkRefund.ReservationID,
+	}}
+	if validActionEvidence(mark, markEvidence) {
+		t.Fatal("refund-pending receipt without ticket order accepted")
+	}
+	markEvidence.MarkRefund.TicketOrderID = uuid.New()
+	if !validActionEvidence(mark, markEvidence) {
+		t.Fatal("valid refund-pending receipt rejected")
+	}
+
+	compensate := ActionClaim{Type: ActionCompensate, Compensation: shard.ApplyRefundCompensationCommand{
+		CommandID: uuid.New(), CompensationID: uuid.New(), PaymentIntentID: uuid.New(), ReservationID: uuid.New(),
+	}}
+	compensationEvidence := ActionEvidence{Compensation: shard.ApplyRefundCompensationReceipt{
+		CommandID: compensate.Compensation.CommandID, CompensationID: compensate.Compensation.CompensationID,
+		PaymentIntentID: compensate.Compensation.PaymentIntentID, ReservationID: compensate.Compensation.ReservationID,
+		TicketOrderID: uuid.New(),
+	}}
+	if validActionEvidence(compensate, compensationEvidence) {
+		t.Fatal("compensation receipt without released seats accepted")
+	}
+	compensationEvidence.Compensation.ReleasedSeatCount = 1
+	if !validActionEvidence(compensate, compensationEvidence) {
+		t.Fatal("valid compensation receipt rejected")
+	}
+}
+
 func TestMaxAttemptsTransitionsToManualReview(t *testing.T) {
 	t.Parallel()
 	claim := validOperation(domain.OperationCapture)
@@ -574,6 +637,31 @@ func TestRunOnceRecordsMeasuredWebhookLagAndDurableUncertainty(t *testing.T) {
 	}
 }
 
+func TestUncertaintyWindowExpiresIntoManualReviewWithoutProviderCall(t *testing.T) {
+	t.Parallel()
+	claim := validOperation(domain.OperationCapture)
+	claim.PreviousState = domain.OperationUncertain
+	claim.CreatedAt = fixedNow.Add(-2 * time.Hour)
+	store := &storeFake{operations: []OperationClaim{claim}}
+	client := &providerFake{}
+	value, err := New(store, Providers{"sandbox": client}, &shardFake{}, nil, Config{
+		WorkerID: "payment-test", BatchSize: 10, MaxAttempts: 4,
+		LeaseTTL: time.Minute, RetryBase: time.Second, RetryMax: time.Minute,
+		MaxUncertain: time.Hour, Interval: time.Second, Now: func() time.Time { return fixedNow },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := value.RunOnce(context.Background())
+	if err != nil || result.ManualReview != 1 || client.statusCalls != 0 || len(store.operationFailures) != 1 {
+		t.Fatalf("result=%+v err=%v statusCalls=%d failures=%+v", result, err, client.statusCalls, store.operationFailures)
+	}
+	failure := store.operationFailures[0]
+	if !failure.ManualReview || !failure.Uncertain || failure.Category != "uncertainty_window_exceeded" {
+		t.Fatalf("failure=%+v", failure)
+	}
+}
+
 func newTestWorker(t *testing.T, store Store, client provider.Client, shards ShardGateway, maxAttempts int) *Worker {
 	t.Helper()
 	value, err := New(store, Providers{"sandbox": client}, shards, nil, Config{
@@ -593,7 +681,7 @@ func validOperation(kind domain.OperationType) OperationClaim {
 		TrainRunID: uuid.New(), OwnerID: uuid.New(), Provider: "sandbox", Type: kind,
 		PreviousState: domain.OperationPending, ProviderPaymentID: "pay-1",
 		ProviderIdempotencyKey: "stable-key-1", AmountMinor: 2500, Currency: "TWD",
-		Attempts: 1, LeaseOwner: "payment-test", LeaseUntil: fixedNow.Add(time.Minute),
+		Attempts: 1, CreatedAt: fixedNow.Add(-time.Minute), LeaseOwner: "payment-test", LeaseUntil: fixedNow.Add(time.Minute),
 	}
 }
 
@@ -631,6 +719,7 @@ type storeFake struct {
 	webhookFailures        []Failure
 	actionFailures         []Failure
 	actionEvidence         ActionEvidence
+	completeActionErr      error
 	onCompleteOperation    func()
 }
 
@@ -684,7 +773,7 @@ func (store *storeFake) ClaimActions(context.Context, ClaimOptions) ([]ActionCla
 func (store *storeFake) CompleteAction(_ context.Context, _ ActionClaim, evidence ActionEvidence) error {
 	store.completeActionCalls++
 	store.actionEvidence = evidence
-	return nil
+	return store.completeActionErr
 }
 func (store *storeFake) FailAction(_ context.Context, _ ActionClaim, failure Failure) error {
 	store.actionFailures = append(store.actionFailures, failure)

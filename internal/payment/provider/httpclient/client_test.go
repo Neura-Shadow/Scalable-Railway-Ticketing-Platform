@@ -87,6 +87,32 @@ func TestClientReadinessUsesFixedBoundedEndpoint(t *testing.T) {
 	client.CloseIdleConnections()
 }
 
+func TestOutboundOnlyClientDoesNotRequireWebhookSecrets(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/readyz" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ready"}`))
+	}))
+	defer server.Close()
+	client, err := httpclient.New(httpclient.Config{
+		BaseURL: server.URL, APIKey: "outbound-only", ConnectTimeout: time.Second,
+		RequestTimeout: time.Second, MaxResponseBytes: 1024,
+	})
+	if err != nil {
+		t.Fatalf("New(outbound-only) error = %v", err)
+	}
+	if err := client.Ready(context.Background()); err != nil {
+		t.Fatalf("Ready() error = %v", err)
+	}
+	_, err = client.VerifyWebhook(context.Background(), provider.WebhookHeaders{
+		KeyID: "unconfigured", Timestamp: "1700000000", Signature: strings.Repeat("0", 64),
+	}, []byte(`{"event_id":"evt_1"}`))
+	assertProviderError(t, err, provider.ErrorAuthentication, false, false)
+}
+
 func TestClientClassifiesMutationResponseLossAsUncertain(t *testing.T) {
 	t.Parallel()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

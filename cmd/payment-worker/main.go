@@ -61,16 +61,10 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return errors.New("payment store initialization failed")
 	}
-	webhookKeys, err := cfg.ParsePaymentWebhookKeys()
-	if err != nil {
-		return errors.New("payment provider initialization failed")
-	}
 	providerClient, err := providerhttp.New(providerhttp.Config{
 		BaseURL: cfg.PaymentProviderBaseURL, APIKey: cfg.PaymentProviderAPIKey,
 		ConnectTimeout: cfg.PaymentProviderConnectTimeout, RequestTimeout: cfg.PaymentProviderRequestTimeout,
-		MaxResponseBytes:    int64(cfg.PaymentProviderMaxResponseBytes),
-		MaxWebhookBodyBytes: int64(cfg.PaymentWebhookMaxBodyBytes), WebhookKeys: webhookKeys,
-		WebhookClockSkew: cfg.PaymentWebhookClockSkew, Now: time.Now,
+		MaxResponseBytes: int64(cfg.PaymentProviderMaxResponseBytes), Now: time.Now,
 	})
 	if err != nil {
 		return errors.New("payment provider initialization failed")
@@ -114,7 +108,8 @@ func run(logger *slog.Logger) error {
 			WorkerID: workerID, BatchSize: cfg.PaymentWorkerBatchSize,
 			MaxAttempts: cfg.PaymentWorkerMaxAttempts, LeaseTTL: cfg.PaymentWorkerLease,
 			RetryBase: cfg.PaymentWorkerRetryBase, RetryMax: retryMaximum(cfg.PaymentWorkerRetryBase),
-			Interval: cfg.PaymentWorkerInterval, Now: time.Now,
+			MaxUncertain: cfg.PaymentMaxUncertain,
+			Interval:     cfg.PaymentWorkerInterval, Now: time.Now,
 		},
 	)
 	if err != nil {

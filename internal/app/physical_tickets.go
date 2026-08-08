@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
+	shardphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physical"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/transport/httpapi"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -148,13 +149,9 @@ func (reader *HybridTicketReader) loadPhysicalTicketGroup(ctx context.Context, o
 	if len(group) == 0 || len(group) > 100 {
 		return nil, sharding.ErrShardUnavailable
 	}
-	trainRunID := group[0].locator.trainRunID
-	resolved, err := reader.router.Resolve(ctx, trainRunID, false)
-	if err != nil || resolved.Route.ShardID() != key.shardID || resolved.Route.Generation().Int64() != key.generation {
-		resolved, err = reader.router.Resolve(ctx, trainRunID, true)
-		if err != nil || resolved.Route.ShardID() != key.shardID || resolved.Route.Generation().Int64() != key.generation {
-			return nil, sharding.ErrAssignmentStale
-		}
+	resolved, err := reader.resolvePhysicalTicketGroup(ctx, key, group)
+	if err != nil {
+		return nil, err
 	}
 	tx, err := resolved.Handle.Pool().BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
@@ -274,6 +271,39 @@ ORDER BY ticket.ticket_order_id,ticket.id`, orderIDs, owner, key.generation)
 		return nil, sharding.ErrShardUnavailable
 	}
 	return result, nil
+}
+
+func (reader *HybridTicketReader) resolvePhysicalTicketGroup(ctx context.Context, key ticketLocatorGroupKey, group []indexedTicketLocator) (shardphysical.Resolution, error) {
+	seen := make(map[uuid.UUID]struct{}, len(group))
+	var batch shardphysical.Resolution
+	for _, item := range group {
+		trainRunID := item.locator.trainRunID
+		if _, alreadyResolved := seen[trainRunID]; alreadyResolved {
+			continue
+		}
+		resolved, err := reader.router.Resolve(ctx, trainRunID, false)
+		if err != nil || !physicalTicketRouteMatches(resolved, trainRunID, key) {
+			resolved, err = reader.router.Resolve(ctx, trainRunID, true)
+			if err != nil || !physicalTicketRouteMatches(resolved, trainRunID, key) {
+				return shardphysical.Resolution{}, sharding.ErrAssignmentStale
+			}
+		}
+		if len(seen) == 0 {
+			batch = resolved
+		}
+		seen[trainRunID] = struct{}{}
+	}
+	if len(seen) == 0 {
+		return shardphysical.Resolution{}, sharding.ErrShardUnavailable
+	}
+	return batch, nil
+}
+
+func physicalTicketRouteMatches(resolved shardphysical.Resolution, trainRunID uuid.UUID, key ticketLocatorGroupKey) bool {
+	return resolved.Route.TrainRunID() == trainRunID &&
+		resolved.Route.ShardID() == key.shardID &&
+		resolved.Route.Generation().Int64() == key.generation &&
+		resolved.Handle.ShardID() == key.shardID && resolved.Handle.Pool() != nil
 }
 
 func (reader *HybridTicketReader) GetTicketOrderRecord(ctx context.Context, owner, orderID uuid.UUID) (TicketOrderRecord, error) {

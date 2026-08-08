@@ -123,12 +123,42 @@ func TestHybridTicketReaderBatchesHundredLocatorsIntoOneShardTransaction(t *test
 			t.Fatalf("item %d = %+v", index, record)
 		}
 	}
-	if router.calls != 1 || tx.begins != 1 || len(tx.queries) != 2 || !tx.committed {
+	if router.calls != 2 || tx.begins != 1 || len(tx.queries) != 2 || !tx.committed {
 		t.Fatalf("resolves=%d begins=%d queries=%d committed=%v", router.calls, tx.begins, len(tx.queries), tx.committed)
+	}
+	if !reflect.DeepEqual(router.trainRunIDs, []uuid.UUID{trainRunID, secondTrainRunID}) {
+		t.Fatalf("resolved train runs = %v, want both distinct locator train runs", router.trainRunIDs)
 	}
 	ids, ok := tx.arguments[0][0].([]uuid.UUID)
 	if !ok || len(ids) != count {
 		t.Fatalf("batched order ids = %T len=%d", tx.arguments[0][0], len(ids))
+	}
+}
+
+func TestHybridTicketReaderValidatesEveryDistinctTrainRunBeforeBatching(t *testing.T) {
+	t.Parallel()
+	owner, firstTrainRunID, staleTrainRunID := uuid.New(), uuid.New(), uuid.New()
+	created := time.Now().UTC().Truncate(time.Microsecond)
+	locatorValues := make([][]any, 0, 2)
+	for _, trainRunID := range []uuid.UUID{firstTrainRunID, staleTrainRunID} {
+		locatorValues = append(locatorValues, []any{
+			uuid.NewString(), uuid.NewString(), "confirmed", int64(1000), "TWD", created,
+			trainRunID, "physical-shard-0", int64(9), "postgres", "active", int64(2),
+		})
+	}
+	tx := &ticketTx{}
+	router := ticketRouter(t, firstTrainRunID, 9, tx)
+	router.staleTrainRunID = staleTrainRunID
+	reader, err := NewHybridTicketReader(&ticketControl{queryRows: &ticketRows{values: locatorValues}}, &ticketLegacy{}, router)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = reader.ListTicketOrderRecords(context.Background(), owner, httpapi.PageRequest{Page: 1, Limit: 2, Sort: "created_at"})
+	if !errors.Is(err, sharding.ErrAssignmentStale) {
+		t.Fatalf("ListTicketOrderRecords error = %v, want assignment stale", err)
+	}
+	if tx.begins != 0 || router.calls != 3 || !reflect.DeepEqual(router.trainRunIDs, []uuid.UUID{firstTrainRunID, staleTrainRunID, staleTrainRunID}) {
+		t.Fatalf("begins=%d resolves=%d train_runs=%v", tx.begins, router.calls, router.trainRunIDs)
 	}
 }
 
@@ -210,13 +240,23 @@ func ticketRouter(t *testing.T, trainRunID uuid.UUID, rawGeneration int64, tx pg
 }
 
 type ticketPhysicalRouter struct {
-	resolution shardphysical.Resolution
-	calls      int
+	resolution      shardphysical.Resolution
+	calls           int
+	trainRunIDs     []uuid.UUID
+	staleTrainRunID uuid.UUID
 }
 
-func (router *ticketPhysicalRouter) Resolve(context.Context, uuid.UUID, bool) (shardphysical.Resolution, error) {
+func (router *ticketPhysicalRouter) Resolve(_ context.Context, trainRunID uuid.UUID, _ bool) (shardphysical.Resolution, error) {
 	router.calls++
-	return router.resolution, nil
+	router.trainRunIDs = append(router.trainRunIDs, trainRunID)
+	if trainRunID == router.staleTrainRunID {
+		return router.resolution, nil
+	}
+	route, err := sharding.NewShardRoute(trainRunID, router.resolution.Route.ShardID(), router.resolution.Route.Generation())
+	if err != nil {
+		return shardphysical.Resolution{}, err
+	}
+	return shardphysical.Resolution{Route: route, Handle: router.resolution.Handle}, nil
 }
 
 type ticketControl struct {

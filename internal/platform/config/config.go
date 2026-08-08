@@ -563,8 +563,12 @@ func validatePaymentConfig(c Config, worker, reconciler bool) error {
 			problems = append(problems, errors.New("PAYMENT_PROVIDER_BASE_URL address is not allowed in production"))
 		}
 	}
-	if _, err := c.ParsePaymentWebhookKeys(); err != nil {
-		problems = append(problems, err)
+	// Only public API ingress verifies webhook signatures. Outbound worker and
+	// reconciler clients must not require webhook key material they never consume.
+	if !worker && !reconciler {
+		if _, err := c.ParsePaymentWebhookKeys(); err != nil {
+			problems = append(problems, err)
+		}
 	}
 	if c.PaymentProviderConnectTimeout <= 0 || c.PaymentProviderConnectTimeout > 30*time.Second {
 		problems = append(problems, errors.New("PAYMENT_PROVIDER_CONNECT_TIMEOUT must be positive and bounded"))

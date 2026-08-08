@@ -15,7 +15,11 @@ import (
 	"github.com/google/uuid"
 )
 
-const maximumBatchSize = 1000
+const (
+	maximumBatchSize    = 1000
+	defaultMaxUncertain = 24 * time.Hour
+	maximumMaxUncertain = 30 * 24 * time.Hour
+)
 
 var workerIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
@@ -28,6 +32,9 @@ type Worker struct {
 }
 
 func New(store Store, providers ProviderRegistry, shards ShardGateway, metrics Metrics, config Config) (*Worker, error) {
+	if config.MaxUncertain == 0 {
+		config.MaxUncertain = defaultMaxUncertain
+	}
 	if store == nil || providers == nil || shards == nil || !validConfig(config) {
 		return nil, ErrInvalidConfiguration
 	}
@@ -39,6 +46,7 @@ func validConfig(config Config) bool {
 		config.BatchSize <= maximumBatchSize && config.MaxAttempts > 0 &&
 		config.MaxAttempts <= 1000 && config.LeaseTTL > 0 &&
 		config.RetryBase > 0 && config.RetryMax >= config.RetryBase &&
+		config.MaxUncertain > 0 && config.MaxUncertain <= maximumMaxUncertain &&
 		config.Interval > 0 && config.Now != nil
 }
 
@@ -103,6 +111,9 @@ func (worker *Worker) processOperation(ctx context.Context, now time.Time, claim
 	started := time.Now()
 	if err := validateOperationClaim(claim, worker.config.WorkerID); err != nil {
 		return worker.failInvalidOperation(ctx, now, started, claim, result)
+	}
+	if claim.PreviousState == domain.OperationUncertain && !now.Before(claim.CreatedAt.Add(worker.config.MaxUncertain)) {
+		return worker.failOperationWithUncertainty(ctx, now, started, claim, "uncertainty_window_exceeded", true, true, result)
 	}
 	var (
 		evidence OperationEvidence
@@ -313,7 +324,10 @@ func (worker *Worker) failAction(ctx context.Context, now, started time.Time, cl
 	if claim.SagaID == uuid.Nil || claim.LeaseOwner == "" {
 		return errors.New("invalid claimed payment action")
 	}
-	compensate := review && claim.Type == ActionIssueTickets
+	// A committed shard command followed by a control-finalization failure is
+	// repairable from its immutable receipt. It must never be mistaken for a
+	// permanent issuance failure and trigger an unnecessary refund.
+	compensate := review && claim.Type == ActionIssueTickets && category != "database_finalize_failed"
 	failure := Failure{Category: boundedCategory(category), ManualReview: review && !compensate, Compensate: compensate}
 	if !review {
 		failure.NextAttemptAt = now.Add(retryDelay(claim.SagaID, claim.Attempts, worker.config.RetryBase, worker.config.RetryMax))
@@ -558,7 +572,7 @@ func validateOperationClaim(claim OperationClaim, workerID string) error {
 	if claim.OperationID == uuid.Nil || claim.PaymentIntentID == uuid.Nil || claim.ReservationID == uuid.Nil ||
 		claim.TrainRunID == uuid.Nil || claim.OwnerID == uuid.Nil || claim.Provider == "" ||
 		claim.ProviderIdempotencyKey == "" || claim.AmountMinor < 0 || len(claim.Currency) != 3 ||
-		claim.Attempts < 1 || claim.LeaseOwner != workerID || claim.LeaseUntil.IsZero() {
+		claim.Attempts < 1 || claim.CreatedAt.IsZero() || claim.LeaseOwner != workerID || claim.LeaseUntil.IsZero() {
 		return errors.New("invalid claimed payment operation")
 	}
 	return nil
@@ -597,7 +611,8 @@ func validActionEvidence(claim ActionClaim, evidence ActionEvidence) bool {
 			evidence.Issue.AmountMinor == claim.Issue.AmountMinor &&
 			evidence.Issue.Currency == claim.Issue.Currency
 	case ActionMarkRefundPending:
-		return evidence.MarkRefund.CommandID == claim.MarkRefund.CommandID &&
+		return evidence.MarkRefund.TicketOrderID != uuid.Nil &&
+			evidence.MarkRefund.CommandID == claim.MarkRefund.CommandID &&
 			evidence.MarkRefund.PaymentIntentID == claim.MarkRefund.PaymentIntentID &&
 			evidence.MarkRefund.ReservationID == claim.MarkRefund.ReservationID
 	case ActionCancelVoided:
@@ -610,6 +625,7 @@ func validActionEvidence(claim ActionClaim, evidence ActionEvidence) bool {
 			evidence.CancelVoided.ReservationID == claim.CancelVoided.ReservationID
 	case ActionCompensate:
 		return evidence.Compensation.TicketOrderID != uuid.Nil &&
+			evidence.Compensation.ReleasedSeatCount > 0 &&
 			evidence.Compensation.CommandID == claim.Compensation.CommandID &&
 			evidence.Compensation.CompensationID == claim.Compensation.CompensationID &&
 			evidence.Compensation.PaymentIntentID == claim.Compensation.PaymentIntentID &&

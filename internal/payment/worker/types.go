@@ -24,14 +24,15 @@ var (
 )
 
 type Config struct {
-	WorkerID    string
-	BatchSize   int
-	MaxAttempts int
-	LeaseTTL    time.Duration
-	RetryBase   time.Duration
-	RetryMax    time.Duration
-	Interval    time.Duration
-	Now         func() time.Time
+	WorkerID     string
+	BatchSize    int
+	MaxAttempts  int
+	LeaseTTL     time.Duration
+	RetryBase    time.Duration
+	RetryMax     time.Duration
+	MaxUncertain time.Duration
+	Interval     time.Duration
+	Now          func() time.Time
 }
 
 type ClaimOptions struct {
@@ -61,6 +62,7 @@ type OperationClaim struct {
 	AmountMinor            int64
 	Currency               string
 	Attempts               int
+	CreatedAt              time.Time
 	LeaseOwner             string
 	LeaseUntil             time.Time
 }

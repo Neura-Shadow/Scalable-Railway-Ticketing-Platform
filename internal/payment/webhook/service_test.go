@@ -163,6 +163,7 @@ func TestRawPayloadAndSignatureNeverCrossRepositoryBoundary(t *testing.T) {
 func TestProviderHeadersAndBodyAreBoundedBeforeVerification(t *testing.T) {
 	t.Parallel()
 	calls := 0
+	metrics := &webhookMetricsFake{}
 	verifier := verifierFake{calls: &calls, event: provider.WebhookEvent{
 		ProviderEventID: "evt-1", Type: provider.EventCaptured,
 		ProviderPaymentID: "pay-1", OccurredAt: time.Now().UTC(),
@@ -170,7 +171,7 @@ func TestProviderHeadersAndBodyAreBoundedBeforeVerification(t *testing.T) {
 	store := &repositoryFake{result: webhook.StoreAccepted}
 	service, err := webhook.NewService(webhook.Config{
 		Providers: map[string]webhook.Verifier{"sandbox": verifier}, Repository: store,
-		MaxBodyBytes: 8, Now: time.Now, NewID: uuid.New,
+		MaxBodyBytes: 8, Now: time.Now, NewID: uuid.New, Metrics: metrics,
 	})
 	if err != nil {
 		t.Fatalf("new service: %v", err)
@@ -199,8 +200,45 @@ func TestProviderHeadersAndBodyAreBoundedBeforeVerification(t *testing.T) {
 			}
 		})
 	}
-	if calls != 0 || store.calls != 0 {
-		t.Fatalf("verification calls=%d persistence calls=%d, want 0,0", calls, store.calls)
+	if calls != 0 || store.calls != 0 || metrics.invalidCalls != 0 {
+		t.Fatalf("verification calls=%d persistence calls=%d invalid metrics=%d, want 0,0,0", calls, store.calls, metrics.invalidCalls)
+	}
+}
+
+func TestInvalidSignatureMetricExcludesNonAuthenticationFailures(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		verifier verifierFake
+	}{
+		{
+			name: "provider verifier unavailable",
+			verifier: verifierFake{err: &provider.Error{
+				Category: provider.ErrorUnavailable, Operation: "verify_webhook", Message: "provider unavailable",
+			}},
+		},
+		{
+			name: "verified event has invalid shape",
+			verifier: verifierFake{event: provider.WebhookEvent{
+				ProviderEventID: "evt-invalid", Type: provider.EventCaptured, ProviderPaymentID: "pay-1",
+			}},
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			metrics := &webhookMetricsFake{}
+			store := &repositoryFake{}
+			service := newTestService(t, test.verifier, store, metrics)
+			disposition, err := service.IngestPaymentWebhook(context.Background(), validRequest([]byte(`{}`)))
+			if disposition != "" || !errors.Is(err, httpapi.ErrWebhookInvalid) {
+				t.Fatalf("ingest disposition=%q error=%v", disposition, err)
+			}
+			if metrics.invalidCalls != 0 || store.calls != 0 {
+				t.Fatalf("invalid metrics=%d persistence calls=%d, want 0,0", metrics.invalidCalls, store.calls)
+			}
+		})
 	}
 }
 

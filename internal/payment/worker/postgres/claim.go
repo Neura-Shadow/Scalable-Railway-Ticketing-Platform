@@ -61,9 +61,9 @@ WITH candidates AS (
    AND (operation.lease_until IS NULL OR operation.lease_until<$1)
    AND (
      operation.operation_type='query_status'
-     OR (operation.operation_type='create_checkout' AND saga.state='reservation_secured')
-     OR (operation.operation_type='authorize' AND saga.state='awaiting_provider')
-     OR (operation.operation_type='capture' AND saga.state='authorized')
+     OR (operation.operation_type='create_checkout' AND saga.state='reservation_secured' AND saga.current_step='create_checkout')
+     OR (operation.operation_type='authorize' AND saga.state='awaiting_provider' AND saga.current_step='await_provider')
+     OR (operation.operation_type='capture' AND saga.state='authorized' AND saga.current_step='capture')
      OR (operation.operation_type='void' AND saga.state='compensating' AND saga.current_step='void')
      OR (operation.operation_type='refund' AND saga.state='refunding' AND saga.current_step='refund')
    )
@@ -80,7 +80,7 @@ SELECT operation.operation_id,operation.payment_intent_id,intent.reservation_id,
        intent.train_run_id,intent.owner_user_id,operation.provider,
        operation.operation_type,'pending',COALESCE(intent.provider_payment_id,''),
        COALESCE(intent.hosted_session_ref,''),operation.provider_idempotency_key_hash,
-       operation.amount_minor,operation.currency,operation.attempts,
+       operation.amount_minor,operation.currency,operation.attempts,operation.created_at,
        operation.lease_owner,operation.lease_until
 FROM claimed
 JOIN public.payment_operations AS operation USING(operation_id)
@@ -125,7 +125,7 @@ SELECT operation.operation_id,operation.payment_intent_id,intent.reservation_id,
        intent.train_run_id,intent.owner_user_id,operation.provider,
        operation.operation_type,'uncertain',COALESCE(intent.provider_payment_id,''),
        COALESCE(intent.hosted_session_ref,''),operation.provider_idempotency_key_hash,
-       operation.amount_minor,operation.currency,operation.attempts,
+       operation.amount_minor,operation.currency,operation.attempts,operation.created_at,
        saga.lease_owner,saga.lease_until
 FROM leased
 JOIN public.payment_sagas AS saga USING(saga_id)
@@ -157,7 +157,7 @@ func scanOperationClaims(rows pgx.Rows, claims []worker.OperationClaim) ([]worke
 			&claim.OperationID, &claim.PaymentIntentID, &claim.ReservationID,
 			&claim.TrainRunID, &claim.OwnerID, &claim.Provider, &rawType, &rawState,
 			&claim.ProviderPaymentID, &claim.HostedSessionReference, &keyHash,
-			&claim.AmountMinor, &claim.Currency, &claim.Attempts,
+			&claim.AmountMinor, &claim.Currency, &claim.Attempts, &claim.CreatedAt,
 			&claim.LeaseOwner, &claim.LeaseUntil,
 		); err != nil || len(keyHash) != sha256.Size {
 			return nil, worker.ErrStoreUnavailable

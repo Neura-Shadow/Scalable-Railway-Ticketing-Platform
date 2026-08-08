@@ -118,7 +118,6 @@ func (service *Service) IngestPaymentWebhook(ctx context.Context, request httpap
 		!validVisibleHeader(request.Timestamp, maximumTimestampLen) ||
 		!validVisibleHeader(request.Signature, maximumSignatureLen) ||
 		len(request.Body) == 0 || len(request.Body) > service.maxBodyBytes {
-		service.recordInvalid(request.Provider)
 		return "", httpapi.ErrWebhookInvalid
 	}
 	body := append([]byte(nil), request.Body...)
@@ -127,7 +126,9 @@ func (service *Service) IngestPaymentWebhook(ctx context.Context, request httpap
 		KeyID: request.KeyID, Timestamp: request.Timestamp, Signature: request.Signature,
 	}, verificationBody)
 	if err != nil {
-		service.recordInvalid(request.Provider)
+		if webhookAuthenticationFailure(err) {
+			service.recordInvalid(request.Provider)
+		}
 		return "", httpapi.ErrWebhookInvalid
 	}
 	now := service.now().UTC()
@@ -139,7 +140,6 @@ func (service *Service) IngestPaymentWebhook(ctx context.Context, request httpap
 	if now.IsZero() || !validIdentifier(event.ProviderEventID, 128, false) ||
 		!validIdentifier(eventType, 128, false) ||
 		!validIdentifier(event.ProviderPaymentID, 128, true) || event.OccurredAt.IsZero() {
-		service.recordInvalid(request.Provider)
 		return "", httpapi.ErrWebhookInvalid
 	}
 	id := service.newID()
@@ -171,6 +171,11 @@ func (service *Service) IngestPaymentWebhook(ctx context.Context, request httpap
 	default:
 		return "", ErrPersistence
 	}
+}
+
+func webhookAuthenticationFailure(err error) bool {
+	var providerError *provider.Error
+	return errors.As(err, &providerError) && providerError.Category == provider.ErrorAuthentication
 }
 
 func (service *Service) recordInvalid(providerName string) {

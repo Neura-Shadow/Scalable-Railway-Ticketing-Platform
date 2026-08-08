@@ -1235,15 +1235,12 @@ func TestLoadAPIUsesExplicitMilestoneThreeCacheControls(t *testing.T) {
 
 func TestLoadPaymentWorkerUsesBoundedProcessOwnedSettings(t *testing.T) {
 	t.Parallel()
-	key := base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
 	env := map[string]string{
 		"APP_ENV":                              "test",
 		"DATABASE_URL":                         "postgres://payment-worker@db.example/railway",
 		"PAYMENT_ENABLED":                      "true",
 		"PAYMENT_PROVIDER_TYPE":                "sandbox",
 		"PAYMENT_PROVIDER_BASE_URL":            "http://payment-sandbox:8099",
-		"PAYMENT_WEBHOOK_KEYRING":              "current=" + key + ",previous=" + key,
-		"PAYMENT_WEBHOOK_ACCEPT_KEY_IDS":       "current",
 		"PAYMENT_SAGA_WORKER_ENABLED":          "true",
 		"PAYMENT_WORKER_ENABLED":               "true",
 		"PAYMENT_WORKER_BATCH_SIZE":            "17",
@@ -1270,9 +1267,26 @@ func TestLoadPaymentWorkerUsesBoundedProcessOwnedSettings(t *testing.T) {
 		cfg.PaymentManualReviewAfter != 30*time.Minute || cfg.PaymentMaxUncertain != 2*time.Hour {
 		t.Fatalf("payment worker settings = %+v", cfg)
 	}
-	keys, err := cfg.ParsePaymentWebhookKeys()
-	if err != nil || len(keys) != 1 || len(keys["current"]) != 32 {
-		t.Fatalf("accepted webhook keys = %v error=%v", len(keys), err)
+	if cfg.PaymentWebhookKeyring != "" || cfg.PaymentWebhookAcceptKeyIDs != "" {
+		t.Fatalf("payment worker unexpectedly loaded webhook verification key selection")
+	}
+}
+
+func TestPaymentReconcilerDoesNotRequireWebhookSecrets(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	cfg.DatabaseURL = "postgres://payment-reconciler@db.example/railway"
+	cfg.PaymentEnabled = true
+	cfg.PaymentProviderType = config.PaymentProviderSandbox
+	cfg.PaymentProviderBaseURL = "http://payment-sandbox:8099"
+	cfg.PaymentReconcilerEnabled = true
+	cfg.PaymentWebhookKeyring = ""
+	cfg.PaymentWebhookAcceptKeyIDs = ""
+	if err := cfg.ValidateFor(config.ProcessPaymentReconciler); err != nil {
+		t.Fatalf("ValidateFor(payment-reconciler) error = %v", err)
+	}
+	if err := cfg.ValidateFor(config.ProcessAPI); err == nil || !strings.Contains(err.Error(), "PAYMENT_WEBHOOK_KEYRING") {
+		t.Fatalf("ValidateFor(api) without webhook secrets error = %v", err)
 	}
 }
 

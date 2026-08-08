@@ -28,6 +28,7 @@ var (
 		"provider_outcome_unknown", "provider_not_applied", "provider_state_conflict",
 		"database_finalize_failed", "invalid_claim", "invalid_action",
 		"shard_command_failed", "shard_receipt_conflict",
+		"uncertainty_window_exceeded",
 	)
 	allowedPaymentEvents = set(
 		"payment.checkout_created", "payment.authorized", "payment.captured",

@@ -80,7 +80,7 @@ func New(config Config) (*Client, error) {
 	if config.ConnectTimeout <= 0 || config.ConnectTimeout > 30*time.Second ||
 		config.RequestTimeout < config.ConnectTimeout || config.RequestTimeout > time.Minute ||
 		config.MaxResponseBytes <= 0 || config.MaxResponseBytes > maximumBoundaryBytes ||
-		config.WebhookClockSkew <= 0 || config.WebhookClockSkew > time.Hour || len(config.WebhookKeys) == 0 {
+		(len(config.WebhookKeys) > 0 && (config.WebhookClockSkew <= 0 || config.WebhookClockSkew > time.Hour)) {
 		return nil, errors.New("payment provider HTTP configuration invalid")
 	}
 	if config.MaxWebhookBodyBytes == 0 {
