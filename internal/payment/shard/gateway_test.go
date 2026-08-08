@@ -73,6 +73,26 @@ func TestGatewayDoesNotRetryNonFencingPaymentFailure(t *testing.T) {
 	}
 }
 
+func TestGatewayRefreshesVoidCancellationExactlyOnceAfterFenceMove(t *testing.T) {
+	t.Parallel()
+	reservationID, trainRunID := uuid.New(), uuid.New()
+	stale := paymentRoute(t, trainRunID, sharding.ShardPhysicalZero, 5)
+	current := paymentRoute(t, trainRunID, sharding.ShardPhysicalOne, 6)
+	directory := &directoryFake{routes: []sharding.ShardRoute{stale, current}}
+	store := &shardStoreFake{voidErrors: []error{sharding.ErrWriteFenced, nil}}
+	gateway, _ := shard.NewGateway(directory, store)
+	command := shard.CancelVoidedReservationCommand{
+		CommandID: uuid.New(), VoidOperationID: uuid.New(), PaymentIntentID: uuid.New(),
+		ReservationID: reservationID, TrainRunID: trainRunID, OwnerID: uuid.New(),
+		AmountMinor: 1, Currency: "TWD", VoidProofHash: [32]byte{1}, VoidedAt: time.Now(),
+	}
+	command.RequestFingerprint = shard.VoidCancellationFingerprint(command)
+	receipt, err := gateway.CancelVoidedReservation(context.Background(), command)
+	if err != nil || receipt.CommandID != command.CommandID || store.voidCalls != 2 || store.voidRoute != current {
+		t.Fatalf("receipt=%+v error=%v calls=%d route=%+v", receipt, err, store.voidCalls, store.voidRoute)
+	}
+}
+
 func paymentRoute(t *testing.T, trainRunID uuid.UUID, shardID sharding.ShardID, generation int64) sharding.ShardRoute {
 	t.Helper()
 	gen, err := sharding.NewAssignmentGeneration(generation)
@@ -106,6 +126,9 @@ type shardStoreFake struct {
 	beginRoute   sharding.ShardRoute
 	beginErrors  []error
 	beginCalls   int
+	voidRoute    sharding.ShardRoute
+	voidErrors   []error
+	voidCalls    int
 }
 
 func (fake *shardStoreFake) GetPayableReservation(_ context.Context, route sharding.ShardRoute, _ uuid.UUID) (paymentapp.ReservationSnapshot, error) {
@@ -129,6 +152,16 @@ func (fake *shardStoreFake) IssueTickets(_ context.Context, _ sharding.ShardRout
 
 func (fake *shardStoreFake) MarkRefundPending(_ context.Context, _ sharding.ShardRoute, command shard.MarkRefundPendingCommand) (shard.MarkRefundPendingReceipt, error) {
 	return shard.MarkRefundPendingReceipt{CommandID: command.CommandID, PaymentIntentID: command.PaymentIntentID, ReservationID: command.ReservationID}, nil
+}
+
+func (fake *shardStoreFake) CancelVoidedReservation(_ context.Context, route sharding.ShardRoute, command shard.CancelVoidedReservationCommand) (shard.CancelVoidedReservationReceipt, error) {
+	fake.voidRoute = route
+	index := fake.voidCalls
+	fake.voidCalls++
+	if index < len(fake.voidErrors) && fake.voidErrors[index] != nil {
+		return shard.CancelVoidedReservationReceipt{}, fake.voidErrors[index]
+	}
+	return shard.CancelVoidedReservationReceipt{CommandID: command.CommandID, VoidOperationID: command.VoidOperationID, PaymentIntentID: command.PaymentIntentID, ReservationID: command.ReservationID}, nil
 }
 
 func (fake *shardStoreFake) ApplyRefundCompensation(_ context.Context, _ sharding.ShardRoute, command shard.ApplyRefundCompensationCommand) (shard.ApplyRefundCompensationReceipt, error) {

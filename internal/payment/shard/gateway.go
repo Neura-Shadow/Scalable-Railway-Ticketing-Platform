@@ -26,7 +26,30 @@ type Store interface {
 	BeginPayment(context.Context, sharding.ShardRoute, paymentapp.BeginPaymentCommand) (paymentapp.BeginPaymentReceipt, error)
 	IssueTickets(context.Context, sharding.ShardRoute, IssueTicketsCommand) (IssueTicketsReceipt, error)
 	MarkRefundPending(context.Context, sharding.ShardRoute, MarkRefundPendingCommand) (MarkRefundPendingReceipt, error)
+	CancelVoidedReservation(context.Context, sharding.ShardRoute, CancelVoidedReservationCommand) (CancelVoidedReservationReceipt, error)
 	ApplyRefundCompensation(context.Context, sharding.ShardRoute, ApplyRefundCompensationCommand) (ApplyRefundCompensationReceipt, error)
+}
+
+func (gateway *Gateway) CancelVoidedReservation(ctx context.Context, command CancelVoidedReservationCommand) (CancelVoidedReservationReceipt, error) {
+	if gateway == nil || ctx == nil || command.ReservationID == uuid.Nil || command.TrainRunID == uuid.Nil {
+		return CancelVoidedReservationReceipt{}, paymentapp.ErrReservationNotPayable
+	}
+	route, err := gateway.directory.ResolveReservation(ctx, command.ReservationID, false)
+	if err != nil || route.TrainRunID() != command.TrainRunID {
+		return CancelVoidedReservationReceipt{}, mapShardError(err)
+	}
+	receipt, err := gateway.store.CancelVoidedReservation(ctx, route, command)
+	if errors.Is(err, sharding.ErrAssignmentStale) || errors.Is(err, sharding.ErrWriteFenced) {
+		refreshed, refreshErr := gateway.directory.ResolveReservation(ctx, command.ReservationID, true)
+		if refreshErr != nil || refreshed.TrainRunID() != command.TrainRunID {
+			return CancelVoidedReservationReceipt{}, ErrShardPaymentUnavailable
+		}
+		return gateway.store.CancelVoidedReservation(ctx, refreshed, command)
+	}
+	if err != nil {
+		return CancelVoidedReservationReceipt{}, mapShardError(err)
+	}
+	return receipt, nil
 }
 
 func (gateway *Gateway) MarkRefundPending(ctx context.Context, command MarkRefundPendingCommand) (MarkRefundPendingReceipt, error) {
