@@ -75,7 +75,7 @@ func NewDefaultShards(source, target DB) (*Shards, error) {
 
 func (shards *Shards) Preflight(ctx context.Context, record physicalmigration.Record) error {
 	if record.SourceProtocolVersion != 1 || record.TargetProtocolVersion != 1 ||
-		record.SourceSchemaVersion != 1 || record.TargetSchemaVersion != 1 {
+		record.SourceSchemaVersion != 2 || record.TargetSchemaVersion != 2 {
 		return physicalmigration.ErrCheckpointConflict
 	}
 	var sourceReady bool
@@ -83,11 +83,15 @@ func (shards *Shards) Preflight(ctx context.Context, record physicalmigration.Re
 SELECT current_setting('server_version_num')::integer >= 160000
 	AND EXISTS (
 	    SELECT 1 FROM public.schema_migrations
-	    WHERE version = 1 AND NOT dirty
+	    WHERE version = 2 AND NOT dirty
 	)
    AND to_regclass('public.train_run_booking_snapshots') IS NOT NULL
    AND to_regclass('public.train_run_mutation_journal') IS NOT NULL
    AND to_regclass('public.outbox_events') IS NOT NULL
+	AND to_regclass('public.payment_command_receipts') IS NOT NULL
+	AND to_regclass('public.ticket_issuance_receipts') IS NOT NULL
+	AND to_regclass('public.payment_refund_receipts') IS NOT NULL
+	AND to_regclass('public.payment_compensation_receipts') IS NOT NULL
 	AND NOT EXISTS (
 	    SELECT 1 FROM (VALUES
 	        ('train_run_booking_snapshots_capture_mutation'),
@@ -99,7 +103,11 @@ SELECT current_setting('server_version_num')::integer >= 160000
 	        ('ticket_orders_capture_mutation'),
 	        ('tickets_capture_mutation'),
 	        ('idempotency_records_capture_mutation'),
-	        ('booking_command_receipts_capture_mutation')
+	        ('booking_command_receipts_capture_mutation'),
+	        ('payment_command_receipts_capture_mutation'),
+	        ('ticket_issuance_receipts_capture_mutation'),
+	        ('payment_refund_receipts_capture_mutation'),
+	        ('payment_compensation_receipts_capture_mutation')
 	    ) AS required(trigger_name)
 	    WHERE NOT EXISTS (
 	        SELECT 1 FROM pg_catalog.pg_trigger
@@ -122,11 +130,15 @@ SELECT current_setting('server_version_num')::integer >= 160000
 SELECT current_setting('server_version_num')::integer >= 160000
 	AND EXISTS (
 	    SELECT 1 FROM public.schema_migrations
-	    WHERE version = 1 AND NOT dirty
+	    WHERE version = 2 AND NOT dirty
 	)
    AND to_regclass('public.train_run_booking_snapshots') IS NOT NULL
    AND to_regclass('public.migration_apply_receipts') IS NOT NULL
    AND to_regclass('public.outbox_events') IS NOT NULL
+	AND to_regclass('public.payment_command_receipts') IS NOT NULL
+	AND to_regclass('public.ticket_issuance_receipts') IS NOT NULL
+	AND to_regclass('public.payment_refund_receipts') IS NOT NULL
+	AND to_regclass('public.payment_compensation_receipts') IS NOT NULL
 	AND NOT EXISTS (
 	    SELECT 1 FROM (VALUES
 	        ('train_run_booking_snapshots_capture_mutation'),
@@ -138,7 +150,11 @@ SELECT current_setting('server_version_num')::integer >= 160000
 	        ('ticket_orders_capture_mutation'),
 	        ('tickets_capture_mutation'),
 	        ('idempotency_records_capture_mutation'),
-	        ('booking_command_receipts_capture_mutation')
+	        ('booking_command_receipts_capture_mutation'),
+	        ('payment_command_receipts_capture_mutation'),
+	        ('ticket_issuance_receipts_capture_mutation'),
+	        ('payment_refund_receipts_capture_mutation'),
+	        ('payment_compensation_receipts_capture_mutation')
 	    ) AS required(trigger_name)
 	    WHERE NOT EXISTS (
 	        SELECT 1 FROM pg_catalog.pg_trigger

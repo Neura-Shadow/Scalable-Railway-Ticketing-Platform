@@ -146,7 +146,14 @@ func TestPreflightChecksActualSchemaHistoryAndMutationTriggerCoverage(t *testing
 		t.Fatalf("Preflight() error = %v", err)
 	}
 	for name, sql := range map[string]string{"source": source.lastSQL, "target": target.lastSQL} {
-		for _, fragment := range []string{"schema_migrations", "NOT dirty", "pg_trigger", "booking_command_receipts_capture_mutation"} {
+		for _, fragment := range []string{
+			"schema_migrations", "version = 2", "NOT dirty", "pg_trigger",
+			"booking_command_receipts_capture_mutation",
+			"payment_command_receipts_capture_mutation",
+			"ticket_issuance_receipts_capture_mutation",
+			"payment_refund_receipts_capture_mutation",
+			"payment_compensation_receipts_capture_mutation",
+		} {
 			if !strings.Contains(sql, fragment) {
 				t.Fatalf("%s preflight omitted %q: %s", name, fragment, sql)
 			}
@@ -362,10 +369,11 @@ func TestCaptureOutboxRejectsAnExceededAggregateStagingBudget(t *testing.T) {
 
 func TestBoundedValidatorChecksInventoryAndReferentialSemantics(t *testing.T) {
 	t.Parallel()
+	const physicalV2MigrationTables = 15
 
 	rows := func() []pgx.Row {
 		result := []pgx.Row{fakeRow{values: []any{0}}}
-		for range 11 {
+		for range physicalV2MigrationTables {
 			result = append(result, fakeRow{values: []any{0, "", ""}})
 		}
 		return result
@@ -374,12 +382,12 @@ func TestBoundedValidatorChecksInventoryAndReferentialSemantics(t *testing.T) {
 	target := &fakeDB{queryRows: rows()}
 	record := testRecord()
 	result, err := (physicalpostgres.BoundedValidator{}).Validate(context.Background(), source, target,
-		physicalmigration.ValidationRequest{Migration: record, MaxRows: 100, MaxTables: 11})
+		physicalmigration.ValidationRequest{Migration: record, MaxRows: 100, MaxTables: physicalV2MigrationTables})
 	if err != nil || !result.Passed {
 		t.Fatalf("Validate() result=%+v error=%v", result, err)
 	}
 	semanticSQL := source.querySQL[0]
-	for _, fragment := range []string{"bit_or", "idempotency_records", "booking_command_receipts", "outbox_events"} {
+	for _, fragment := range []string{"bit_or", "payment_pending", "idempotency_records", "booking_command_receipts", "payment_command_receipts", "ticket_issuance_receipts", "payment_refund_receipts", "payment_compensation_receipts", "outbox_events"} {
 		if !strings.Contains(semanticSQL, fragment) {
 			t.Fatalf("semantic validation omitted %q: %s", fragment, semanticSQL)
 		}
@@ -409,10 +417,15 @@ func TestReverseTargetPreparationCleansChildrenButRetainsExactSnapshotAndFenceMa
 		t.Fatalf("preparation deleted the retained snapshot/fence marker: %s", joined)
 	}
 	outbox := strings.Index(joined, "DELETE FROM public.outbox_events")
+	compensation := strings.Index(joined, "DELETE FROM public.payment_compensation_receipts")
+	refund := strings.Index(joined, "DELETE FROM public.payment_refund_receipts")
+	issuance := strings.Index(joined, "DELETE FROM public.ticket_issuance_receipts")
+	paymentCommand := strings.Index(joined, "DELETE FROM public.payment_command_receipts")
 	tickets := strings.Index(joined, "DELETE FROM public.tickets")
 	snapshot := strings.LastIndex(joined, "UPDATE public.train_run_booking_snapshots")
 	fence := strings.LastIndex(joined, "UPDATE public.train_run_write_fences")
-	if outbox < 0 || tickets <= outbox || snapshot <= tickets || fence <= snapshot {
+	if outbox < 0 || compensation <= outbox || refund <= compensation || issuance <= refund ||
+		paymentCommand <= issuance || tickets <= paymentCommand || snapshot <= tickets || fence <= snapshot {
 		t.Fatalf("unsafe reverse cleanup order: %s", joined)
 	}
 }
@@ -628,8 +641,8 @@ func testRecord() physicalmigration.Record {
 	return physicalmigration.Record{
 		MigrationID: uuid.New(), TrainRunID: uuid.New(), SourceShardID: "physical-shard-0",
 		TargetShardID: "physical-shard-1", SourceGeneration: 7, TargetGeneration: 8,
-		SourceProtocolVersion: 1, SourceSchemaVersion: 1,
-		TargetProtocolVersion: 1, TargetSchemaVersion: 1,
+		SourceProtocolVersion: 1, SourceSchemaVersion: 2,
+		TargetProtocolVersion: 1, TargetSchemaVersion: 2,
 		State: migration.PhysicalStateCatchingUp,
 	}
 }

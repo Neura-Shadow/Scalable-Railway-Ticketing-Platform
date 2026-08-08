@@ -25,12 +25,16 @@ var migrationTables = []tableSpec{
 	{name: "booking_seat_catalog", columns: fields("id train_run_id assignment_generation train_id coach_id seat_id coach_order seat_order seat_class active source_version source_updated_at created_at updated_at")},
 	{name: "booking_fare_snapshots", columns: fields("id train_run_id assignment_generation segment_count from_stop_index to_stop_index seat_class amount_minor currency source_version active source_updated_at created_at updated_at")},
 	{name: "seat_inventory", columns: fields("id train_run_id assignment_generation segment_count seat_id seat_class occupied_segments version created_at updated_at")},
-	{name: "reservations", columns: fields("id user_id train_run_id assignment_generation segment_count from_stop_index to_stop_index seat_class status expires_at total_amount_minor currency created_at updated_at")},
+	{name: "reservations", columns: fields("id user_id train_run_id assignment_generation segment_count from_stop_index to_stop_index seat_class status expires_at total_amount_minor currency payment_intent_id payment_amount_minor payment_currency payment_grace_expires_at created_at updated_at")},
 	{name: "reservation_seats", columns: fields("id reservation_id train_run_id assignment_generation segment_count seat_id passenger_id fare_snapshot_id segment_mask fare_amount_minor currency created_at updated_at")},
-	{name: "ticket_orders", columns: fields("id reservation_id user_id train_run_id assignment_generation status total_amount_minor currency created_at updated_at")},
+	{name: "ticket_orders", columns: fields("id reservation_id user_id train_run_id assignment_generation status total_amount_minor currency payment_intent_id payment_currency authorized_amount_minor captured_amount_minor refunded_amount_minor created_at updated_at")},
 	{name: "tickets", columns: fields("id ticket_order_id reservation_seat_id train_run_id assignment_generation ticket_code status created_at updated_at")},
 	{name: "idempotency_records", columns: fields("id train_run_id assignment_generation user_id operation key_hash request_fingerprint status resource_type resource_id expires_at created_at updated_at")},
 	{name: "booking_command_receipts", columns: fields("id command_id train_run_id assignment_generation command_type request_fingerprint status result_type result_id result_source_version result_booking_policy_version error_code started_at completed_at created_at updated_at")},
+	{name: "payment_command_receipts", columns: fields("id command_id payment_intent_id reservation_id train_run_id assignment_generation operation request_fingerprint amount_minor currency status result_resource_id result_status error_code created_at committed_at updated_at")},
+	{name: "ticket_issuance_receipts", columns: fields("id issuance_id payment_intent_id reservation_id payment_operation_id ticket_order_id train_run_id assignment_generation capture_proof_hash amount_minor currency issued_ticket_count created_at")},
+	{name: "payment_refund_receipts", columns: fields("id refund_operation_id payment_intent_id reservation_id ticket_order_id train_run_id assignment_generation refund_proof_hash captured_amount_minor refunded_amount_minor currency refunded_at created_at")},
+	{name: "payment_compensation_receipts", columns: fields("id compensation_id payment_intent_id reservation_id ticket_order_id refund_receipt_id train_run_id assignment_generation released_seat_count cancelled_ticket_count applied_at created_at")},
 	{name: "outbox_events", columns: fields("id train_run_id assignment_generation aggregate_type aggregate_id event_type event_version payload status attempts next_attempt_at locked_at locked_by lease_token created_at updated_at published_at")},
 }
 
@@ -234,6 +238,10 @@ SELECT
 	if err := tx.QueryRow(ctx, `
 SELECT
     (SELECT count(*) FROM public.outbox_events WHERE train_run_id = $1 AND assignment_generation = $2)
+  + (SELECT count(*) FROM public.payment_compensation_receipts WHERE train_run_id = $1 AND assignment_generation = $2)
+  + (SELECT count(*) FROM public.payment_refund_receipts WHERE train_run_id = $1 AND assignment_generation = $2)
+  + (SELECT count(*) FROM public.ticket_issuance_receipts WHERE train_run_id = $1 AND assignment_generation = $2)
+  + (SELECT count(*) FROM public.payment_command_receipts WHERE train_run_id = $1 AND assignment_generation = $2)
   + (SELECT count(*) FROM public.tickets WHERE train_run_id = $1 AND assignment_generation = $2)
   + (SELECT count(*) FROM public.ticket_orders WHERE train_run_id = $1 AND assignment_generation = $2)
   + (SELECT count(*) FROM public.booking_command_receipts WHERE train_run_id = $1 AND assignment_generation = $2)
@@ -260,6 +268,10 @@ WHERE train_run_id = $1 AND source_generation = $2`, record.TrainRunID, record.R
 	}
 	deletes := []string{
 		"DELETE FROM public.outbox_events WHERE train_run_id = $1 AND assignment_generation = $2",
+		"DELETE FROM public.payment_compensation_receipts WHERE train_run_id = $1 AND assignment_generation = $2",
+		"DELETE FROM public.payment_refund_receipts WHERE train_run_id = $1 AND assignment_generation = $2",
+		"DELETE FROM public.ticket_issuance_receipts WHERE train_run_id = $1 AND assignment_generation = $2",
+		"DELETE FROM public.payment_command_receipts WHERE train_run_id = $1 AND assignment_generation = $2",
 		"DELETE FROM public.tickets WHERE train_run_id = $1 AND assignment_generation = $2",
 		"DELETE FROM public.ticket_orders WHERE train_run_id = $1 AND assignment_generation = $2",
 		"DELETE FROM public.booking_command_receipts WHERE train_run_id = $1 AND assignment_generation = $2",
@@ -421,7 +433,10 @@ func semanticInvariantViolations(ctx context.Context, db DB, trainRunID uuid.UUI
 		          ON reservation.id = seat.reservation_id
 		         AND reservation.train_run_id = seat.train_run_id
 		         AND reservation.assignment_generation = seat.assignment_generation
-		        WHERE reservation.status IN ('held', 'confirmed')
+		        WHERE reservation.status IN (
+		            'held', 'payment_pending', 'payment_review', 'confirmed',
+		            'refund_pending'
+		        )
 		        GROUP BY seat.train_run_id, seat.assignment_generation, seat.seat_id
 		    ) AS expected
 		      ON expected.train_run_id = inventory.train_run_id

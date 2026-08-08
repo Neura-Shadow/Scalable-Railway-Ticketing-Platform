@@ -108,7 +108,7 @@ func openBackend(ctx context.Context, lookup func(string) (string, bool)) (backe
 	}
 	result := &postgresBackend{control: control, registry: registry, shards: make(map[string]physicalpostgres.DB, 2)}
 	for _, shardID := range []sharding.ShardID{sharding.ShardPhysicalZero, sharding.ShardPhysicalOne} {
-		handle, resolveErr := registry.Resolve(physical.CatalogEntry{ShardID: shardID, StorageKind: physical.StoragePostgres, ConnectionRef: shardID.String(), ProtocolVersion: 1, SchemaVersion: 1, Enabled: true, WriteEnabled: true, HealthState: physical.HealthHealthy, State: physical.StateActive})
+		handle, resolveErr := registry.Resolve(physical.CatalogEntry{ShardID: shardID, StorageKind: physical.StoragePostgres, ConnectionRef: shardID.String(), ProtocolVersion: physical.SupportedProtocolVersion, SchemaVersion: physical.SupportedSchemaVersion, Enabled: true, WriteEnabled: true, HealthState: physical.HealthHealthy, State: physical.StateActive})
 		if resolveErr != nil {
 			result.Close()
 			return nil, errUnavailable
@@ -384,7 +384,7 @@ func (b *postgresBackend) checkSchema(ctx context.Context, shardID string) (any,
 		Version int64  `json:"version"`
 		Dirty   bool   `json:"dirty"`
 		Ready   bool   `json:"ready"`
-	}{shardID, version, dirty, version == 1 && !dirty}
+	}{shardID, version, dirty, version == int64(physical.SupportedSchemaVersion) && !dirty}
 	if !result.Ready {
 		return result, errState
 	}
@@ -404,8 +404,9 @@ SET enabled = true, write_enabled = true, health_state = 'healthy',
 WHERE shard_id = $1
   AND storage_kind = 'postgres'
   AND connection_ref = $1
-  AND protocol_version = 1
-  AND schema_version = 1`, req.ShardID)
+  AND protocol_version = $2
+  AND schema_version = $3`, req.ShardID, physical.SupportedProtocolVersion,
+		physical.SupportedSchemaVersion)
 	if err != nil || tag.RowsAffected() != 1 {
 		return result, errState
 	}

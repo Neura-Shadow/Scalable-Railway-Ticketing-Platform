@@ -82,7 +82,7 @@ func TestRegistryRejectsCatalogConnectionReferenceNotConfigured(t *testing.T) {
 		StorageKind:     physical.StoragePostgres,
 		ConnectionRef:   "attacker-controlled-ref",
 		ProtocolVersion: 1,
-		SchemaVersion:   1,
+		SchemaVersion:   physical.SupportedSchemaVersion,
 		Enabled:         true,
 		WriteEnabled:    true,
 	})
@@ -120,7 +120,7 @@ func TestRegistryReturnsOnlyValidatedHandleMetadata(t *testing.T) {
 		StorageKind:     physical.StoragePostgres,
 		ConnectionRef:   "physical-shard-1",
 		ProtocolVersion: 1,
-		SchemaVersion:   1,
+		SchemaVersion:   physical.SupportedSchemaVersion,
 		Enabled:         true,
 		WriteEnabled:    false,
 		HealthState:     physical.HealthHealthy,
@@ -130,7 +130,7 @@ func TestRegistryReturnsOnlyValidatedHandleMetadata(t *testing.T) {
 		t.Fatalf("Resolve() error = %v", err)
 	}
 	if handle.ShardID() != sharding.ShardPhysicalOne || handle.StorageKind() != physical.StoragePostgres ||
-		handle.SchemaVersion() != 1 || handle.ProtocolVersion() != 1 || handle.HealthState() != physical.HealthHealthy ||
+		handle.SchemaVersion() != physical.SupportedSchemaVersion || handle.ProtocolVersion() != 1 || handle.HealthState() != physical.HealthHealthy ||
 		handle.WriteEnabled() || handle.Pool() != pool {
 		t.Fatalf("validated handle = %+v", handle)
 	}

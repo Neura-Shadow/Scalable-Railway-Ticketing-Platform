@@ -18,7 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-func TestBootstrapRequiresTheFixedShardAndCleanV1Schema(t *testing.T) {
+func TestBootstrapRequiresTheFixedShardAndCleanV2Schema(t *testing.T) {
 	t.Parallel()
 	for _, testCase := range []struct {
 		name    string
@@ -27,9 +27,9 @@ func TestBootstrapRequiresTheFixedShardAndCleanV1Schema(t *testing.T) {
 		dirty   bool
 		wantErr error
 	}{
-		{name: "clean v1", shardID: "physical-shard-0", version: 1},
+		{name: "clean v2", shardID: "physical-shard-0", version: 2},
 		{name: "old schema", shardID: "physical-shard-0", version: 0, wantErr: errState},
-		{name: "dirty schema", shardID: "physical-shard-0", version: 1, dirty: true, wantErr: errState},
+		{name: "dirty schema", shardID: "physical-shard-0", version: 2, dirty: true, wantErr: errState},
 		{name: "unknown shard", shardID: "attacker-shard", wantErr: errArguments},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -46,7 +46,7 @@ func TestBootstrapRequiresTheFixedShardAndCleanV1Schema(t *testing.T) {
 	}
 }
 
-func TestBootstrapMutatesCatalogOnlyAfterCleanV1Check(t *testing.T) {
+func TestBootstrapMutatesCatalogOnlyAfterCleanV2Check(t *testing.T) {
 	t.Parallel()
 	for _, testCase := range []struct {
 		name      string
@@ -55,12 +55,12 @@ func TestBootstrapMutatesCatalogOnlyAfterCleanV1Check(t *testing.T) {
 		wantExec  int
 		wantError error
 	}{
-		{name: "clean v1", version: 1, wantExec: 1},
-		{name: "dirty v1", version: 1, dirty: true, wantError: errState},
-		{name: "unsupported v2", version: 2, wantError: errState},
+		{name: "clean v2", version: 2, wantExec: 1},
+		{name: "dirty v2", version: 2, dirty: true, wantError: errState},
+		{name: "unsupported v1", version: 1, wantError: errState},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			control := &scriptedControl{rows: []pgx.Row{valueRow{"physical-shard-0", true, true, "healthy", "active", int32(1), int32(1)}}}
+			control := &scriptedControl{rows: []pgx.Row{valueRow{"physical-shard-0", true, true, "healthy", "active", int32(1), int32(2)}}}
 			backend := &postgresBackend{control: control, shards: map[string]physicalpostgres.DB{
 				"physical-shard-0": &scriptedShard{rows: []pgx.Row{valueRow{testCase.version, testCase.dirty}}},
 			}}
@@ -178,9 +178,10 @@ func TestReversePhysicalMigrationUsesTheFixedControlTargetAdapter(t *testing.T) 
 func TestReconcileValidationExecutesTheCompleteFixedTableSet(t *testing.T) {
 	t.Parallel()
 	record := migrationRecord(migration.PhysicalStateValidatingOnline)
-	rows := make([]pgx.Row, 0, 12)
+	const physicalV2MigrationTables = 15
+	rows := make([]pgx.Row, 0, physicalV2MigrationTables+1)
 	rows = append(rows, valueRow{0})
-	for range 11 {
+	for range physicalV2MigrationTables {
 		rows = append(rows, valueRow{0, "", ""})
 	}
 	sourceRows := append([]pgx.Row(nil), rows...)
@@ -200,7 +201,7 @@ func TestReconcileValidationExecutesTheCompleteFixedTableSet(t *testing.T) {
 		Tables       int  `json:"tables"`
 		Truncated    bool `json:"truncated"`
 	})
-	if !ok || !summary.Passed || summary.Tables != 11 || summary.Truncated {
+	if !ok || !summary.Passed || summary.Tables != physicalV2MigrationTables || summary.Truncated {
 		t.Fatalf("reconcile() result = %#v", result)
 	}
 }
@@ -360,7 +361,7 @@ func backendWithEngine(engine migrationEngine, record physicalmigration.Record) 
 }
 
 func migrationRecord(state migration.PhysicalState) physicalmigration.Record {
-	return physicalmigration.Record{MigrationID: uuid.MustParse(testMigration), TrainRunID: uuid.MustParse(testTrainRun), SourceShardID: "physical-shard-0", TargetShardID: "physical-shard-1", SourceGeneration: 7, TargetGeneration: 8, SourceProtocolVersion: 1, SourceSchemaVersion: 1, TargetProtocolVersion: 1, TargetSchemaVersion: 1, State: state}
+	return physicalmigration.Record{MigrationID: uuid.MustParse(testMigration), TrainRunID: uuid.MustParse(testTrainRun), SourceShardID: "physical-shard-0", TargetShardID: "physical-shard-1", SourceGeneration: 7, TargetGeneration: 8, SourceProtocolVersion: 1, SourceSchemaVersion: 2, TargetProtocolVersion: 1, TargetSchemaVersion: 2, State: state}
 }
 
 func cleanupBackend(record physicalmigration.Record, retention time.Time, state string, tx *scriptedTx) *postgresBackend {

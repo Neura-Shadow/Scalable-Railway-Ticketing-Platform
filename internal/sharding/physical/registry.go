@@ -22,7 +22,7 @@ var (
 
 const (
 	SupportedProtocolVersion int32 = 1
-	SupportedSchemaVersion   int32 = 1
+	SupportedSchemaVersion   int32 = 2
 )
 
 type StorageKind string

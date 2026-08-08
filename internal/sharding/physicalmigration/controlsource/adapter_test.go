@@ -2,6 +2,7 @@ package controlsource
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,6 +13,25 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
+
+func TestReverseAdapterRejectsPhysicalV2RatherThanDroppingPaymentEvidence(t *testing.T) {
+	t.Parallel()
+
+	adapter, err := NewReverse(&fakeDB{}, &fakeDB{}, SourceLegacy)
+	if err != nil {
+		t.Fatalf("NewReverse() error = %v", err)
+	}
+	record := physicalmigration.Record{
+		MigrationID: uuid.New(), TrainRunID: uuid.New(), ReverseMigration: true,
+		SourceShardID: "physical-shard-0", TargetShardID: SourceLegacy,
+		SourceGeneration: 7, TargetGeneration: 8,
+		SourceProtocolVersion: 1, SourceSchemaVersion: 2,
+		TargetProtocolVersion: 1, TargetSchemaVersion: 8,
+	}
+	if err := adapter.Preflight(context.Background(), record); !errors.Is(err, physicalmigration.ErrCheckpointConflict) {
+		t.Fatalf("Preflight() error = %v, want fail-closed checkpoint conflict", err)
+	}
+}
 
 func TestFareSnapshotUsesDurableControlSourceVersion(t *testing.T) {
 	t.Parallel()
@@ -260,11 +280,11 @@ func TestControlMigrationScopesReverseApplyAuthorizationToTheExactTransaction(t 
 	if tableStart < 0 {
 		t.Fatal("control migration omitted the reverse-apply authorization table")
 	}
-	tableEnd := strings.Index(sql[tableStart:], "\n);\n")
+	tableEnd := strings.Index(sql[tableStart:], "\n);")
 	if tableEnd < 0 {
 		t.Fatal("control migration omitted the reverse-apply authorization table")
 	}
-	tableSQL := sql[tableStart : tableStart+tableEnd+len("\n);\n")]
+	tableSQL := sql[tableStart : tableStart+tableEnd+len("\n);")]
 	for _, required := range []string{
 		"migration_id uuid NOT NULL",
 		"train_run_id uuid NOT NULL",

@@ -38,6 +38,9 @@ func NewReverse(control, source physicalpostgres.DB, targetID string) (*ReverseA
 }
 
 func (adapter *ReverseAdapter) Preflight(ctx context.Context, record physicalmigration.Record) error {
+	// Physical schema v2 contains payment state and durable receipts that the
+	// version-8 control layouts cannot represent. Keep this path pinned to v1
+	// so an operator cannot silently down-convert or discard payment evidence.
 	if adapter == nil || !record.ReverseMigration || record.TargetShardID != adapter.targetID ||
 		record.SourceProtocolVersion != 1 || record.SourceSchemaVersion != 1 ||
 		record.TargetProtocolVersion != 1 || record.TargetSchemaVersion != 8 {

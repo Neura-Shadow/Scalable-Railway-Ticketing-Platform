@@ -134,7 +134,7 @@ FROM public.outbox_events WHERE id=$1`, eventID).Scan(
 			seedSnapshotAndFence(t, side.pool, record.TrainRunID, side.generation, side.state, side.write, true)
 		}
 		result, err := (physicalpostgres.BoundedValidator{}).Validate(context.Background(), source, target,
-			physicalmigration.ValidationRequest{Migration: record, MaxRows: 100, MaxTables: 11})
+			physicalmigration.ValidationRequest{Migration: record, MaxRows: 100, MaxTables: 15})
 		if err != nil {
 			t.Fatalf("Validate() error = %v", err)
 		}
@@ -229,8 +229,8 @@ func integrationRecord(sourceGeneration, targetGeneration int64) physicalmigrati
 	return physicalmigration.Record{
 		MigrationID: uuid.New(), TrainRunID: uuid.New(), SourceShardID: "physical-shard-0",
 		TargetShardID: "physical-shard-1", SourceGeneration: sourceGeneration,
-		TargetGeneration: targetGeneration, SourceProtocolVersion: 1, SourceSchemaVersion: 1,
-		TargetProtocolVersion: 1, TargetSchemaVersion: 1, State: migration.PhysicalStatePreparingTarget,
+		TargetGeneration: targetGeneration, SourceProtocolVersion: 1, SourceSchemaVersion: 2,
+		TargetProtocolVersion: 1, TargetSchemaVersion: 2, State: migration.PhysicalStatePreparingTarget,
 	}
 }
 
@@ -284,6 +284,10 @@ func cleanupTrainRun(t *testing.T, pool *pgxpool.Pool, trainRunID uuid.UUID) {
 		"DELETE FROM public.train_run_target_write_evidence WHERE train_run_id=$1",
 		"DELETE FROM public.train_run_write_fences WHERE train_run_id=$1",
 		"DELETE FROM public.outbox_events WHERE train_run_id=$1",
+		"DELETE FROM public.payment_compensation_receipts WHERE train_run_id=$1",
+		"DELETE FROM public.payment_refund_receipts WHERE train_run_id=$1",
+		"DELETE FROM public.ticket_issuance_receipts WHERE train_run_id=$1",
+		"DELETE FROM public.payment_command_receipts WHERE train_run_id=$1",
 		"DELETE FROM public.booking_command_receipts WHERE train_run_id=$1",
 		"DELETE FROM public.idempotency_records WHERE train_run_id=$1",
 		"DELETE FROM public.tickets WHERE train_run_id=$1",

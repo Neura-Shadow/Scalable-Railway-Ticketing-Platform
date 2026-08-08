@@ -66,7 +66,7 @@ func validSource(value string) bool {
 func (adapter *Adapter) Preflight(ctx context.Context, record physicalmigration.Record) error {
 	if adapter == nil || record.SourceShardID != adapter.sourceID || !validSource(record.SourceShardID) ||
 		record.SourceProtocolVersion != 1 || record.SourceSchemaVersion != 8 ||
-		record.TargetProtocolVersion != 1 || record.TargetSchemaVersion != 1 {
+		record.TargetProtocolVersion != 1 || record.TargetSchemaVersion != 2 {
 		return physicalmigration.ErrCheckpointConflict
 	}
 	var sourceReady bool
@@ -94,9 +94,29 @@ WHERE assignment.train_run_id = $1`, record.TrainRunID, adapter.sourceID,
 	var targetReady bool
 	if err := adapter.target.QueryRow(ctx, `
 SELECT current_setting('server_version_num')::integer >= 160000
+	AND EXISTS (
+	    SELECT 1 FROM public.schema_migrations
+	    WHERE version = 2 AND NOT dirty
+	)
    AND to_regclass('public.train_run_booking_snapshots') IS NOT NULL
    AND to_regclass('public.migration_apply_receipts') IS NOT NULL
    AND to_regclass('public.outbox_events') IS NOT NULL
+	AND to_regclass('public.payment_command_receipts') IS NOT NULL
+	AND to_regclass('public.ticket_issuance_receipts') IS NOT NULL
+	AND to_regclass('public.payment_refund_receipts') IS NOT NULL
+	AND to_regclass('public.payment_compensation_receipts') IS NOT NULL
+	AND NOT EXISTS (
+	    SELECT 1 FROM (VALUES
+	        ('payment_command_receipts_capture_mutation'),
+	        ('ticket_issuance_receipts_capture_mutation'),
+	        ('payment_refund_receipts_capture_mutation'),
+	        ('payment_compensation_receipts_capture_mutation')
+	    ) AS required(trigger_name)
+	    WHERE NOT EXISTS (
+	        SELECT 1 FROM pg_catalog.pg_trigger
+	        WHERE tgname = required.trigger_name AND NOT tgisinternal
+	    )
+	)
    AND NOT EXISTS (
        SELECT 1 FROM public.train_run_write_fences
        WHERE train_run_id = $1 AND write_enabled
