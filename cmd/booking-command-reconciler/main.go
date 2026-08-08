@@ -31,7 +31,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-const controlSchemaVersion = 9
+const controlSchemaVersion = 10
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))

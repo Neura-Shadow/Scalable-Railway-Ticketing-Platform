@@ -562,7 +562,7 @@ FROM (
 		activeMigrations = maxRowCap
 	}
 	result.ActiveMigrationsObserved = activeMigrations
-	result.Ready = result.SchemaVersion == 9 && !result.SchemaDirty && complete &&
+	result.Ready = result.SchemaVersion == 10 && !result.SchemaDirty && complete &&
 		result.ShardCatalogEntries == maxShardLimit && result.WritableActiveShards == maxShardLimit &&
 		!result.ActiveMigrationsTruncated
 	if !result.Ready {
