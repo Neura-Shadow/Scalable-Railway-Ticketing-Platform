@@ -9,6 +9,7 @@ import (
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command"
 	bookingquota "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/quota"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
+	shardphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physical"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
@@ -270,8 +271,9 @@ WHERE assignment.train_run_id = $1
   AND shard.health_state = 'healthy'
   AND shard.state = 'active'
   AND shard.protocol_version = 1
-  AND shard.schema_version = 1
-  AND shard.minimum_fencing_protocol_version <= $2`, trainRunID, sharding.SupportedFencingProtocolVersion).Scan(
+  AND shard.schema_version = $3
+  AND shard.minimum_fencing_protocol_version <= $2`, trainRunID, sharding.SupportedFencingProtocolVersion,
+		shardphysical.SupportedSchemaVersion).Scan(
 		&rawShardID,
 		&rawGeneration,
 	)

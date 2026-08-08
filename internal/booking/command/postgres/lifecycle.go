@@ -7,6 +7,7 @@ import (
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
+	shardphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physical"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
@@ -49,10 +50,10 @@ WHERE directory.reservation_id = $1
   AND shard.health_state = 'healthy'
   AND shard.state = 'active'
   AND shard.protocol_version = 1
-  AND shard.schema_version = 1
+  AND shard.schema_version = $4
   AND shard.minimum_fencing_protocol_version <= $3
 FOR UPDATE OF directory`, request.ReservationID, request.OwnerUserID,
-		sharding.SupportedFencingProtocolVersion).Scan(
+		sharding.SupportedFencingProtocolVersion, shardphysical.SupportedSchemaVersion).Scan(
 		&trainRunID, &rawShardID, &rawGeneration, &directoryState, &storageKind,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {

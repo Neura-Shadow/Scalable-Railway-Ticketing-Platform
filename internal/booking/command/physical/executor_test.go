@@ -473,7 +473,7 @@ func handleForTx(t *testing.T, tx pgx.Tx, writeEnabled bool) shardphysical.Handl
 	t.Cleanup(registry.Close)
 	handle, err := registry.Resolve(shardphysical.CatalogEntry{
 		ShardID: sharding.ShardPhysicalZero, StorageKind: shardphysical.StoragePostgres, ConnectionRef: "physical-shard-0",
-		ProtocolVersion: 1, SchemaVersion: 1, Enabled: true, WriteEnabled: writeEnabled,
+		ProtocolVersion: 1, SchemaVersion: shardphysical.SupportedSchemaVersion, Enabled: true, WriteEnabled: writeEnabled,
 		HealthState: shardphysical.HealthHealthy, State: shardphysical.StateActive,
 	})
 	if err != nil {
