@@ -218,8 +218,20 @@ func TestCapturedManualReviewWithoutTicketStillProducesFinding(t *testing.T) {
 	control.Saga = Saga{State: "manual_review", Step: "refund", ErrorCategory: "database_finalize_failed"}
 	findings = nil
 	checkShard(ScopeAll, control, shard, func(code string, _ bool) { findings = append(findings, code) })
+	if !containsString(findings, "captured_payment_without_ticket") {
+		t.Fatalf("missing refund-pending receipt hid captured-without-ticket: %v", findings)
+	}
+	shard.RefundPendingReceiptFound = true
+	findings = nil
+	checkShard(ScopeAll, control, shard, func(code string, _ bool) { findings = append(findings, code) })
 	if containsString(findings, "captured_payment_without_ticket") {
-		t.Fatalf("mark-refund finalize window was misclassified: %v", findings)
+		t.Fatalf("receipt-backed mark-refund finalize window was misclassified: %v", findings)
+	}
+	control.Saga.State = "compensating"
+	findings = nil
+	checkShard(ScopeAll, control, shard, func(code string, _ bool) { findings = append(findings, code) })
+	if !containsString(findings, "captured_payment_without_ticket") {
+		t.Fatalf("wrong saga state hid captured-without-ticket: %v", findings)
 	}
 }
 

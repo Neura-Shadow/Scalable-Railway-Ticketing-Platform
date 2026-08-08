@@ -337,7 +337,7 @@ func checkShard(scope Scope, control ControlSnapshot, shard ShardSnapshot, add f
 	if control.Intent.State == "completed" && (!shard.TicketOrderFound || shard.TicketOrderState != "issued") {
 		add("completed_payment_without_issued_ticket_order", false)
 	}
-	if capturedRequiresIssuedTickets(control, refunded, voided) && (!shard.TicketOrderFound || shard.TicketOrderState != "issued") {
+	if capturedRequiresIssuedTickets(control, shard, refunded, voided) && (!shard.TicketOrderFound || shard.TicketOrderState != "issued") {
 		add("captured_payment_without_ticket", false)
 	}
 	if !captured && (shard.TicketOrderState == "issued" || shard.ActiveTicketCount > 0) {
@@ -390,7 +390,7 @@ func checkShard(scope Scope, control ControlSnapshot, shard ShardSnapshot, add f
 	}
 }
 
-func capturedRequiresIssuedTickets(control ControlSnapshot, refunded, voided bool) bool {
+func capturedRequiresIssuedTickets(control ControlSnapshot, shard ShardSnapshot, refunded, voided bool) bool {
 	if refunded || voided {
 		return false
 	}
@@ -398,7 +398,8 @@ func capturedRequiresIssuedTickets(control ControlSnapshot, refunded, voided boo
 	case "refund_pending", "refunded", "voided", "cancelled":
 		return false
 	case "manual_review":
-		return !(control.Saga.Step == "refund" && control.Saga.ErrorCategory == "database_finalize_failed")
+		return !(control.Saga.State == "manual_review" && control.Saga.Step == "refund" &&
+			control.Saga.ErrorCategory == "database_finalize_failed" && shard.RefundPendingReceiptFound)
 	default:
 		return true
 	}
