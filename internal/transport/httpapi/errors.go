@@ -26,6 +26,20 @@ var (
 	ErrReservationQuotaExceeded      = errors.New("reservation quota exceeded")
 	ErrReservationBackpressure       = errors.New("reservation backpressure")
 	ErrServiceTemporarilyRebalancing = errors.New("service temporarily rebalancing")
+	ErrPaymentNotEnabled             = errors.New("payment not enabled")
+	ErrPaymentIntentConflict         = errors.New("payment intent conflict")
+	ErrReservationNotPayable         = errors.New("reservation not payable")
+	ErrPaymentAlreadyCompleted       = errors.New("payment already completed")
+	ErrPaymentProviderUnavailable    = errors.New("payment provider unavailable")
+	ErrPaymentProcessing             = errors.New("payment processing")
+	ErrPaymentRequiresCustomerAction = errors.New("payment requires customer action")
+	ErrPaymentFailed                 = errors.New("payment failed")
+	ErrPaymentUnderReview            = errors.New("payment under review")
+	ErrRefundProcessing              = errors.New("refund processing")
+	ErrRefundFailed                  = errors.New("refund failed")
+	ErrTicketIssuanceProcessing      = errors.New("ticket issuance processing")
+	ErrWebhookInvalid                = errors.New("payment webhook invalid")
+	ErrWebhookConflict               = errors.New("payment webhook conflict")
 )
 
 type retryAfterError struct {
@@ -105,6 +119,34 @@ func classifyError(err error) (int, string, string) {
 		return http.StatusServiceUnavailable, "service_temporarily_rebalancing", "booking is temporarily rebalancing"
 	case errors.Is(err, ErrReservationBackpressure):
 		return http.StatusServiceUnavailable, "reservation_backpressure", "reservation capacity is temporarily full"
+	case errors.Is(err, ErrPaymentNotEnabled):
+		return http.StatusServiceUnavailable, "payment_not_enabled", "payment is not enabled"
+	case errors.Is(err, ErrPaymentIntentConflict):
+		return http.StatusConflict, "payment_intent_conflict", "payment intent conflicts with the request"
+	case errors.Is(err, ErrReservationNotPayable):
+		return http.StatusConflict, "reservation_not_payable", "reservation cannot enter payment"
+	case errors.Is(err, ErrPaymentAlreadyCompleted):
+		return http.StatusConflict, "payment_already_completed", "payment is already completed"
+	case errors.Is(err, ErrPaymentProviderUnavailable):
+		return http.StatusServiceUnavailable, "payment_provider_unavailable", "payment provider is unavailable"
+	case errors.Is(err, ErrPaymentProcessing):
+		return http.StatusAccepted, "payment_processing", "payment is processing"
+	case errors.Is(err, ErrPaymentRequiresCustomerAction):
+		return http.StatusConflict, "payment_requires_customer_action", "payment requires customer action"
+	case errors.Is(err, ErrPaymentFailed):
+		return http.StatusConflict, "payment_failed", "payment failed"
+	case errors.Is(err, ErrPaymentUnderReview):
+		return http.StatusConflict, "payment_under_review", "payment is under review"
+	case errors.Is(err, ErrRefundProcessing):
+		return http.StatusAccepted, "refund_processing", "refund is processing"
+	case errors.Is(err, ErrRefundFailed):
+		return http.StatusConflict, "refund_failed", "refund failed"
+	case errors.Is(err, ErrTicketIssuanceProcessing):
+		return http.StatusAccepted, "ticket_issuance_processing", "ticket issuance is processing"
+	case errors.Is(err, ErrWebhookInvalid):
+		return http.StatusUnauthorized, "payment_webhook_invalid", "payment webhook is invalid"
+	case errors.Is(err, ErrWebhookConflict):
+		return http.StatusConflict, "payment_webhook_conflict", "payment webhook conflicts with a prior event"
 	default:
 		return http.StatusInternalServerError, "internal_error", "internal server error"
 	}
