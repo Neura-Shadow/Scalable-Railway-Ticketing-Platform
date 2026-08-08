@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"encoding/base64"
 	"fmt"
 	"reflect"
 	"strings"
@@ -1229,6 +1230,88 @@ func TestLoadAPIUsesExplicitMilestoneThreeCacheControls(t *testing.T) {
 		cfg.SearchCacheJitter != 5*time.Second || cfg.AvailabilityCacheTTL != 8*time.Second ||
 		cfg.AvailabilityCacheJitter != time.Second || cfg.AvailabilityCacheMaxStale != 6*time.Second {
 		t.Fatalf("Milestone 3 cache controls = %+v", cfg)
+	}
+}
+
+func TestLoadPaymentWorkerUsesBoundedProcessOwnedSettings(t *testing.T) {
+	t.Parallel()
+	key := base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+	env := map[string]string{
+		"APP_ENV":                              "test",
+		"DATABASE_URL":                         "postgres://payment-worker@db.example/railway",
+		"PAYMENT_ENABLED":                      "true",
+		"PAYMENT_PROVIDER_TYPE":                "sandbox",
+		"PAYMENT_PROVIDER_BASE_URL":            "http://payment-sandbox:8099",
+		"PAYMENT_WEBHOOK_KEYRING":              "current=" + key + ",previous=" + key,
+		"PAYMENT_WEBHOOK_ACCEPT_KEY_IDS":       "current",
+		"PAYMENT_SAGA_WORKER_ENABLED":          "true",
+		"PAYMENT_WORKER_ENABLED":               "true",
+		"PAYMENT_WORKER_BATCH_SIZE":            "17",
+		"PAYMENT_WORKER_INTERVAL_MILLISECONDS": "400",
+		"PAYMENT_WORKER_MAX_ATTEMPTS":          "9",
+		"PAYMENT_WORKER_RETRY_BASE_SECONDS":    "2",
+		"PAYMENT_WORKER_LEASE_SECONDS":         "40",
+		"JWT_SECRET":                           "unused-malformed",
+	}
+	cfg, err := config.LoadFromFor(func(key string) (string, bool) {
+		value, ok := env[key]
+		return value, ok
+	}, config.ProcessPaymentWorker)
+	if err != nil {
+		t.Fatalf("LoadFromFor(payment-worker) error = %v", err)
+	}
+	if !cfg.PaymentEnabled || cfg.PaymentProviderType != config.PaymentProviderSandbox ||
+		cfg.PaymentWorkerBatchSize != 17 || cfg.PaymentWorkerInterval != 400*time.Millisecond ||
+		cfg.PaymentWorkerMaxAttempts != 9 || cfg.PaymentWorkerRetryBase != 2*time.Second ||
+		cfg.PaymentWorkerLease != 40*time.Second {
+		t.Fatalf("payment worker settings = %+v", cfg)
+	}
+	keys, err := cfg.ParsePaymentWebhookKeys()
+	if err != nil || len(keys) != 1 || len(keys["current"]) != 32 {
+		t.Fatalf("accepted webhook keys = %v error=%v", len(keys), err)
+	}
+}
+
+func TestPaymentProductionPolicyFailsClosedWithoutLeakingSecrets(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	cfg.Environment = config.EnvironmentProduction
+	cfg.DatabaseURL = "postgres://api@db.example/railway"
+	cfg.RedisAddress = "redis.example:6379"
+	cfg.JWTSecret = strings.Repeat("s", 32)
+	setValidAdmissionTokenConfig(&cfg)
+	cfg.PaymentEnabled = true
+	cfg.PaymentProviderType = config.PaymentProviderSandbox
+	cfg.PaymentProviderBaseURL = "https://provider.example"
+	cfg.PaymentProviderAPIKey = "sentinel-provider-secret"
+	cfg.PaymentWebhookKeyring = "current=" + base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+	cfg.PaymentWebhookAcceptKeyIDs = "current"
+	err := cfg.ValidateFor(config.ProcessAPI)
+	if err == nil || !strings.Contains(err.Error(), "sandbox payment provider") {
+		t.Fatalf("ValidateFor(api) error = %v", err)
+	}
+	if strings.Contains(err.Error(), cfg.PaymentProviderAPIKey) || strings.Contains(err.Error(), cfg.PaymentWebhookKeyring) {
+		t.Fatal("payment validation exposed secret material")
+	}
+}
+
+func TestPaymentProductionOverrideStillRejectsPrivateProviderTargets(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	cfg.Environment = config.EnvironmentProduction
+	cfg.DatabaseURL = "postgres://api@db.example/railway"
+	cfg.RedisAddress = "redis.example:6379"
+	cfg.JWTSecret = strings.Repeat("s", 32)
+	setValidAdmissionTokenConfig(&cfg)
+	cfg.PaymentEnabled = true
+	cfg.PaymentProviderType = config.PaymentProviderSandbox
+	cfg.PaymentAllowSandboxInProductionDisposableTestOnly = true
+	cfg.PaymentProviderBaseURL = "https://payments.internal"
+	cfg.PaymentWebhookKeyring = "current=" + base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+	cfg.PaymentWebhookAcceptKeyIDs = "current"
+	err := cfg.ValidateFor(config.ProcessAPI)
+	if err == nil || !strings.Contains(err.Error(), "host is not allowed") {
+		t.Fatalf("ValidateFor(api) error = %v", err)
 	}
 }
 

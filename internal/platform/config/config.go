@@ -41,11 +41,20 @@ const (
 type Process string
 
 const (
-	ProcessAPI             Process = "api"
-	ProcessHoldExpirer     Process = "hold-expirer"
-	ProcessOutboxWorker    Process = "outbox-worker"
-	ProcessAdmissionWorker Process = "admission-worker"
-	ProcessReadModelWorker Process = "read-model-worker"
+	ProcessAPI               Process = "api"
+	ProcessHoldExpirer       Process = "hold-expirer"
+	ProcessOutboxWorker      Process = "outbox-worker"
+	ProcessAdmissionWorker   Process = "admission-worker"
+	ProcessReadModelWorker   Process = "read-model-worker"
+	ProcessPaymentWorker     Process = "payment-worker"
+	ProcessPaymentReconciler Process = "payment-reconciler"
+)
+
+type PaymentProviderType string
+
+const (
+	PaymentProviderDisabled PaymentProviderType = "disabled"
+	PaymentProviderSandbox  PaymentProviderType = "sandbox"
 )
 
 const (
@@ -58,6 +67,9 @@ const (
 	maxBookingShardQueryTimeout = 30 * time.Second
 	maxPhysicalShardCount       = 2
 	maxPhysicalShardPoolSize    = 100
+	maxPaymentWorkerBatchSize   = 100
+	maxPaymentAttempts          = 20
+	maxPaymentPayloadBytes      = 1 << 20
 )
 
 // Config contains the typed runtime settings used by the application and its
@@ -157,6 +169,27 @@ type Config struct {
 	ReservationMaxActivePassengersPerUser       int
 	ReservationMaxInflightPerInstance           int
 
+	PaymentEnabled                                    bool
+	PaymentProviderType                               PaymentProviderType
+	PaymentProviderBaseURL                            string
+	PaymentProviderAPIKey                             string
+	PaymentWebhookKeyring                             string
+	PaymentWebhookAcceptKeyIDs                        string
+	PaymentProviderConnectTimeout                     time.Duration
+	PaymentProviderRequestTimeout                     time.Duration
+	PaymentProviderMaxResponseBytes                   int
+	PaymentWebhookMaxBodyBytes                        int
+	PaymentWebhookClockSkew                           time.Duration
+	PaymentSagaWorkerEnabled                          bool
+	PaymentReconcilerEnabled                          bool
+	PaymentWorkerEnabled                              bool
+	PaymentWorkerBatchSize                            int
+	PaymentWorkerInterval                             time.Duration
+	PaymentWorkerMaxAttempts                          int
+	PaymentWorkerRetryBase                            time.Duration
+	PaymentWorkerLease                                time.Duration
+	PaymentAllowSandboxInProductionDisposableTestOnly bool
+
 	HTTPReadTimeout  time.Duration
 	HTTPWriteTimeout time.Duration
 	ShutdownTimeout  time.Duration
@@ -222,6 +255,17 @@ func Defaults() Config {
 		ReservationMaxActiveHoldsPerUserPerTrainRun: 3,
 		ReservationMaxActivePassengersPerUser:       24,
 		ReservationMaxInflightPerInstance:           32,
+		PaymentProviderType:                         PaymentProviderDisabled,
+		PaymentProviderConnectTimeout:               2 * time.Second,
+		PaymentProviderRequestTimeout:               5 * time.Second,
+		PaymentProviderMaxResponseBytes:             64 << 10,
+		PaymentWebhookMaxBodyBytes:                  64 << 10,
+		PaymentWebhookClockSkew:                     5 * time.Minute,
+		PaymentWorkerBatchSize:                      25,
+		PaymentWorkerInterval:                       250 * time.Millisecond,
+		PaymentWorkerMaxAttempts:                    8,
+		PaymentWorkerRetryBase:                      time.Second,
+		PaymentWorkerLease:                          30 * time.Second,
 		WorkerBatchSize:                             100,
 		HoldExpirerBatchSize:                        50,
 		HoldExpirerInterval:                         30 * time.Second,
@@ -277,8 +321,8 @@ func (c Config) ValidateFor(process Process) error {
 	}
 
 	var problems []error
-	if process != ProcessAPI && process != ProcessHoldExpirer && process != ProcessOutboxWorker && process != ProcessAdmissionWorker && process != ProcessReadModelWorker {
-		problems = append(problems, errors.New("runtime process must be api, hold-expirer, outbox-worker, admission-worker, or read-model-worker"))
+	if process != ProcessAPI && process != ProcessHoldExpirer && process != ProcessOutboxWorker && process != ProcessAdmissionWorker && process != ProcessReadModelWorker && process != ProcessPaymentWorker && process != ProcessPaymentReconciler {
+		problems = append(problems, errors.New("runtime process is not supported"))
 	}
 	if c.Environment != EnvironmentDevelopment && c.Environment != EnvironmentTest && c.Environment != EnvironmentProduction {
 		problems = append(problems, errors.New("APP_ENV must be development, test, or production"))
@@ -375,6 +419,9 @@ func (c Config) ValidateFor(process Process) error {
 				break
 			}
 		}
+		if err := validatePaymentConfig(c, false, false); err != nil {
+			problems = append(problems, err)
+		}
 	case ProcessHoldExpirer:
 		validateWorkerHTTP()
 		validatePositive(
@@ -443,6 +490,28 @@ func (c Config) ValidateFor(process Process) error {
 		if c.ReadModelConsumerName != "" && !validRuntimeName(c.ReadModelConsumerName, 128) {
 			problems = append(problems, errors.New("READ_MODEL_CONSUMER_NAME must be empty or contain between 1 and 128 trimmed characters"))
 		}
+	case ProcessPaymentWorker:
+		validateWorkerHTTP()
+		if err := validatePaymentConfig(c, true, false); err != nil {
+			problems = append(problems, err)
+		}
+		validatePositive(
+			validationCheck{"PAYMENT_WORKER_BATCH_SIZE", positiveBounded(c.PaymentWorkerBatchSize, maxPaymentWorkerBatchSize)},
+			validationCheck{"PAYMENT_WORKER_INTERVAL_MILLISECONDS", c.PaymentWorkerInterval > 0 && c.PaymentWorkerInterval <= time.Minute},
+			validationCheck{"PAYMENT_WORKER_MAX_ATTEMPTS", positiveBounded(c.PaymentWorkerMaxAttempts, maxPaymentAttempts)},
+			validationCheck{"PAYMENT_WORKER_RETRY_BASE_SECONDS", c.PaymentWorkerRetryBase > 0 && c.PaymentWorkerRetryBase <= time.Hour},
+			validationCheck{"PAYMENT_WORKER_LEASE_SECONDS", c.PaymentWorkerLease > c.PaymentProviderRequestTimeout && c.PaymentWorkerLease <= 10*time.Minute},
+			validationCheck{"WORKER_PASS_TIMEOUT", c.WorkerPassTimeout > 0},
+		)
+		if c.PaymentWorkerEnabled && !c.PaymentSagaWorkerEnabled {
+			problems = append(problems, errors.New("PAYMENT_SAGA_WORKER_ENABLED must be true when PAYMENT_WORKER_ENABLED is true"))
+		}
+	case ProcessPaymentReconciler:
+		validateWorkerHTTP()
+		if err := validatePaymentConfig(c, false, true); err != nil {
+			problems = append(problems, err)
+		}
+		validatePositive(validationCheck{"WORKER_PASS_TIMEOUT", c.WorkerPassTimeout > 0})
 	}
 	return errors.Join(problems...)
 }
@@ -454,6 +523,102 @@ func positiveBounded(value, maximum int) bool {
 func validRuntimeName(value string, maximum int) bool {
 	return value == strings.TrimSpace(value) && len(value) >= 1 && len(value) <= maximum &&
 		!strings.ContainsAny(value, "\x00\r\n")
+}
+
+func validatePaymentConfig(c Config, worker, reconciler bool) error {
+	if !c.PaymentEnabled {
+		if c.PaymentWorkerEnabled || c.PaymentSagaWorkerEnabled || c.PaymentReconcilerEnabled {
+			return errors.New("payment workers and reconciler require PAYMENT_ENABLED=true")
+		}
+		if c.PaymentProviderType != PaymentProviderDisabled {
+			return errors.New("PAYMENT_PROVIDER_TYPE must be disabled when payment is disabled")
+		}
+		return nil
+	}
+	var problems []error
+	if c.PaymentProviderType != PaymentProviderSandbox {
+		problems = append(problems, errors.New("PAYMENT_PROVIDER_TYPE must be sandbox when payment is enabled"))
+	}
+	if c.Environment == EnvironmentProduction && c.PaymentProviderType == PaymentProviderSandbox && !c.PaymentAllowSandboxInProductionDisposableTestOnly {
+		problems = append(problems, errors.New("sandbox payment provider is disabled in production"))
+	}
+	providerURL, err := url.Parse(c.PaymentProviderBaseURL)
+	if err != nil || providerURL.Host == "" || (providerURL.Scheme != "http" && providerURL.Scheme != "https") ||
+		providerURL.User != nil || providerURL.RawQuery != "" || providerURL.Fragment != "" {
+		problems = append(problems, errors.New("PAYMENT_PROVIDER_BASE_URL must be an absolute HTTP or HTTPS URL without credentials, query, or fragment"))
+	} else if c.Environment == EnvironmentProduction {
+		if providerURL.Scheme != "https" {
+			problems = append(problems, errors.New("PAYMENT_PROVIDER_BASE_URL must use HTTPS in production"))
+		}
+		host := strings.ToLower(providerURL.Hostname())
+		if host == "localhost" || strings.HasSuffix(host, ".localhost") || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
+			problems = append(problems, errors.New("PAYMENT_PROVIDER_BASE_URL host is not allowed in production"))
+		} else if address := net.ParseIP(host); address != nil && (address.IsLoopback() || address.IsPrivate() || address.IsUnspecified() || address.IsLinkLocalUnicast() || address.IsLinkLocalMulticast() || address.IsMulticast()) {
+			problems = append(problems, errors.New("PAYMENT_PROVIDER_BASE_URL address is not allowed in production"))
+		}
+	}
+	if _, err := c.ParsePaymentWebhookKeys(); err != nil {
+		problems = append(problems, err)
+	}
+	if c.PaymentProviderConnectTimeout <= 0 || c.PaymentProviderConnectTimeout > 30*time.Second {
+		problems = append(problems, errors.New("PAYMENT_PROVIDER_CONNECT_TIMEOUT must be positive and bounded"))
+	}
+	if c.PaymentProviderRequestTimeout <= 0 || c.PaymentProviderRequestTimeout > time.Minute || c.PaymentProviderRequestTimeout < c.PaymentProviderConnectTimeout {
+		problems = append(problems, errors.New("PAYMENT_PROVIDER_REQUEST_TIMEOUT must be bounded and no shorter than the connect timeout"))
+	}
+	if c.PaymentProviderMaxResponseBytes < 1 || c.PaymentProviderMaxResponseBytes > maxPaymentPayloadBytes {
+		problems = append(problems, errors.New("PAYMENT_PROVIDER_MAX_RESPONSE_BYTES must be positive and bounded"))
+	}
+	if c.PaymentWebhookMaxBodyBytes < 1 || c.PaymentWebhookMaxBodyBytes > maxPaymentPayloadBytes {
+		problems = append(problems, errors.New("PAYMENT_WEBHOOK_MAX_BODY_BYTES must be positive and bounded"))
+	}
+	if c.PaymentWebhookClockSkew <= 0 || c.PaymentWebhookClockSkew > time.Hour {
+		problems = append(problems, errors.New("PAYMENT_WEBHOOK_CLOCK_SKEW_SECONDS must be positive and bounded"))
+	}
+	if worker && !c.PaymentWorkerEnabled {
+		problems = append(problems, errors.New("PAYMENT_WORKER_ENABLED must be true for the payment-worker process"))
+	}
+	if reconciler && !c.PaymentReconcilerEnabled {
+		problems = append(problems, errors.New("PAYMENT_RECONCILER_ENABLED must be true for the payment-reconciler process"))
+	}
+	return errors.Join(problems...)
+}
+
+// ParsePaymentWebhookKeys returns only explicitly accepted HMAC key material.
+// Error text never includes configured key material.
+func (c Config) ParsePaymentWebhookKeys() (map[string][]byte, error) {
+	entries := splitList(c.PaymentWebhookKeyring)
+	acceptIDs := splitList(c.PaymentWebhookAcceptKeyIDs)
+	if len(entries) < 1 || len(entries) > 8 || len(acceptIDs) < 1 || len(acceptIDs) > 8 {
+		return nil, errors.New("PAYMENT_WEBHOOK_KEYRING and PAYMENT_WEBHOOK_ACCEPT_KEY_IDS must contain between one and eight entries")
+	}
+	all := make(map[string][]byte, len(entries))
+	for _, entry := range entries {
+		parts := strings.SplitN(entry, "=", 2)
+		if len(parts) != 2 || !validAdmissionKeyID(parts[0]) {
+			return nil, errors.New("PAYMENT_WEBHOOK_KEYRING must use key-id=base64 entries")
+		}
+		material, err := base64.StdEncoding.DecodeString(parts[1])
+		if err != nil || len(material) != 32 {
+			return nil, errors.New("PAYMENT_WEBHOOK_KEYRING entries must decode to exactly 32 bytes")
+		}
+		if _, duplicate := all[parts[0]]; duplicate {
+			return nil, errors.New("PAYMENT_WEBHOOK_KEYRING key IDs must be unique")
+		}
+		all[parts[0]] = append([]byte(nil), material...)
+	}
+	accepted := make(map[string][]byte, len(acceptIDs))
+	for _, keyID := range acceptIDs {
+		material, ok := all[keyID]
+		if !ok {
+			return nil, errors.New("PAYMENT_WEBHOOK_ACCEPT_KEY_IDS must name configured keys")
+		}
+		if _, duplicate := accepted[keyID]; duplicate {
+			return nil, errors.New("PAYMENT_WEBHOOK_ACCEPT_KEY_IDS must not contain duplicates")
+		}
+		accepted[keyID] = append([]byte(nil), material...)
+	}
+	return accepted, nil
 }
 
 func validateAdmissionTokenKeyring(c Config) error {
@@ -695,6 +860,9 @@ func LoadFromFor(lookup LookupFunc, process Process) (Config, error) {
 	switch process {
 	case ProcessAPI:
 		err = loadAPISettings(lookup, &cfg)
+		if err == nil {
+			err = loadPaymentSettings(lookup, &cfg)
+		}
 	case ProcessHoldExpirer:
 		err = loadHoldExpirerSettings(lookup, &cfg)
 	case ProcessOutboxWorker:
@@ -703,8 +871,18 @@ func LoadFromFor(lookup LookupFunc, process Process) (Config, error) {
 		err = loadAdmissionWorkerSettings(lookup, &cfg)
 	case ProcessReadModelWorker:
 		err = loadReadModelWorkerSettings(lookup, &cfg)
+	case ProcessPaymentWorker:
+		err = loadPaymentSettings(lookup, &cfg)
+		if err == nil {
+			err = loadPaymentWorkerSettings(lookup, &cfg)
+		}
+	case ProcessPaymentReconciler:
+		err = loadPaymentSettings(lookup, &cfg)
+		if err == nil {
+			err = loadPaymentReconcilerSettings(lookup, &cfg)
+		}
 	default:
-		err = errors.New("runtime process must be api, hold-expirer, outbox-worker, admission-worker, or read-model-worker")
+		err = errors.New("runtime process is not supported")
 	}
 	if err != nil {
 		return Config{}, err
@@ -713,6 +891,88 @@ func LoadFromFor(lookup LookupFunc, process Process) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func loadPaymentSettings(lookup LookupFunc, cfg *Config) error {
+	setString(lookup, "PAYMENT_PROVIDER_BASE_URL", &cfg.PaymentProviderBaseURL)
+	setString(lookup, "PAYMENT_PROVIDER_API_KEY", &cfg.PaymentProviderAPIKey)
+	setString(lookup, "PAYMENT_WEBHOOK_KEYRING", &cfg.PaymentWebhookKeyring)
+	setString(lookup, "PAYMENT_WEBHOOK_ACCEPT_KEY_IDS", &cfg.PaymentWebhookAcceptKeyIDs)
+	if value, ok := lookup("PAYMENT_PROVIDER_TYPE"); ok {
+		cfg.PaymentProviderType = PaymentProviderType(strings.ToLower(strings.TrimSpace(value)))
+	}
+	for _, item := range []struct {
+		name   string
+		target *bool
+	}{
+		{"PAYMENT_ENABLED", &cfg.PaymentEnabled},
+		{"PAYMENT_SAGA_WORKER_ENABLED", &cfg.PaymentSagaWorkerEnabled},
+		{"PAYMENT_RECONCILER_ENABLED", &cfg.PaymentReconcilerEnabled},
+		{"PAYMENT_ALLOW_SANDBOX_IN_PRODUCTION_DISPOSABLE_TEST_ONLY", &cfg.PaymentAllowSandboxInProductionDisposableTestOnly},
+	} {
+		if err := setBool(lookup, item.name, item.target); err != nil {
+			return err
+		}
+	}
+	for _, item := range []struct {
+		name   string
+		target *time.Duration
+	}{
+		{"PAYMENT_PROVIDER_CONNECT_TIMEOUT", &cfg.PaymentProviderConnectTimeout},
+		{"PAYMENT_PROVIDER_REQUEST_TIMEOUT", &cfg.PaymentProviderRequestTimeout},
+	} {
+		if err := setDuration(lookup, item.name, item.target); err != nil {
+			return err
+		}
+	}
+	if err := setSeconds(lookup, "PAYMENT_WEBHOOK_CLOCK_SKEW_SECONDS", &cfg.PaymentWebhookClockSkew); err != nil {
+		return err
+	}
+	for _, item := range []struct {
+		name   string
+		target *int
+	}{
+		{"PAYMENT_PROVIDER_MAX_RESPONSE_BYTES", &cfg.PaymentProviderMaxResponseBytes},
+		{"PAYMENT_WEBHOOK_MAX_BODY_BYTES", &cfg.PaymentWebhookMaxBodyBytes},
+	} {
+		if err := setInt(lookup, item.name, item.target); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func loadPaymentWorkerSettings(lookup LookupFunc, cfg *Config) error {
+	setString(lookup, "WORKER_HTTP_ADDRESS", &cfg.WorkerHTTPAddress)
+	if err := setBool(lookup, "PAYMENT_WORKER_ENABLED", &cfg.PaymentWorkerEnabled); err != nil {
+		return err
+	}
+	for _, item := range []struct {
+		name   string
+		target *int
+	}{
+		{"PAYMENT_WORKER_BATCH_SIZE", &cfg.PaymentWorkerBatchSize},
+		{"PAYMENT_WORKER_MAX_ATTEMPTS", &cfg.PaymentWorkerMaxAttempts},
+	} {
+		if err := setInt(lookup, item.name, item.target); err != nil {
+			return err
+		}
+	}
+	if err := setMilliseconds(lookup, "PAYMENT_WORKER_INTERVAL_MILLISECONDS", &cfg.PaymentWorkerInterval); err != nil {
+		return err
+	}
+	if err := setSeconds(lookup, "PAYMENT_WORKER_RETRY_BASE_SECONDS", &cfg.PaymentWorkerRetryBase); err != nil {
+		return err
+	}
+	if err := setSeconds(lookup, "PAYMENT_WORKER_LEASE_SECONDS", &cfg.PaymentWorkerLease); err != nil {
+		return err
+	}
+	return setDuration(lookup, "WORKER_PASS_TIMEOUT", &cfg.WorkerPassTimeout)
+}
+
+func loadPaymentReconcilerSettings(lookup LookupFunc, cfg *Config) error {
+	setString(lookup, "WORKER_HTTP_ADDRESS", &cfg.WorkerHTTPAddress)
+	return setDuration(lookup, "WORKER_PASS_TIMEOUT", &cfg.WorkerPassTimeout)
 }
 
 func loadBookingShardSettings(lookup LookupFunc, cfg *Config) error {
