@@ -70,6 +70,23 @@ func TestClientUsesFixedEndpointBoundedResponsesAndNoRedirects(t *testing.T) {
 	assertProviderError(t, err, provider.ErrorInconsistentResponse, false, true)
 }
 
+func TestClientReadinessUsesFixedBoundedEndpoint(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/readyz" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ready"}`))
+	}))
+	defer server.Close()
+	client := mustClient(t, server.URL, 128)
+	if err := client.Ready(context.Background()); err != nil {
+		t.Fatalf("Ready() error = %v", err)
+	}
+	client.CloseIdleConnections()
+}
+
 func TestClientClassifiesMutationResponseLossAsUncertain(t *testing.T) {
 	t.Parallel()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -86,6 +103,28 @@ func TestClientClassifiesMutationResponseLossAsUncertain(t *testing.T) {
 		Currency: "TWD", IdempotencyKey: "capture-intent-1",
 	})
 	assertProviderError(t, err, provider.ErrorTimeoutUnknown, false, true)
+}
+
+func TestClientVoidValidatesProviderReturnedOriginalMoney(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/payments/pay_1/void" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(provider.OperationResult{
+			ProviderPaymentID: "pay_1", ProviderOperationID: "op_1", Status: provider.StatusVoided,
+			AmountMinor: 100, Currency: "TWD",
+		})
+	}))
+	defer server.Close()
+	client := mustClient(t, server.URL, 1024)
+	result, err := client.Void(context.Background(), provider.VoidRequest{
+		PaymentIntentID: "intent_1", ProviderPaymentID: "pay_1", IdempotencyKey: "void-intent-1",
+	})
+	if err != nil || result.AmountMinor != 100 || result.Currency != "TWD" {
+		t.Fatalf("Void() = %#v, %v", result, err)
+	}
 }
 
 func TestClientRejectsMalformedAndOversizedProviderResponses(t *testing.T) {

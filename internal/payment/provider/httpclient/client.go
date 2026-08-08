@@ -50,6 +50,27 @@ type Client struct {
 	now              func() time.Time
 }
 
+// Ready probes only the fixed provider readiness endpoint and validates a
+// bounded response. It never reveals the endpoint or credential in errors.
+func (client *Client) Ready(ctx context.Context) error {
+	var response struct {
+		Status string `json:"status"`
+	}
+	if err := client.doJSON(ctx, http.MethodGet, "/readyz", nil, &response, "readiness", false); err != nil {
+		return err
+	}
+	if response.Status != "ready" {
+		return inconsistent("readiness", false)
+	}
+	return nil
+}
+
+func (client *Client) CloseIdleConnections() {
+	if client != nil && client.http != nil {
+		client.http.CloseIdleConnections()
+	}
+}
+
 func New(config Config) (*Client, error) {
 	parsed, err := url.Parse(strings.TrimSpace(config.BaseURL))
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
@@ -141,36 +162,37 @@ func (client *Client) Authorize(ctx context.Context, request provider.AuthorizeR
 	if !validCommon(request.PaymentIntentID, request.ProviderPaymentID, request.AmountMinor, request.Currency, request.IdempotencyKey, request.Metadata) || !validIdentifier(request.SyntheticToken) {
 		return provider.OperationResult{}, validation("authorize")
 	}
-	return client.operation(ctx, "authorize", request.ProviderPaymentID, request, request.AmountMinor, request.Currency)
+	return client.operation(ctx, "authorize", request.ProviderPaymentID, request, request.AmountMinor, request.Currency, true)
 }
 
 func (client *Client) Capture(ctx context.Context, request provider.CaptureRequest) (provider.OperationResult, error) {
 	if !validCommon(request.PaymentIntentID, request.ProviderPaymentID, request.AmountMinor, request.Currency, request.IdempotencyKey, request.Metadata) {
 		return provider.OperationResult{}, validation("capture")
 	}
-	return client.operation(ctx, "capture", request.ProviderPaymentID, request, request.AmountMinor, request.Currency)
+	return client.operation(ctx, "capture", request.ProviderPaymentID, request, request.AmountMinor, request.Currency, true)
 }
 
 func (client *Client) Void(ctx context.Context, request provider.VoidRequest) (provider.OperationResult, error) {
 	if !validIdentifier(request.PaymentIntentID) || !validIdentifier(request.ProviderPaymentID) || !validIdentifier(request.IdempotencyKey) || provider.ValidateMetadata(request.Metadata) != nil {
 		return provider.OperationResult{}, validation("void")
 	}
-	return client.operation(ctx, "void", request.ProviderPaymentID, request, 0, "")
+	return client.operation(ctx, "void", request.ProviderPaymentID, request, 0, "", false)
 }
 
 func (client *Client) Refund(ctx context.Context, request provider.RefundRequest) (provider.OperationResult, error) {
 	if !validCommon(request.PaymentIntentID, request.ProviderPaymentID, request.AmountMinor, request.Currency, request.IdempotencyKey, request.Metadata) {
 		return provider.OperationResult{}, validation("refund")
 	}
-	return client.operation(ctx, "refund", request.ProviderPaymentID, request, request.AmountMinor, request.Currency)
+	return client.operation(ctx, "refund", request.ProviderPaymentID, request, request.AmountMinor, request.Currency, true)
 }
 
-func (client *Client) operation(ctx context.Context, operation, paymentID string, request any, amount int64, currency string) (provider.OperationResult, error) {
+func (client *Client) operation(ctx context.Context, operation, paymentID string, request any, amount int64, currency string, exactMoney bool) (provider.OperationResult, error) {
 	var result provider.OperationResult
 	err := client.doJSON(ctx, http.MethodPost, "/v1/payments/"+url.PathEscape(paymentID)+"/"+operation, request, &result, operation, true)
 	if err == nil && (!validIdentifier(result.ProviderPaymentID) || result.ProviderPaymentID != paymentID ||
 		!validIdentifier(result.ProviderOperationID) || !validStatus(result.Status) ||
-		result.AmountMinor != amount || result.Currency != currency) {
+		(exactMoney && (result.AmountMinor != amount || result.Currency != currency)) ||
+		(!exactMoney && (result.AmountMinor <= 0 || !validCurrency(result.Currency)))) {
 		err = inconsistent(operation, true)
 	}
 	return result, err
