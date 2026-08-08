@@ -5,14 +5,20 @@
 Reconciliation is detect-only by default. It compares durable provider,
 control-plane, directory, current-shard, reservation, ticket, receipt, and
 financial-operation state. The core accepts only replay of an already recorded
-command through an explicit safe path, but the shipped reconciler/admin runtime
-intentionally wires no repairer and rejects every `--repair`/mutation as
-`safe_replay_unavailable`. It never directly changes seat masks, mints tickets,
-blindly charges, blindly refunds, bypasses a shard fence, or treats an
-unreachable dependency as proof of absence.
+command through an explicit safe path. The scheduled reconciler is always
+detect-only and has no shard mutation gateway. `payment-admin` constructs the
+recorded-command replayer only after operator-role validation, an explicit
+confirmation, and a non-dry-run request. It never directly changes seat masks,
+mints tickets, blindly charges, blindly refunds, bypasses a shard fence, or
+treats an unreachable dependency as proof of absence.
 
 The long-running entry point is `cmd/payment-reconciler`; the operator tool is
-`cmd/payment-admin`. Expected application methods are `RunOnce(ctx)`,
+`cmd/payment-admin`. The disposable Compose topology creates separate
+`payment_reconciler` roles with table SELECT on control and both physical
+shards. Control additionally grants INSERT/UPDATE on reconciliation
+checkpoints and INSERT-only on manual-review cases, so detection evidence is durable while
+payment, reservation, ticket, receipt, and inventory mutation is denied by
+PostgreSQL. Expected application methods are `RunOnce(ctx)`,
 `InspectPayment(ctx, paymentIntentID)`, `ReconcilePayment(ctx,
 paymentIntentID)`, and bounded `ReconcileAll(ctx, options)`.
 
@@ -82,16 +88,21 @@ not local failure. Contradiction enters manual review.
 | shard begin receipt, control still securing | report | finalize control after route/fence/fingerprint validation |
 | shard issuance receipt, control not completed | report | finalize intent/saga/projection; no capture or issuance |
 | shard compensation receipt, control not compensated | report | finalize refunded/compensated control state |
+| shard void-cancellation receipt, control not compensated | report | finalize cancelled/compensated control state |
 | uncertain provider operation | query/report | apply a definite normalized result only |
 | captured without issuance receipt | report/escalate | enqueue the existing issuance command, never issue directly |
 | refunded with active ticket | report/escalate | enqueue existing local compensation command after proof |
 | inventory mismatch | report Critical/High as classified | no automatic repair |
 
-These rows define the only admissible future repair shape. The current runtime
-performs none of them. A future selected repair must be idempotent, audited,
-expected-state guarded, and bounded. Administration already requires current
-operator authorization and explicit confirmation for provider-side or mutating
-actions, then fails closed until a reviewed recorded-command replayer exists.
+These rows define the only admissible repair shape. The current admin runtime
+supports the receipt-backed begin, issuance, void-cancellation, and refund
+compensation cases plus rescheduling an already persisted provider operation.
+Every replay uses the original deterministic identity, acquires a bounded saga
+lease before shard I/O, rechecks exact intent/saga/step state, and finalizes
+under the same live lease. A mismatch, missing receipt, conflicting locator, or
+unsupported manual-review category fails closed and opens/escalates manual
+review. No command accepts provider amount, currency, shard, or financial proof
+from the operator.
 
 ## Results and metrics
 

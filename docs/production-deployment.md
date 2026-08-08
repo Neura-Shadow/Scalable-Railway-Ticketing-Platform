@@ -50,7 +50,7 @@ Required keys, scoped to the process that consumes them:
 - payment provider API credentials, mounted only into payment workers,
   reconciler/admin as needed; and
 - payment webhook HMAC keyring plus accepted key IDs, mounted only into
-  payment-enabled APIs, workers/reconciler/admin. Never reuse these keys for
+  payment-enabled API ingress. Never reuse these keys for
   JWT, admission, database, Redis, or sandbox fault control.
 
 Admission derivation keys are not JWT keys and must not be reused for database,
@@ -83,10 +83,11 @@ Set `APP_ENV=production` and validate process-owned settings:
   control schema v10, booking-shard schema v2, provider and configured-shard
   readiness;
 - payment-reconciler: detect-only scope/batch/interval/timeout with bounded
-  control/current-shard/provider reads;
-- payment-admin: private audited operator/superuser database role. The shipped
-  runtime rejects mutation/repair because no reviewed recorded-command replayer
-  is wired;
+  control/current-shard/provider reads, SELECT-only shard roles, and a control
+  role limited to reads plus checkpoint/manual-review evidence writes;
+- payment-admin: private audited operator database role. Explicitly confirmed
+  mutations are limited to expected-state replay of existing provider/shard
+  command identities; unsupported or contradictory evidence fails closed;
 - trusted proxy CIDRs and explicit CORS origins; and
 - request, dependency, and shutdown timeouts.
 

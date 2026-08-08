@@ -66,7 +66,8 @@ can claim different rows without duplicating effects.
 |---|---|---|
 | control intent committed before shard command | intent/saga | replay same begin command |
 | shard begin committed before control finalize | shard command receipt | finalize control; do not secure again |
-| provider committed before response | operation `uncertain` and stable identity | query status before side-effect retry |
+| checkout committed before response but no provider ID returned | operation `uncertain` and stable identity | replay the exact checkout request with the same provider idempotency key |
+| capture/void/refund committed before response | operation `uncertain`, provider ID and stable identity | query status before any side-effect retry |
 | verified webhook stored before processing | inbox row | worker reclaims and applies idempotently |
 | capture recorded before issuance | intent/operation captured | replay same issuance command |
 | shard issuance committed before control finalize | issuance receipt/order/tickets | finalize control; do not capture or issue again |
@@ -80,6 +81,11 @@ checkout or voids an authorization before local release. After capture, it
 creates one full-refund operation, moves local resources to `refund_pending`,
 retains the seat, and applies local cancellation only after refund proof.
 
+The customer reservation-cancel endpoint routes every reservation with a
+payment intent through this saga. The legacy shard-local cancellation predicate
+also requires `payment_intent_id IS NULL`, so a racing or stale caller cannot
+release paid inventory outside compensation.
+
 An irrecoverable issuance failure uses the same post-capture path. A transient
 issuance failure instead retains the seat and retries the original command. An
 unknown void/refund/capture outcome is never treated as success or safe failure;
@@ -91,10 +97,13 @@ The reconciliation interface permits only replaying an already recorded
 command after validating a current-shard receipt:
 load the current assignment, validate generation, command fingerprint, payment
 intent, reservation, amount/currency, order, and issued-ticket count, then
-complete control in one transaction. It never creates tickets or mutates
-inventory directly. A stale or conflicting receipt becomes a mismatch, not a
-repair. The shipped runtime has no repairer and therefore reports/escalates the
-finding and returns `safe_replay_unavailable` for requested mutation.
+complete control in one transaction. The scheduled reconciler remains
+detect-only. The operator-only admin path can replay the existing deterministic
+shard command after explicit confirmation, a bounded saga lease, and exact
+state/receipt validation. It never invents a command, calls a provider for
+repair, or mutates inventory directly. A stale route, expired lease,
+contradictory receipt, unsupported state, or conflicting locator becomes a
+manual-review mismatch rather than an approximate repair.
 
 ## Bounded customer behavior
 

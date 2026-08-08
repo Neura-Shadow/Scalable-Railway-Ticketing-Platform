@@ -22,9 +22,11 @@ sandbox, fixtures, fault schedule, tool versions, and workload.
   inventory cost and requires alerting and staffed manual review.
 - Automatic reconciliation is bounded and detect-first. It does not directly
   repair inventory, mint/cancel tickets, charge, refund, or bypass a shard
-  command. The current CLI has no recorded-command replayer and rejects every
-  mutation/safe-repair request. Some mismatches require explicit operator
-  judgment.
+  command. The scheduled process is domain-detect-only; it writes only bounded
+  reconciliation checkpoints and manual-review evidence. The operator CLI supports only
+  explicitly confirmed replay/finalization from existing deterministic
+  commands and immutable receipts; other mutations fail closed. Some
+  mismatches still require explicit operator judgment.
 - Ticket-code duplicate detection is authoritative within the intent's current
   shard only. A cross-shard global proof needs a control-plane code directory
   or index; reconciliation deliberately does not scan unrelated shards.
@@ -44,7 +46,9 @@ sandbox, fixtures, fault schedule, tool versions, and workload.
   credentials. Offline validation, PDF/email/SMS delivery, Apple Pay, Google
   Pay, bank transfer, convenience-store payment, and frontend payment UI remain
   out of scope.
-- Process configuration and application controls cannot protect against a
+- Only API ingress receives webhook-verification keys; worker,
+  reconciler, and admin provider clients are outbound-only. Process
+  configuration and application controls cannot protect against a
   compromised runtime host, database superuser, secret provider, payment
   provider, or authorized operator. Production needs separate least-privilege,
   egress, TLS, secret rotation, audit retention, backup, incident, and access

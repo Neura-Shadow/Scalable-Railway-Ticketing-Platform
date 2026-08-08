@@ -249,8 +249,11 @@ Residual gates are direct runtime, failure, concurrency, secret-scan,
 vulnerability, container and CI evidence. A clean source review does not prove
 live-provider behavior, PCI certification, settlement correctness, global
 cross-shard ticket-code uniqueness, multi-region resilience or production
-capacity. The shipped admin/reconciler has no recorded-command repairer and
-fails closed on all mutation/repair requests.
+capacity. The scheduled reconciler remains detect-only and uses SELECT-only
+shard credentials plus a control role that can write only checkpoints/manual
+reviews in the disposable topology. The private admin wires
+the reviewed recorded-command repairer only after operator-role, explicit
+confirmation, and exact state/receipt checks; unsupported repairs fail closed.
 
 ### Inherited physical-sharding threats
 
