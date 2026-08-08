@@ -135,6 +135,14 @@ func TestGetOwnedIntentDoesNotRevealAnotherOwnersIntent(t *testing.T) {
 	}
 }
 
+func TestGetOwnedIntentByReservationDoesNotRevealAnotherOwnersIntent(t *testing.T) {
+	store := mustStore(t, &fakeDB{rows: []pgx.Row{fakeRow{err: pgx.ErrNoRows}}})
+	_, err := store.GetOwnedIntentByReservation(context.Background(), uuid.New(), uuid.New())
+	if !errors.Is(err, paymentapp.ErrPaymentNotFound) {
+		t.Fatalf("GetOwnedIntentByReservation() error = %v, want not found", err)
+	}
+}
+
 func TestRequestCancellationCreatesVoidBeforeCaptureAndRefundAfterCapture(t *testing.T) {
 	for _, test := range []struct {
 		name      string
@@ -145,6 +153,7 @@ func TestRequestCancellationCreatesVoidBeforeCaptureAndRefundAfterCapture(t *tes
 	}{
 		{name: "before capture", state: "authorized", wantKind: "void", wantState: "void_pending"},
 		{name: "after capture", state: "captured", captured: true, wantKind: "refund", wantState: "refund_pending"},
+		{name: "after issuance", state: "completed", captured: true, wantKind: "refund", wantState: "refund_pending"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			intent := intentFixture()
@@ -178,6 +187,9 @@ func TestRequestCancellationCreatesVoidBeforeCaptureAndRefundAfterCapture(t *tes
 			}
 			if !strings.Contains(tx.execs[0].query, "intent.amount_minor,intent.currency") {
 				t.Fatal("cancellation financials are not selected from the stored intent")
+			}
+			if test.state == "completed" && (!strings.Contains(tx.execs[2].query, "'completed'") || !strings.Contains(tx.execs[2].query, "completed_at=NULL")) {
+				t.Fatalf("completed saga is not reopened safely: %s", tx.execs[2].query)
 			}
 		})
 	}

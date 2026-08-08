@@ -226,6 +226,20 @@ WHERE intent.payment_intent_id=$1 AND intent.owner_user_id=$2`, intentID, ownerI
 	return record, err
 }
 
+func (store *Store) GetOwnedIntentByReservation(ctx context.Context, ownerID, reservationID uuid.UUID) (paymentapp.IntentRecord, error) {
+	if store == nil || store.db == nil || ctx == nil || ownerID == uuid.Nil || reservationID == uuid.Nil {
+		return paymentapp.IntentRecord{}, paymentapp.ErrPaymentNotFound
+	}
+	record, _, err := scanIntent(store.db.QueryRow(ctx, selectIntent+`
+WHERE intent.reservation_id=$1 AND intent.owner_user_id=$2
+ORDER BY intent.created_at DESC
+LIMIT 1`, reservationID, ownerID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return paymentapp.IntentRecord{}, paymentapp.ErrPaymentNotFound
+	}
+	return record, err
+}
+
 func (store *Store) RequestCancellation(ctx context.Context, request paymentapp.CancelIntentRequest) (paymentapp.IntentRecord, error) {
 	if store == nil || store.db == nil || ctx == nil || !validCancellationRequest(request) {
 		return paymentapp.IntentRecord{}, paymentapp.ErrPaymentConflict
@@ -328,25 +342,37 @@ WHERE payment_intent_id=$1 AND operation_type=$2`, request.PaymentIntentID, kind
 		return paymentapp.IntentRecord{}, paymentapp.ErrPaymentConflict
 	}
 	if kind == "refund" {
-		_, err = tx.Exec(ctx, `
+		var tag pgconn.CommandTag
+		tag, err = tx.Exec(ctx, `
 UPDATE public.payment_intents SET state='refund_pending'
 WHERE payment_intent_id=$1
   AND state IN ('captured','ticket_issue_pending','completed','manual_review')`, request.PaymentIntentID)
+		if err == nil && tag.RowsAffected() != 1 {
+			return paymentapp.IntentRecord{}, paymentapp.ErrPaymentConflict
+		}
 	} else {
-		_, err = tx.Exec(ctx, `
+		var tag pgconn.CommandTag
+		tag, err = tx.Exec(ctx, `
 UPDATE public.payment_intents SET state='void_pending'
 WHERE payment_intent_id=$1
   AND state IN ('awaiting_customer','authorized','manual_review')`, request.PaymentIntentID)
+		if err == nil && tag.RowsAffected() != 1 {
+			return paymentapp.IntentRecord{}, paymentapp.ErrPaymentConflict
+		}
 	}
 	if err != nil {
 		return paymentapp.IntentRecord{}, err
 	}
-	if _, err = tx.Exec(ctx, `
+	var sagaTag pgconn.CommandTag
+	if sagaTag, err = tx.Exec(ctx, `
 UPDATE public.payment_sagas
-SET state='compensating',current_step=$2,next_attempt_at=clock_timestamp()
+SET state='compensating',current_step=$2,next_attempt_at=clock_timestamp(),completed_at=NULL
 WHERE payment_intent_id=$1
-  AND state IN ('awaiting_provider','authorized','captured','issuing_tickets','manual_review')`, request.PaymentIntentID, kind); err != nil {
+  AND state IN ('awaiting_provider','authorized','captured','issuing_tickets','completed','manual_review')`, request.PaymentIntentID, kind); err != nil {
 		return paymentapp.IntentRecord{}, err
+	}
+	if sagaTag.RowsAffected() != 1 {
+		return paymentapp.IntentRecord{}, paymentapp.ErrPaymentConflict
 	}
 	record, _, err = scanIntent(tx.QueryRow(ctx, selectIntent+`
 WHERE intent.payment_intent_id=$1`, request.PaymentIntentID))

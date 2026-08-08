@@ -121,12 +121,13 @@ func TestPaymentWebhookEnforcesConfiguredRequestTimeout(t *testing.T) {
 }
 
 type paymentServiceStub struct {
-	create   httpapi.CreatePaymentIntentCommand
-	cancel   httpapi.CancelPaymentIntentCommand
-	getOwner string
-	getID    string
-	result   httpapi.PaymentIntentView
-	err      error
+	create            httpapi.CreatePaymentIntentCommand
+	cancel            httpapi.CancelPaymentIntentCommand
+	reservationCancel httpapi.CancelReservationPaymentCommand
+	getOwner          string
+	getID             string
+	result            httpapi.PaymentIntentView
+	err               error
 }
 
 func (stub *paymentServiceStub) CreatePaymentIntent(_ context.Context, command httpapi.CreatePaymentIntentCommand) (httpapi.PaymentIntentView, error) {
@@ -141,6 +142,11 @@ func (stub *paymentServiceStub) GetPaymentIntent(_ context.Context, ownerID, pay
 
 func (stub *paymentServiceStub) CancelPaymentIntent(_ context.Context, command httpapi.CancelPaymentIntentCommand) (httpapi.PaymentIntentView, error) {
 	stub.cancel = command
+	return stub.result, stub.err
+}
+
+func (stub *paymentServiceStub) CancelReservationPayment(_ context.Context, command httpapi.CancelReservationPaymentCommand) (httpapi.PaymentIntentView, error) {
+	stub.reservationCancel = command
 	return stub.result, stub.err
 }
 

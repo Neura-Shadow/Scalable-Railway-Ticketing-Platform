@@ -73,6 +73,12 @@ type CancelPaymentIntentCommand struct {
 	IdempotencyKey  string
 }
 
+type CancelReservationPaymentCommand struct {
+	OwnerID        string
+	ReservationID  string
+	IdempotencyKey string
+}
+
 // PaymentIntentView exposes only bounded customer-facing state. Provider
 // operation IDs, physical shard identity, and internal error details stay out
 // of the HTTP contract.
@@ -92,6 +98,10 @@ type PaymentService interface {
 	CreatePaymentIntent(context.Context, CreatePaymentIntentCommand) (PaymentIntentView, error)
 	GetPaymentIntent(context.Context, string, string) (PaymentIntentView, error)
 	CancelPaymentIntent(context.Context, CancelPaymentIntentCommand) (PaymentIntentView, error)
+}
+
+type ReservationPaymentCancellationService interface {
+	CancelReservationPayment(context.Context, CancelReservationPaymentCommand) (PaymentIntentView, error)
 }
 
 type PaymentWebhookDisposition string

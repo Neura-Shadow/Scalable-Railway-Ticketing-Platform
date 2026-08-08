@@ -53,6 +53,12 @@ type CancelIntentCommand struct {
 	IdempotencyKey  string
 }
 
+type CancelReservationCommand struct {
+	OwnerID        uuid.UUID
+	ReservationID  uuid.UUID
+	IdempotencyKey string
+}
+
 type IntentRecord struct {
 	ID                uuid.UUID
 	SagaID            uuid.UUID
@@ -116,6 +122,7 @@ type IntentStore interface {
 	ReserveIntent(context.Context, ReserveIntentRequest) (IntentRecord, bool, error)
 	MarkReservationSecured(context.Context, uuid.UUID, uuid.UUID, [sha256.Size]byte) (IntentRecord, error)
 	GetOwnedIntent(context.Context, uuid.UUID, uuid.UUID) (IntentRecord, error)
+	GetOwnedIntentByReservation(context.Context, uuid.UUID, uuid.UUID) (IntentRecord, error)
 	RequestCancellation(context.Context, CancelIntentRequest) (IntentRecord, error)
 }
 
@@ -160,6 +167,30 @@ func (service *Service) CancelIntent(ctx context.Context, command CancelIntentCo
 		}
 	}
 	return intent, nil
+}
+
+func (service *Service) CancelReservation(ctx context.Context, command CancelReservationCommand) (IntentRecord, error) {
+	if service == nil || service.store == nil || ctx == nil || command.OwnerID == uuid.Nil || command.ReservationID == uuid.Nil {
+		return IntentRecord{}, ErrInvalidPaymentRequest
+	}
+	intent, err := service.store.GetOwnedIntentByReservation(ctx, command.OwnerID, command.ReservationID)
+	if err != nil {
+		if errors.Is(err, ErrPaymentNotFound) {
+			return IntentRecord{}, ErrPaymentNotFound
+		}
+		return IntentRecord{}, ErrPaymentUnavailable
+	}
+	switch intent.State {
+	case "failed", "expired":
+		return IntentRecord{}, ErrPaymentNotFound
+	case "cancelled", "voided", "refunded":
+		return intent, nil
+	case "created", "reservation_securing", "checkout_pending", "authorization_pending", "capture_pending":
+		return IntentRecord{}, ErrPaymentConflict
+	}
+	return service.CancelIntent(ctx, CancelIntentCommand{
+		OwnerID: command.OwnerID, PaymentIntentID: intent.ID, IdempotencyKey: command.IdempotencyKey,
+	})
 }
 
 type ReservationGateway interface {

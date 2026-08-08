@@ -132,6 +132,31 @@ func TestOwnedIntentReadAndCancellationAreBoundedAndIdempotent(t *testing.T) {
 	if first.State != "void_pending" {
 		t.Fatalf("cancelled intent state = %q, want void_pending", first.State)
 	}
+	byReservation, err := service.CancelReservation(context.Background(), application.CancelReservationCommand{
+		OwnerID: owner, ReservationID: store.intent.ReservationID, IdempotencyKey: "cancel-payment-1",
+	})
+	if err != nil || byReservation.ID != intentID || store.cancelCalls != 3 {
+		t.Fatalf("CancelReservation() = %#v, calls=%d, error=%v", byReservation, store.cancelCalls, err)
+	}
+}
+
+func TestReservationCancellationRejectsNoncancellableTerminalIntent(t *testing.T) {
+	t.Parallel()
+	for _, state := range []string{"failed", "expired"} {
+		t.Run(state, func(t *testing.T) {
+			owner, reservationID := uuid.New(), uuid.New()
+			store := &intentStoreFake{intent: application.IntentRecord{
+				ID: uuid.New(), OwnerID: owner, ReservationID: reservationID, State: state,
+			}}
+			service := application.NewService(store, &reservationGatewayFake{}, time.Now, uuid.New)
+			_, err := service.CancelReservation(context.Background(), application.CancelReservationCommand{
+				OwnerID: owner, ReservationID: reservationID, IdempotencyKey: "cancel-payment-1",
+			})
+			if !errors.Is(err, application.ErrPaymentNotFound) || store.cancelCalls != 0 {
+				t.Fatalf("state=%s error=%v cancelCalls=%d", state, err, store.cancelCalls)
+			}
+		})
+	}
 }
 
 type intentStoreFake struct {
@@ -187,6 +212,13 @@ func (store *intentStoreFake) MarkReservationSecured(_ context.Context, intentID
 
 func (store *intentStoreFake) GetOwnedIntent(_ context.Context, ownerID, intentID uuid.UUID) (application.IntentRecord, error) {
 	if store.intent.ID != intentID || store.intent.OwnerID != ownerID {
+		return application.IntentRecord{}, application.ErrPaymentNotFound
+	}
+	return store.intent, nil
+}
+
+func (store *intentStoreFake) GetOwnedIntentByReservation(_ context.Context, ownerID, reservationID uuid.UUID) (application.IntentRecord, error) {
+	if store.intent.ReservationID != reservationID || store.intent.OwnerID != ownerID {
 		return application.IntentRecord{}, application.ErrPaymentNotFound
 	}
 	return store.intent, nil

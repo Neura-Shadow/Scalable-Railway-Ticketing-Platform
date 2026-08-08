@@ -33,6 +33,12 @@ func TestPaymentServiceMapsOwnerScopedCommandsAndSafeView(t *testing.T) {
 	if view.ReservationID != reservationID.String() || view.AmountMinor != 12500 || view.Currency != "TWD" || view.State != "awaiting_customer" {
 		t.Fatalf("safe view=%#v", view)
 	}
+	cancelled, err := service.CancelReservationPayment(context.Background(), httpapi.CancelReservationPaymentCommand{
+		OwnerID: owner.String(), ReservationID: reservationID.String(), IdempotencyKey: "cancel-payment-1",
+	})
+	if err != nil || cancelled.ID != intentID.String() || useCases.reservationCancelled.ReservationID != reservationID {
+		t.Fatalf("cancelled=%#v command=%#v error=%v", cancelled, useCases.reservationCancelled, err)
+	}
 }
 
 func TestPaymentServiceReturnsStableResourceForDeferredFinalization(t *testing.T) {
@@ -70,10 +76,11 @@ func TestPaymentServiceMapsBoundedErrors(t *testing.T) {
 }
 
 type paymentUseCasesFake struct {
-	created   paymentapp.CreateIntentCommand
-	cancelled paymentapp.CancelIntentCommand
-	record    paymentapp.IntentRecord
-	err       error
+	created              paymentapp.CreateIntentCommand
+	cancelled            paymentapp.CancelIntentCommand
+	reservationCancelled paymentapp.CancelReservationCommand
+	record               paymentapp.IntentRecord
+	err                  error
 }
 
 func (fake *paymentUseCasesFake) CreateIntent(_ context.Context, command paymentapp.CreateIntentCommand) (paymentapp.IntentRecord, error) {
@@ -87,5 +94,10 @@ func (fake *paymentUseCasesFake) GetIntent(context.Context, uuid.UUID, uuid.UUID
 
 func (fake *paymentUseCasesFake) CancelIntent(_ context.Context, command paymentapp.CancelIntentCommand) (paymentapp.IntentRecord, error) {
 	fake.cancelled = command
+	return fake.record, fake.err
+}
+
+func (fake *paymentUseCasesFake) CancelReservation(_ context.Context, command paymentapp.CancelReservationCommand) (paymentapp.IntentRecord, error) {
+	fake.reservationCancelled = command
 	return fake.record, fake.err
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -316,6 +317,9 @@ func TestExecutorCancellationCommitsReceiptMutationOutboxAndEvidenceTogether(t *
 			t.Fatalf("missing %q in SQL: %s", fragment, joined)
 		}
 	}
+	if !slices.ContainsFunc(tx.queries, func(query string) bool { return strings.Contains(query, "payment_intent_id IS NULL") }) {
+		t.Fatal("legacy cancellation did not exclude payment-bound reservations")
+	}
 }
 
 func TestExecutorLifecycleDuplicateReturnsReceiptWithoutMutation(t *testing.T) {
@@ -510,13 +514,15 @@ type scriptedTx struct {
 	execs              []string
 	execArguments      [][]any
 	queryRows          []pgx.Rows
+	queries            []string
 	queryIndex         int
 	commits            int
 	rollbacks          int
 	affectedByContains map[string]int64
 }
 
-func (tx *scriptedTx) QueryRow(_ context.Context, _ string, _ ...any) pgx.Row {
+func (tx *scriptedTx) QueryRow(_ context.Context, query string, _ ...any) pgx.Row {
+	tx.queries = append(tx.queries, query)
 	row := tx.rows[tx.rowIndex]
 	tx.rowIndex++
 	return row

@@ -98,6 +98,24 @@ func reservationActionHandler(dependencies Dependencies, action string) gin.Hand
 			}
 			result, err = dependencies.Reservations.ConfirmReservation(c.Request.Context(), ReservationMutationCommand{OwnerID: identity.Subject, ReservationID: reservationID, IdempotencyKey: idempotencyKey})
 		case "cancel":
+			if dependencies.PaymentRequiredForConfirm {
+				cancellations, ok := dependencies.Payments.(ReservationPaymentCancellationService)
+				if !ok {
+					writeError(c, ErrPaymentNotEnabled)
+					return
+				}
+				paymentResult, paymentErr := cancellations.CancelReservationPayment(c.Request.Context(), CancelReservationPaymentCommand{
+					OwnerID: identity.Subject, ReservationID: reservationID, IdempotencyKey: idempotencyKey,
+				})
+				if paymentErr == nil {
+					c.JSON(http.StatusAccepted, paymentResult)
+					return
+				}
+				if !errors.Is(paymentErr, ErrNotFound) {
+					writeError(c, paymentErr)
+					return
+				}
+			}
 			result, err = dependencies.Reservations.CancelReservation(c.Request.Context(), ReservationMutationCommand{OwnerID: identity.Subject, ReservationID: reservationID, IdempotencyKey: idempotencyKey})
 		default:
 			err = errors.New("unsupported reservation action")

@@ -14,6 +14,7 @@ type paymentUseCases interface {
 	CreateIntent(context.Context, paymentapp.CreateIntentCommand) (paymentapp.IntentRecord, error)
 	GetIntent(context.Context, uuid.UUID, uuid.UUID) (paymentapp.IntentRecord, error)
 	CancelIntent(context.Context, paymentapp.CancelIntentCommand) (paymentapp.IntentRecord, error)
+	CancelReservation(context.Context, paymentapp.CancelReservationCommand) (paymentapp.IntentRecord, error)
 }
 
 type PaymentService struct{ useCases paymentUseCases }
@@ -74,6 +75,23 @@ func (service *PaymentService) CancelPaymentIntent(ctx context.Context, command 
 	return paymentIntentView(record), nil
 }
 
+func (service *PaymentService) CancelReservationPayment(ctx context.Context, command httpapi.CancelReservationPaymentCommand) (httpapi.PaymentIntentView, error) {
+	owner, reservationID, err := parsePaymentIDs(command.OwnerID, command.ReservationID)
+	if err != nil {
+		return httpapi.PaymentIntentView{}, err
+	}
+	if service == nil || service.useCases == nil {
+		return httpapi.PaymentIntentView{}, httpapi.ErrPaymentNotEnabled
+	}
+	record, err := service.useCases.CancelReservation(ctx, paymentapp.CancelReservationCommand{
+		OwnerID: owner, ReservationID: reservationID, IdempotencyKey: command.IdempotencyKey,
+	})
+	if err != nil {
+		return httpapi.PaymentIntentView{}, mapPaymentError(err)
+	}
+	return paymentIntentView(record), nil
+}
+
 func parsePaymentIDs(left, right string) (uuid.UUID, uuid.UUID, error) {
 	first, err := uuid.Parse(left)
 	if err != nil {
@@ -117,3 +135,4 @@ func mapPaymentError(err error) error {
 }
 
 var _ httpapi.PaymentService = (*PaymentService)(nil)
+var _ httpapi.ReservationPaymentCancellationService = (*PaymentService)(nil)

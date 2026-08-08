@@ -1231,6 +1231,7 @@ BEGIN
             OR (OLD.state = 'issuing_tickets' AND NEW.state IN (
                 'completed', 'compensating', 'failed', 'manual_review'
             ))
+            OR (OLD.state = 'completed' AND NEW.state = 'compensating')
             OR (OLD.state = 'compensating' AND NEW.state IN (
                 'refunding', 'compensated', 'failed', 'manual_review'
             ))

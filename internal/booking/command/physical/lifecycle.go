@@ -113,6 +113,7 @@ func lockOwnedPhysicalReservation(ctx context.Context, tx pgx.Tx, bookingCommand
 SELECT status,total_amount_minor,currency
 FROM reservations
 WHERE id=$1 AND user_id=$2 AND train_run_id=$3 AND assignment_generation=$4
+  AND payment_intent_id IS NULL
 FOR UPDATE`, bookingCommand.ReservationID, bookingCommand.OwnerUserID,
 		bookingCommand.TrainRunID, bookingCommand.Route.Generation().Int64()).Scan(&status, &total, &currency)
 	if errors.Is(err, pgx.ErrNoRows) {
