@@ -114,7 +114,7 @@ func TestHybridTicketReaderFailsClosedWithoutLegacyFallbackForPhysicalLocator(t 
 	}
 }
 
-func ticketRouter(t *testing.T, trainRunID uuid.UUID, rawGeneration int64, tx pgx.Tx) *hybridPhysicalRouter {
+func ticketRouter(t *testing.T, trainRunID uuid.UUID, rawGeneration int64, tx pgx.Tx) *ticketPhysicalRouter {
 	t.Helper()
 	registry, err := shardphysical.NewRegistry(context.Background(), shardphysical.RegistryConfig{
 		Connections: map[string]shardphysical.ConnectionConfig{"physical-shard-0": {ShardID: sharding.ShardPhysicalZero, DSN: "synthetic"}},
@@ -127,14 +127,20 @@ func ticketRouter(t *testing.T, trainRunID uuid.UUID, rawGeneration int64, tx pg
 	}
 	t.Cleanup(registry.Close)
 	handle, err := registry.Resolve(shardphysical.CatalogEntry{ShardID: sharding.ShardPhysicalZero, StorageKind: shardphysical.StoragePostgres,
-		ConnectionRef: "physical-shard-0", ProtocolVersion: 1, SchemaVersion: 1, Enabled: true, WriteEnabled: true,
+		ConnectionRef: "physical-shard-0", ProtocolVersion: 1, SchemaVersion: shardphysical.SupportedSchemaVersion, Enabled: true, WriteEnabled: true,
 		HealthState: shardphysical.HealthHealthy, State: shardphysical.StateActive})
 	if err != nil {
 		t.Fatal(err)
 	}
 	generation, _ := sharding.NewAssignmentGeneration(rawGeneration)
 	route, _ := sharding.NewShardRoute(trainRunID, sharding.ShardPhysicalZero, generation)
-	return &hybridPhysicalRouter{resolution: shardphysical.Resolution{Route: route, Handle: handle}}
+	return &ticketPhysicalRouter{resolution: shardphysical.Resolution{Route: route, Handle: handle}}
+}
+
+type ticketPhysicalRouter struct{ resolution shardphysical.Resolution }
+
+func (router *ticketPhysicalRouter) Resolve(context.Context, uuid.UUID, bool) (shardphysical.Resolution, error) {
+	return router.resolution, nil
 }
 
 type ticketControl struct {
@@ -159,6 +165,7 @@ func (control *ticketControl) Query(_ context.Context, query string, arguments .
 
 type ticketLegacy struct {
 	record TicketOrderRecord
+	ticket TicketRecord
 	gets   int
 }
 
@@ -171,6 +178,53 @@ func (legacy *ticketLegacy) GetTicketOrderRecord(context.Context, uuid.UUID, uui
 		return legacy.record, nil
 	}
 	return TicketOrderRecord{}, ErrReadNotFound
+}
+
+func TestHybridTicketReaderGetsOwnerScopedTicketFromExactlyOneCurrentPhysicalShard(t *testing.T) {
+	t.Parallel()
+	owner, orderID, reservationID, trainRunID, ticketID, seatID, passengerID :=
+		uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	control := &ticketControl{rows: []pgx.Row{ticketRow{values: []any{
+		orderID, reservationID, trainRunID, "physical-shard-0", int64(7), "postgres", "active",
+	}}}}
+	tx := &ticketTx{row: ticketRow{values: []any{
+		ticketID.String(), "opaque-ticket-code", passengerID.String(), seatID.String(), "active",
+	}}}
+	reader, err := NewHybridTicketReader(control, &ticketLegacy{}, ticketRouter(t, trainRunID, 7, tx))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := reader.GetTicketRecord(context.Background(), owner, ticketID)
+	if err != nil || record.ID != ticketID.String() || record.TicketCode != "opaque-ticket-code" || !tx.committed {
+		t.Fatalf("record=%+v err=%v committed=%v", record, err, tx.committed)
+	}
+	if len(control.queries) != 1 || !strings.Contains(control.queries[0], "public.ticket_shard_locators") ||
+		!strings.Contains(control.queries[0], "locator.owner_user_id=$2") ||
+		!strings.Contains(control.queries[0], "reservation_directory") || tx.options.AccessMode != pgx.ReadOnly {
+		t.Fatalf("control=%v options=%+v", control.queries, tx.options)
+	}
+}
+
+func TestHybridTicketReaderRejectsForeignTicketBeforePhysicalRead(t *testing.T) {
+	t.Parallel()
+	owner, ticketID, trainRunID := uuid.New(), uuid.New(), uuid.New()
+	control := &ticketControl{rows: []pgx.Row{ticketRow{err: pgx.ErrNoRows}}}
+	tx := &ticketTx{}
+	reader, err := NewHybridTicketReader(control, &ticketLegacy{}, ticketRouter(t, trainRunID, 7, tx))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = reader.GetTicketRecord(context.Background(), owner, ticketID)
+	if !errors.Is(err, ErrReadNotFound) || tx.committed || tx.options.AccessMode == pgx.ReadOnly {
+		t.Fatalf("err=%v committed=%v options=%+v", err, tx.committed, tx.options)
+	}
+}
+func (legacy *ticketLegacy) GetTicketRecord(context.Context, uuid.UUID, uuid.UUID) (TicketRecord, error) {
+	legacy.gets++
+	if legacy.ticket.ID != "" {
+		return legacy.ticket, nil
+	}
+	return TicketRecord{}, ErrReadNotFound
 }
 
 type ticketPool struct{ tx pgx.Tx }

@@ -17,6 +17,7 @@ type ticketReadStoreFake struct {
 	id     uuid.UUID
 	page   TicketOrderRecords
 	record TicketOrderRecord
+	ticket TicketRecord
 	err    error
 }
 
@@ -27,6 +28,10 @@ func (f *ticketReadStoreFake) ListTicketOrderRecords(_ context.Context, owner uu
 func (f *ticketReadStoreFake) GetTicketOrderRecord(_ context.Context, owner, id uuid.UUID) (TicketOrderRecord, error) {
 	f.owner, f.id = owner, id
 	return f.record, f.err
+}
+func (f *ticketReadStoreFake) GetTicketRecord(_ context.Context, owner, id uuid.UUID) (TicketRecord, error) {
+	f.owner, f.id = owner, id
+	return f.ticket, f.err
 }
 
 func TestTicketQueriesKeepOwnerScopeAndMapNestedTickets(t *testing.T) {
@@ -50,6 +55,26 @@ func TestTicketQueriesHideCrossOwnerAndPersistenceDetails(t *testing.T) {
 	_, err = NewTicketQueries(store).GetTicketOrder(context.Background(), owner.String(), order.String())
 	if err != httpapi.ErrUnavailable {
 		t.Fatalf("persistence error=%v", err)
+	}
+}
+
+func TestTicketQueriesGetTicketKeepsOwnerScopeAndRejectsTicketCodeIdentity(t *testing.T) {
+	t.Parallel()
+	owner, ticketID := uuid.New(), uuid.New()
+	store := &ticketReadStoreFake{ticket: TicketRecord{
+		ID: ticketID.String(), TicketCode: "opaque-ticket-code", PassengerID: uuid.NewString(),
+		SeatID: uuid.NewString(), Status: "active",
+	}}
+	view, err := NewTicketQueries(store).GetTicket(context.Background(), owner.String(), ticketID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.owner != owner || store.id != ticketID || view.ID != ticketID.String() ||
+		view.TicketCode != "opaque-ticket-code" || view.Status != "active" {
+		t.Fatalf("owner=%s id=%s view=%+v", store.owner, store.id, view)
+	}
+	if _, err := NewTicketQueries(store).GetTicket(context.Background(), owner.String(), "opaque-ticket-code"); !errors.Is(err, httpapi.ErrInvalidInput) {
+		t.Fatalf("ticket code accepted as resource identity: %v", err)
 	}
 }
 

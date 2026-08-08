@@ -153,6 +153,47 @@ func (r *PostgresReads) GetTicketOrderRecord(ctx context.Context, owner, id uuid
 	}
 	return record, nil
 }
+func (r *PostgresReads) GetTicketRecord(ctx context.Context, owner, id uuid.UUID) (TicketRecord, error) {
+	if r == nil || r.pool == nil || owner == uuid.Nil || id == uuid.Nil {
+		return TicketRecord{}, ErrReadNotFound
+	}
+	if r.shards != nil {
+		var orderID uuid.UUID
+		err := r.pool.QueryRow(ctx, `SELECT ticket_order_id
+FROM public.ticket_shard_locators
+WHERE ticket_id=$1 AND owner_user_id=$2`, id, owner).Scan(&orderID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return TicketRecord{}, ErrReadNotFound
+		}
+		if err != nil {
+			return TicketRecord{}, err
+		}
+		order, err := r.GetTicketOrderRecord(ctx, owner, orderID)
+		if err != nil {
+			return TicketRecord{}, err
+		}
+		for _, ticket := range order.Tickets {
+			if ticket.ID == id.String() {
+				return ticket, nil
+			}
+		}
+		return TicketRecord{}, ErrReadNotFound
+	}
+	var ticket TicketRecord
+	err := r.pool.QueryRow(ctx, `SELECT t.id::text,t.ticket_code,rs.passenger_id::text,rs.seat_id::text,t.status
+FROM tickets AS t
+JOIN ticket_orders AS o ON o.id=t.ticket_order_id
+JOIN reservation_seats AS rs ON rs.id=t.reservation_seat_id
+WHERE t.id=$1 AND o.user_id=$2`, id, owner).Scan(
+		&ticket.ID, &ticket.TicketCode, &ticket.PassengerID, &ticket.SeatID, &ticket.Status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return TicketRecord{}, ErrReadNotFound
+	}
+	if err != nil {
+		return TicketRecord{}, err
+	}
+	return ticket, nil
+}
 func (r *PostgresReads) loadTickets(ctx context.Context, owner uuid.UUID, record TicketOrderRecord) ([]TicketRecord, error) {
 	var (
 		rows pgx.Rows
@@ -230,15 +271,6 @@ WHERE t.ticket_order_id=$1 AND o.user_id=$2 ORDER BY t.id`, record.ID, owner)
 	return items, nil
 }
 
-func sameTicketOrderSummary(locator, authoritative TicketOrderRecord) bool {
-	return locator.ID == authoritative.ID &&
-		locator.ReservationID == authoritative.ReservationID &&
-		locator.Status == authoritative.Status &&
-		locator.TotalAmountMinor == authoritative.TotalAmountMinor &&
-		locator.Currency == authoritative.Currency &&
-		locator.CreatedAt.Equal(authoritative.CreatedAt)
-}
-
 func ticketOrderBy(raw string) (string, bool) {
 	switch strings.TrimSpace(raw) {
 	case "", "-created_at":
@@ -249,21 +281,6 @@ func ticketOrderBy(raw string) (string, bool) {
 		return "status ASC, created_at DESC, id DESC", true
 	case "-status":
 		return "status DESC, created_at DESC, id DESC", true
-	default:
-		return "", false
-	}
-}
-
-func ticketOrderLocatorBy(raw string) (string, bool) {
-	switch strings.TrimSpace(raw) {
-	case "", "-created_at":
-		return "created_at DESC, ticket_order_id DESC", true
-	case "created_at":
-		return "created_at ASC, ticket_order_id ASC", true
-	case "status":
-		return "status ASC, created_at DESC, ticket_order_id DESC", true
-	case "-status":
-		return "status DESC, created_at DESC, ticket_order_id DESC", true
 	default:
 		return "", false
 	}

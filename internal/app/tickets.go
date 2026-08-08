@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/transport/httpapi"
@@ -25,6 +26,7 @@ type TicketOrderRecords struct {
 type ticketReadStore interface {
 	ListTicketOrderRecords(context.Context, uuid.UUID, httpapi.PageRequest) (TicketOrderRecords, error)
 	GetTicketOrderRecord(context.Context, uuid.UUID, uuid.UUID) (TicketOrderRecord, error)
+	GetTicketRecord(context.Context, uuid.UUID, uuid.UUID) (TicketRecord, error)
 }
 type TicketQueries struct{ store ticketReadStore }
 
@@ -65,12 +67,57 @@ func (q *TicketQueries) GetTicketOrder(ctx context.Context, ownerID, ticketOrder
 	}
 	return ticketOrderView(record), nil
 }
+func (q *TicketQueries) GetTicket(ctx context.Context, ownerID, ticketID string) (httpapi.TicketView, error) {
+	owner, err := uuid.Parse(ownerID)
+	if err != nil {
+		return httpapi.TicketView{}, httpapi.ErrInvalidInput
+	}
+	id, err := uuid.Parse(ticketID)
+	if err != nil {
+		return httpapi.TicketView{}, httpapi.ErrInvalidInput
+	}
+	if q == nil || q.store == nil {
+		return httpapi.TicketView{}, httpapi.ErrUnavailable
+	}
+	record, err := q.store.GetTicketRecord(ctx, owner, id)
+	if err != nil {
+		return httpapi.TicketView{}, mapReadError(err)
+	}
+	return ticketView(record), nil
+}
 func ticketOrderView(record TicketOrderRecord) httpapi.TicketOrderView {
 	tickets := make([]httpapi.TicketView, 0, len(record.Tickets))
 	for _, ticket := range record.Tickets {
-		tickets = append(tickets, httpapi.TicketView{ID: ticket.ID, TicketCode: ticket.TicketCode, PassengerID: ticket.PassengerID, SeatID: ticket.SeatID, Status: ticket.Status})
+		tickets = append(tickets, ticketView(ticket))
 	}
 	return httpapi.TicketOrderView{ID: record.ID, ReservationID: record.ReservationID, Status: record.Status, TotalAmountMinor: record.TotalAmountMinor, Currency: record.Currency, Tickets: tickets, CreatedAt: record.CreatedAt.UTC()}
+}
+func ticketView(ticket TicketRecord) httpapi.TicketView {
+	return httpapi.TicketView{ID: ticket.ID, TicketCode: ticket.TicketCode, PassengerID: ticket.PassengerID, SeatID: ticket.SeatID, Status: ticket.Status}
+}
+
+func sameTicketOrderSummary(locator, authoritative TicketOrderRecord) bool {
+	return locator.ID == authoritative.ID &&
+		locator.ReservationID == authoritative.ReservationID &&
+		locator.Status == authoritative.Status &&
+		locator.TotalAmountMinor == authoritative.TotalAmountMinor &&
+		locator.Currency == authoritative.Currency &&
+		locator.CreatedAt.Equal(authoritative.CreatedAt)
+}
+
+func ticketOrderLocatorBy(raw string) (string, bool) {
+	switch strings.TrimSpace(raw) {
+	case "", "-created_at":
+		return "created_at DESC, ticket_order_id DESC", true
+	case "created_at":
+		return "created_at ASC, ticket_order_id ASC", true
+	case "status":
+		return "status ASC, created_at DESC, ticket_order_id DESC", true
+	case "-status":
+		return "status DESC, created_at DESC, ticket_order_id DESC", true
+	default:
+		return "", false
+	}
 }
 func mapReadError(err error) error {
 	if errors.Is(err, httpapi.ErrInvalidInput) {

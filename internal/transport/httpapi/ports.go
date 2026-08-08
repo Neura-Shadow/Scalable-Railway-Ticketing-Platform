@@ -371,6 +371,7 @@ type TicketOrderPage struct {
 type TicketQueries interface {
 	ListTicketOrders(ctx context.Context, ownerID string, page PageRequest) (TicketOrderPage, error)
 	GetTicketOrder(ctx context.Context, ownerID, ticketOrderID string) (TicketOrderView, error)
+	GetTicket(ctx context.Context, ownerID, ticketID string) (TicketView, error)
 }
 
 type ResourceView struct {
