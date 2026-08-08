@@ -119,3 +119,33 @@ func TestHeldAndConfirmedReservationsCanBeCancelled(t *testing.T) {
 		}
 	}
 }
+
+func TestPaymentReservationStatesRequireExplicitReconciliationAndCompensation(t *testing.T) {
+	t.Parallel()
+	expiresAt := time.Date(2026, 8, 5, 12, 10, 0, 0, time.UTC)
+	reservation, err := domain.NewHeldReservation(expiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reservation.BeginPayment(expiresAt.Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reservation.Expire(expiresAt.Add(time.Hour)); !errors.Is(err, domain.ErrInvalidReservationTransition) {
+		t.Fatalf("payment_pending Expire() error = %v", err)
+	}
+	if _, err := reservation.ReviewPayment(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reservation.Expire(expiresAt.Add(time.Hour)); !errors.Is(err, domain.ErrInvalidReservationTransition) {
+		t.Fatalf("payment_review Expire() error = %v", err)
+	}
+	if _, err := reservation.BeginRefund(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reservation.CompleteCompensation(); err != nil {
+		t.Fatal(err)
+	}
+	if reservation.Status() != domain.ReservationStatusCancelled {
+		t.Fatalf("Status() = %q", reservation.Status())
+	}
+}
