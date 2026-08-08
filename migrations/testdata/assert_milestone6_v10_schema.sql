@@ -12,6 +12,16 @@ BEGIN
         RAISE EXCEPTION 'control migration must be clean at version 10';
     END IF;
 
+    IF (
+        SELECT count(*)
+        FROM public.booking_shards
+        WHERE shard_id IN ('physical-shard-0', 'physical-shard-1')
+          AND storage_kind = 'postgres'
+          AND schema_version = 2
+    ) <> 2 THEN
+        RAISE EXCEPTION 'Milestone 6 physical shard catalog is not at schema version 2';
+    END IF;
+
     IF (SELECT count(*)
         FROM information_schema.tables
         WHERE table_schema = 'public'

@@ -8,6 +8,22 @@ SELECT pg_advisory_xact_lock(804230010);
 -- pending/uncertain row can still correspond to an external financial effect.
 DO $m6_down_preflight$
 BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM public.booking_shards
+        WHERE shard_id IN ('physical-shard-0', 'physical-shard-1')
+          AND (
+              storage_kind <> 'postgres'
+              OR schema_version <> 2
+              OR enabled
+              OR write_enabled
+              OR state <> 'disabled'
+          )
+    ) THEN
+        RAISE EXCEPTION 'cannot downgrade while a physical shard is enabled or has an unexpected schema contract'
+            USING ERRCODE = '55000';
+    END IF;
+
     IF EXISTS (SELECT 1 FROM public.payment_intents) THEN
         RAISE EXCEPTION 'cannot downgrade while payment intent evidence is retained'
             USING ERRCODE = '55000';
@@ -61,5 +77,11 @@ DROP FUNCTION public.guard_payment_financial_settlement();
 DROP FUNCTION public.guard_payment_operation_row();
 DROP FUNCTION public.guard_payment_saga_row();
 DROP FUNCTION public.guard_payment_intent_row();
+
+UPDATE public.booking_shards
+SET schema_version = 1
+WHERE shard_id IN ('physical-shard-0', 'physical-shard-1')
+  AND storage_kind = 'postgres'
+  AND schema_version = 2;
 
 COMMIT;

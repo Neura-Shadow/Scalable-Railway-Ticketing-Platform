@@ -2,6 +2,30 @@ BEGIN;
 
 SELECT pg_advisory_xact_lock(804230010);
 
+-- Both fixed physical shards must run booking-shard schema v2 before payment
+-- routing is enabled. The catalog stores only the required schema contract;
+-- connection details remain process configuration.
+DO $m6_physical_schema_preflight$
+BEGIN
+    IF (
+        SELECT count(*)
+        FROM public.booking_shards
+        WHERE shard_id IN ('physical-shard-0', 'physical-shard-1')
+          AND storage_kind = 'postgres'
+          AND schema_version = 1
+    ) <> 2 THEN
+        RAISE EXCEPTION 'fixed physical shard catalog is not at schema version 1'
+            USING ERRCODE = '55000';
+    END IF;
+END
+$m6_physical_schema_preflight$;
+
+UPDATE public.booking_shards
+SET schema_version = 2
+WHERE shard_id IN ('physical-shard-0', 'physical-shard-1')
+  AND storage_kind = 'postgres'
+  AND schema_version = 1;
+
 -- Payment orchestration is durable in the control database. The authoritative
 -- reservation and ticket mutations remain shard-local and are represented here
 -- only by globally unique identities and bounded fingerprints. No provider
