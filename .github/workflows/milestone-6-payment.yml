@@ -1,0 +1,230 @@
+name: Milestone 6 payment gates
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: milestone-6-payment-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.25.12"
+
+jobs:
+  payment-contracts:
+    name: Sandbox, webhook, worker, and compensation contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+      - name: Run deterministic sandbox and webhook contracts repeatedly
+        run: >-
+          go test
+          ./internal/payment/provider/...
+          ./internal/payment/webhook
+          ./cmd/payment-sandbox
+          -count=3 -timeout 180s
+      - name: Run payment concurrency and uncertainty recovery repeatedly
+        run: >-
+          go test
+          ./internal/payment/application
+          ./internal/payment/postgres
+          ./internal/payment/worker/...
+          ./cmd/payment-worker
+          -count=3 -timeout 240s
+      - name: Run issuance, refund, cancellation, and reconciliation repeatedly
+        run: >-
+          go test
+          ./internal/payment/shard/...
+          ./internal/payment/reconcile/...
+          ./cmd/payment-reconciler
+          ./cmd/payment-admin
+          -count=3 -timeout 240s
+  payment-migrations:
+    name: Control v10, booking-shard v2, and migration interaction
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      control-postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: railway_control
+          POSTGRES_USER: railway_control
+          POSTGRES_PASSWORD: control-ci-local
+        ports:
+          - 55430:5432
+        options: >-
+          --health-cmd "pg_isready -U railway_control -d railway_control"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      booking-shard-0-postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: railway_booking
+          POSTGRES_USER: railway_booking
+          POSTGRES_PASSWORD: shard-0-ci-local
+        ports:
+          - 55431:5432
+        options: >-
+          --health-cmd "pg_isready -U railway_booking -d railway_booking"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      booking-shard-1-postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: railway_booking
+          POSTGRES_USER: railway_booking
+          POSTGRES_PASSWORD: shard-1-ci-local
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U railway_booking -d railway_booking"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      CONTROL_DATABASE_URL: postgres://railway_control:control-ci-local@localhost:55430/railway_control?sslmode=disable
+      BOOKING_SHARD_0_DATABASE_URL: postgres://railway_booking:shard-0-ci-local@localhost:55431/railway_booking?sslmode=disable
+      BOOKING_SHARD_1_DATABASE_URL: postgres://railway_booking:shard-1-ci-local@localhost:55432/railway_booking?sslmode=disable
+      TEST_CONTROL_DATABASE_URL: postgres://railway_control:control-ci-local@localhost:55430/railway_control?sslmode=disable
+      TEST_BOOKING_SHARD_0_DATABASE_URL: postgres://railway_booking:shard-0-ci-local@localhost:55431/railway_booking?sslmode=disable
+      TEST_BOOKING_SHARD_1_DATABASE_URL: postgres://railway_booking:shard-1-ci-local@localhost:55432/railway_booking?sslmode=disable
+      PAYMENT_SHARD_TEST_DATABASE_URL: postgres://railway_booking:shard-0-ci-local@localhost:55431/railway_booking?sslmode=disable
+      CONTROL_TARGET_TEST_DATABASE_URL: postgres://railway_control:control-ci-local@localhost:55430/railway_control?sslmode=disable
+      CONTROL_TARGET_TEST_SOURCE_DATABASE_URL: postgres://railway_booking:shard-0-ci-local@localhost:55431/railway_booking?sslmode=disable
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+      - name: Rehearse control migration v10 up, down, and replay
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/control-v9"
+          cp migrations/00000[1-9]_*.sql "$RUNNER_TEMP/control-v9/"
+          go run ./cmd/migrate -path "$RUNNER_TEMP/control-v9" \
+            -database "$CONTROL_DATABASE_URL" up
+          psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone5_v9_schema.sql
+
+          go run ./cmd/migrate -path migrations \
+            -database "$CONTROL_DATABASE_URL" up
+          psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone6_v10_schema.sql
+          psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone6_v10_reverse_compat.sql
+
+          go run ./cmd/migrate -path migrations \
+            -database "$CONTROL_DATABASE_URL" down
+          psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone5_v9_schema.sql
+          go run ./cmd/migrate -path migrations \
+            -database "$CONTROL_DATABASE_URL" up
+          psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone6_v10_schema.sql
+      - name: Rehearse populated booking-shard v2 up, down, and replay
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/booking-shard-v1"
+          cp migrations/booking-shard/000001_*.sql \
+            "$RUNNER_TEMP/booking-shard-v1/"
+          for database_url in \
+            "$BOOKING_SHARD_0_DATABASE_URL" \
+            "$BOOKING_SHARD_1_DATABASE_URL"
+          do
+            go run ./cmd/migrate -path "$RUNNER_TEMP/booking-shard-v1" \
+              -database "$database_url" up
+            psql "$database_url" --set=ON_ERROR_STOP=1 \
+              --file migrations/testdata/assert_booking_shard_v1_schema.sql
+            psql "$database_url" --set=ON_ERROR_STOP=1 \
+              --file migrations/testdata/seed_booking_shard_v1_payment_fixture.sql
+
+            go run ./cmd/migrate -path migrations/booking-shard \
+              -database "$database_url" up
+            psql "$database_url" --set=ON_ERROR_STOP=1 \
+              --file migrations/testdata/assert_booking_shard_v2_schema.sql
+            psql "$database_url" --set=ON_ERROR_STOP=1 \
+              --file migrations/testdata/assert_booking_shard_v2_data.sql
+
+            go run ./cmd/migrate -path migrations/booking-shard \
+              -database "$database_url" down
+            psql "$database_url" --set=ON_ERROR_STOP=1 \
+              --file migrations/testdata/assert_booking_shard_v1_schema.sql
+            go run ./cmd/migrate -path migrations/booking-shard \
+              -database "$database_url" up
+            psql "$database_url" --set=ON_ERROR_STOP=1 \
+              --file migrations/testdata/assert_booking_shard_v2_schema.sql
+          done
+      - name: Run live shard compensation and physical migration tests
+        run: >-
+          go test -p 1
+          ./internal/payment/shard/postgres
+          ./internal/sharding/physicalmigration/postgres
+          ./internal/sharding/physicalmigration/controlsource
+          -count=3 -timeout 420s
+
+  payment-topology-regressions:
+    name: Multi-replica topology, load modules, and regressions
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+      - name: Validate payment multi-replica Compose topology
+        run: >-
+          docker compose
+          -f docker-compose.physical-shards.yml
+          -f deploy/compose/payment.override.yml
+          config --quiet
+      - name: Validate bounded payment k6 modules
+        shell: bash
+        run: |
+          for script in \
+            payment-intent-create.js payment-idempotency.js \
+            payment-webhook-burst.js payment-capture-recovery.js \
+            ticket-issuance.js payment-refund.js \
+            payment-provider-outage.js payment-shard-outage.js \
+            payment-during-migration.js multi-replica-payment.js
+          do
+            docker run --rm -v "$PWD/loadtest/k6:/scripts:ro" \
+              grafana/k6:0.54.0 inspect "/scripts/$script" >/dev/null
+          done
+      - name: Run payment-adjacent regression packages
+        run: >-
+          go test -p 1
+          ./internal/app
+          ./internal/booking/domain
+          ./internal/booking/command/...
+          ./internal/sharding/migration
+          ./internal/sharding/physicalmigration/...
+          ./cmd/hold-expirer
+          ./cmd/booking-command-reconciler
+          -count=1 -timeout 420s
