@@ -419,7 +419,7 @@ func TestRunOnceRetriesTicketIssuanceWithSameCommandIdentity(t *testing.T) {
 		CommandID: commandID, IssuanceID: claim.Issue.IssuanceID,
 		PaymentIntentID: claim.Issue.PaymentIntentID, ReservationID: claim.Issue.ReservationID,
 		AmountMinor: claim.Issue.AmountMinor, Currency: claim.Issue.Currency,
-		TicketOrderID: uuid.New(), TicketIDs: []uuid.UUID{uuid.New()}, IssuedAt: fixedNow,
+		TicketOrderID: uuid.New(), TicketIDs: []uuid.UUID{uuid.New()}, TicketCodes: []string{"ticket_code_000001"}, IssuedAt: fixedNow,
 	}
 	second, err := worker.RunOnce(context.Background())
 	if err != nil || second.ActionsDone != 1 || shards.lastIssue.CommandID != commandID {
@@ -495,7 +495,7 @@ func TestCommittedIssuanceControlFinalizeFailureNeverStartsRefund(t *testing.T) 
 		CommandID: claim.Issue.CommandID, IssuanceID: claim.Issue.IssuanceID,
 		PaymentIntentID: claim.Issue.PaymentIntentID, ReservationID: claim.Issue.ReservationID,
 		TicketOrderID: uuid.New(), TicketIDs: []uuid.UUID{ticketID}, AmountMinor: 100,
-		Currency: "TWD", IssuedAt: fixedNow,
+		TicketCodes: []string{"ticket_code_000001"}, Currency: "TWD", IssuedAt: fixedNow,
 	}}
 	store := &storeFake{actions: []ActionClaim{claim}, completeActionErr: errors.New("control commit failed")}
 	value := newTestWorker(t, store, &providerFake{}, shards, 1)

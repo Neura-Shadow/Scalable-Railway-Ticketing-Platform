@@ -660,8 +660,9 @@ WHERE ticket_order_shard_locators.reservation_id=EXCLUDED.reservation_id
  AND ticket_order_shard_locators.created_at=EXCLUDED.created_at`, receipt.TicketOrderID, e.ReservationID, trainRunID, shardID, generation, ownerID, e.AmountMinor, e.Currency, receipt.IssuedAt.UTC()); err != nil || tag.RowsAffected() != 1 {
 		return paymentreconcile.ErrRepairUnavailable
 	}
-	for _, ticketID := range receipt.TicketIDs {
-		if ticketID == uuid.Nil {
+	for index, ticketID := range receipt.TicketIDs {
+		ticketCode := receipt.TicketCodes[index]
+		if ticketID == uuid.Nil || !paymentshard.ValidTicketCode(ticketCode) {
 			return paymentreconcile.ErrRepairUnavailable
 		}
 		if tag, err := tx.Exec(ctx, `INSERT INTO public.ticket_shard_locators(
@@ -674,6 +675,12 @@ WHERE ticket_shard_locators.ticket_order_id=EXCLUDED.ticket_order_id
  AND ticket_shard_locators.shard_id=EXCLUDED.shard_id
  AND ticket_shard_locators.assignment_generation=EXCLUDED.assignment_generation
  AND ticket_shard_locators.owner_user_id=EXCLUDED.owner_user_id`, ticketID, receipt.TicketOrderID, e.ReservationID, trainRunID, shardID, generation, ownerID); err != nil || tag.RowsAffected() != 1 {
+			return paymentreconcile.ErrRepairUnavailable
+		}
+		if tag, err := tx.Exec(ctx, `INSERT INTO public.ticket_code_directory(ticket_code,ticket_id)
+VALUES($1,$2)
+ON CONFLICT(ticket_code) DO UPDATE SET ticket_id=EXCLUDED.ticket_id
+WHERE ticket_code_directory.ticket_id=EXCLUDED.ticket_id`, ticketCode, ticketID); err != nil || tag.RowsAffected() != 1 {
 			return paymentreconcile.ErrRepairUnavailable
 		}
 	}
@@ -737,18 +744,25 @@ func (r *Repairer) finalizeCompensation(ctx context.Context, e repairEvidence, c
 func validIssueRepairReceipt(e repairEvidence, command paymentshard.IssueTicketsCommand, receipt paymentshard.IssueTicketsReceipt) bool {
 	if receipt.CommandID != command.CommandID || receipt.IssuanceID != command.IssuanceID || receipt.PaymentIntentID != e.IntentID ||
 		receipt.ReservationID != e.ReservationID || receipt.TicketOrderID == uuid.Nil || len(receipt.TicketIDs) == 0 ||
+		len(receipt.TicketCodes) != len(receipt.TicketIDs) ||
 		receipt.AmountMinor != e.AmountMinor || receipt.Currency != e.Currency || receipt.IssuedAt.IsZero() {
 		return false
 	}
 	seen := make(map[uuid.UUID]struct{}, len(receipt.TicketIDs))
-	for _, ticketID := range receipt.TicketIDs {
-		if ticketID == uuid.Nil {
+	seenCodes := make(map[string]struct{}, len(receipt.TicketCodes))
+	for index, ticketID := range receipt.TicketIDs {
+		ticketCode := receipt.TicketCodes[index]
+		if ticketID == uuid.Nil || !paymentshard.ValidTicketCode(ticketCode) {
 			return false
 		}
 		if _, duplicate := seen[ticketID]; duplicate {
 			return false
 		}
 		seen[ticketID] = struct{}{}
+		if _, duplicate := seenCodes[ticketCode]; duplicate {
+			return false
+		}
+		seenCodes[ticketCode] = struct{}{}
 	}
 	return true
 }

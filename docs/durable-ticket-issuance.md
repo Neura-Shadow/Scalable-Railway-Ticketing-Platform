@@ -36,6 +36,11 @@ No control query or provider call occurs inside this transaction. A constraint
 on reservation/order/seat identity plus unique issuance/command receipts and
 ticket codes prevents duplicate order, ticket, confirmation, or receipt.
 
+The verified issuance receipt carries every immutable ticket ID/code pair to
+control. A single control transaction inserts the unique route-independent code
+claim with the ticket locator before completing the saga. Forward and reverse
+migration therefore update only the locator; the code claim remains stable.
+
 ## Replay behavior
 
 A repeat with the same command identity and fingerprint returns the existing

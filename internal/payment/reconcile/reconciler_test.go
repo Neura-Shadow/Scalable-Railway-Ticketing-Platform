@@ -103,6 +103,24 @@ func TestInspectPaymentDetectsPartialTicketIssuance(t *testing.T) {
 	}
 }
 
+func TestInspectPaymentDetectsGlobalTicketCodeDirectoryDrift(t *testing.T) {
+	id := uuid.New()
+	store := healthyStore(id)
+	store.shard.MissingTicketCodeClaims = 1
+	store.shard.ConflictingTicketCodes = 1
+	store.shard.UnexpectedTicketCodeClaims = 1
+	reconciler := newTestReconciler(t, store, fakeRegistry{client: &fakeProvider{payment: healthyProviderPayment()}}, nil)
+
+	report, err := reconciler.InspectPayment(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"global_ticket_code_claim_missing", "global_ticket_code_claim_unexpected", "global_ticket_code_conflict"}
+	if got := findingCodes(report); !reflect.DeepEqual(got, want) {
+		t.Fatalf("findings = %v, want %v", got, want)
+	}
+}
+
 func TestCheckShardDetectsCommittedReceiptsBeforeControlFinalization(t *testing.T) {
 	intentID := uuid.New()
 	cases := []struct {

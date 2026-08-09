@@ -101,30 +101,33 @@ type ControlSnapshot struct {
 }
 
 type ShardSnapshot struct {
-	Found                     bool
-	DirectoryResolved         bool
-	ReservationState          string
-	ReservationAmountMinor    int64
-	ReservationCurrency       string
-	ReservationSeatCount      int
-	TicketOrderFound          bool
-	TicketOrderID             uuid.UUID
-	TicketOrderState          string
-	TicketOrderAmountMinor    int64
-	TicketOrderCurrency       string
-	IssuanceReceiptFound      bool
-	IssuancePaymentIntentID   uuid.UUID
-	BeginReceiptFound         bool
-	BeginCommandID            uuid.UUID
-	RefundPendingReceiptFound bool
-	CancellationReceiptFound  bool
-	CompensationReceiptFound  bool
-	ReceiptFingerprint        [sha256.Size]byte
-	ActiveTicketCount         int
-	RefundPendingTicketCount  int
-	CancelledTicketCount      int
-	DuplicateTicketCodeCount  int
-	RecordedCommands          []RecordedCommand
+	Found                      bool
+	DirectoryResolved          bool
+	ReservationState           string
+	ReservationAmountMinor     int64
+	ReservationCurrency        string
+	ReservationSeatCount       int
+	TicketOrderFound           bool
+	TicketOrderID              uuid.UUID
+	TicketOrderState           string
+	TicketOrderAmountMinor     int64
+	TicketOrderCurrency        string
+	IssuanceReceiptFound       bool
+	IssuancePaymentIntentID    uuid.UUID
+	BeginReceiptFound          bool
+	BeginCommandID             uuid.UUID
+	RefundPendingReceiptFound  bool
+	CancellationReceiptFound   bool
+	CompensationReceiptFound   bool
+	ReceiptFingerprint         [sha256.Size]byte
+	ActiveTicketCount          int
+	RefundPendingTicketCount   int
+	CancelledTicketCount       int
+	DuplicateTicketCodeCount   int
+	MissingTicketCodeClaims    int
+	ConflictingTicketCodes     int
+	UnexpectedTicketCodeClaims int
+	RecordedCommands           []RecordedCommand
 }
 
 type RecordedCommand struct {

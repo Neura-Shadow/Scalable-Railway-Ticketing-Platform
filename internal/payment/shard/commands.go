@@ -3,10 +3,17 @@ package shard
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"regexp"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+var ticketCodePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{16,64}$`)
+
+// ValidTicketCode applies the shared opaque ticket-code boundary used by shard
+// receipts, control-plane uniqueness claims, and reconciliation.
+func ValidTicketCode(value string) bool { return ticketCodePattern.MatchString(value) }
 
 type IssueTicketsCommand struct {
 	CommandID          uuid.UUID
@@ -29,6 +36,7 @@ type IssueTicketsReceipt struct {
 	ReservationID   uuid.UUID
 	TicketOrderID   uuid.UUID
 	TicketIDs       []uuid.UUID
+	TicketCodes     []string
 	AmountMinor     int64
 	Currency        string
 	IssuedAt        time.Time

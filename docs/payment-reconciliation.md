@@ -61,9 +61,10 @@ unbounded shard set or scan shards when the global directory is missing.
   that receipt references the same payment intent, reservation, capture, amount
   and currency.
 - An issued order has exactly one active ticket per reservation seat on its one
-  current shard. Ticket-code duplicate checks are current-shard-local. A global
-  cross-shard duplicate proof requires a future control-plane ticket-code
-  directory/index, because the reconciler must not scan unbound shards.
+  current shard. Each shard ticket ID/code pair must have the identical
+  immutable entry in the unique control-plane ticket-code directory. Missing,
+  conflicting, or unexpected claims are reported with bounded categories; the
+  comparison follows the current locator and never scans unbound shards.
 - Refunded payment has `refund_pending`/cancelled tickets according to saga
   progress; no active ticket remains after completed compensation.
 - Shard command/issuance/refund fingerprints agree with control intent and
@@ -91,6 +92,7 @@ not local failure. Contradiction enters manual review.
 | shard void-cancellation receipt, control not compensated | report | finalize cancelled/compensated control state |
 | uncertain provider operation | query/report | apply a definite normalized result only |
 | captured without issuance receipt | report/escalate | enqueue the existing issuance command, never issue directly |
+| missing/conflicting global ticket-code claim | report/escalate | only receipt-backed control finalization may insert the original ID/code claim; conflicts are never overwritten |
 | refunded with active ticket | report/escalate | enqueue existing local compensation command after proof |
 | inventory mismatch | report Critical/High as classified | no automatic repair |
 

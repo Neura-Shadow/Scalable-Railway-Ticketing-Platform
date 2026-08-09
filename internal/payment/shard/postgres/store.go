@@ -145,6 +145,7 @@ ORDER BY id`, command.ReservationID, route.TrainRunID(), route.Generation().Int6
 	}
 	rows.Close()
 	ticketIDs := make([]uuid.UUID, 0, len(seatIDs))
+	ticketCodes := make([]string, 0, len(seatIDs))
 	for _, seatID := range seatIDs {
 		ticketID := uuid.NewSHA1(command.IssuanceID, seatID[:])
 		ticketCode := opaqueTicketCode(command.IssuanceID, seatID)
@@ -163,6 +164,7 @@ INSERT INTO public.tickets(
 			return rollback(err)
 		}
 		ticketIDs = append(ticketIDs, ticketID)
+		ticketCodes = append(ticketCodes, ticketCode)
 	}
 	issuanceReceiptID := uuid.NewSHA1(command.IssuanceID, []byte("ticket-issuance-receipt"))
 	var issuedAt time.Time
@@ -205,7 +207,7 @@ WHERE command_id=$1 AND status='started'`, command.CommandID, ticketOrderID); er
 	}
 	return paymentshard.IssueTicketsReceipt{
 		CommandID: command.CommandID, IssuanceID: command.IssuanceID, PaymentIntentID: command.PaymentIntentID,
-		ReservationID: command.ReservationID, TicketOrderID: ticketOrderID, TicketIDs: ticketIDs,
+		ReservationID: command.ReservationID, TicketOrderID: ticketOrderID, TicketIDs: ticketIDs, TicketCodes: ticketCodes,
 		AmountMinor: command.AmountMinor, Currency: command.Currency, IssuedAt: issuedAt.UTC(),
 	}, nil
 }
@@ -286,25 +288,28 @@ WHERE command_id=$1 AND operation='payment.capture_recorded'`, command.CommandID
 	if storedFingerprint != command.RequestFingerprint {
 		return paymentshard.IssueTicketsReceipt{}, false, paymentapp.ErrPaymentConflict
 	}
-	rows, err := tx.Query(ctx, `SELECT id FROM public.tickets WHERE ticket_order_id=$1 ORDER BY id LIMIT 101`, orderID)
+	rows, err := tx.Query(ctx, `SELECT id,ticket_code FROM public.tickets WHERE ticket_order_id=$1 ORDER BY id LIMIT 101`, orderID)
 	if err != nil {
 		return paymentshard.IssueTicketsReceipt{}, false, paymentshard.ErrShardPaymentUnavailable
 	}
 	defer rows.Close()
 	ticketIDs := make([]uuid.UUID, 0, count)
+	ticketCodes := make([]string, 0, count)
 	for rows.Next() {
 		var ticketID uuid.UUID
-		if err := rows.Scan(&ticketID); err != nil || ticketID == uuid.Nil {
+		var ticketCode string
+		if err := rows.Scan(&ticketID, &ticketCode); err != nil || ticketID == uuid.Nil || !paymentshard.ValidTicketCode(ticketCode) {
 			return paymentshard.IssueTicketsReceipt{}, false, paymentshard.ErrShardPaymentUnavailable
 		}
 		ticketIDs = append(ticketIDs, ticketID)
+		ticketCodes = append(ticketCodes, ticketCode)
 	}
 	if rows.Err() != nil || len(ticketIDs) != count {
 		return paymentshard.IssueTicketsReceipt{}, false, paymentshard.ErrShardPaymentUnavailable
 	}
 	return paymentshard.IssueTicketsReceipt{
 		CommandID: command.CommandID, IssuanceID: command.IssuanceID, PaymentIntentID: paymentIntentID,
-		ReservationID: reservationID, TicketOrderID: orderID, TicketIDs: ticketIDs,
+		ReservationID: reservationID, TicketOrderID: orderID, TicketIDs: ticketIDs, TicketCodes: ticketCodes,
 		AmountMinor: amount, Currency: currency, IssuedAt: createdAt.Time.UTC(),
 	}, true, nil
 }
@@ -417,6 +422,18 @@ FOR UPDATE`, command.ReservationID, route.TrainRunID(), route.Generation().Int64
 	}
 	receiptID := uuid.NewSHA1(command.CommandID, []byte("payment-command-receipt"))
 	if err := execOne(ctx, tx, `
+UPDATE public.reservations
+SET status='payment_pending',payment_intent_id=$2,payment_amount_minor=$3,
+    payment_currency=$4,payment_grace_expires_at=$5
+WHERE id=$1 AND status='held'`, command.ReservationID, command.PaymentIntentID,
+		command.AmountMinor, command.Currency, command.GraceExpiresAt.UTC()); err != nil {
+		return rollback(err)
+	}
+	// The receipt FK includes the immutable payment authority snapshot. Persist
+	// it only after the reservation row carries that snapshot; both writes are
+	// still atomic in this transaction, while immediate FK checking remains a
+	// fail-closed guard against mismatched intent or money.
+	if err := execOne(ctx, tx, `
 INSERT INTO public.payment_command_receipts(
  id,command_id,payment_intent_id,reservation_id,train_run_id,
  assignment_generation,operation,request_fingerprint,amount_minor,currency,status
@@ -424,14 +441,6 @@ INSERT INTO public.payment_command_receipts(
 		receiptID, command.CommandID, command.PaymentIntentID, command.ReservationID,
 		route.TrainRunID(), route.Generation().Int64(), command.RequestFingerprint[:],
 		command.AmountMinor, command.Currency); err != nil {
-		return rollback(err)
-	}
-	if err := execOne(ctx, tx, `
-UPDATE public.reservations
-SET status='payment_pending',payment_intent_id=$2,payment_amount_minor=$3,
-    payment_currency=$4,payment_grace_expires_at=$5
-WHERE id=$1 AND status='held'`, command.ReservationID, command.PaymentIntentID,
-		command.AmountMinor, command.Currency, command.GraceExpiresAt.UTC()); err != nil {
 		return rollback(err)
 	}
 	ticketOrderID := uuid.NewSHA1(command.PaymentIntentID, []byte("ticket-order"))

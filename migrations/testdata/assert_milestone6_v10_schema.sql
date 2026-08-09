@@ -30,11 +30,47 @@ BEGIN
               'payment_sagas',
               'payment_operations',
               'payment_webhook_inbox',
-              'payment_provider_event_conflicts',
-              'payment_reconciliation_checkpoints',
-              'payment_manual_review_cases'
-          )) <> 7 THEN
+               'payment_provider_event_conflicts',
+               'payment_reconciliation_checkpoints',
+               'payment_manual_review_cases',
+               'ticket_code_directory'
+           )) <> 8 THEN
         RAISE EXCEPTION 'control-plane version 10 payment tables are incomplete';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint AS constraint_row
+        JOIN pg_class AS table_row ON table_row.oid = constraint_row.conrelid
+        JOIN pg_namespace AS schema_row ON schema_row.oid = table_row.relnamespace
+        WHERE schema_row.nspname = 'public'
+          AND table_row.relname = 'ticket_code_directory'
+          AND constraint_row.contype = 'p'
+          AND pg_get_constraintdef(constraint_row.oid) LIKE '%ticket_code%'
+    ) OR NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint AS constraint_row
+        JOIN pg_class AS table_row ON table_row.oid = constraint_row.conrelid
+        JOIN pg_namespace AS schema_row ON schema_row.oid = table_row.relnamespace
+        WHERE schema_row.nspname = 'public'
+          AND table_row.relname = 'ticket_code_directory'
+          AND constraint_row.contype = 'u'
+          AND pg_get_constraintdef(constraint_row.oid) LIKE '%ticket_id%'
+    ) THEN
+        RAISE EXCEPTION 'global ticket code identity constraints are incomplete';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_trigger AS trigger_row
+        JOIN pg_class AS table_row ON table_row.oid = trigger_row.tgrelid
+        JOIN pg_namespace AS schema_row ON schema_row.oid = table_row.relnamespace
+        WHERE NOT trigger_row.tgisinternal
+          AND schema_row.nspname = 'public'
+          AND table_row.relname = 'ticket_code_directory'
+          AND trigger_row.tgname = 'ticket_code_directory_guard'
+    ) THEN
+        RAISE EXCEPTION 'global ticket code immutability guard is missing';
     END IF;
 
     IF EXISTS (

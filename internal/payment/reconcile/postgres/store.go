@@ -9,6 +9,7 @@ import (
 	"time"
 
 	paymentreconcile "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/reconcile"
+	paymentshard "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/shard"
 	shardphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physical"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -27,6 +28,17 @@ type shardResolver interface {
 type Store struct {
 	control  controlDB
 	resolver shardResolver
+}
+
+type ticketIdentity struct {
+	id   uuid.UUID
+	code string
+}
+
+type directoryIdentity struct {
+	id      uuid.UUID
+	code    string
+	orderID uuid.UUID
 }
 
 func New(control controlDB, resolver shardResolver) (*Store, error) {
@@ -331,22 +343,60 @@ WHERE payment_intent_id=$1 AND train_run_id=$2 AND assignment_generation=$3
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return snapshot, err
 	}
+	var tickets []ticketIdentity
 	if snapshot.TicketOrderFound {
-		if err := tx.QueryRow(ctx, `
-SELECT count(*) FILTER (WHERE status='active'),
-       count(*) FILTER (WHERE status='refund_pending'),
-       count(*) FILTER (WHERE status='cancelled'),
-       count(*)-count(DISTINCT ticket_code)
+		rows, err := tx.Query(ctx, `SELECT id,ticket_code,status
 FROM public.tickets
-WHERE ticket_order_id=$1 AND train_run_id=$2 AND assignment_generation=$3`, snapshot.TicketOrderID, trainRunID, generation).Scan(
-			&snapshot.ActiveTicketCount, &snapshot.RefundPendingTicketCount,
-			&snapshot.CancelledTicketCount, &snapshot.DuplicateTicketCodeCount,
-		); err != nil {
+WHERE ticket_order_id=$1 AND train_run_id=$2 AND assignment_generation=$3
+ORDER BY id LIMIT 101`, snapshot.TicketOrderID, trainRunID, generation)
+		if err != nil {
 			return snapshot, err
 		}
+		seenCodes := make(map[string]struct{}, snapshot.ReservationSeatCount)
+		for rows.Next() {
+			var ticket ticketIdentity
+			var status string
+			if err := rows.Scan(&ticket.id, &ticket.code, &status); err != nil || ticket.id == uuid.Nil || !paymentshard.ValidTicketCode(ticket.code) {
+				rows.Close()
+				return snapshot, errors.New("invalid shard ticket identity")
+			}
+			switch status {
+			case "active":
+				snapshot.ActiveTicketCount++
+			case "refund_pending":
+				snapshot.RefundPendingTicketCount++
+			case "cancelled":
+				snapshot.CancelledTicketCount++
+			default:
+				rows.Close()
+				return snapshot, errors.New("invalid shard ticket state")
+			}
+			if _, duplicate := seenCodes[ticket.code]; duplicate {
+				snapshot.DuplicateTicketCodeCount++
+			}
+			seenCodes[ticket.code] = struct{}{}
+			tickets = append(tickets, ticket)
+		}
+		if err := rows.Err(); err != nil || len(tickets) > 100 {
+			rows.Close()
+			if err != nil {
+				return snapshot, err
+			}
+			return snapshot, errors.New("shard ticket set exceeds reconciliation bound")
+		}
+		rows.Close()
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return snapshot, err
+	}
+	if snapshot.TicketOrderFound {
+		missing, conflicts, unexpected, err := s.compareTicketCodeDirectory(ctx, snapshot.TicketOrderID, tickets)
+		if err != nil {
+			return snapshot, err
+		}
+		snapshot.MissingTicketCodeClaims = missing
+		snapshot.ConflictingTicketCodes = conflicts
+		snapshot.UnexpectedTicketCodeClaims = unexpected
 	}
 	commands, err := s.loadRecordedCommands(ctx, intentID)
 	if err != nil {
@@ -367,6 +417,92 @@ WHERE payment_intent_id=$1 AND state='created' AND current_step='secure_reservat
 	}
 	snapshot.RecordedCommands = commands
 	return snapshot, nil
+}
+
+func (s *Store) compareTicketCodeDirectory(ctx context.Context, ticketOrderID uuid.UUID, tickets []ticketIdentity) (int, int, int, error) {
+	if ticketOrderID == uuid.Nil || len(tickets) > 100 {
+		return 0, 0, 0, paymentreconcile.ErrInvalidRequest
+	}
+	ids := make([]uuid.UUID, 0, len(tickets))
+	codes := make([]string, 0, len(tickets))
+	for _, ticket := range tickets {
+		if ticket.id == uuid.Nil || !paymentshard.ValidTicketCode(ticket.code) {
+			return 0, 0, 0, paymentreconcile.ErrInvalidRequest
+		}
+		ids = append(ids, ticket.id)
+		codes = append(codes, ticket.code)
+	}
+	rows, err := s.control.Query(ctx, `SELECT directory.ticket_code,directory.ticket_id,locator.ticket_order_id
+FROM public.ticket_code_directory AS directory
+JOIN public.ticket_shard_locators AS locator ON locator.ticket_id=directory.ticket_id
+WHERE directory.ticket_code=ANY($1::text[])
+   OR directory.ticket_id=ANY($2::uuid[])
+   OR locator.ticket_order_id=$3
+ORDER BY directory.ticket_code,directory.ticket_id
+LIMIT 201`, codes, ids, ticketOrderID)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer rows.Close()
+	observed := make([]directoryIdentity, 0, len(tickets))
+	for rows.Next() {
+		var identity directoryIdentity
+		if err := rows.Scan(&identity.code, &identity.id, &identity.orderID); err != nil {
+			return 0, 0, 0, err
+		}
+		observed = append(observed, identity)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, 0, 0, err
+	}
+	if len(observed) > 200 {
+		return 0, 0, 0, errors.New("ticket code directory comparison exceeds bound")
+	}
+	return compareTicketCodeRows(ticketOrderID, tickets, observed)
+}
+
+func compareTicketCodeRows(ticketOrderID uuid.UUID, tickets []ticketIdentity, observed []directoryIdentity) (int, int, int, error) {
+	if ticketOrderID == uuid.Nil || len(tickets) > 100 || len(observed) > 200 {
+		return 0, 0, 0, paymentreconcile.ErrInvalidRequest
+	}
+	expectedByID := make(map[uuid.UUID]string, len(tickets))
+	expectedByCode := make(map[string]uuid.UUID, len(tickets))
+	for _, ticket := range tickets {
+		if ticket.id == uuid.Nil || !paymentshard.ValidTicketCode(ticket.code) {
+			return 0, 0, 0, paymentreconcile.ErrInvalidRequest
+		}
+		expectedByID[ticket.id] = ticket.code
+		expectedByCode[ticket.code] = ticket.id
+	}
+	matched := make(map[uuid.UUID]struct{}, len(tickets))
+	conflicted := make(map[uuid.UUID]struct{}, len(tickets))
+	unexpected := 0
+	for _, identity := range observed {
+		expectedID, codeExpected := expectedByCode[identity.code]
+		expectedCode, idExpected := expectedByID[identity.id]
+		if codeExpected && expectedID != identity.id {
+			conflicted[expectedID] = struct{}{}
+		}
+		if idExpected && expectedCode != identity.code {
+			conflicted[identity.id] = struct{}{}
+		}
+		if codeExpected && idExpected && expectedID == identity.id && expectedCode == identity.code {
+			matched[identity.id] = struct{}{}
+		}
+		if identity.orderID == ticketOrderID && (!idExpected || expectedCode != identity.code) {
+			unexpected++
+		}
+	}
+	missing := 0
+	for id := range expectedByID {
+		if _, conflict := conflicted[id]; conflict {
+			continue
+		}
+		if _, ok := matched[id]; !ok {
+			missing++
+		}
+	}
+	return missing, len(conflicted), unexpected, nil
 }
 
 func (s *Store) StartCheckpoint(ctx context.Context, scope paymentreconcile.Scope, intentID uuid.UUID, repair bool, now time.Time) (paymentreconcile.Checkpoint, error) {

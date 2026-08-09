@@ -97,6 +97,8 @@ BEGIN
 END
 $m6_down_preflight$;
 
+DROP TABLE public.ticket_code_directory;
+DROP FUNCTION public.guard_ticket_code_directory_row();
 DROP TABLE public.payment_manual_review_cases;
 DROP TABLE public.payment_reconciliation_checkpoints;
 DROP TABLE public.payment_provider_event_conflicts;

@@ -47,6 +47,33 @@ func TestBoundedCategoryNeverEchoesUnsafeText(t *testing.T) {
 	}
 }
 
+func TestCompareTicketCodeRowsDetectsCrossShardDirectoryDrift(t *testing.T) {
+	orderID := uuid.New()
+	firstID, secondID := uuid.New(), uuid.New()
+	tickets := []ticketIdentity{
+		{id: firstID, code: "ticket_code_000001"},
+		{id: secondID, code: "ticket_code_000002"},
+	}
+	otherID := uuid.New()
+	observed := []directoryIdentity{
+		{id: firstID, code: "ticket_code_000001", orderID: orderID},
+		{id: otherID, code: "ticket_code_000002", orderID: uuid.New()},
+		{id: uuid.New(), code: "ticket_code_000003", orderID: orderID},
+	}
+	missing, conflicts, unexpected, err := compareTicketCodeRows(orderID, tickets, observed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missing != 0 || conflicts != 1 || unexpected != 1 {
+		t.Fatalf("missing=%d conflicts=%d unexpected=%d", missing, conflicts, unexpected)
+	}
+
+	missing, conflicts, unexpected, err = compareTicketCodeRows(orderID, tickets, nil)
+	if err != nil || missing != 2 || conflicts != 0 || unexpected != 0 {
+		t.Fatalf("empty directory: missing=%d conflicts=%d unexpected=%d err=%v", missing, conflicts, unexpected, err)
+	}
+}
+
 type fakeControl struct{}
 
 func (fakeControl) BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)  { return nil, nil }

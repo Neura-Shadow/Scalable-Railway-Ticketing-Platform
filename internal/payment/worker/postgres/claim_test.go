@@ -133,6 +133,7 @@ func TestCompleteTicketIssuanceWritesAllLocatorsInSameControlTransaction(t *test
 	}
 	receipt := shard.IssueTicketsReceipt{
 		TicketOrderID: uuid.New(), TicketIDs: []uuid.UUID{uuid.New(), uuid.New()},
+		TicketCodes: []string{"ticket_code_000001", "ticket_code_000002"},
 		AmountMinor: 2500, Currency: "TWD", IssuedAt: time.Now().UTC(),
 	}
 	if err := store.CompleteAction(context.Background(), claim, worker.ActionEvidence{Issue: receipt}); err != nil {
@@ -141,9 +142,34 @@ func TestCompleteTicketIssuanceWritesAllLocatorsInSameControlTransaction(t *test
 	joined := strings.ToLower(strings.Join(tx.execs, "\n"))
 	if strings.Count(joined, "insert into public.ticket_order_shard_locators") != 1 ||
 		strings.Count(joined, "insert into public.ticket_shard_locators") != len(receipt.TicketIDs) ||
+		strings.Count(joined, "insert into public.ticket_code_directory") != len(receipt.TicketIDs) ||
 		!strings.Contains(joined, "update public.payment_intents") ||
 		!strings.Contains(joined, "update public.payment_sagas") || !tx.committed {
 		t.Fatalf("control finalize SQL missing atomic locator writes:\n%s", joined)
+	}
+}
+
+func TestCompleteTicketIssuanceRejectsDuplicateGlobalCodeClaims(t *testing.T) {
+	t.Parallel()
+	trainRunID, ownerID := uuid.New(), uuid.New()
+	tx := &recordingTx{row: staticRow{values: []any{trainRunID, "physical-shard-0", int64(7), ownerID}}}
+	store, err := New(&recordingDB{tx: tx})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	claim := worker.ActionClaim{
+		SagaID: uuid.New(), Type: worker.ActionIssueTickets, LeaseOwner: "payment-test",
+		Issue: shard.IssueTicketsCommand{ReservationID: uuid.New(), TrainRunID: trainRunID, OwnerID: ownerID},
+	}
+	receipt := shard.IssueTicketsReceipt{
+		TicketOrderID: uuid.New(), TicketIDs: []uuid.UUID{uuid.New(), uuid.New()},
+		TicketCodes: []string{"duplicate_code_001", "duplicate_code_001"}, IssuedAt: time.Now().UTC(),
+	}
+	if err := store.CompleteAction(context.Background(), claim, worker.ActionEvidence{Issue: receipt}); !errors.Is(err, worker.ErrStoreUnavailable) {
+		t.Fatalf("CompleteAction() error = %v, want store unavailable", err)
+	}
+	if tx.committed {
+		t.Fatal("duplicate ticket code claims committed")
 	}
 }
 

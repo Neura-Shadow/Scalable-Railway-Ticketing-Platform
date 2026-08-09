@@ -39,8 +39,8 @@ In one local transaction the shard:
 6. creates or activates exactly one ticket for each reservation-seat row;
 7. assigns each ticket an opaque, globally collision-resistant, non-sequential
    code containing no passenger PII;
-8. records issued count, ticket order, command and operation identities in the
-   issuance receipt;
+8. records issued count, ticket order, command and operation identities plus
+   the immutable ticket ID/code pairs in the issuance receipt;
 9. appends shard-local reservation, order, ticket, and issuance outbox intent;
    and
 10. commits all rows together.
@@ -58,10 +58,15 @@ is not ticket authority and the system does not claim exactly-once distributed
 processing.
 
 After the shard commit, the control plane loads and verifies the issuance
-receipt and local result, then conditionally marks the saga and payment intent
-completed and updates any global directory or projection. If that control
-transaction fails, the authoritative tickets remain valid. Retry or
-reconciliation finalizes control from the same receipt and never reissues.
+receipt and local result. One control transaction writes the order locator,
+ticket locators, and each immutable ticket-code-to-ticket-ID claim before it
+conditionally marks the saga and payment intent completed. The ticket-code
+directory has unique identities in both directions and contains no route; a
+migration changes the existing ticket locator while the code claim remains
+stable. A code collision rolls back the whole control finalization and is
+reported for manual review rather than publishing an ambiguous global ticket.
+Retry or reconciliation finalizes control from the same receipt and never
+reissues.
 
 Transient issuance failures before local commit retry the same issuance command.
 An ambiguous shard response is resolved by reading the same command/issuance
@@ -79,8 +84,9 @@ and full-refund decision in ADR 052.
   receipt, and local outbox intent commit atomically on one shard.
 - Control finalization, cache population, and event publication are not required
   for an already committed ticket to remain durable.
-- Ticket codes are opaque and globally unique; offline signed boarding
-  credentials are outside Milestone 6.
+- Every globally addressable ticket has exactly one immutable control-plane
+  ticket-code claim, and both code and ticket ID are globally unique. Offline
+  signed boarding credentials are outside Milestone 6.
 
 ## Consequences
 

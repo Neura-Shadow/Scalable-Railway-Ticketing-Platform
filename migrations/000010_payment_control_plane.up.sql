@@ -316,6 +316,64 @@ CREATE UNIQUE INDEX ticket_orders_payment_intent_unique_idx
     ON booking_shard_1.ticket_orders(payment_intent_id)
     WHERE payment_intent_id IS NOT NULL;
 
+-- Ticket codes must be globally unique even though authoritative ticket rows
+-- live on independent booking shards. The directory binds only the immutable
+-- public code to the immutable ticket identity; routing remains in
+-- ticket_shard_locators, so forward and reverse migration can move a ticket by
+-- updating its locator without rewriting the global code claim.
+CREATE TABLE public.ticket_code_directory (
+    ticket_code text PRIMARY KEY
+        CHECK (ticket_code ~ '^[A-Za-z0-9_-]{16,64}$'),
+    ticket_id uuid NOT NULL UNIQUE
+        REFERENCES public.ticket_shard_locators(ticket_id)
+        ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE FUNCTION public.guard_ticket_code_directory_row()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $ticket_code_directory_guard$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'ticket code directory identities are immutable'
+            USING ERRCODE = '23514';
+    END IF;
+    IF NEW.ticket_code IS DISTINCT FROM OLD.ticket_code
+       OR NEW.ticket_id IS DISTINCT FROM OLD.ticket_id
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION 'ticket code directory identities are immutable'
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END
+$ticket_code_directory_guard$;
+
+CREATE TRIGGER ticket_code_directory_guard
+BEFORE UPDATE OR DELETE ON public.ticket_code_directory
+FOR EACH ROW EXECUTE FUNCTION public.guard_ticket_code_directory_row();
+
+-- Version-10 installation can safely backfill tickets still resident in the
+-- three control-local layouts. Physical ticket codes are never guessed or
+-- scanned here; all new physical issuance writes the claim with its locator in
+-- one control transaction.
+INSERT INTO public.ticket_code_directory(ticket_code,ticket_id)
+SELECT ticket.ticket_code, locator.ticket_id
+FROM public.ticket_shard_locators AS locator
+JOIN public.tickets AS ticket ON ticket.id=locator.ticket_id
+WHERE locator.shard_id='legacy'
+UNION ALL
+SELECT ticket.ticket_code, locator.ticket_id
+FROM public.ticket_shard_locators AS locator
+JOIN booking_shard_0.tickets AS ticket ON ticket.id=locator.ticket_id
+WHERE locator.shard_id='shard-0'
+UNION ALL
+SELECT ticket.ticket_code, locator.ticket_id
+FROM public.ticket_shard_locators AS locator
+JOIN booking_shard_1.tickets AS ticket ON ticket.id=locator.ticket_id
+WHERE locator.shard_id='shard-1';
+
 CREATE FUNCTION public.guard_control_booking_payment_snapshot()
 RETURNS trigger
 LANGUAGE plpgsql

@@ -21,6 +21,12 @@ permanent authority. Before every shard mutation, the coordinator resolves the
 current reservation directory and train-run assignment and sends the command to
 exactly one allowlisted shard with the expected generation.
 
+Control also owns a route-independent ticket-code directory. Issuance writes
+each immutable code-to-ticket-ID claim atomically with the ticket locator and
+control finalization. Forward migration, permitted direct rollback, and reverse
+migration update only the locator's shard and generation; they never rewrite or
+duplicate the code claim.
+
 Every begin-payment, issuance, cancellation, and refund-compensation command
 validates the selected database's storage identity and local generation fence.
 A stale route fails before any receipt, reservation, ticket, inventory, journal,

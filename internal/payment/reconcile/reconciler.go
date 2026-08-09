@@ -385,6 +385,15 @@ func checkShard(scope Scope, control ControlSnapshot, shard ShardSnapshot, add f
 	if shard.DuplicateTicketCodeCount > 0 {
 		add("duplicate_ticket_code", false)
 	}
+	if shard.MissingTicketCodeClaims > 0 {
+		add("global_ticket_code_claim_missing", false)
+	}
+	if shard.ConflictingTicketCodes > 0 {
+		add("global_ticket_code_conflict", false)
+	}
+	if shard.UnexpectedTicketCodeClaims > 0 {
+		add("global_ticket_code_claim_unexpected", false)
+	}
 	if shard.IssuanceReceiptFound && shard.ReceiptFingerprint != ([sha256.Size]byte{}) && shard.ReceiptFingerprint != control.Intent.Fingerprint {
 		add("shard_control_fingerprint_mismatch", false)
 	}

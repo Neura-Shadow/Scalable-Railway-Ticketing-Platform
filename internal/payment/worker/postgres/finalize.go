@@ -738,7 +738,8 @@ WHERE saga_id=$1 AND state='refunding' AND current_step='compensate'
 }
 
 func writeTicketLocators(ctx context.Context, tx pgx.Tx, claim worker.ActionClaim, receipt shard.IssueTicketsReceipt) error {
-	if receipt.TicketOrderID == uuid.Nil || len(receipt.TicketIDs) == 0 || receipt.IssuedAt.IsZero() {
+	if receipt.TicketOrderID == uuid.Nil || len(receipt.TicketIDs) == 0 ||
+		len(receipt.TicketCodes) != len(receipt.TicketIDs) || receipt.IssuedAt.IsZero() {
 		return worker.ErrStoreUnavailable
 	}
 	var trainRunID, ownerID uuid.UUID
@@ -768,10 +769,21 @@ WHERE ticket_order_shard_locators.reservation_id=EXCLUDED.reservation_id
 		ownerID, receipt.AmountMinor, receipt.Currency, receipt.IssuedAt.UTC())); err != nil {
 		return err
 	}
-	for _, ticketID := range receipt.TicketIDs {
-		if ticketID == uuid.Nil {
+	seenIDs := make(map[uuid.UUID]struct{}, len(receipt.TicketIDs))
+	seenCodes := make(map[string]struct{}, len(receipt.TicketCodes))
+	for index, ticketID := range receipt.TicketIDs {
+		ticketCode := receipt.TicketCodes[index]
+		if ticketID == uuid.Nil || !shard.ValidTicketCode(ticketCode) {
 			return worker.ErrStoreUnavailable
 		}
+		if _, duplicate := seenIDs[ticketID]; duplicate {
+			return worker.ErrStoreUnavailable
+		}
+		if _, duplicate := seenCodes[ticketCode]; duplicate {
+			return worker.ErrStoreUnavailable
+		}
+		seenIDs[ticketID] = struct{}{}
+		seenCodes[ticketCode] = struct{}{}
 		if err := oneRow(tx.Exec(ctx, `INSERT INTO public.ticket_shard_locators(
  ticket_id,ticket_order_id,reservation_id,train_run_id,shard_id,assignment_generation,owner_user_id
 ) VALUES($1,$2,$3,$4,$5,$6,$7)
@@ -783,6 +795,12 @@ WHERE ticket_shard_locators.ticket_order_id=EXCLUDED.ticket_order_id
  AND ticket_shard_locators.assignment_generation=EXCLUDED.assignment_generation
  AND ticket_shard_locators.owner_user_id=EXCLUDED.owner_user_id`,
 			ticketID, receipt.TicketOrderID, claim.Issue.ReservationID, trainRunID, shardID, generation, ownerID)); err != nil {
+			return err
+		}
+		if err := oneRow(tx.Exec(ctx, `INSERT INTO public.ticket_code_directory(ticket_code,ticket_id)
+VALUES($1,$2)
+ON CONFLICT(ticket_code) DO UPDATE SET ticket_id=EXCLUDED.ticket_id
+WHERE ticket_code_directory.ticket_id=EXCLUDED.ticket_id`, ticketCode, ticketID)); err != nil {
 			return err
 		}
 	}

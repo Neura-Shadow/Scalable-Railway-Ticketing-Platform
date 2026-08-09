@@ -62,12 +62,14 @@ func TestRepairReceiptValidationFailsClosed(t *testing.T) {
 	issue := paymentshard.IssueTicketsReceipt{
 		CommandID: issueCommand.CommandID, IssuanceID: issueCommand.IssuanceID, PaymentIntentID: evidence.IntentID,
 		ReservationID: evidence.ReservationID, TicketOrderID: uuid.New(), TicketIDs: []uuid.UUID{ticketID},
+		TicketCodes: []string{"ticket_code_000001"},
 		AmountMinor: evidence.AmountMinor, Currency: evidence.Currency, IssuedAt: time.Now(),
 	}
 	if !validIssueRepairReceipt(evidence, issueCommand, issue) {
 		t.Fatal("valid issue receipt rejected")
 	}
 	issue.TicketIDs = []uuid.UUID{ticketID, ticketID}
+	issue.TicketCodes = []string{"ticket_code_000001", "ticket_code_000002"}
 	if validIssueRepairReceipt(evidence, issueCommand, issue) {
 		t.Fatal("duplicate ticket receipt accepted")
 	}
@@ -138,6 +140,8 @@ func TestRepairSourceKeepsLeaseAndLocatorConflictGuards(t *testing.T) {
 		"ticket_order_shard_locators.reservation_id=EXCLUDED.reservation_id",
 		"ON CONFLICT(ticket_id) DO UPDATE SET ticket_order_id=EXCLUDED.ticket_order_id",
 		"ticket_shard_locators.reservation_id=EXCLUDED.reservation_id",
+		"INSERT INTO public.ticket_code_directory(ticket_code,ticket_id)",
+		"ticket_code_directory.ticket_id=EXCLUDED.ticket_id",
 		"finalizeTerminalCompensation(ctx, e, \"voided\", \"compensating\", receipt.TicketOrderID, false, leaseOwner)",
 	} {
 		if !strings.Contains(source, fragment) {
