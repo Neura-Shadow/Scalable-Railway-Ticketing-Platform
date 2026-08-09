@@ -3,17 +3,17 @@
 ## Current status
 
 **Passed for bounded local correctness, recovery and pressure evidence.** The
-canonical run is `railway-m6-full-20260809x`; its 390-file index has SHA-256
-`7892880d56a832615c73a62c4a290c332630912e3c02856247994597d56cecde`.
+canonical run is `railway-m6-full-20260809z`; its 391-file index has SHA-256
+`f53baccc96bf6f0b930e4be08b0ba4ed8033359fdb51ad7737113194b2829464`.
 See [`benchmark-report-milestone-6.md`](benchmark-report-milestone-6.md) for
 measured values. CI runs the same ten-scenario driver and uploads the sanitized
 summary, k6 results, pool/payment metrics, invariant counts, secret scan,
 artifact index and teardown result for 14 days.
 
 The scoped execution source is SHA-256
-`11862b4cd5d0f0de3a0a416239eaa13c7040890c35372f53e556783e927720f5`;
+`5ae444064eabc60a69e2e5d0109fb8f062bd48d5b7bf3bc905bf8e34ce360ced`;
 the rendered Compose configuration is SHA-256
-`408de6814c42a57b40c4a1124ee2a5e296152d8db3293daadb29ee9cf0ff5ff0`.
+`80c89805897e29e4393c4e47cd0734e7f52b3d4176494d94d83bedd1cc074be9`.
 Only the two post-run publication files
 `docs/benchmark-report-milestone-6.md` and
 `docs/milestone-6-load-testing.md` are excluded from that source digest.
@@ -75,8 +75,8 @@ reconciliation and pgx histogram/counter data. Pool records include total,
 acquired, idle, max, acquire count/duration, empty/cancelled acquire and peak,
 using only bounded role/shard labels.
 
-The canonical run observed 5,507 pgx acquires, 0.092466 seconds cumulative
-acquire duration, 19 empty acquires, zero cancelled acquires and maximum
+The canonical run observed 5,734 pgx acquires, 0.095535 seconds cumulative
+acquire duration, 18 empty acquires, zero cancelled acquires and maximum
 per-process/per-pool peak 1. These are honest local observations, not a sizing
 recommendation. Exact scenario and histogram measurements are in the benchmark
 report and raw bundle.

@@ -671,7 +671,7 @@ RESET ROLE;
 "@ | Out-Null
     }
     $reconciliation = Invoke-Milestone5DriverCompose -Context $context -AllowFailure `
-        -Arguments @('run','--rm','-e','PAYMENT_PROCESSING_GRACE_SECONDS=1','payment-reconciler','--once','--scope','payment-all','--batch-size','100','--timeout','30s') `
+        -Arguments @('run','--rm','--no-deps','-e','PAYMENT_PROCESSING_GRACE_SECONDS=1','payment-reconciler','--once','--scope','payment-all','--batch-size','100','--timeout','30s') `
         -Artifact 'final-detect-only-reconciliation.log'
     if ($reconciliation.ExitCode -ne 0) { throw 'final detect-only payment reconciliation failed' }
     $reconciliationLine = [string](@($reconciliation.Output | Where-Object {
