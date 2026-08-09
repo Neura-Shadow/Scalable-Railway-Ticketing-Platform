@@ -20,11 +20,14 @@ amount and currency. Captured proof is necessary but not sufficient: the shard
 command independently validates local reservation and payment facts.
 
 The issuance coordinator resolves the current reservation directory and train-
-run assignment immediately before dispatch and sends an immutable, globally
-unique issuance command to exactly one approved shard. The command does not bind
-the payment intent permanently to a shard. The selected shard validates its
-storage identity and expected monotonic generation fence as required by ADR 037
-and ADR 043.
+run assignment immediately before dispatch. It reads the bounded authoritative
+reservation-seat identities, derives the immutable ticket ID/code plan, and
+claims every pair in the control-plane global directory before dispatch. Claims
+are immutable tombstones and are not recycled if dispatch never commits. The
+coordinator then sends that exact plan in the issuance command to one approved
+shard. The command does not bind the payment intent permanently to a shard. The
+selected shard validates its storage identity, expected monotonic generation
+fence, and recomputed ticket plan as required by ADR 037 and ADR 043.
 
 In one local transaction the shard:
 
@@ -58,15 +61,13 @@ is not ticket authority and the system does not claim exactly-once distributed
 processing.
 
 After the shard commit, the control plane loads and verifies the issuance
-receipt and local result. One control transaction writes the order locator,
-ticket locators, and each immutable ticket-code-to-ticket-ID claim before it
+receipt and local result. One control transaction writes the order and ticket
+locators, re-verifies the existing immutable ticket-code claims, and
 conditionally marks the saga and payment intent completed. The ticket-code
 directory has unique identities in both directions and contains no route; a
 migration changes the existing ticket locator while the code claim remains
-stable. A code collision rolls back the whole control finalization and is
-reported for manual review rather than publishing an ambiguous global ticket.
-Retry or reconciliation finalizes control from the same receipt and never
-reissues.
+stable. A collision prevents dispatch, before a shard can activate the ticket.
+Retry or reconciliation reuses the same plan and receipt and never reissues.
 
 Transient issuance failures before local commit retry the same issuance command.
 An ambiguous shard response is resolved by reading the same command/issuance
@@ -87,6 +88,8 @@ and full-refund decision in ADR 052.
 - Every globally addressable ticket has exactly one immutable control-plane
   ticket-code claim, and both code and ticket ID are globally unique. Offline
   signed boarding credentials are outside Milestone 6.
+- No M6 shard transaction can activate a ticket whose exact ID/code pair was
+  not already exclusively claimed in the control-plane directory.
 
 ## Consequences
 

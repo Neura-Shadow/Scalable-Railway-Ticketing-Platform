@@ -22,9 +22,11 @@ below passes.
 - Take a control-database backup and complete a restore rehearsal in a
   disposable environment. Record PostgreSQL version, table sizes, disk/WAL
   headroom, active locks, statement/lock timeout, and connection budget.
-- Deploy binaries that understand both the version-9 baseline and the expanded
-  M6 enums/schema, while payment routes, workers, webhook acceptance and the
-  provider adapter remain disabled.
+- Plan a coordinated maintenance boundary. The Milestone 6 binaries are
+  deliberately fail-closed until control version 10 and physical shard version
+  2 are installed; they must not be advertised as version-9/version-1-ready.
+  Keep payment routes, workers, webhook acceptance and the provider adapter
+  disabled throughout the boundary.
 - Verify runtime roles cannot alter schema, provider configuration, webhook
   keys, saga history or reconciliation findings. Use a separate migration
   identity; never print a DSN, key, signature or provider credential.
@@ -72,10 +74,11 @@ The rehearsal must prove at least:
 
 ## Staged rollout
 
-1. Deploy compatible binaries with M6 disabled. Prove Milestones 1-5 regression
-   gates and verify all replicas report the expected minimum/maximum schema
-   compatibility.
-2. Apply migration 10 once with bounded statement and lock timeouts. Stop on
+1. Prove Milestones 1-5 regression gates on the release artifact, drain
+   in-flight booking commands, and remove the old replicas from readiness before
+   changing either schema. This rollout does not claim zero downtime.
+2. Apply migration 10 once with bounded statement and lock timeouts while no
+   new-version replica is serving. Stop on
    timeout, dirty state, unexpected lock growth, disk/WAL pressure or validation
    mismatch.
 3. Run read-only post-validation and verify version 10, constraints, indexes,
@@ -83,13 +86,23 @@ The rehearsal must prove at least:
 4. Apply booking-shard schema version 2 independently to every configured
    physical booking database. Keep M6 disabled if even one enabled shard is
    absent, dirty, unreachable or below version 2.
-5. Start the deterministic sandbox only in the explicitly allowed local/test
+5. Start the new API replicas with M6 disabled only after control is clean at
+   version 10 and every enabled shard/catalog entry is clean at version 2;
+   require every replica readiness probe to pass before restoring traffic.
+6. While M6 remains disabled, run `payment-admin backfill-ticket-codes
+   --dry-run`, review the bounded count, then run the same command with
+   `--confirm`. The confirmed pass reads each pre-existing physical ticket from
+   its authoritative locator, claims the exact code/ID pair, rejects collisions
+   atomically, and marks readiness only after zero locators remain unclaimed.
+   Any legacy confirmation after this pass resets readiness to pending, so
+   repeat the dry-run and confirmed pass immediately before enabling M6.
+7. Start the deterministic sandbox only in the explicitly allowed local/test
    profile. Prove production configuration rejects the sandbox and non-HTTPS
    future provider endpoints by default.
-6. Enable the webhook receiver in store-only mode, then the payment worker and
+8. Enable the webhook receiver in store-only mode, then the payment worker and
    reconciler for synthetic canary traffic. The webhook HTTP request may only
    verify and persist; it may not capture, refund, issue or mutate seats.
-7. Enable payment-intent creation last, in a bounded canary. Verify queue age,
+9. Enable payment-intent creation last, in a bounded canary. Verify queue age,
    unknown outcomes, manual-review count, duplicate-operation invariants,
    control/shard reconciliation and pgx pool pressure before widening.
 
@@ -98,7 +111,8 @@ The rehearsal must prove at least:
 Payment readiness is fail-closed unless the control schema is clean at version
 10, the configured provider and key ring pass validation, every enabled booking
 shard is reachable at clean schema version 2, worker lease settings are bounded,
-and no incompatible replica is serving. A provider outage may degrade payment
+the ticket-code claim readiness row is `ready`, every existing ticket locator
+has a directory claim, and no incompatible replica is serving. A provider outage may degrade payment
 readiness without making existing non-payment reads authoritative elsewhere.
 
 Stop new payment-intent creation and webhook processing, without discarding

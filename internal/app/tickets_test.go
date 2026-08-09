@@ -90,3 +90,35 @@ func TestTicketQueriesBoundExtremePageNumbers(t *testing.T) {
 		t.Fatalf("page=%d want=%d", page.Page, querypostgres.MaxPage)
 	}
 }
+
+func TestTicketOrderSummaryAcceptsOnlyIssuedPaymentAuthorityForConfirmedLocator(t *testing.T) {
+	t.Parallel()
+	createdAt := time.Now().UTC()
+	locator := TicketOrderRecord{
+		ID: uuid.NewString(), ReservationID: uuid.NewString(), Status: "confirmed",
+		TotalAmountMinor: 2500, Currency: "TWD", CreatedAt: createdAt,
+	}
+	authoritative := locator
+	authoritative.Status = "issued"
+	if !sameTicketOrderSummary(locator, authoritative) {
+		t.Fatal("confirmed locator did not accept issued payment authority")
+	}
+	for _, invalid := range []string{"payment_pending", "payment_captured", "cancelled"} {
+		authoritative.Status = invalid
+		if sameTicketOrderSummary(locator, authoritative) {
+			t.Fatalf("confirmed locator accepted non-issued authority %q", invalid)
+		}
+	}
+
+	locator.Status = "cancelled"
+	authoritative.Status = "refunded"
+	if !sameTicketOrderSummary(locator, authoritative) {
+		t.Fatal("cancelled locator did not accept refunded payment authority")
+	}
+	for _, invalid := range []string{"payment_pending", "payment_captured", "issued", "confirmed"} {
+		authoritative.Status = invalid
+		if sameTicketOrderSummary(locator, authoritative) {
+			t.Fatalf("cancelled locator accepted invalid authority %q", invalid)
+		}
+	}
+}

@@ -70,6 +70,35 @@ func TestClientUsesFixedEndpointBoundedResponsesAndNoRedirects(t *testing.T) {
 	assertProviderError(t, err, provider.ErrorInconsistentResponse, false, true)
 }
 
+func TestClientRejectsHostedReferenceOutsidePersistenceContract(t *testing.T) {
+	t.Parallel()
+	for _, hostedReference := range []string{
+		"https://provider.example/checkout/pay_1",
+		"checkout reference",
+		":checkout",
+		strings.Repeat("a", 257),
+	} {
+		hostedReference := hostedReference
+		t.Run(hostedReference[:min(len(hostedReference), 24)], func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(provider.Checkout{
+					ProviderPaymentID: "pay_1", HostedReference: hostedReference,
+					SyntheticToken: "tok_1", Status: provider.StatusCreated, AmountMinor: 12500, Currency: "TWD",
+				})
+			}))
+			defer server.Close()
+			client := mustClient(t, server.URL, 1024)
+			_, err := client.CreateCheckout(context.Background(), provider.CreateCheckoutRequest{
+				PaymentIntentID: "intent_1", MerchantReference: "intent_1", AmountMinor: 12500,
+				Currency: "TWD", IdempotencyKey: "checkout-intent-1",
+			})
+			assertProviderError(t, err, provider.ErrorInconsistentResponse, false, true)
+		})
+	}
+}
+
 func TestClientReadinessUsesFixedBoundedEndpoint(t *testing.T) {
 	t.Parallel()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

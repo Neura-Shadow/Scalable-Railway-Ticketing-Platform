@@ -18,6 +18,8 @@ import (
 	reconcilepostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/reconcile/postgres"
 	paymentshard "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/shard"
 	paymentshardpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/shard/postgres"
+	paymentticketcodes "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/ticketcodes"
+	paymentworkerpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/worker/postgres"
 	platformconfig "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
@@ -202,7 +204,8 @@ func knownCommand(name string) bool {
 	switch name {
 	case "inspect-intent", "inspect-saga", "inspect-provider-status", "inspect-webhook",
 		"retry-saga", "reconcile-intent", "mark-manual-review", "resume-ticket-issuance",
-		"request-void", "request-refund", "inspect-financial-operations", "inspect-ticket-issuance":
+		"request-void", "request-refund", "inspect-financial-operations", "inspect-ticket-issuance",
+		"backfill-ticket-codes":
 		return true
 	default:
 		return false
@@ -222,7 +225,7 @@ func requiresIntent(name string) bool {
 
 func isMutation(name string) bool {
 	switch name {
-	case "retry-saga", "mark-manual-review", "resume-ticket-issuance", "request-void", "request-refund":
+	case "retry-saga", "mark-manual-review", "resume-ticket-issuance", "request-void", "request-refund", "backfill-ticket-codes":
 		return true
 	default:
 		return false
@@ -292,6 +295,10 @@ func openBackend(ctx context.Context, lookup func(string) (string, bool), req re
 	if err != nil {
 		return fail()
 	}
+	ticketBackfill, err := paymentticketcodes.NewBackfiller(control, router)
+	if err != nil {
+		return fail()
+	}
 	store, err := reconcilepostgres.New(control, router)
 	if err != nil {
 		return fail()
@@ -306,7 +313,11 @@ func openBackend(ctx context.Context, lookup func(string) (string, bool), req re
 		if err != nil {
 			return fail()
 		}
-		gateway, err := paymentshard.NewGateway(directory, shardStore)
+		claimStore, err := paymentworkerpostgres.New(control)
+		if err != nil {
+			return fail()
+		}
+		gateway, err := paymentshard.NewGateway(directory, shardStore, paymentshard.WithTicketCodeClaimer(claimStore))
 		if err != nil {
 			return fail()
 		}
@@ -331,7 +342,7 @@ func openBackend(ctx context.Context, lookup func(string) (string, bool), req re
 	if repairer != nil {
 		operator = repairer
 	}
-	return &runtimeBackend{store: store, reconciler: reconciler, provider: providerClient, operator: operator}, closeAll, nil
+	return &runtimeBackend{store: store, reconciler: reconciler, provider: providerClient, operator: operator, ticketBackfill: ticketBackfill}, closeAll, nil
 }
 
 type queryRower interface {
@@ -360,10 +371,11 @@ WHERE role.rolname=current_user`).Scan(&allowed)
 }
 
 type runtimeBackend struct {
-	store      adminStore
-	reconciler adminReconciler
-	provider   paymentreconcile.StatusQuerier
-	operator   adminOperator
+	store          adminStore
+	reconciler     adminReconciler
+	provider       paymentreconcile.StatusQuerier
+	operator       adminOperator
+	ticketBackfill ticketCodeBackfiller
 }
 
 type adminStore interface {
@@ -384,14 +396,24 @@ type adminOperator interface {
 	MarkManualReview(context.Context, uuid.UUID) error
 }
 
+type ticketCodeBackfiller interface {
+	Inspect(context.Context, int) (paymentticketcodes.Result, error)
+	Backfill(context.Context, int) (paymentticketcodes.Result, error)
+}
+
 func (b *runtimeBackend) Execute(ctx context.Context, req request) (outcome, error) {
-	if b == nil || b.store == nil || b.reconciler == nil || b.provider == nil {
+	if b == nil || b.store == nil || b.reconciler == nil || b.provider == nil ||
+		(req.Command == "backfill-ticket-codes" && b.ticketBackfill == nil) {
 		return outcome{}, errRuntimeWiring
 	}
 	if (isMutation(req.Command) || req.Repair) && !req.DryRun && !req.Confirm {
 		return outcome{}, errConfirmation
 	}
 	if req.DryRun {
+		if req.Command == "backfill-ticket-codes" {
+			result, err := b.ticketBackfill.Inspect(ctx, req.Limit)
+			return ticketBackfillOutcome(result), err
+		}
 		report, err := b.reconciler.InspectPayment(ctx, req.PaymentIntentID)
 		if req.Command == "retry-saga" {
 			return outcome{Items: []item{{ResourceID: req.SagaID, Kind: "payment_saga", State: "recorded_replay_preview"}}, Count: 1}, nil
@@ -447,9 +469,24 @@ func (b *runtimeBackend) Execute(ctx context.Context, req request) (outcome, err
 		return b.inspectFinancial(ctx, req.PaymentIntentID, req.Limit)
 	case "inspect-ticket-issuance":
 		return b.inspectIssuance(ctx, req.PaymentIntentID)
+	case "backfill-ticket-codes":
+		result, err := b.ticketBackfill.Backfill(ctx, req.Limit)
+		return ticketBackfillOutcome(result), err
 	default:
 		return outcome{}, errRuntimeWiring
 	}
+}
+
+func ticketBackfillOutcome(result paymentticketcodes.Result) outcome {
+	state := "pending"
+	if result.Ready {
+		state = "ready"
+	}
+	count := result.Claimed
+	if count == 0 {
+		count = result.Missing
+	}
+	return outcome{Items: []item{{Kind: "ticket_code_directory", State: state}}, Count: count}
 }
 
 func mutationOutcome(id uuid.UUID, kind string, err error) (outcome, error) {

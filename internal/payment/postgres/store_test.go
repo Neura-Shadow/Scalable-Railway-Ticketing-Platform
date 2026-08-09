@@ -44,6 +44,7 @@ func TestReserveIntentAtomicallyCreatesIntentAndSagaWithStableBeginIdentity(t *t
 	tx := &fakeTx{rows: []pgx.Row{
 		fakeRow{err: pgx.ErrNoRows},
 		fakeRow{err: pgx.ErrNoRows},
+		fakeRow{values: []any{true}},
 		intentRow(fixture),
 	}}
 	store := mustStore(t, &fakeDB{transactions: []pgx.Tx{tx}})
@@ -67,6 +68,14 @@ func TestReserveIntentAtomicallyCreatesIntentAndSagaWithStableBeginIdentity(t *t
 	}
 }
 
+func TestReserveIntentReadinessDoesNotScanHistoricalTicketLocators(t *testing.T) {
+	normalized := strings.ToLower(reserveIntentReadinessSQL)
+	if strings.Contains(normalized, "ticket_shard_locators") ||
+		!strings.Contains(normalized, "where readiness.singleton") {
+		t.Fatalf("unbounded readiness query: %s", reserveIntentReadinessSQL)
+	}
+}
+
 func TestReserveIntentRejectsAnotherActiveIntentForReservation(t *testing.T) {
 	fixture := intentFixture()
 	tx := &fakeTx{rows: []pgx.Row{fakeRow{err: pgx.ErrNoRows}, intentRow(fixture)}}
@@ -84,7 +93,7 @@ func TestReserveIntentRejectsAnotherActiveIntentForReservation(t *testing.T) {
 func TestReserveIntentReplaysWinnerAfterConcurrentSameKeyInsert(t *testing.T) {
 	fixture := intentFixture()
 	tx := &fakeTx{
-		rows:       []pgx.Row{fakeRow{err: pgx.ErrNoRows}, fakeRow{err: pgx.ErrNoRows}},
+		rows:       []pgx.Row{fakeRow{err: pgx.ErrNoRows}, fakeRow{err: pgx.ErrNoRows}, fakeRow{values: []any{true}}},
 		execErrors: []error{&pgconn.PgError{Code: "23505"}},
 	}
 	store := mustStore(t, &fakeDB{
@@ -127,6 +136,21 @@ func TestMarkReservationSecuredRepairsFinalizationAndCreatesStableCheckout(t *te
 	}
 }
 
+func TestFailReservationSecuringTerminatesIntentAndSagaAtomically(t *testing.T) {
+	intent := intentFixture()
+	tx := &fakeTx{}
+	store := mustStore(t, &fakeDB{transactions: []pgx.Tx{tx}})
+
+	err := store.FailReservationSecuring(context.Background(), intent.ID, fixtureFingerprint)
+	if err != nil || !tx.committed || len(tx.execs) != 2 {
+		t.Fatalf("FailReservationSecuring() error=%v committed=%v execs=%d", err, tx.committed, len(tx.execs))
+	}
+	if !strings.Contains(tx.execs[0].query, "state='reservation_securing'") ||
+		!strings.Contains(tx.execs[1].query, "reservation_not_payable") {
+		t.Fatalf("terminal queries = %+v", tx.execs)
+	}
+}
+
 func TestGetOwnedIntentDoesNotRevealAnotherOwnersIntent(t *testing.T) {
 	store := mustStore(t, &fakeDB{rows: []pgx.Row{fakeRow{err: pgx.ErrNoRows}}})
 	_, err := store.GetOwnedIntent(context.Background(), uuid.New(), uuid.New())
@@ -152,7 +176,6 @@ func TestRequestCancellationCreatesVoidBeforeCaptureAndRefundAfterCapture(t *tes
 		wantState string
 	}{
 		{name: "before capture", state: "authorized", wantKind: "void", wantState: "void_pending"},
-		{name: "after capture", state: "captured", captured: true, wantKind: "refund", wantState: "refund_pending"},
 		{name: "after issuance", state: "completed", captured: true, wantKind: "refund", wantState: "refund_pending"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -190,6 +213,25 @@ func TestRequestCancellationCreatesVoidBeforeCaptureAndRefundAfterCapture(t *tes
 			}
 			if test.state == "completed" && (!strings.Contains(tx.execs[2].query, "'completed'") || !strings.Contains(tx.execs[2].query, "completed_at=NULL")) {
 				t.Fatalf("completed saga is not reopened safely: %s", tx.execs[2].query)
+			}
+		})
+	}
+}
+
+func TestRequestCancellationDefersWhileTicketIssuanceIsNotControlFinalized(t *testing.T) {
+	for _, state := range []string{"captured", "ticket_issue_pending", "manual_review"} {
+		t.Run(state, func(t *testing.T) {
+			intent := intentFixture()
+			intent.State = state
+			tx := &fakeTx{rows: []pgx.Row{
+				intentRow(intent), fakeRow{values: []any{true}},
+				fakeRow{err: pgx.ErrNoRows}, fakeRow{err: pgx.ErrNoRows},
+			}}
+			store := mustStore(t, &fakeDB{transactions: []pgx.Tx{tx}})
+
+			_, err := store.RequestCancellation(context.Background(), cancellationRequest(intent))
+			if !errors.Is(err, paymentapp.ErrPaymentConflict) || tx.committed || len(tx.execs) != 0 {
+				t.Fatalf("state=%s error=%v committed=%v execs=%d", state, err, tx.committed, len(tx.execs))
 			}
 		})
 	}

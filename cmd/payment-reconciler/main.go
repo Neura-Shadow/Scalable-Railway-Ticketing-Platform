@@ -58,14 +58,16 @@ type runner interface {
 type runnerFactory func(context.Context, func(string) (string, bool), config) (runner, func(), error)
 
 type envelope struct {
-	Status        string                 `json:"status"`
-	Scope         paymentreconcile.Scope `json:"scope"`
-	ReadOnly      bool                   `json:"read_only"`
-	RowsExamined  int                    `json:"rows_examined"`
-	MismatchCount int                    `json:"mismatch_count"`
-	ManualReviews int                    `json:"manual_reviews"`
-	Truncated     bool                   `json:"truncated"`
-	Error         string                 `json:"error,omitempty"`
+	Status         string                 `json:"status"`
+	Scope          paymentreconcile.Scope `json:"scope"`
+	ReadOnly       bool                   `json:"read_only"`
+	RowsExamined   int                    `json:"rows_examined"`
+	ShardRowsFound int                    `json:"shard_rows_found"`
+	IssuedOrders   int                    `json:"issued_orders"`
+	MismatchCount  int                    `json:"mismatch_count"`
+	ManualReviews  int                    `json:"manual_reviews"`
+	Truncated      bool                   `json:"truncated"`
+	Error          string                 `json:"error,omitempty"`
 }
 
 func main() {
@@ -104,6 +106,7 @@ func run(parent context.Context, args []string, lookup func(string) (string, boo
 		}
 		writeErr := writeEnvelope(stdout, envelope{
 			Status: status, Scope: cfg.Scope, ReadOnly: true, RowsExamined: result.RowsExamined,
+			ShardRowsFound: countShardRows(result.Reports), IssuedOrders: countIssuedOrders(result.Reports),
 			MismatchCount: result.MismatchCount, ManualReviews: result.ManualReviews,
 			Truncated: result.Truncated, Error: code,
 		})
@@ -131,6 +134,26 @@ func run(parent context.Context, args []string, lookup func(string) (string, boo
 			}
 		}
 	}
+}
+
+func countShardRows(reports []paymentreconcile.Report) int {
+	count := 0
+	for _, report := range reports {
+		if report.ShardFound {
+			count++
+		}
+	}
+	return count
+}
+
+func countIssuedOrders(reports []paymentreconcile.Report) int {
+	count := 0
+	for _, report := range reports {
+		if report.TicketOrderFound && report.TicketOrderState == "issued" {
+			count++
+		}
+	}
+	return count
 }
 
 func parse(args []string, lookup func(string) (string, bool)) (config, error) {

@@ -42,7 +42,7 @@ export function paymentRefund() {
     ? cancelIntent(apiURL(), initial.id, actor.token, iterationKey('m6-refund-cancel'))
     : null;
   const refunded = cancellation && pollIntent(
-    apiURL(), initial.id, actor.token, ['refunded', 'manual_review', 'failed'],
+    apiURL(), initial.id, actor.token, ['cancelled', 'manual_review', 'failed'],
     positiveInteger('REFUND_POLL_ATTEMPTS', 80, 120),
   );
   const order = ticketOrderForReservation(listTicketOrders(apiURL(), actor.token), actor.reservationID);
@@ -53,7 +53,7 @@ export function paymentRefund() {
     'refund request is accepted': () => Boolean(cancellation && cancellation.status === 202),
     'refund retry fault is armed': () => Boolean(armed && armed.status === 204),
     'refund converges without active tickets': () => Boolean(
-      refunded && refunded.state === 'refunded' && order
+      refunded && refunded.state === 'cancelled' && order
       && ['refunded', 'cancelled'].includes(order.status)
       && (!Array.isArray(order.tickets) || order.tickets.every((ticket) => ticket.status !== 'active'))
     ),

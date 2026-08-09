@@ -30,7 +30,7 @@ BEGIN
         FROM public.tickets
         WHERE id = '61000000-0000-0000-0000-000000000015'
           AND status = 'active'
-          AND ticket_code = 'TKT61000000-0000-0000-0000-000000000015') <> 1 THEN
+          AND ticket_code = 'TKT.61000000/legacy?00000015') <> 1 THEN
         RAISE EXCEPTION 'version-1 ticket was not preserved';
     END IF;
 END;

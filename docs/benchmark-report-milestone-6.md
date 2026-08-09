@@ -2,91 +2,116 @@
 
 ## Status and evidence boundary
 
-**Status: `not_run`.** No canonical Milestone 6 load/failure bundle has been
-produced, and no payment latency, throughput, recovery, pool-pressure,
-container, capacity or production-readiness result is claimed. This file is an
-honest publication scaffold for the evidence contract in
-[`milestone-6-load-testing.md`](milestone-6-load-testing.md).
+**Status: `passed` for bounded disposable correctness/recovery evidence.** The
+canonical local bundle is `railway-m6-full-20260809s`, with 384 indexed files
+and bundle SHA-256
+`fd5cf8a225f54e95050c1ef5ebb95281f26f35a742be035470a9cea7fe82a399`.
+All ten scenarios, final reconciliation, invariant checks, secret scan and
+project-scoped teardown passed. This does not establish production capacity,
+a live-provider SLO, PCI scope, multi-region behavior or an RPO/RTO.
 
-Do not infer results from unit/integration tests, Milestone 5 benchmarks,
-Compose startup, synthetic provider semantics, or a passing HTTP status. A
-future result must identify the exact source commit and configuration, retain
-raw artifacts, and prove database/provider invariants after every fault.
+The execution-source inventory was frozen for the runtime run. Its only
+source-digest exclusions are the two post-run publication files
+`docs/benchmark-report-milestone-6.md` and
+`docs/milestone-6-load-testing.md`; every executable, workflow, test,
+migration, configuration and runner file remains covered. These reports are
+then verified against the completed external bundle by the generic publication
+guardrail.
 
 ## Run manifest
 
 | Field | Recorded value |
 |---|---|
-| Source commit / worktree state | Not recorded |
-| Start / end time and timezone | Not recorded |
-| Canonical bundle path and SHA-256 | Not recorded |
-| Compose file/config hash | Not recorded |
-| Image names and immutable digests | Not recorded |
-| Fixture seed and scale | Not recorded |
-| Host CPU, memory, disk and OS | Not recorded |
-| Go, Docker, Compose, k6 and PostgreSQL versions | Not recorded |
-| Database settings and pool caps | Not recorded |
-| Provider sandbox profile/version | Not recorded |
-| Failure-hook sequence | Not recorded |
-| Evidence secret/sensitive-data scan | Not recorded |
-| Teardown result | Not recorded |
+| Source commit / worktree state | `d820822fdcf140837b88f3fee442a467b9632723`; dirty 732-file scoped source inventory SHA-256 `ac69442d8f673167b0d50d47abbf7f884a0e0822f995d31c66ccc1e9660fab4f` |
+| Start / end | 2026-08-09 10:30:35Z / 10:34:31Z; 235.274 seconds |
+| Bundle | `railway-m6-full-20260809s`; 384 indexed files; SHA-256 above |
+| Compose hashes | wrapper `15aa2d15c83a928989606e49626fee0ef867439a5ff87a2fe6940682995592d3`; rendered config `e3188182f76511069205d600f8b10dd881dd3a332570e004f80e92d5dca87246` |
+| Fixture seed | `7708ec37a7`; one bounded iteration unless the fault scenario requires 2 or 3 |
+| Topology | 3 APIs, 2 payment workers, 1 reconciler, sandbox, control PostgreSQL, 2 booking-shard PostgreSQL instances |
+| Host | Windows 10.0.22631; 24 logical processors; repository drive 2,048,390,066,176 bytes total / 1,275,440,156,672 free |
+| Docker engine | Docker Desktop x86_64; 24 CPUs; 16,619,581,440-byte memory limit |
+| Tools | Go 1.25.12; Docker 29.6.2; Compose 5.3.1; k6 0.55.0; PostgreSQL 16.14 |
+| PostgreSQL | `max_connections=100`, `shared_buffers=128MB`, `work_mem=4MB`, `wal_level=replica` |
+| Pool caps | control 4/process; each shard 3/process; two-shard process budget 6; shard idle cap 2 |
+| Sensitive-data scan | Passed; zero exact-secret/credential/DSN violations |
+| Teardown | Passed; zero project-labelled containers, volumes or networks remained |
+
+Image names/digests, raw scenario summaries, allowlisted Prometheus samples,
+container samples, database snapshots and failure-hook logs are retained in the
+indexed bundle. CI reproduces and uploads the same bounded artifact shape.
 
 ## Scenario results
 
-| Scenario | Requests / iterations | Checks | Latency / rate | Required observation | Status |
-|---|---:|---:|---|---|---|
-| Payment intent create | - | - | Not measured | One active intent/saga; immutable server-derived amount/currency | `not_run` |
-| Payment idempotency | - | - | Not measured | Exact replay converges; changed fingerprint conflicts | `not_run` |
-| Webhook burst | - | - | Not measured | Duplicate/order/conflict/signature semantics and store-only HTTP | `not_run` |
-| Capture recovery | - | - | Not measured | Query-before-retry after unknown; no duplicate capture | `not_run` |
-| Ticket issuance | - | - | Not measured | One receipt and one ticket per reservation seat after capture | `not_run` |
-| Full refund | - | - | Not measured | Full refund accounting and post-refund seat release | `not_run` |
-| Provider outage | - | - | Not measured | Bounded backoff/manual review and no resource leak | `not_run` |
-| Shard outage | - | - | Not measured | No fallback writer; healthy work isolated | `not_run` |
-| Payment during migration | - | - | Not measured | Version-2 state preserved through cutover/reverse | `not_run` |
-| Multi-replica payment | - | - | Not measured | Stable provider/ticket/refund effects under retries | `not_run` |
+Latency values are k6 request p95/p99. Convergence is the script's end-to-end
+Trend p50/p95/p99; blank means the scenario asserts an immediate boundary
+rather than a convergence duration.
 
-## Requested measurements
+| Scenario | Requests / iterations | Checks | HTTP p95 / p99 ms | Convergence p50 / p95 / p99 ms | Status |
+|---|---:|---:|---:|---:|---|
+| Payment intent create | 1 / 1 | 1/1 | 56.842 / 56.842 | - | `passed` |
+| Capture recovery | 17 / 1 | 3/3 | 16.542 / 22.859 | 1009.5 / 1689.45 / 1749.89 | `passed` |
+| Ticket issuance | 13 / 1 | 3/3 | 18.794 / 23.972 | 382.5 / 495.45 / 505.49 | `passed` |
+| Full refund | 23 / 1 | 4/4 | 15.426 / 20.285 | 506 / 1865.9 / 1986.78 | `passed` |
+| Multi-replica payment | 15 / 1 | 2/2 | 15.405 / 20.991 | 379.5 / 493.35 / 503.47 | `passed` |
+| Payment idempotency | 3 / 1 | 2/2 | 19.275 / 20.864 | - | `passed` |
+| Webhook burst | 19 / 2 | 6/6 | 15.731 / 18.531 | 254 / 254 / 254 | `passed` |
+| Provider outage | 9 / 3 | 6/6 | 23.124 / 24.272 | 1 / 1.9 / 1.98 | `passed` |
+| Shard outage | 2 / 1 | 2/2 | 1734.091 / 1805.989 | - | `passed` |
+| Payment during migration | 16 / 1 | 2/2 | 20.927 / 40.673 | 379 / 492.4 / 502.48 | `passed` |
 
-| Measurement | Result | Evidence |
-|---|---|---|
-| Intent create request/accept rate | Not measured | None |
-| Webhook receive/authenticate/duplicate/conflict/process rate | Not measured | None |
-| Provider authorize/capture/query/void/refund p50/p95/p99 | Not measured | None |
-| Ticket issuance and control-finalization p50/p95/p99 | Not measured | None |
-| End-to-end payment-to-active-ticket p50/p95/p99 | Not measured | None |
-| Refund completion p50/p95/p99 | Not measured | None |
-| Unknown/manual/retry/exhausted counts and repair latency | Not measured | None |
-| Queue depth, oldest age and claim throughput | Not measured | None |
-| pgx total/acquired/idle/max/peak and acquire pressure | Not measured | None |
-| Per-role and allowlisted-shard connection counts | Not measured | None |
-| Host and PostgreSQL resource limits | Not measured | None |
+The shard-outage latency includes the bounded failed-shard timeout. The paired
+healthy-shard request still returned a durable intent, and no fallback writer
+or cross-shard mutation occurred.
+
+## Operational and pool measurements
+
+Final worker histograms aggregate both payment-worker replicas. Percentiles are
+Prometheus bucket upper bounds, not interpolated exact percentiles.
+
+| Measurement | Samples | Average ms | p50 / p95 / p99 upper-bound ms |
+|---|---:|---:|---:|
+| Provider create-checkout success | 13 | 10.429 | 10 / 25 / 25 |
+| Provider capture success | 7 | 10.392 | 10 / 25 / 25 |
+| Provider refund success | 1 | 11.638 | 25 / 25 / 25 |
+| Ticket issuance success | 7 | 32.746 | 25 / 100 / 100 |
+| Webhook processing success | 27 | 6.310 | 10 / 25 / 25 |
+
+Authorize, query-status and void did not produce a success histogram sample in
+this hosted-checkout bundle, so no percentile is invented for them. Their
+timeout/before-commit/after-commit/idempotency behavior is covered by focused
+sandbox, HTTP-adapter and worker integration tests.
+
+Pool evidence contains 1,620 bounded observations and 2,578 allowlisted payment
+metric samples across three API and two worker processes. Final pgx totals were
+5,860 acquires, 0.099084 seconds cumulative acquire duration, 17 empty acquires,
+0 cancelled acquires and a maximum per-process/per-pool observed peak of 1.
+Every record includes total/acquired/idle/max plus only `database_role` and
+allowlisted `shard_id`; no DSN, host, port or entity identifier is a label.
 
 ## Invariant and reconciliation results
 
-| Invariant | Result | Evidence |
-|---|---|---|
-| No duplicate authorize/capture/void/refund provider effect | Not evaluated | None |
-| Intent/receipt/provider amount and currency agree | Not evaluated | None |
-| Unknown provider outcome is queried before retry | Not evaluated | None |
-| No issue before durable captured proof | Not evaluated | None |
-| One stable ticket per reservation seat and unique ticket code | Not evaluated | None |
-| Full refund only; refunded amount within captured amount | Not evaluated | None |
-| No seat release before durable successful refund | Not evaluated | None |
-| Duplicate webhook harmless; changed-hash event rejected | Not evaluated | None |
-| No stale/fallback writer or payment migration mismatch | Not evaluated | None |
-| No leaked lease, goroutine, HTTP body or database connection | Not evaluated | None |
-| No secret, raw card data or unbounded telemetry label | Not evaluated | None |
+| Invariant | Result |
+|---|---|
+| Duplicate provider financial operation/effect | Passed; zero duplicate authorize/capture/void/refund identities |
+| Intent/operation amount and currency | Passed; zero mismatch |
+| Unknown capture handling | Passed; query-before-retry convergence, one durable capture |
+| Ticket issuance | Passed; no issue before captured proof, one receipt/ticket per seat, globally claimed code |
+| Refund/compensation | Passed; full refund only, durable compensation before seat release |
+| Webhook identity/order | Passed; duplicate/out-of-order handling and changed-hash quarantine assertions |
+| Shard failure isolation | Passed; no fallback writer and healthy shard accepted work |
+| Physical migration | Passed; v2 payment state/receipts survived cutover; final state `rollback_window` |
+| Leases/journals/routes | Passed; zero expired claimed lease, journal gap or stale-route effect |
+| Reconciliation | `payment-all`, detect-only; 13 intents and 13 shard rows examined, 6 issued orders observed, 0 mismatches, 0 manual reviews, not truncated |
+| Final database violations | control 0; shard 0 |
+| Secrets and teardown | scan passed; zero retained project resources |
 
-## Publication gate
+Publication proof:
+`rows_examined=13; shard_rows_found=13; issued_orders=6; mismatch_count=0; manual_reviews=0; truncated=false`.
 
-Replace `not_run` and `Not measured` only with values directly parsed from a
-sanitized canonical result and linked raw artifacts. Record sample sizes,
-units, time window and percentile method. Expected fault responses must be
-separated from unexpected failures. Missing host or database metrics remain
-explicitly unavailable; they must not be estimated.
+## Interpretation
 
-A future passing report is bounded disposable evidence only. It must state its
-limits and cannot claim live-provider behavior, PCI compliance, production
-capacity, exactly-once delivery, zero downtime, multi-region resilience,
-national-scale throughput, RPO/RTO or cost without separate direct evidence.
+This run is deliberately small and correctness-oriented. Request counts and
+latencies are reported to make the result reproducible, not as a capacity
+claim. Production sizing requires a separate clean-environment campaign with a
+real provider, production ingress/egress, sustained concurrency, resource and
+WAL/I/O sampling, settlement reconciliation, and region-failure objectives.

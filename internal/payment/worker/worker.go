@@ -12,6 +12,7 @@ import (
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/domain"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/shard"
 	"github.com/google/uuid"
 )
 
@@ -306,7 +307,7 @@ func (worker *Worker) processAction(ctx context.Context, now time.Time, claim Ac
 	}
 	if err != nil {
 		review := claim.Attempts >= worker.config.MaxAttempts || permanentShardError(err)
-		return worker.failAction(ctx, now, started, claim, "shard_command_failed", review, result)
+		return worker.failAction(ctx, now, started, claim, shardFailureCategory(err), review, result)
 	}
 	if !validActionEvidence(claim, evidence) {
 		return worker.failAction(ctx, now, started, claim, "shard_receipt_conflict", true, result)
@@ -318,6 +319,37 @@ func (worker *Worker) processAction(ctx context.Context, now time.Time, claim Ac
 	result.ActionsDone++
 	worker.record(actionObservation(claim, "success", "none", time.Since(started)))
 	return nil
+}
+
+func shardFailureCategory(err error) string {
+	switch {
+	case errors.Is(err, shard.ErrTicketPlanUnavailable):
+		return "shard_ticket_plan_failed"
+	case errors.Is(err, shard.ErrTicketClaimUnauthorized):
+		return "shard_ticket_claim_unauthorized"
+	case errors.Is(err, shard.ErrTicketClaimReadFailed):
+		switch {
+		case errors.Is(err, shard.ErrTicketClaimReadTimeout):
+			return "shard_ticket_claim_read_timeout"
+		case errors.Is(err, shard.ErrTicketClaimSQLFailed):
+			return "shard_ticket_claim_sql_failed"
+		case errors.Is(err, shard.ErrTicketClaimScanFailed):
+			return "shard_ticket_claim_scan_failed"
+		case errors.Is(err, shard.ErrTicketClaimDecodeFailed):
+			return "shard_ticket_claim_decode_failed"
+		}
+		return "shard_ticket_claim_read_failed"
+	case errors.Is(err, shard.ErrTicketClaimConflict):
+		return "shard_ticket_claim_conflict"
+	case errors.Is(err, shard.ErrTicketClaimCommitFailed):
+		return "shard_ticket_claim_commit_failed"
+	case errors.Is(err, shard.ErrTicketClaimUnavailable):
+		return "shard_ticket_claim_failed"
+	case errors.Is(err, shard.ErrTicketIssueUnavailable):
+		return "shard_ticket_issue_failed"
+	default:
+		return "shard_command_failed"
+	}
 }
 
 func (worker *Worker) failAction(ctx context.Context, now, started time.Time, claim ActionClaim, category string, review bool, result *Result) error {
@@ -591,7 +623,8 @@ func validActionClaim(claim ActionClaim, workerID string) bool {
 func validActionEvidence(claim ActionClaim, evidence ActionEvidence) bool {
 	switch claim.Type {
 	case ActionIssueTickets:
-		if evidence.Issue.TicketOrderID == uuid.Nil || len(evidence.Issue.TicketIDs) == 0 || evidence.Issue.IssuedAt.IsZero() {
+		if evidence.Issue.TicketOrderID == uuid.Nil || len(evidence.Issue.TicketIDs) == 0 ||
+			evidence.Issue.OrderCreatedAt.IsZero() || evidence.Issue.IssuedAt.IsZero() {
 			return false
 		}
 		seen := make(map[uuid.UUID]struct{}, len(evidence.Issue.TicketIDs))

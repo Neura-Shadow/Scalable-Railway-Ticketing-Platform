@@ -57,9 +57,12 @@ Customer cancellation maps to the financial boundary:
   the idempotent shard cancellation command;
 - after authorization and before capture, void the authorization, query any
   unknown outcome, then cancel locally only after absence of capture is proven;
-- after capture, use the same full-refund saga, move reservation/tickets to
-  `refund_pending`, and release only after proven refund and local compensation;
-  and
+- after capture, serialize behind the ticket-issuance boundary: while the
+  intent is `ticket_issue_pending` (including receipt-backed control-finalize
+  repair), cancellation returns a bounded conflict and performs no provider or
+  shard mutation; once issuance is durably `completed`, use the same
+  full-refund saga, move reservation/tickets to `refund_pending`, and release
+  only after proven refund and local compensation; and
 - after full compensation, repeated cancellation returns the same terminal
   result.
 

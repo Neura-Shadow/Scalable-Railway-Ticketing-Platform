@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -130,5 +131,35 @@ FROM public.reservations AS reservation WHERE reservation.id=$1`, reservationID,
 	}
 	if status != "payment_pending" || intentID != command.PaymentIntentID || receiptCount != 1 || orderCount != 1 {
 		t.Fatalf("status=%s intent=%s receipts=%d orders=%d", status, intentID, receiptCount, orderCount)
+	}
+
+	expiredReservationID := uuid.New()
+	if _, err := admin.Exec(ctx, `INSERT INTO public.reservations(
+ id,user_id,train_run_id,assignment_generation,segment_count,from_stop_index,to_stop_index,
+ seat_class,status,expires_at,total_amount_minor,currency,created_at,updated_at
+) VALUES($1,$2,$3,1,1,0,1,'standard','held',clock_timestamp()-interval '1 second',700,'TWD',
+         clock_timestamp()-interval '2 minutes',clock_timestamp()-interval '2 minutes')`,
+		expiredReservationID, ownerID, trainRunID); err != nil {
+		t.Fatalf("seed expired reservation: %v", err)
+	}
+	expiredCommand := command
+	expiredCommand.CommandID = uuid.New()
+	expiredCommand.PaymentIntentID = uuid.New()
+	expiredCommand.ReservationID = expiredReservationID
+	if _, err := store.BeginPayment(ctx, route, expiredCommand); !errors.Is(err, paymentapp.ErrReservationNotPayable) {
+		t.Fatalf("expired BeginPayment() error = %v, want not payable", err)
+	}
+	var expiredStatus string
+	var expiredReceipts, expiredOrders int
+	if err := admin.QueryRow(ctx, `SELECT status,
+ (SELECT count(*)::integer FROM public.payment_command_receipts WHERE command_id=$2),
+ (SELECT count(*)::integer FROM public.ticket_orders WHERE reservation_id=$1)
+ FROM public.reservations WHERE id=$1`, expiredReservationID, expiredCommand.CommandID).Scan(
+		&expiredStatus, &expiredReceipts, &expiredOrders,
+	); err != nil {
+		t.Fatalf("inspect expired reservation: %v", err)
+	}
+	if expiredStatus != "held" || expiredReceipts != 0 || expiredOrders != 0 {
+		t.Fatalf("expired status=%s receipts=%d orders=%d", expiredStatus, expiredReceipts, expiredOrders)
 	}
 }

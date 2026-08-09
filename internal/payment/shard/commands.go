@@ -27,6 +27,13 @@ type IssueTicketsCommand struct {
 	Currency           string
 	CaptureProofHash   [32]byte
 	RequestFingerprint [32]byte
+	PlannedTicketIDs   []uuid.UUID
+	PlannedTicketCodes []string
+}
+
+type TicketIdentityPlan struct {
+	TicketIDs   []uuid.UUID
+	TicketCodes []string
 }
 
 type IssueTicketsReceipt struct {
@@ -39,6 +46,7 @@ type IssueTicketsReceipt struct {
 	TicketCodes     []string
 	AmountMinor     int64
 	Currency        string
+	OrderCreatedAt  time.Time
 	IssuedAt        time.Time
 }
 

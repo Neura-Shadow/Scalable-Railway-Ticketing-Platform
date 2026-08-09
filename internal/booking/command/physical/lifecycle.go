@@ -217,7 +217,7 @@ VALUES($1,$2,$3,'ticket',$4,'ticket.created',$5::jsonb)`,
 	}
 	receipt := committedReceipt(bookingCommand)
 	receipt.TicketOrderID, receipt.TicketCount = orderID, len(seatIDs)
-	receipt.TicketIDs, err = loadOrderTicketIDs(ctx, tx, orderID, len(seatIDs))
+	receipt.TicketIDs, receipt.TicketCodes, err = loadOrderTicketIdentities(ctx, tx, orderID, len(seatIDs))
 	if err != nil {
 		return command.Receipt{}, false, err
 	}
@@ -228,28 +228,31 @@ VALUES($1,$2,$3,'ticket',$4,'ticket.created',$5::jsonb)`,
 	return receipt, changed, nil
 }
 
-func loadOrderTicketIDs(ctx context.Context, tx pgx.Tx, orderID uuid.UUID, expected int) ([]uuid.UUID, error) {
+func loadOrderTicketIdentities(ctx context.Context, tx pgx.Tx, orderID uuid.UUID, expected int) ([]uuid.UUID, []string, error) {
 	if orderID == uuid.Nil || expected < 1 || expected > command.MaxReceiptTickets {
-		return nil, ErrShardPersistence
+		return nil, nil, ErrShardPersistence
 	}
-	rows, err := tx.Query(ctx, `SELECT id FROM tickets WHERE ticket_order_id=$1 ORDER BY id LIMIT $2`,
+	rows, err := tx.Query(ctx, `SELECT id,ticket_code FROM tickets WHERE ticket_order_id=$1 ORDER BY id LIMIT $2`,
 		orderID, command.MaxReceiptTickets+1)
 	if err != nil {
-		return nil, ErrShardPersistence
+		return nil, nil, ErrShardPersistence
 	}
 	defer rows.Close()
 	ticketIDs := make([]uuid.UUID, 0, expected)
+	ticketCodes := make([]string, 0, expected)
 	for rows.Next() {
 		var ticketID uuid.UUID
-		if err := rows.Scan(&ticketID); err != nil || ticketID == uuid.Nil {
-			return nil, ErrShardPersistence
+		var ticketCode string
+		if err := rows.Scan(&ticketID, &ticketCode); err != nil || ticketID == uuid.Nil || len(ticketCode) < 16 || len(ticketCode) > 64 {
+			return nil, nil, ErrShardPersistence
 		}
 		ticketIDs = append(ticketIDs, ticketID)
+		ticketCodes = append(ticketCodes, ticketCode)
 	}
 	if rows.Err() != nil || len(ticketIDs) != expected || len(ticketIDs) > command.MaxReceiptTickets {
-		return nil, ErrShardPersistence
+		return nil, nil, ErrShardPersistence
 	}
-	return ticketIDs, nil
+	return ticketIDs, ticketCodes, nil
 }
 
 func cancelReservation(ctx context.Context, tx pgx.Tx, bookingCommand command.Command) (command.Receipt, bool, error) {

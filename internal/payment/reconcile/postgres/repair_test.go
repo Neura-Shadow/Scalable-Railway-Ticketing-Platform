@@ -63,7 +63,8 @@ func TestRepairReceiptValidationFailsClosed(t *testing.T) {
 		CommandID: issueCommand.CommandID, IssuanceID: issueCommand.IssuanceID, PaymentIntentID: evidence.IntentID,
 		ReservationID: evidence.ReservationID, TicketOrderID: uuid.New(), TicketIDs: []uuid.UUID{ticketID},
 		TicketCodes: []string{"ticket_code_000001"},
-		AmountMinor: evidence.AmountMinor, Currency: evidence.Currency, IssuedAt: time.Now(),
+		AmountMinor: evidence.AmountMinor, Currency: evidence.Currency,
+		OrderCreatedAt: time.Now().Add(-time.Minute), IssuedAt: time.Now(),
 	}
 	if !validIssueRepairReceipt(evidence, issueCommand, issue) {
 		t.Fatal("valid issue receipt rejected")

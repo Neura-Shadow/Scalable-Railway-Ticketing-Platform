@@ -62,6 +62,7 @@ func TestCreateIntentRejectsNonPayableReservationBeforeControlMutation(t *testin
 		{name: "wrong owner", snapshot: application.ReservationSnapshot{ID: uuid.New(), OwnerID: uuid.New(), TrainRunID: uuid.New(), Status: "held", AmountMinor: 100, Currency: "TWD", ExpiresAt: now.Add(time.Minute)}, want: application.ErrPaymentNotFound},
 		{name: "confirmed", snapshot: application.ReservationSnapshot{ID: uuid.New(), OwnerID: uuid.New(), TrainRunID: uuid.New(), Status: "confirmed", AmountMinor: 100, Currency: "TWD", ExpiresAt: now.Add(time.Minute)}, want: application.ErrReservationNotPayable},
 		{name: "expired", snapshot: application.ReservationSnapshot{ID: uuid.New(), OwnerID: uuid.New(), TrainRunID: uuid.New(), Status: "held", AmountMinor: 100, Currency: "TWD", ExpiresAt: now}, want: application.ErrReservationNotPayable},
+		{name: "zero amount", snapshot: application.ReservationSnapshot{ID: uuid.New(), OwnerID: uuid.New(), TrainRunID: uuid.New(), Status: "held", AmountMinor: 0, Currency: "TWD", ExpiresAt: now.Add(time.Minute)}, want: application.ErrReservationNotPayable},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -159,6 +160,48 @@ func TestReservationCancellationRejectsNoncancellableTerminalIntent(t *testing.T
 	}
 }
 
+func TestReservationCancellationDefersAcrossTicketIssuanceBoundary(t *testing.T) {
+	t.Parallel()
+	for _, state := range []string{"captured", "ticket_issue_pending", "manual_review"} {
+		t.Run(state, func(t *testing.T) {
+			owner, reservationID := uuid.New(), uuid.New()
+			store := &intentStoreFake{intent: application.IntentRecord{
+				ID: uuid.New(), OwnerID: owner, ReservationID: reservationID, State: state,
+			}}
+			service := application.NewService(store, &reservationGatewayFake{}, time.Now, uuid.New)
+			_, err := service.CancelReservation(context.Background(), application.CancelReservationCommand{
+				OwnerID: owner, ReservationID: reservationID, IdempotencyKey: "cancel-payment-1",
+			})
+			if !errors.Is(err, application.ErrPaymentConflict) || store.cancelCalls != 0 {
+				t.Fatalf("state=%s error=%v cancelCalls=%d", state, err, store.cancelCalls)
+			}
+		})
+	}
+}
+
+func TestExpiredShardReservationTerminatesReservedIntentBeforeProviderWork(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
+	owner, reservationID := uuid.New(), uuid.New()
+	store := &intentStoreFake{}
+	reservations := &reservationGatewayFake{
+		snapshot: application.ReservationSnapshot{
+			ID: reservationID, TrainRunID: uuid.New(), OwnerID: owner, Status: "held",
+			ExpiresAt: now.Add(time.Minute), AmountMinor: 700, Currency: "TWD",
+		},
+		beginErr: application.ErrReservationNotPayable,
+	}
+	service := application.NewService(store, reservations, func() time.Time { return now }, uuid.New)
+	intent, err := service.CreateIntent(context.Background(), application.CreateIntentCommand{
+		OwnerID: owner, ReservationID: reservationID, IdempotencyKey: "payment-key-123",
+	})
+	if !errors.Is(err, application.ErrReservationNotPayable) || intent.ID == uuid.Nil ||
+		store.failCalls != 1 || store.intent.State != "failed" || store.finalizeCalls != 0 {
+		t.Fatalf("intent=%+v err=%v failCalls=%d state=%s finalizeCalls=%d",
+			intent, err, store.failCalls, store.intent.State, store.finalizeCalls)
+	}
+}
+
 type intentStoreFake struct {
 	intent        application.IntentRecord
 	lastReserve   application.ReserveIntentRequest
@@ -168,6 +211,16 @@ type intentStoreFake struct {
 	lastCancel    application.CancelIntentRequest
 	cancelCalls   int
 	finalizeCalls int
+	failCalls     int
+}
+
+func (store *intentStoreFake) FailReservationSecuring(_ context.Context, intentID uuid.UUID, fingerprint [32]byte) error {
+	store.failCalls++
+	if intentID != store.intent.ID || fingerprint != store.lastReserve.RequestFingerprint {
+		return application.ErrPaymentConflict
+	}
+	store.intent.State = "failed"
+	return nil
 }
 
 func (store *intentStoreFake) LookupIntentByIdempotency(_ context.Context, _ uuid.UUID, keyHash, fingerprint [32]byte) (application.IntentRecord, bool, error) {
@@ -241,6 +294,7 @@ type reservationGatewayFake struct {
 	snapshot   application.ReservationSnapshot
 	beginCalls int
 	lastBegin  application.BeginPaymentCommand
+	beginErr   error
 }
 
 func (gateway *reservationGatewayFake) GetPayableReservation(context.Context, uuid.UUID) (application.ReservationSnapshot, error) {
@@ -248,6 +302,11 @@ func (gateway *reservationGatewayFake) GetPayableReservation(context.Context, uu
 }
 
 func (gateway *reservationGatewayFake) BeginPayment(_ context.Context, command application.BeginPaymentCommand) (application.BeginPaymentReceipt, error) {
+	if gateway.beginErr != nil {
+		gateway.beginCalls++
+		gateway.lastBegin = command
+		return application.BeginPaymentReceipt{}, gateway.beginErr
+	}
 	if gateway.beginCalls > 0 {
 		return application.BeginPaymentReceipt{CommandID: gateway.lastBegin.CommandID, PaymentIntentID: gateway.lastBegin.PaymentIntentID, RequestFingerprint: gateway.lastBegin.RequestFingerprint}, nil
 	}

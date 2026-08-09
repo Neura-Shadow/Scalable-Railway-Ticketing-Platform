@@ -22,6 +22,62 @@ type RouteResolver interface {
 	Resolve(context.Context, uuid.UUID, bool) (shardphysical.Resolution, error)
 }
 
+func (store *Store) PlanTicketIssue(ctx context.Context, route sharding.ShardRoute, command paymentshard.IssueTicketsCommand) (paymentshard.TicketIdentityPlan, error) {
+	if !validIssueCommandBase(route, command) {
+		return paymentshard.TicketIdentityPlan{}, paymentapp.ErrReservationNotPayable
+	}
+	resolved, err := store.resolve(ctx, route, false, true)
+	if err != nil {
+		return paymentshard.TicketIdentityPlan{}, err
+	}
+	tx, err := resolved.Handle.Pool().BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return paymentshard.TicketIdentityPlan{}, paymentshard.ErrShardPaymentUnavailable
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	var owner uuid.UUID
+	var status string
+	var amount int64
+	var currency string
+	var intentID pgtype.UUID
+	if err := tx.QueryRow(ctx, `SELECT user_id,status,total_amount_minor,currency,payment_intent_id
+FROM public.reservations
+WHERE id=$1 AND train_run_id=$2 AND assignment_generation=$3`, command.ReservationID,
+		route.TrainRunID(), route.Generation().Int64()).Scan(&owner, &status, &amount, &currency, &intentID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return paymentshard.TicketIdentityPlan{}, paymentapp.ErrPaymentNotFound
+		}
+		return paymentshard.TicketIdentityPlan{}, paymentshard.ErrShardPaymentUnavailable
+	}
+	if owner != command.OwnerID || (status != "payment_pending" && status != "payment_review") ||
+		!intentID.Valid || intentID.Bytes != command.PaymentIntentID || amount != command.AmountMinor || currency != command.Currency {
+		return paymentshard.TicketIdentityPlan{}, paymentapp.ErrReservationNotPayable
+	}
+	rows, err := tx.Query(ctx, `SELECT id FROM public.reservation_seats
+WHERE reservation_id=$1 AND train_run_id=$2 AND assignment_generation=$3 ORDER BY id`,
+		command.ReservationID, route.TrainRunID(), route.Generation().Int64())
+	if err != nil {
+		return paymentshard.TicketIdentityPlan{}, paymentshard.ErrShardPaymentUnavailable
+	}
+	defer rows.Close()
+	plan := paymentshard.TicketIdentityPlan{TicketIDs: make([]uuid.UUID, 0, 8), TicketCodes: make([]string, 0, 8)}
+	for rows.Next() {
+		var seatID uuid.UUID
+		if err := rows.Scan(&seatID); err != nil || seatID == uuid.Nil || len(plan.TicketIDs) >= 100 {
+			return paymentshard.TicketIdentityPlan{}, paymentshard.ErrShardPaymentUnavailable
+		}
+		plan.TicketIDs = append(plan.TicketIDs, uuid.NewSHA1(command.IssuanceID, seatID[:]))
+		plan.TicketCodes = append(plan.TicketCodes, opaqueTicketCode(command.IssuanceID, seatID))
+	}
+	if rows.Err() != nil || len(plan.TicketIDs) == 0 {
+		return paymentshard.TicketIdentityPlan{}, paymentshard.ErrShardPaymentUnavailable
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return paymentshard.TicketIdentityPlan{}, paymentshard.ErrShardPaymentUnavailable
+	}
+	return plan, nil
+}
+
 func (store *Store) IssueTickets(ctx context.Context, route sharding.ShardRoute, command paymentshard.IssueTicketsCommand) (paymentshard.IssueTicketsReceipt, error) {
 	if !validIssueCommand(route, command) {
 		return paymentshard.IssueTicketsReceipt{}, paymentapp.ErrReservationNotPayable
@@ -90,14 +146,18 @@ FOR UPDATE`, command.ReservationID, route.TrainRunID(), route.Generation().Int64
 	}
 	ticketOrderID := uuid.NewSHA1(command.PaymentIntentID, []byte("ticket-order"))
 	var orderStatus string
+	var orderCreatedAt time.Time
 	err = tx.QueryRow(ctx, `
-SELECT status FROM public.ticket_orders
+SELECT status,created_at FROM public.ticket_orders
 WHERE id=$1 AND reservation_id=$2 AND payment_intent_id=$3
   AND train_run_id=$4 AND assignment_generation=$5
   AND total_amount_minor=$6 AND currency=$7
 FOR UPDATE`, ticketOrderID, command.ReservationID, command.PaymentIntentID,
-		route.TrainRunID(), route.Generation().Int64(), command.AmountMinor, command.Currency).Scan(&orderStatus)
+		route.TrainRunID(), route.Generation().Int64(), command.AmountMinor, command.Currency).Scan(&orderStatus, &orderCreatedAt)
 	if err != nil || (orderStatus != "payment_pending" && orderStatus != "payment_authorized" && orderStatus != "payment_captured" && orderStatus != "issuance_pending") {
+		return rollback(paymentshard.ErrShardPaymentUnavailable)
+	}
+	if orderCreatedAt.IsZero() {
 		return rollback(paymentshard.ErrShardPaymentUnavailable)
 	}
 	commandReceiptID := uuid.NewSHA1(command.CommandID, []byte("payment-command-receipt"))
@@ -144,11 +204,17 @@ ORDER BY id`, command.ReservationID, route.TrainRunID(), route.Generation().Int6
 		return rollback(paymentshard.ErrShardPaymentUnavailable)
 	}
 	rows.Close()
+	if len(command.PlannedTicketIDs) != len(seatIDs) || len(command.PlannedTicketCodes) != len(seatIDs) {
+		return rollback(paymentapp.ErrPaymentConflict)
+	}
 	ticketIDs := make([]uuid.UUID, 0, len(seatIDs))
 	ticketCodes := make([]string, 0, len(seatIDs))
-	for _, seatID := range seatIDs {
+	for index, seatID := range seatIDs {
 		ticketID := uuid.NewSHA1(command.IssuanceID, seatID[:])
 		ticketCode := opaqueTicketCode(command.IssuanceID, seatID)
+		if command.PlannedTicketIDs[index] != ticketID || command.PlannedTicketCodes[index] != ticketCode {
+			return rollback(paymentapp.ErrPaymentConflict)
+		}
 		if err := execOne(ctx, tx, `
 INSERT INTO public.tickets(
  id,ticket_order_id,reservation_seat_id,train_run_id,
@@ -208,11 +274,17 @@ WHERE command_id=$1 AND status='started'`, command.CommandID, ticketOrderID); er
 	return paymentshard.IssueTicketsReceipt{
 		CommandID: command.CommandID, IssuanceID: command.IssuanceID, PaymentIntentID: command.PaymentIntentID,
 		ReservationID: command.ReservationID, TicketOrderID: ticketOrderID, TicketIDs: ticketIDs, TicketCodes: ticketCodes,
-		AmountMinor: command.AmountMinor, Currency: command.Currency, IssuedAt: issuedAt.UTC(),
+		AmountMinor: command.AmountMinor, Currency: command.Currency,
+		OrderCreatedAt: orderCreatedAt.UTC(), IssuedAt: issuedAt.UTC(),
 	}, nil
 }
 
 func validIssueCommand(route sharding.ShardRoute, command paymentshard.IssueTicketsCommand) bool {
+	return validIssueCommandBase(route, command) && len(command.PlannedTicketIDs) > 0 &&
+		len(command.PlannedTicketIDs) == len(command.PlannedTicketCodes)
+}
+
+func validIssueCommandBase(route sharding.ShardRoute, command paymentshard.IssueTicketsCommand) bool {
 	return command.CommandID != uuid.Nil && command.IssuanceID != uuid.Nil && command.PaymentIntentID != uuid.Nil &&
 		command.PaymentOperationID != uuid.Nil && command.ReservationID != uuid.Nil && command.OwnerID != uuid.Nil &&
 		command.TrainRunID == route.TrainRunID() && command.AmountMinor >= 0 && len(command.Currency) == 3 &&
@@ -288,6 +360,15 @@ WHERE command_id=$1 AND operation='payment.capture_recorded'`, command.CommandID
 	if storedFingerprint != command.RequestFingerprint {
 		return paymentshard.IssueTicketsReceipt{}, false, paymentapp.ErrPaymentConflict
 	}
+	var orderCreatedAt time.Time
+	if err := tx.QueryRow(ctx, `SELECT created_at
+FROM public.ticket_orders
+WHERE id=$1 AND reservation_id=$2 AND payment_intent_id=$3
+  AND status='issued' AND total_amount_minor=$4 AND currency=$5`,
+		orderID, command.ReservationID, command.PaymentIntentID,
+		command.AmountMinor, command.Currency).Scan(&orderCreatedAt); err != nil || orderCreatedAt.IsZero() {
+		return paymentshard.IssueTicketsReceipt{}, false, paymentapp.ErrPaymentConflict
+	}
 	rows, err := tx.Query(ctx, `SELECT id,ticket_code FROM public.tickets WHERE ticket_order_id=$1 ORDER BY id LIMIT 101`, orderID)
 	if err != nil {
 		return paymentshard.IssueTicketsReceipt{}, false, paymentshard.ErrShardPaymentUnavailable
@@ -310,7 +391,8 @@ WHERE command_id=$1 AND operation='payment.capture_recorded'`, command.CommandID
 	return paymentshard.IssueTicketsReceipt{
 		CommandID: command.CommandID, IssuanceID: command.IssuanceID, PaymentIntentID: paymentIntentID,
 		ReservationID: reservationID, TicketOrderID: orderID, TicketIDs: ticketIDs, TicketCodes: ticketCodes,
-		AmountMinor: amount, Currency: currency, IssuedAt: createdAt.Time.UTC(),
+		AmountMinor: amount, Currency: currency,
+		OrderCreatedAt: orderCreatedAt.UTC(), IssuedAt: createdAt.Time.UTC(),
 	}, true, nil
 }
 
@@ -399,13 +481,15 @@ func (store *Store) BeginPayment(ctx context.Context, route sharding.ShardRoute,
 		amountMinor    int64
 		currency       string
 		storedIntentID pgtype.UUID
+		unexpired      bool
 	)
 	err = tx.QueryRow(ctx, `
-SELECT user_id,status,expires_at,total_amount_minor,currency,payment_intent_id
+SELECT user_id,status,expires_at,total_amount_minor,currency,payment_intent_id,
+       expires_at > clock_timestamp()
 FROM public.reservations
 WHERE id=$1 AND train_run_id=$2 AND assignment_generation=$3
 FOR UPDATE`, command.ReservationID, route.TrainRunID(), route.Generation().Int64()).Scan(
-		&owner, &status, &expiresAt, &amountMinor, &currency, &storedIntentID,
+		&owner, &status, &expiresAt, &amountMinor, &currency, &storedIntentID, &unexpired,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return rollback(paymentapp.ErrPaymentNotFound)
@@ -416,7 +500,7 @@ FOR UPDATE`, command.ReservationID, route.TrainRunID(), route.Generation().Int64
 	if owner != command.OwnerID {
 		return rollback(paymentapp.ErrPaymentNotFound)
 	}
-	if status != "held" || !expiresAt.Valid || !command.GraceExpiresAt.After(expiresAt.Time) ||
+	if status != "held" || !expiresAt.Valid || !unexpired || !command.GraceExpiresAt.After(expiresAt.Time) ||
 		amountMinor != command.AmountMinor || currency != command.Currency || storedIntentID.Valid {
 		return rollback(paymentapp.ErrReservationNotPayable)
 	}
@@ -425,8 +509,11 @@ FOR UPDATE`, command.ReservationID, route.TrainRunID(), route.Generation().Int64
 UPDATE public.reservations
 SET status='payment_pending',payment_intent_id=$2,payment_amount_minor=$3,
     payment_currency=$4,payment_grace_expires_at=$5
-WHERE id=$1 AND status='held'`, command.ReservationID, command.PaymentIntentID,
-		command.AmountMinor, command.Currency, command.GraceExpiresAt.UTC()); err != nil {
+WHERE id=$1 AND train_run_id=$6 AND assignment_generation=$7
+  AND status='held' AND payment_intent_id IS NULL
+  AND expires_at > clock_timestamp()`, command.ReservationID, command.PaymentIntentID,
+		command.AmountMinor, command.Currency, command.GraceExpiresAt.UTC(),
+		route.TrainRunID(), route.Generation().Int64()); err != nil {
 		return rollback(err)
 	}
 	// The receipt FK includes the immutable payment authority snapshot. Persist
@@ -503,7 +590,7 @@ func (store *Store) resolve(ctx context.Context, route sharding.ShardRoute, refr
 
 func validBeginCommand(route sharding.ShardRoute, command paymentapp.BeginPaymentCommand) bool {
 	return command.CommandID != uuid.Nil && command.PaymentIntentID != uuid.Nil && command.ReservationID != uuid.Nil &&
-		command.OwnerID != uuid.Nil && command.TrainRunID == route.TrainRunID() && command.AmountMinor >= 0 &&
+		command.OwnerID != uuid.Nil && command.TrainRunID == route.TrainRunID() && command.AmountMinor > 0 &&
 		len(command.Currency) == 3 && !command.GraceExpiresAt.IsZero() && command.RequestFingerprint != [32]byte{}
 }
 

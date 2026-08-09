@@ -97,6 +97,11 @@ BEGIN
 END
 $m6_down_preflight$;
 
+DROP TRIGGER ticket_shard_locators_mark_unclaimed_code_pending
+    ON public.ticket_shard_locators;
+DROP FUNCTION public.mark_ticket_code_claims_pending_for_unclaimed_locator();
+DROP FUNCTION public.lock_ticket_code_claims();
+DROP TABLE public.ticket_code_claim_readiness;
 DROP TABLE public.ticket_code_directory;
 DROP FUNCTION public.guard_ticket_code_directory_row();
 DROP TABLE public.payment_manual_review_cases;
@@ -236,6 +241,11 @@ ALTER TABLE booking_shard_1.tickets
     DROP CONSTRAINT tickets_opaque_code_check,
     DROP CONSTRAINT tickets_status_check,
     ADD CONSTRAINT tickets_status_check CHECK (status IN ('active','cancelled'));
+
+DROP TRIGGER tickets_guard_identity ON public.tickets;
+DROP TRIGGER tickets_guard_identity ON booking_shard_0.tickets;
+DROP TRIGGER tickets_guard_identity ON booking_shard_1.tickets;
+DROP FUNCTION public.guard_ticket_identity();
 
 CREATE VIEW public.physical_source_reservation_rows AS
 SELECT 'legacy'::text AS source_shard_id, reservation.* FROM public.reservations AS reservation

@@ -110,6 +110,11 @@ func paymentWebhookHandler(dependencies Dependencies) gin.HandlerFunc {
 			writeError(c, ErrPaymentNotEnabled)
 			return
 		}
+		if !enforceRateLimit(c, dependencies.RateLimiter, RateLimitRequest{
+			Scope: RateLimitPaymentWebhook, Key: directClientKey(c),
+		}, false) {
+			return
+		}
 		mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
 		if err != nil || mediaType != "application/json" {
 			writePublicError(c, http.StatusUnsupportedMediaType, "unsupported_media_type", "content type must be application/json")

@@ -66,7 +66,7 @@ func TestLoadFromForParsesSchemaPOCBookingShardControls(t *testing.T) {
 		"APP_ENV":                         "test",
 		"DATABASE_URL":                    "postgres://api@db.example/railway",
 		"REDIS_ADDRESS":                   "redis.example:6379",
-		"JWT_SECRET":                      "test-secret",
+		"JWT_SECRET":                      "test-secret-at-least-32-bytes-long",
 		"ADMISSION_TOKEN_KEYRING":         testAdmissionKeyring,
 		"ADMISSION_TOKEN_ISSUE_KEY_ID":    "current",
 		"ADMISSION_TOKEN_ACCEPT_KEY_IDS":  "current",
@@ -333,7 +333,7 @@ func validBookingShardAPIEnvironment() map[string]string {
 		"APP_ENV":                        "test",
 		"DATABASE_URL":                   "postgres://api@db.example/railway",
 		"REDIS_ADDRESS":                  "redis.example:6379",
-		"JWT_SECRET":                     "test-secret",
+		"JWT_SECRET":                     "test-secret-at-least-32-bytes-long",
 		"ADMISSION_TOKEN_KEYRING":        testAdmissionKeyring,
 		"ADMISSION_TOKEN_ISSUE_KEY_ID":   "current",
 		"ADMISSION_TOKEN_ACCEPT_KEY_IDS": "current",
@@ -353,7 +353,7 @@ func TestLoadFromForAPILoadsReservationProtectionAndSharedTokenKeyring(t *testin
 	env := map[string]string{
 		"DATABASE_URL":                          "postgres://api@db.example/railway",
 		"REDIS_ADDRESS":                         "redis.example:6379",
-		"JWT_SECRET":                            "test-secret",
+		"JWT_SECRET":                            "test-secret-at-least-32-bytes-long",
 		"RESERVATION_MAX_ACTIVE_HOLDS_PER_USER": "7",
 		"RESERVATION_MAX_ACTIVE_HOLDS_PER_USER_PER_TRAIN_RUN": "2",
 		"RESERVATION_MAX_ACTIVE_PASSENGERS_PER_USER":          "15",
@@ -564,6 +564,19 @@ func TestProductionRequiresSafeDependenciesAndSecret(t *testing.T) {
 	}
 	if strings.Contains(message, cfg.JWTSecret) {
 		t.Fatal("validation error exposed JWT secret")
+	}
+}
+
+func TestAPIRejectsShortJWTSecretInEveryEnvironment(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	cfg.DatabaseURL = "postgres://api@db.example/railway"
+	cfg.RedisAddress = "redis.example:6379"
+	cfg.JWTSecret = "short-secret"
+	setValidAdmissionTokenConfig(&cfg)
+	err := cfg.ValidateFor(config.ProcessAPI)
+	if err == nil || !strings.Contains(err.Error(), "JWT_SECRET must contain at least 32 bytes") {
+		t.Fatalf("ValidateFor(api) error = %v, want bounded JWT secret error", err)
 	}
 }
 
@@ -991,7 +1004,7 @@ func TestLoadFromEnvironmentOverridesDefaults(t *testing.T) {
 		"HTTP_ADDRESS":                   "127.0.0.1:9090",
 		"DATABASE_URL":                   "postgres://db.example/railway",
 		"REDIS_ADDRESS":                  "redis.example:6379",
-		"JWT_SECRET":                     "test-secret",
+		"JWT_SECRET":                     "test-secret-at-least-32-bytes-long",
 		"ADMISSION_TOKEN_KEYRING":        testAdmissionKeyring,
 		"ADMISSION_TOKEN_ISSUE_KEY_ID":   "current",
 		"ADMISSION_TOKEN_ACCEPT_KEY_IDS": "current",
@@ -1047,7 +1060,7 @@ func TestLoadFromSupportsCommittedEnvironmentContract(t *testing.T) {
 		"HTTP_ADDR":                         ":8181",
 		"REDIS_ADDR":                        "redis:6379",
 		"REDIS_PASSWORD":                    "sentinel-redis-secret",
-		"JWT_SECRET":                        "sentinel-test-secret",
+		"JWT_SECRET":                        "sentinel-test-secret-at-least-32-bytes",
 		"ADMISSION_TOKEN_KEYRING":           testAdmissionKeyring,
 		"ADMISSION_TOKEN_ISSUE_KEY_ID":      "current",
 		"ADMISSION_TOKEN_ACCEPT_KEY_IDS":    "current",
@@ -1201,7 +1214,7 @@ func TestLoadAPIUsesExplicitMilestoneThreeCacheControls(t *testing.T) {
 		"APP_ENV":                              "test",
 		"DATABASE_URL":                         "postgres://api@db.example/railway",
 		"REDIS_ADDR":                           "redis.example:6379",
-		"JWT_SECRET":                           "test",
+		"JWT_SECRET":                           "test-secret-at-least-32-bytes-long",
 		"ADMISSION_TOKEN_KEYRING":              "test=" + strings.Repeat("A", 43),
 		"ADMISSION_TOKEN_ISSUE_KEY_ID":         "test",
 		"ADMISSION_TOKEN_ACCEPT_KEY_IDS":       "test",

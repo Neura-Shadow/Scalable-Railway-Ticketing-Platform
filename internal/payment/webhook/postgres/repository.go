@@ -70,11 +70,12 @@ WHERE provider=$1 AND provider_event_id=$2 AND state='received'`,
 	}
 
 	var canonicalHash []byte
+	var canonicalState string
 	if err := tx.QueryRow(ctx, `
-SELECT payload_hash
+SELECT payload_hash,state
 FROM public.payment_webhook_inbox
 WHERE provider=$1 AND provider_event_id=$2
-FOR UPDATE`, record.Provider, record.ProviderEventID).Scan(&canonicalHash); err != nil {
+FOR UPDATE`, record.Provider, record.ProviderEventID).Scan(&canonicalHash, &canonicalState); err != nil {
 		return "", webhook.ErrPersistence
 	}
 	if bytes.Equal(canonicalHash, record.PayloadHash[:]) {
@@ -100,19 +101,25 @@ SET occurrence_count=LEAST(
 	if err != nil {
 		return "", webhook.ErrPersistence
 	}
-	_, err = tx.Exec(ctx, `
+	if webhookConflictQuarantinable(canonicalState) {
+		tag, updateErr := tx.Exec(ctx, `
 UPDATE public.payment_webhook_inbox
 SET state='security_conflict',bounded_error_category='payload_hash_conflict',
-    processed_at=$3
-WHERE provider=$1 AND provider_event_id=$2 AND state='received'`,
-		record.Provider, record.ProviderEventID, record.ReceivedAt)
-	if err != nil {
-		return "", webhook.ErrPersistence
+	    lease_owner=NULL,lease_until=NULL,processed_at=$3
+WHERE provider=$1 AND provider_event_id=$2 AND state=$4`,
+			record.Provider, record.ProviderEventID, record.ReceivedAt, canonicalState)
+		if updateErr != nil || tag.RowsAffected() != 1 {
+			return "", webhook.ErrPersistence
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return "", webhook.ErrPersistence
 	}
 	return webhook.StoreConflict, nil
+}
+
+func webhookConflictQuarantinable(state string) bool {
+	return state == "received" || state == "processing" || state == "failed_retryable"
 }
 
 func nullableString(value string) any {

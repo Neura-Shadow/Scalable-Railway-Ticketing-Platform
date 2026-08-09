@@ -144,13 +144,16 @@ type Finding struct {
 }
 
 type Report struct {
-	PaymentIntentID uuid.UUID `json:"payment_intent_id"`
-	Scope           Scope     `json:"scope"`
-	RowsExamined    int       `json:"rows_examined"`
-	Findings        []Finding `json:"findings"`
-	ProviderQueried bool      `json:"provider_queried"`
-	RepairsApplied  int       `json:"repairs_applied"`
-	Truncated       bool      `json:"truncated"`
+	PaymentIntentID  uuid.UUID `json:"payment_intent_id"`
+	Scope            Scope     `json:"scope"`
+	RowsExamined     int       `json:"rows_examined"`
+	Findings         []Finding `json:"findings"`
+	ProviderQueried  bool      `json:"provider_queried"`
+	RepairsApplied   int       `json:"repairs_applied"`
+	Truncated        bool      `json:"truncated"`
+	ShardFound       bool      `json:"-"`
+	TicketOrderFound bool      `json:"-"`
+	TicketOrderState string    `json:"-"`
 }
 
 type Result struct {

@@ -99,10 +99,22 @@ func ticketView(ticket TicketRecord) httpapi.TicketView {
 func sameTicketOrderSummary(locator, authoritative TicketOrderRecord) bool {
 	return locator.ID == authoritative.ID &&
 		locator.ReservationID == authoritative.ReservationID &&
-		locator.Status == authoritative.Status &&
+		sameTicketOrderLifecycle(locator.Status, authoritative.Status) &&
 		locator.TotalAmountMinor == authoritative.TotalAmountMinor &&
 		locator.Currency == authoritative.Currency &&
 		locator.CreatedAt.Equal(authoritative.CreatedAt)
+}
+
+// The v8 control locator intentionally exposes reservation lifecycle states
+// (confirmed/cancelled), while a v2 payment shard advances the authoritative
+// ticket order from payment_pending to issued and, after a full compensation,
+// to refunded. Those payment-specific terminal forms must remain readable
+// through the coarse confirmed/cancelled locator lifecycle. No other
+// cross-state equivalence is permitted.
+func sameTicketOrderLifecycle(locator, authoritative string) bool {
+	return locator == authoritative ||
+		(locator == "confirmed" && authoritative == "issued") ||
+		(locator == "cancelled" && authoritative == "refunded")
 }
 
 func ticketOrderLocatorBy(raw string) (string, bool) {

@@ -15,6 +15,17 @@ import (
 var (
 	ErrInvalidGateway          = errors.New("invalid payment shard gateway")
 	ErrShardPaymentUnavailable = errors.New("payment shard unavailable")
+	ErrTicketPlanUnavailable   = errors.New("ticket issue plan unavailable")
+	ErrTicketClaimUnavailable  = errors.New("ticket code claim unavailable")
+	ErrTicketClaimReadFailed   = errors.New("ticket code claim authorization unavailable")
+	ErrTicketClaimReadTimeout  = errors.New("ticket code claim authorization timeout")
+	ErrTicketClaimSQLFailed    = errors.New("ticket code claim authorization query failed")
+	ErrTicketClaimScanFailed   = errors.New("ticket code claim authorization scan failed")
+	ErrTicketClaimDecodeFailed = errors.New("ticket code claim authorization decode failed")
+	ErrTicketClaimUnauthorized = errors.New("ticket code claim not authorized")
+	ErrTicketClaimConflict     = errors.New("ticket code claim conflict")
+	ErrTicketClaimCommitFailed = errors.New("ticket code claim commit unavailable")
+	ErrTicketIssueUnavailable  = errors.New("ticket issue command unavailable")
 )
 
 type Directory interface {
@@ -24,10 +35,18 @@ type Directory interface {
 type Store interface {
 	GetPayableReservation(context.Context, sharding.ShardRoute, uuid.UUID) (paymentapp.ReservationSnapshot, error)
 	BeginPayment(context.Context, sharding.ShardRoute, paymentapp.BeginPaymentCommand) (paymentapp.BeginPaymentReceipt, error)
+	PlanTicketIssue(context.Context, sharding.ShardRoute, IssueTicketsCommand) (TicketIdentityPlan, error)
 	IssueTickets(context.Context, sharding.ShardRoute, IssueTicketsCommand) (IssueTicketsReceipt, error)
 	MarkRefundPending(context.Context, sharding.ShardRoute, MarkRefundPendingCommand) (MarkRefundPendingReceipt, error)
 	CancelVoidedReservation(context.Context, sharding.ShardRoute, CancelVoidedReservationCommand) (CancelVoidedReservationReceipt, error)
 	ApplyRefundCompensation(context.Context, sharding.ShardRoute, ApplyRefundCompensationCommand) (ApplyRefundCompensationReceipt, error)
+}
+
+// TicketCodeClaimer owns the control-plane uniqueness boundary. Claims are
+// immutable tombstones: a shard issue is never attempted until every planned
+// ticket identity has been exclusively reserved in control PostgreSQL.
+type TicketCodeClaimer interface {
+	ClaimTicketCodes(context.Context, IssueTicketsCommand, TicketIdentityPlan) error
 }
 
 func (gateway *Gateway) CancelVoidedReservation(ctx context.Context, command CancelVoidedReservationCommand) (CancelVoidedReservationReceipt, error) {
@@ -97,37 +116,69 @@ func (gateway *Gateway) ApplyRefundCompensation(ctx context.Context, command App
 }
 
 func (gateway *Gateway) IssueTickets(ctx context.Context, command IssueTicketsCommand) (IssueTicketsReceipt, error) {
-	if gateway == nil || ctx == nil || command.ReservationID == uuid.Nil || command.TrainRunID == uuid.Nil {
+	if gateway == nil || ctx == nil || gateway.ticketCodes == nil || command.ReservationID == uuid.Nil || command.TrainRunID == uuid.Nil {
 		return IssueTicketsReceipt{}, paymentapp.ErrReservationNotPayable
 	}
 	route, err := gateway.directory.ResolveReservation(ctx, command.ReservationID, false)
 	if err != nil || route.TrainRunID() != command.TrainRunID {
 		return IssueTicketsReceipt{}, mapShardError(err)
 	}
+	plan, err := gateway.store.PlanTicketIssue(ctx, route, command)
+	if err != nil {
+		return IssueTicketsReceipt{}, errors.Join(ErrTicketPlanUnavailable, mapShardError(err))
+	}
+	if err := gateway.ticketCodes.ClaimTicketCodes(ctx, command, plan); err != nil {
+		return IssueTicketsReceipt{}, errors.Join(ErrTicketClaimUnavailable, err)
+	}
+	command.PlannedTicketIDs = append([]uuid.UUID(nil), plan.TicketIDs...)
+	command.PlannedTicketCodes = append([]string(nil), plan.TicketCodes...)
 	receipt, err := gateway.store.IssueTickets(ctx, route, command)
 	if errors.Is(err, sharding.ErrAssignmentStale) || errors.Is(err, sharding.ErrWriteFenced) {
 		refreshed, refreshErr := gateway.directory.ResolveReservation(ctx, command.ReservationID, true)
 		if refreshErr != nil || refreshed.TrainRunID() != command.TrainRunID {
-			return IssueTicketsReceipt{}, ErrShardPaymentUnavailable
+			return IssueTicketsReceipt{}, errors.Join(ErrTicketIssueUnavailable, ErrShardPaymentUnavailable)
 		}
-		return gateway.store.IssueTickets(ctx, refreshed, command)
+		refreshedReceipt, refreshedErr := gateway.store.IssueTickets(ctx, refreshed, command)
+		if refreshedErr != nil {
+			return IssueTicketsReceipt{}, errors.Join(ErrTicketIssueUnavailable, mapShardError(refreshedErr))
+		}
+		return refreshedReceipt, nil
 	}
 	if err != nil {
-		return IssueTicketsReceipt{}, mapShardError(err)
+		return IssueTicketsReceipt{}, errors.Join(ErrTicketIssueUnavailable, mapShardError(err))
 	}
 	return receipt, nil
 }
 
 type Gateway struct {
-	directory Directory
-	store     Store
+	directory   Directory
+	store       Store
+	ticketCodes TicketCodeClaimer
 }
 
-func NewGateway(directory Directory, store Store) (*Gateway, error) {
+type GatewayOption func(*Gateway) error
+
+func WithTicketCodeClaimer(claimer TicketCodeClaimer) GatewayOption {
+	return func(gateway *Gateway) error {
+		if claimer == nil {
+			return ErrInvalidGateway
+		}
+		gateway.ticketCodes = claimer
+		return nil
+	}
+}
+
+func NewGateway(directory Directory, store Store, options ...GatewayOption) (*Gateway, error) {
 	if directory == nil || store == nil {
 		return nil, ErrInvalidGateway
 	}
-	return &Gateway{directory: directory, store: store}, nil
+	gateway := &Gateway{directory: directory, store: store}
+	for _, option := range options {
+		if option == nil || option(gateway) != nil {
+			return nil, ErrInvalidGateway
+		}
+	}
+	return gateway, nil
 }
 
 func (gateway *Gateway) GetPayableReservation(ctx context.Context, reservationID uuid.UUID) (paymentapp.ReservationSnapshot, error) {

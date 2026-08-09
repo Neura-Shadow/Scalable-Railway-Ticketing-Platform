@@ -192,7 +192,11 @@ func (r *Reconciler) inspect(ctx context.Context, id uuid.UUID, scope Scope) (Re
 			return Report{}, err
 		}
 	}
-	report := Report{PaymentIntentID: id, Scope: scope, RowsExamined: 1}
+	report := Report{
+		PaymentIntentID: id, Scope: scope, RowsExamined: 1,
+		ShardFound: shard.Found, TicketOrderFound: shard.TicketOrderFound,
+		TicketOrderState: shard.TicketOrderState,
+	}
 	seenFindings := make(map[string]struct{}, 16)
 	add := func(code string, repairable bool) {
 		if _, exists := seenFindings[code]; exists {
@@ -337,7 +341,7 @@ func checkShard(scope Scope, control ControlSnapshot, shard ShardSnapshot, add f
 	if control.Intent.State == "completed" && (!shard.TicketOrderFound || shard.TicketOrderState != "issued") {
 		add("completed_payment_without_issued_ticket_order", false)
 	}
-	if capturedRequiresIssuedTickets(control, shard, refunded, voided) && (!shard.TicketOrderFound || shard.TicketOrderState != "issued") {
+	if captured && capturedRequiresIssuedTickets(control, shard, refunded, voided) && (!shard.TicketOrderFound || shard.TicketOrderState != "issued") {
 		add("captured_payment_without_ticket", false)
 	}
 	if !captured && (shard.TicketOrderState == "issued" || shard.ActiveTicketCount > 0) {

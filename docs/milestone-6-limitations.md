@@ -27,9 +27,12 @@ sandbox, fixtures, fault schedule, tool versions, and workload.
   explicitly confirmed replay/finalization from existing deterministic
   commands and immutable receipts; other mutations fail closed. Some
   mismatches still require explicit operator judgment.
-- Ticket-code duplicate detection is authoritative within the intent's current
-  shard only. A cross-shard global proof needs a control-plane code directory
-  or index; reconciliation deliberately does not scan unrelated shards.
+- Ticket codes have an immutable control-plane identity directory. The M6
+  rollout remains fail closed until `payment-admin backfill-ticket-codes
+  --confirm` has claimed and verified every pre-existing locator. New payment
+  issuance first reserves deterministic ID/code pairs in that directory and
+  the shard then validates and uses exactly the reserved plan. Abandoned claims
+  remain tombstones; they are not recycled.
 - Milestone 6 supports full capture and full refund only. It omits partial
   capture/refund, split tender, installments, cancellation fees, FX, tax,
   invoices, accounting ledgers, disputes, chargebacks, and settlement matching.
@@ -46,6 +49,10 @@ sandbox, fixtures, fault schedule, tool versions, and workload.
   credentials. Offline validation, PDF/email/SMS delivery, Apple Pay, Google
   Pay, bank transfer, convenience-store payment, and frontend payment UI remain
   out of scope.
+- Zero-fare reservations remain valid historical booking data but are not sent
+  through the M6 provider workflow. Payment-intent creation rejects a zero
+  amount before control or shard mutation; a future provider-free issuance
+  policy must be designed explicitly rather than sending a zero-value charge.
 - Only API ingress receives webhook-verification keys; worker,
   reconciler, and admin provider clients are outbound-only. Process
   configuration and application controls cannot protect against a

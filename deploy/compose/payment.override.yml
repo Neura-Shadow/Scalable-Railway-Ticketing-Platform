@@ -136,7 +136,11 @@ services:
         if ! psql -h control-postgres -U railway_control -d railway_control -tAc "SELECT 1 FROM pg_roles WHERE rolname='payment_reconciler'" | grep -qx 1; then
           psql -h control-postgres -U railway_control -d railway_control -v ON_ERROR_STOP=1 -c "CREATE ROLE payment_reconciler LOGIN PASSWORD 'reconciler-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
         fi
-        psql -h control-postgres -U railway_control -d railway_control -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_control TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; GRANT SELECT ON ALL TABLES IN SCHEMA public TO payment_reconciler; GRANT INSERT,UPDATE ON public.payment_reconciliation_checkpoints TO payment_reconciler; GRANT INSERT ON public.payment_manual_review_cases TO payment_reconciler; REVOKE UPDATE ON public.payment_manual_review_cases FROM payment_reconciler"
+        psql -h control-postgres -U railway_control -d railway_control -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_control TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM payment_reconciler; GRANT SELECT ON public.schema_migrations,public.booking_shards,public.train_run_shard_assignments,public.payment_intents,public.payment_sagas,public.payment_operations,public.payment_webhook_inbox,public.payment_provider_event_conflicts,public.payment_reconciliation_checkpoints,public.payment_manual_review_cases,public.ticket_code_directory,public.ticket_shard_locators,public.reservations,public.reservation_seats,public.ticket_orders,public.tickets,public.ticket_issuance_receipts,public.payment_command_receipts,public.payment_compensation_receipts TO payment_reconciler; GRANT INSERT,UPDATE ON public.payment_reconciliation_checkpoints TO payment_reconciler; GRANT INSERT ON public.payment_manual_review_cases TO payment_reconciler; REVOKE UPDATE ON public.payment_manual_review_cases FROM payment_reconciler"
+        if psql -h control-postgres -U railway_control -d railway_control -tAc "SELECT has_table_privilege('payment_reconciler','public.users','SELECT')" | grep -qx t; then
+          echo 'payment_reconciler must not read account credentials' >&2
+          exit 1
+        fi
     depends_on:
       migrate-control:
         condition: service_completed_successfully
@@ -154,7 +158,7 @@ services:
         if ! psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -tAc "SELECT 1 FROM pg_roles WHERE rolname='payment_reconciler'" | grep -qx 1; then
           psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "CREATE ROLE payment_reconciler LOGIN PASSWORD 'reconciler-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
         fi
-        psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_booking TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; GRANT SELECT ON ALL TABLES IN SCHEMA public TO payment_reconciler"
+        psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_booking TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM payment_reconciler; GRANT SELECT ON public.schema_migrations,public.reservations,public.reservation_seats,public.ticket_orders,public.tickets,public.ticket_issuance_receipts,public.payment_command_receipts,public.payment_compensation_receipts TO payment_reconciler"
     depends_on:
       migrate-booking-shard-0:
         condition: service_completed_successfully
@@ -172,7 +176,7 @@ services:
         if ! psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -tAc "SELECT 1 FROM pg_roles WHERE rolname='payment_reconciler'" | grep -qx 1; then
           psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "CREATE ROLE payment_reconciler LOGIN PASSWORD 'reconciler-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
         fi
-        psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_booking TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; GRANT SELECT ON ALL TABLES IN SCHEMA public TO payment_reconciler"
+        psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_booking TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM payment_reconciler; GRANT SELECT ON public.schema_migrations,public.reservations,public.reservation_seats,public.ticket_orders,public.tickets,public.ticket_issuance_receipts,public.payment_command_receipts,public.payment_compensation_receipts TO payment_reconciler"
     depends_on:
       migrate-booking-shard-1:
         condition: service_completed_successfully
@@ -182,6 +186,7 @@ services:
   api-1:
     environment:
       <<: [*payment-settings, *payment-webhook-verification]
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET explicitly; API startup enforces at least 32 bytes}
       CONTROL_DATABASE_POOL_COUNT: 13
       PHYSICAL_SHARD_WORKER_REPLICA_COUNT: 6
       POSTGRES_MAX_CONNECTIONS_LIMIT: 140
@@ -192,6 +197,7 @@ services:
   api-2:
     environment:
       <<: [*payment-settings, *payment-webhook-verification]
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET explicitly; API startup enforces at least 32 bytes}
       CONTROL_DATABASE_POOL_COUNT: 13
       PHYSICAL_SHARD_WORKER_REPLICA_COUNT: 6
       POSTGRES_MAX_CONNECTIONS_LIMIT: 140
@@ -202,6 +208,7 @@ services:
   api-3:
     environment:
       <<: [*payment-settings, *payment-webhook-verification]
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET explicitly; API startup enforces at least 32 bytes}
       CONTROL_DATABASE_POOL_COUNT: 13
       PHYSICAL_SHARD_WORKER_REPLICA_COUNT: 6
       POSTGRES_MAX_CONNECTIONS_LIMIT: 140

@@ -137,6 +137,9 @@ ALTER TABLE tickets
         status IN ('active', 'cancelled')
     );
 
+DROP TRIGGER tickets_guard_identity ON tickets;
+DROP FUNCTION booking_shard_guard_ticket_identity();
+
 DROP TRIGGER ticket_orders_guard_payment_snapshot ON ticket_orders;
 DROP FUNCTION booking_shard_guard_ticket_order_payment_snapshot();
 

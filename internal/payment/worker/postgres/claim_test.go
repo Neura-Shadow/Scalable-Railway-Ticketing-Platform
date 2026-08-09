@@ -65,6 +65,10 @@ func TestClaimsUseShortReadCommittedSkipLockedTransactions(t *testing.T) {
 			if test.name == "webhooks" && !strings.Contains(joined, "event_created_at") {
 				t.Fatalf("webhook claim does not load immutable provider event time:\n%s", joined)
 			}
+			if test.name == "operations" && (!strings.Contains(joined, "claimed.attempts") ||
+				!strings.Contains(joined, "claimed.lease_owner") || !strings.Contains(joined, "leased.lease_owner")) {
+				t.Fatalf("operation claim reads pre-update lease values instead of CTE RETURNING values:\n%s", joined)
+			}
 		})
 	}
 }
@@ -134,7 +138,8 @@ func TestCompleteTicketIssuanceWritesAllLocatorsInSameControlTransaction(t *test
 	receipt := shard.IssueTicketsReceipt{
 		TicketOrderID: uuid.New(), TicketIDs: []uuid.UUID{uuid.New(), uuid.New()},
 		TicketCodes: []string{"ticket_code_000001", "ticket_code_000002"},
-		AmountMinor: 2500, Currency: "TWD", IssuedAt: time.Now().UTC(),
+		AmountMinor: 2500, Currency: "TWD",
+		OrderCreatedAt: time.Now().Add(-time.Minute).UTC(), IssuedAt: time.Now().UTC(),
 	}
 	if err := store.CompleteAction(context.Background(), claim, worker.ActionEvidence{Issue: receipt}); err != nil {
 		t.Fatalf("CompleteAction() error = %v", err)
@@ -163,7 +168,8 @@ func TestCompleteTicketIssuanceRejectsDuplicateGlobalCodeClaims(t *testing.T) {
 	}
 	receipt := shard.IssueTicketsReceipt{
 		TicketOrderID: uuid.New(), TicketIDs: []uuid.UUID{uuid.New(), uuid.New()},
-		TicketCodes: []string{"duplicate_code_001", "duplicate_code_001"}, IssuedAt: time.Now().UTC(),
+		TicketCodes:    []string{"duplicate_code_001", "duplicate_code_001"},
+		OrderCreatedAt: time.Now().Add(-time.Minute).UTC(), IssuedAt: time.Now().UTC(),
 	}
 	if err := store.CompleteAction(context.Background(), claim, worker.ActionEvidence{Issue: receipt}); !errors.Is(err, worker.ErrStoreUnavailable) {
 		t.Fatalf("CompleteAction() error = %v, want store unavailable", err)
@@ -175,7 +181,7 @@ func TestCompleteTicketIssuanceRejectsDuplicateGlobalCodeClaims(t *testing.T) {
 
 func TestCompleteCompensationCancelsTicketOrderLocator(t *testing.T) {
 	t.Parallel()
-	tx := &recordingTx{}
+	tx := &recordingTx{execTags: []pgconn.CommandTag{pgconn.NewCommandTag("UPDATE 1")}}
 	store, err := New(&recordingDB{tx: tx})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -185,12 +191,37 @@ func TestCompleteCompensationCancelsTicketOrderLocator(t *testing.T) {
 		LeaseOwner: "payment-test", LeaseUntil: time.Now().Add(time.Minute),
 		Compensation: shard.ApplyRefundCompensationCommand{ReservationID: uuid.New(), OwnerID: uuid.New()},
 	}
-	evidence := worker.ActionEvidence{Compensation: shard.ApplyRefundCompensationReceipt{TicketOrderID: uuid.New()}}
+	evidence := worker.ActionEvidence{Compensation: shard.ApplyRefundCompensationReceipt{
+		TicketOrderID: uuid.New(), CancelledTicketCount: 1,
+	}}
 	if err := store.CompleteAction(context.Background(), claim, evidence); err != nil {
 		t.Fatalf("CompleteAction() error = %v", err)
 	}
 	if !strings.Contains(strings.ToLower(strings.Join(tx.execs, "\n")), "update public.ticket_order_shard_locators") {
 		t.Fatal("compensation did not cancel ticket-order locator")
+	}
+}
+
+func TestCompleteCompensationWithoutIssuedTicketsRequiresNoControlLocator(t *testing.T) {
+	t.Parallel()
+	tx := &recordingTx{execTags: []pgconn.CommandTag{pgconn.NewCommandTag("UPDATE 0")}}
+	store, err := New(&recordingDB{tx: tx})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	claim := worker.ActionClaim{
+		SagaID: uuid.New(), Type: worker.ActionCompensate, Provider: "sandbox",
+		LeaseOwner: "payment-test", LeaseUntil: time.Now().Add(time.Minute),
+		Compensation: shard.ApplyRefundCompensationCommand{ReservationID: uuid.New(), OwnerID: uuid.New()},
+	}
+	evidence := worker.ActionEvidence{Compensation: shard.ApplyRefundCompensationReceipt{
+		TicketOrderID: uuid.New(), CancelledTicketCount: 0,
+	}}
+	if err := store.CompleteAction(context.Background(), claim, evidence); err != nil {
+		t.Fatalf("CompleteAction() error = %v", err)
+	}
+	if !tx.committed {
+		t.Fatal("zero-ticket compensation did not finalize without an impossible locator")
 	}
 }
 
@@ -382,20 +413,29 @@ func (db *recordingDB) BeginTx(_ context.Context, options pgx.TxOptions) (pgx.Tx
 
 type recordingTx struct {
 	pgx.Tx
-	options    pgx.TxOptions
-	execs      []string
-	execArgs   [][]any
-	queries    []string
-	committed  bool
-	rolledBack bool
-	row        pgx.Row
-	queryRows  []pgx.Row
-	rowIndex   int
+	options      pgx.TxOptions
+	execs        []string
+	execArgs     [][]any
+	queries      []string
+	committed    bool
+	rolledBack   bool
+	row          pgx.Row
+	queryRows    []pgx.Row
+	queryRowSQL  []string
+	queryRowArgs [][]any
+	rowIndex     int
+	execTags     []pgconn.CommandTag
+	execIndex    int
 }
 
 func (tx *recordingTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	tx.execs = append(tx.execs, sql)
 	tx.execArgs = append(tx.execArgs, append([]any(nil), args...))
+	if tx.execIndex < len(tx.execTags) {
+		tag := tx.execTags[tx.execIndex]
+		tx.execIndex++
+		return tag, nil
+	}
 	return pgconn.NewCommandTag("UPDATE 1"), nil
 }
 
@@ -404,7 +444,9 @@ func (tx *recordingTx) Query(_ context.Context, sql string, _ ...any) (pgx.Rows,
 	return &emptyRows{}, nil
 }
 
-func (tx *recordingTx) QueryRow(_ context.Context, _ string, _ ...any) pgx.Row {
+func (tx *recordingTx) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
+	tx.queryRowSQL = append(tx.queryRowSQL, sql)
+	tx.queryRowArgs = append(tx.queryRowArgs, append([]any(nil), args...))
 	if tx.rowIndex < len(tx.queryRows) {
 		row := tx.queryRows[tx.rowIndex]
 		tx.rowIndex++

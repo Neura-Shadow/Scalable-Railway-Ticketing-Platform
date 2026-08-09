@@ -74,14 +74,14 @@ WITH candidates AS (
  SET state='claimed',attempts=attempts+1,lease_owner=$3,
      lease_until=$1+($4::bigint*interval '1 millisecond')
  FROM candidates WHERE operation.operation_id=candidates.operation_id
- RETURNING operation.operation_id
+ RETURNING operation.operation_id,operation.attempts,operation.lease_owner,operation.lease_until
 )
 SELECT operation.operation_id,operation.payment_intent_id,intent.reservation_id,
        intent.train_run_id,intent.owner_user_id,operation.provider,
        operation.operation_type,'pending',COALESCE(intent.provider_payment_id,''),
        COALESCE(intent.hosted_session_ref,''),operation.provider_idempotency_key_hash,
-       operation.amount_minor,operation.currency,operation.attempts,operation.created_at,
-       operation.lease_owner,operation.lease_until
+       operation.amount_minor,operation.currency,claimed.attempts,operation.created_at,
+       claimed.lease_owner,claimed.lease_until
 FROM claimed
 JOIN public.payment_operations AS operation USING(operation_id)
 JOIN public.payment_intents AS intent ON intent.payment_intent_id=operation.payment_intent_id
@@ -119,14 +119,14 @@ WITH uncertain AS (
  UPDATE public.payment_sagas AS saga
  SET lease_owner=$3,lease_until=$1+($4::bigint*interval '1 millisecond'),attempts=attempts+1
  FROM selected WHERE saga.saga_id=selected.saga_id
- RETURNING saga.saga_id,selected.operation_id
+ RETURNING saga.saga_id,selected.operation_id,saga.lease_owner,saga.lease_until
 )
 SELECT operation.operation_id,operation.payment_intent_id,intent.reservation_id,
        intent.train_run_id,intent.owner_user_id,operation.provider,
        operation.operation_type,'uncertain',COALESCE(intent.provider_payment_id,''),
        COALESCE(intent.hosted_session_ref,''),operation.provider_idempotency_key_hash,
        operation.amount_minor,operation.currency,operation.attempts,operation.created_at,
-       saga.lease_owner,saga.lease_until
+       leased.lease_owner,leased.lease_until
 FROM leased
 JOIN public.payment_sagas AS saga USING(saga_id)
 JOIN public.payment_operations AS operation ON operation.operation_id=leased.operation_id

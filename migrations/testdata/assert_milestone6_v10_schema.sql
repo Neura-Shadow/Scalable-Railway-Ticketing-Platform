@@ -33,9 +33,21 @@ BEGIN
                'payment_provider_event_conflicts',
                'payment_reconciliation_checkpoints',
                'payment_manual_review_cases',
-               'ticket_code_directory'
-           )) <> 8 THEN
+               'ticket_code_directory',
+               'ticket_code_claim_readiness'
+           )) <> 9 THEN
         RAISE EXCEPTION 'control-plane version 10 payment tables are incomplete';
+    END IF;
+
+    IF (SELECT count(*) FROM public.ticket_code_claim_readiness
+        WHERE singleton AND state='ready' AND verified_at IS NOT NULL) <> 1
+       OR EXISTS (
+           SELECT 1 FROM public.ticket_shard_locators AS locator
+           LEFT JOIN public.ticket_code_directory AS directory
+             ON directory.ticket_id=locator.ticket_id
+           WHERE directory.ticket_id IS NULL
+       ) THEN
+        RAISE EXCEPTION 'fresh ticket-code rollout readiness is incomplete';
     END IF;
 
     IF NOT EXISTS (
@@ -58,6 +70,31 @@ BEGIN
           AND pg_get_constraintdef(constraint_row.oid) LIKE '%ticket_id%'
     ) THEN
         RAISE EXCEPTION 'global ticket code identity constraints are incomplete';
+    END IF;
+
+    IF (SELECT count(*) FROM pg_trigger AS trigger_row
+        JOIN pg_class AS table_row ON table_row.oid=trigger_row.tgrelid
+        JOIN pg_namespace AS namespace_row ON namespace_row.oid=table_row.relnamespace
+        WHERE NOT trigger_row.tgisinternal
+          AND trigger_row.tgname='tickets_guard_identity'
+          AND (namespace_row.nspname,table_row.relname) IN (
+              ('public','tickets'),('booking_shard_0','tickets'),('booking_shard_1','tickets')
+          )) <> 3 THEN
+        RAISE EXCEPTION 'ticket identity immutability triggers are incomplete';
+    END IF;
+
+    IF (SELECT count(*) FROM pg_trigger AS trigger_row
+        JOIN pg_class AS table_row ON table_row.oid=trigger_row.tgrelid
+        JOIN pg_namespace AS namespace_row ON namespace_row.oid=table_row.relnamespace
+        WHERE NOT trigger_row.tgisinternal
+          AND trigger_row.tgname='ticket_shard_locators_mark_unclaimed_code_pending'
+          AND namespace_row.nspname='public'
+          AND table_row.relname='ticket_shard_locators') <> 1 THEN
+        RAISE EXCEPTION 'ticket-code readiness locator trigger is missing';
+    END IF;
+
+    IF to_regprocedure('public.lock_ticket_code_claims()') IS NULL THEN
+        RAISE EXCEPTION 'ticket-code readiness advisory-lock contract is missing';
     END IF;
 
     IF NOT EXISTS (

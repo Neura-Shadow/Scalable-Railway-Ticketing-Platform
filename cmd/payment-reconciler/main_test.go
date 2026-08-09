@@ -11,7 +11,14 @@ import (
 )
 
 func TestRunOnceUsesDetectOnlyBoundedOptions(t *testing.T) {
-	backend := &fakeRunner{result: paymentreconcile.Result{RowsExamined: 3, MismatchCount: 1, ManualReviews: 1}}
+	backend := &fakeRunner{result: paymentreconcile.Result{
+		RowsExamined: 3, MismatchCount: 1, ManualReviews: 1,
+		Reports: []paymentreconcile.Report{
+			{ShardFound: true, TicketOrderFound: true, TicketOrderState: "issued"},
+			{ShardFound: true, TicketOrderFound: true, TicketOrderState: "refunded"},
+			{},
+		},
+	}}
 	var stdout, stderr bytes.Buffer
 	code := run(context.Background(), []string{"--once", "--scope", "payment-tickets", "--batch-size", "7"}, noEnv, &stdout, &stderr,
 		func(context.Context, func(string) (string, bool), config) (runner, func(), error) {
@@ -20,7 +27,10 @@ func TestRunOnceUsesDetectOnlyBoundedOptions(t *testing.T) {
 	if code != 0 || backend.options.Scope != paymentreconcile.ScopeTickets || backend.options.Limit != 7 {
 		t.Fatalf("code=%d options=%+v stderr=%q", code, backend.options, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), `"read_only":true`) || !strings.Contains(stdout.String(), `"mismatch_count":1`) {
+	if !strings.Contains(stdout.String(), `"read_only":true`) ||
+		!strings.Contains(stdout.String(), `"shard_rows_found":2`) ||
+		!strings.Contains(stdout.String(), `"issued_orders":1`) ||
+		!strings.Contains(stdout.String(), `"mismatch_count":1`) {
 		t.Fatalf("stdout=%s", stdout.String())
 	}
 }

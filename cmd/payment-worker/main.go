@@ -30,6 +30,8 @@ import (
 
 const paymentControlSchemaVersion = 10
 
+const databasePoolObservationInterval = time.Second
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	if err := run(logger); err != nil {
@@ -88,7 +90,7 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return errors.New("payment shard store initialization failed")
 	}
-	shardGateway, err := paymentshard.NewGateway(directory, shardStore)
+	shardGateway, err := paymentshard.NewGateway(directory, shardStore, paymentshard.WithTicketCodeClaimer(controlStore))
 	if err != nil {
 		return errors.New("payment shard gateway initialization failed")
 	}
@@ -98,6 +100,10 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return errors.New("metrics initialization failed")
 	}
+	stopDatabasePoolObserver := startDatabasePoolObserver(
+		rootContext, metrics, pool, physicalRegistry, databasePoolObservationInterval,
+	)
+	defer stopDatabasePoolObserver()
 	workerID := "payment-" + uuid.NewString()
 	paymentWorker, err := paymentworker.New(
 		controlStore,

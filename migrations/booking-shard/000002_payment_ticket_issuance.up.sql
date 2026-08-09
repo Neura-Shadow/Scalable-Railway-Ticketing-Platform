@@ -239,8 +239,26 @@ ALTER TABLE tickets
         status IN ('pending', 'active', 'refund_pending', 'cancelled')
     ),
     ADD CONSTRAINT tickets_opaque_code_check CHECK (
-        ticket_code ~ '^[A-Za-z0-9_-]{16,64}$'
+        length(ticket_code) BETWEEN 16 AND 64
     );
+
+CREATE FUNCTION booking_shard_guard_ticket_identity()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NEW.id IS DISTINCT FROM OLD.id
+       OR NEW.ticket_code IS DISTINCT FROM OLD.ticket_code THEN
+        RAISE EXCEPTION 'ticket identity is immutable'
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER tickets_guard_identity
+BEFORE UPDATE ON tickets
+FOR EACH ROW EXECUTE FUNCTION booking_shard_guard_ticket_identity();
 
 ALTER TABLE outbox_events
     DROP CONSTRAINT outbox_events_aggregate_type_check;

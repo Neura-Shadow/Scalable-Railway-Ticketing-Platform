@@ -238,7 +238,7 @@ SET current_step='compensate',bounded_error_category=NULL,next_attempt_at=clock_
 WHERE payment_intent_id=$1 AND state='compensating'`, claim.PaymentIntentID))
 	case domain.OperationRefund:
 		if err := oneRow(tx.Exec(ctx, `
-UPDATE public.payment_intents SET state='refunded',completed_at=clock_timestamp()
+UPDATE public.payment_intents SET state='refunded',completed_at=COALESCE(completed_at,clock_timestamp())
 WHERE payment_intent_id=$1 AND state='refund_pending'`, claim.PaymentIntentID)); err != nil {
 			return err
 		}
@@ -710,11 +710,16 @@ WHERE saga_id=$1 AND state='compensating' AND current_step='compensate'
 			return err
 		}
 	case worker.ActionCompensate:
-		if err := oneRow(tx.Exec(ctx, `UPDATE public.ticket_order_shard_locators
+		tag, err := tx.Exec(ctx, `UPDATE public.ticket_order_shard_locators
 SET status='cancelled'
 WHERE ticket_order_id=$1 AND reservation_id=$2 AND owner_user_id=$3`,
-			evidence.Compensation.TicketOrderID, claim.Compensation.ReservationID, claim.Compensation.OwnerID)); err != nil {
-			return err
+			evidence.Compensation.TicketOrderID, claim.Compensation.ReservationID, claim.Compensation.OwnerID)
+		expectedLocators := int64(0)
+		if evidence.Compensation.CancelledTicketCount > 0 {
+			expectedLocators = 1
+		}
+		if err != nil || tag.RowsAffected() != expectedLocators {
+			return worker.ErrStoreUnavailable
 		}
 		if err := oneRow(tx.Exec(ctx, `UPDATE public.payment_intents AS intent
 SET state='cancelled'
@@ -739,7 +744,8 @@ WHERE saga_id=$1 AND state='refunding' AND current_step='compensate'
 
 func writeTicketLocators(ctx context.Context, tx pgx.Tx, claim worker.ActionClaim, receipt shard.IssueTicketsReceipt) error {
 	if receipt.TicketOrderID == uuid.Nil || len(receipt.TicketIDs) == 0 ||
-		len(receipt.TicketCodes) != len(receipt.TicketIDs) || receipt.IssuedAt.IsZero() {
+		len(receipt.TicketCodes) != len(receipt.TicketIDs) ||
+		receipt.OrderCreatedAt.IsZero() || receipt.IssuedAt.IsZero() {
 		return worker.ErrStoreUnavailable
 	}
 	var trainRunID, ownerID uuid.UUID
@@ -766,7 +772,7 @@ WHERE ticket_order_shard_locators.reservation_id=EXCLUDED.reservation_id
  AND ticket_order_shard_locators.currency=EXCLUDED.currency
  AND ticket_order_shard_locators.created_at=EXCLUDED.created_at`,
 		receipt.TicketOrderID, claim.Issue.ReservationID, trainRunID, shardID, generation,
-		ownerID, receipt.AmountMinor, receipt.Currency, receipt.IssuedAt.UTC())); err != nil {
+		ownerID, receipt.AmountMinor, receipt.Currency, receipt.OrderCreatedAt.UTC())); err != nil {
 		return err
 	}
 	seenIDs := make(map[uuid.UUID]struct{}, len(receipt.TicketIDs))

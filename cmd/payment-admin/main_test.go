@@ -9,6 +9,7 @@ import (
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider"
 	paymentreconcile "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/reconcile"
+	paymentticketcodes "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/ticketcodes"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
@@ -139,6 +140,49 @@ func TestOperatorRoleIsMandatory(t *testing.T) {
 	}
 }
 
+func TestTicketCodeBackfillRequiresConfirmationAndEmitsBoundedCount(t *testing.T) {
+	for _, args := range [][]string{
+		{"backfill-ticket-codes"},
+		{"backfill-ticket-codes", "--confirm", "--dry-run"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if code := run(context.Background(), args, noEnv, &stdout, &stderr, openBackend); code != 2 ||
+			!strings.Contains(stdout.String(), "confirmation_required") {
+			t.Fatalf("args=%v code=%d stdout=%q", args, code, stdout.String())
+		}
+	}
+
+	backfill := &fakeTicketBackfill{backfillResult: paymentticketcodes.Result{Missing: 3, Claimed: 3, Total: 7, Ready: true}}
+	service := runtimeTestBackend()
+	service.ticketBackfill = backfill
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{"backfill-ticket-codes", "--confirm", "--limit", "3"}, noEnv, &stdout, &stderr,
+		func(context.Context, func(string) (string, bool), request) (backend, func(), error) {
+			return service, func() {}, nil
+		})
+	if code != 0 || !backfill.backfillCalled || backfill.limit != 3 ||
+		!strings.Contains(stdout.String(), `"read_only":false`) ||
+		!strings.Contains(stdout.String(), `"count":3`) ||
+		!strings.Contains(stdout.String(), `"state":"ready"`) {
+		t.Fatalf("code=%d called=%v limit=%d stdout=%q stderr=%q", code, backfill.backfillCalled, backfill.limit, stdout.String(), stderr.String())
+	}
+}
+
+func TestTicketCodeBackfillDryRunUsesInspectOnly(t *testing.T) {
+	backfill := &fakeTicketBackfill{inspectResult: paymentticketcodes.Result{Missing: 4}}
+	service := runtimeTestBackend()
+	service.ticketBackfill = backfill
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{"backfill-ticket-codes", "--dry-run", "--limit", "4"}, noEnv, &stdout, &stderr,
+		func(context.Context, func(string) (string, bool), request) (backend, func(), error) {
+			return service, func() {}, nil
+		})
+	if code != 0 || !backfill.inspectCalled || backfill.backfillCalled || backfill.limit != 4 ||
+		!strings.Contains(stdout.String(), `"read_only":true`) || !strings.Contains(stdout.String(), `"count":4`) {
+		t.Fatalf("code=%d inspect=%v backfill=%v stdout=%q stderr=%q", code, backfill.inspectCalled, backfill.backfillCalled, stdout.String(), stderr.String())
+	}
+}
+
 func runtimeTestBackend() *runtimeBackend {
 	id := uuid.MustParse(testIntent)
 	store := &fakeAdminStore{
@@ -191,6 +235,24 @@ type fakeStatusProvider struct{}
 
 func (fakeStatusProvider) GetPaymentStatus(context.Context, string) (provider.Payment, error) {
 	return provider.Payment{Status: provider.StatusCaptured}, nil
+}
+
+type fakeTicketBackfill struct {
+	inspectResult  paymentticketcodes.Result
+	backfillResult paymentticketcodes.Result
+	inspectCalled  bool
+	backfillCalled bool
+	limit          int
+}
+
+func (fake *fakeTicketBackfill) Inspect(_ context.Context, limit int) (paymentticketcodes.Result, error) {
+	fake.inspectCalled, fake.limit = true, limit
+	return fake.inspectResult, nil
+}
+
+func (fake *fakeTicketBackfill) Backfill(_ context.Context, limit int) (paymentticketcodes.Result, error) {
+	fake.backfillCalled, fake.limit = true, limit
+	return fake.backfillResult, nil
 }
 
 type roleDB struct{ allowed bool }

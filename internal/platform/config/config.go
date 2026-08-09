@@ -372,8 +372,10 @@ func (c Config) ValidateFor(process Process) error {
 		}
 		if strings.TrimSpace(c.JWTSecret) == "" {
 			problems = append(problems, errors.New("JWT_SECRET is required"))
-		} else if c.Environment == EnvironmentProduction && (len(c.JWTSecret) < 32 || isCommittedDevelopmentJWTSecret(c.JWTSecret)) {
-			problems = append(problems, errors.New("JWT_SECRET must be a non-development value containing at least 32 bytes in production"))
+		} else if len(c.JWTSecret) < 32 {
+			problems = append(problems, errors.New("JWT_SECRET must contain at least 32 bytes"))
+		} else if c.Environment == EnvironmentProduction && isCommittedDevelopmentJWTSecret(c.JWTSecret) {
+			problems = append(problems, errors.New("JWT_SECRET must be a non-development value in production"))
 		}
 		if err := validateRedisAddress(c.RedisAddress); err != nil {
 			problems = append(problems, err)

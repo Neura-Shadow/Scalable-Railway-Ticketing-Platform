@@ -121,6 +121,7 @@ type IntentStore interface {
 	LookupIntentByIdempotency(context.Context, uuid.UUID, [sha256.Size]byte, [sha256.Size]byte) (IntentRecord, bool, error)
 	ReserveIntent(context.Context, ReserveIntentRequest) (IntentRecord, bool, error)
 	MarkReservationSecured(context.Context, uuid.UUID, uuid.UUID, [sha256.Size]byte) (IntentRecord, error)
+	FailReservationSecuring(context.Context, uuid.UUID, [sha256.Size]byte) error
 	GetOwnedIntent(context.Context, uuid.UUID, uuid.UUID) (IntentRecord, error)
 	GetOwnedIntentByReservation(context.Context, uuid.UUID, uuid.UUID) (IntentRecord, error)
 	RequestCancellation(context.Context, CancelIntentRequest) (IntentRecord, error)
@@ -185,7 +186,8 @@ func (service *Service) CancelReservation(ctx context.Context, command CancelRes
 		return IntentRecord{}, ErrPaymentNotFound
 	case "cancelled", "voided", "refunded":
 		return intent, nil
-	case "created", "reservation_securing", "checkout_pending", "authorization_pending", "capture_pending":
+	case "created", "reservation_securing", "checkout_pending", "authorization_pending", "capture_pending",
+		"captured", "ticket_issue_pending", "manual_review":
 		return IntentRecord{}, ErrPaymentConflict
 	}
 	return service.CancelIntent(ctx, CancelIntentCommand{
@@ -252,7 +254,7 @@ func (service *Service) CreateIntent(ctx context.Context, command CreateIntentCo
 		return IntentRecord{}, ErrPaymentNotFound
 	}
 	if snapshot.TrainRunID == uuid.Nil || snapshot.Status != "held" || !now.Before(snapshot.ExpiresAt) ||
-		snapshot.AmountMinor < 0 || !validCurrency(snapshot.Currency) {
+		snapshot.AmountMinor <= 0 || !validCurrency(snapshot.Currency) {
 		return IntentRecord{}, ErrReservationNotPayable
 	}
 
@@ -283,6 +285,11 @@ func (service *Service) secureReservation(ctx context.Context, intent IntentReco
 		Currency: intent.Currency, GraceExpiresAt: now.Add(service.grace), RequestFingerprint: fingerprint,
 	})
 	if err != nil {
+		if errors.Is(err, ErrReservationNotPayable) {
+			if failErr := service.store.FailReservationSecuring(ctx, intent.ID, fingerprint); failErr != nil {
+				return intent, normalizeStoreError(failErr)
+			}
+		}
 		return intent, normalizeReservationError(err)
 	}
 	if receipt.CommandID != intent.BeginCommandID || receipt.PaymentIntentID != intent.ID || receipt.RequestFingerprint != fingerprint {

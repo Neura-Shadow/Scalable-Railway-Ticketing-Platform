@@ -2,6 +2,7 @@ package httpapi_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -117,6 +118,35 @@ func TestPaymentWebhookEnforcesConfiguredRequestTimeout(t *testing.T) {
 	router.ServeHTTP(response, request)
 	if response.Code != http.StatusUnauthorized || !webhooks.contextCancelled {
 		t.Fatalf("status=%d cancelled=%t body=%s", response.Code, webhooks.contextCancelled, response.Body.String())
+	}
+}
+
+func TestPaymentWebhookRateLimitRunsBeforeBodyAndFailsClosed(t *testing.T) {
+	t.Parallel()
+	webhooks := &webhookServiceStub{result: httpapi.PaymentWebhookAccepted}
+	limiter := &rateLimiterStub{allowed: false}
+	router := httpapi.New(httpapi.Dependencies{PaymentWebhooks: webhooks, RateLimiter: limiter})
+	request := httptest.NewRequest(http.MethodPost, "/webhooks/payments/sandbox", strings.NewReader(strings.Repeat("x", 1024)))
+	request.RemoteAddr = "192.0.2.45:49152"
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusTooManyRequests || webhooks.request.Provider != "" {
+		t.Fatalf("status=%d request=%+v", response.Code, webhooks.request)
+	}
+	if limiter.input != (httpapi.RateLimitRequest{Scope: httpapi.RateLimitPaymentWebhook, Key: "192.0.2.45"}) {
+		t.Fatalf("limiter input = %+v", limiter.input)
+	}
+
+	outageWebhooks := &webhookServiceStub{result: httpapi.PaymentWebhookAccepted}
+	outage := &rateLimiterStub{err: errors.New("redis unavailable")}
+	router = httpapi.New(httpapi.Dependencies{PaymentWebhooks: outageWebhooks, RateLimiter: outage})
+	request = httptest.NewRequest(http.MethodPost, "/webhooks/payments/sandbox", strings.NewReader(`{}`))
+	request.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable || outageWebhooks.request.Provider != "" {
+		t.Fatalf("outage status=%d request=%+v", response.Code, outageWebhooks.request)
 	}
 }
 

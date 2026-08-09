@@ -93,6 +93,33 @@ func TestGatewayRefreshesVoidCancellationExactlyOnceAfterFenceMove(t *testing.T)
 	}
 }
 
+func TestGatewayClaimsDeterministicTicketPlanBeforeShardIssuance(t *testing.T) {
+	t.Parallel()
+	reservationID, trainRunID := uuid.New(), uuid.New()
+	route := paymentRoute(t, trainRunID, sharding.ShardPhysicalZero, 5)
+	order := make([]string, 0, 3)
+	plan := shard.TicketIdentityPlan{
+		TicketIDs: []uuid.UUID{uuid.New()}, TicketCodes: []string{"planned_ticket_code_0001"},
+	}
+	store := &shardStoreFake{plan: plan, order: &order}
+	claimer := &ticketClaimerFake{order: &order}
+	gateway, err := shard.NewGateway(&directoryFake{routes: []sharding.ShardRoute{route}}, store, shard.WithTicketCodeClaimer(claimer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := shard.IssueTicketsCommand{ReservationID: reservationID, TrainRunID: trainRunID}
+	if _, err := gateway.IssueTickets(context.Background(), command); err != nil {
+		t.Fatal(err)
+	}
+	if len(order) != 3 || order[0] != "plan" || order[1] != "claim" || order[2] != "issue" {
+		t.Fatalf("ticket issuance order = %v", order)
+	}
+	if len(store.issueCommand.PlannedTicketIDs) != 1 || store.issueCommand.PlannedTicketIDs[0] != plan.TicketIDs[0] ||
+		len(store.issueCommand.PlannedTicketCodes) != 1 || store.issueCommand.PlannedTicketCodes[0] != plan.TicketCodes[0] {
+		t.Fatalf("issued command did not preserve claimed plan: %+v", store.issueCommand)
+	}
+}
+
 func paymentRoute(t *testing.T, trainRunID uuid.UUID, shardID sharding.ShardID, generation int64) sharding.ShardRoute {
 	t.Helper()
 	gen, err := sharding.NewAssignmentGeneration(generation)
@@ -129,6 +156,9 @@ type shardStoreFake struct {
 	voidRoute    sharding.ShardRoute
 	voidErrors   []error
 	voidCalls    int
+	plan         shard.TicketIdentityPlan
+	issueCommand shard.IssueTicketsCommand
+	order        *[]string
 }
 
 func (fake *shardStoreFake) GetPayableReservation(_ context.Context, route sharding.ShardRoute, _ uuid.UUID) (paymentapp.ReservationSnapshot, error) {
@@ -146,8 +176,31 @@ func (fake *shardStoreFake) BeginPayment(_ context.Context, route sharding.Shard
 	return paymentapp.BeginPaymentReceipt{CommandID: command.CommandID, PaymentIntentID: command.PaymentIntentID, RequestFingerprint: command.RequestFingerprint}, nil
 }
 
+func (fake *shardStoreFake) PlanTicketIssue(_ context.Context, _ sharding.ShardRoute, _ shard.IssueTicketsCommand) (shard.TicketIdentityPlan, error) {
+	if fake.order != nil {
+		*fake.order = append(*fake.order, "plan")
+	}
+	if len(fake.plan.TicketIDs) > 0 {
+		return fake.plan, nil
+	}
+	return shard.TicketIdentityPlan{TicketIDs: []uuid.UUID{uuid.New()}, TicketCodes: []string{"planned_ticket_code_0001"}}, nil
+}
+
 func (fake *shardStoreFake) IssueTickets(_ context.Context, _ sharding.ShardRoute, command shard.IssueTicketsCommand) (shard.IssueTicketsReceipt, error) {
+	fake.issueCommand = command
+	if fake.order != nil {
+		*fake.order = append(*fake.order, "issue")
+	}
 	return shard.IssueTicketsReceipt{CommandID: command.CommandID, IssuanceID: command.IssuanceID, PaymentIntentID: command.PaymentIntentID, ReservationID: command.ReservationID}, nil
+}
+
+type ticketClaimerFake struct{ order *[]string }
+
+func (fake *ticketClaimerFake) ClaimTicketCodes(_ context.Context, _ shard.IssueTicketsCommand, _ shard.TicketIdentityPlan) error {
+	if fake.order != nil {
+		*fake.order = append(*fake.order, "claim")
+	}
+	return nil
 }
 
 func (fake *shardStoreFake) MarkRefundPending(_ context.Context, _ sharding.ShardRoute, command shard.MarkRefundPendingCommand) (shard.MarkRefundPendingReceipt, error) {

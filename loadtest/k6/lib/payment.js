@@ -160,14 +160,17 @@ export function publicErrorCode(response) {
   }
 }
 
-export function record(response, expectedStatuses, expectedFaultCodes = []) {
+export function record(response, expectedStatuses, expectedFaultCodes = [], operation = 'unknown') {
   paymentHTTPRequests.add(1);
   paymentHTTPRequestDuration.add(response.timings.duration);
   const code = publicErrorCode(response);
   const expected = expectedStatuses.includes(response.status);
   const expectedFault = expectedFaultCodes.includes(code);
   if (expectedFault) expectedFaultResponses.add(1);
-  if (!expected && !expectedFault) unexpectedResponses.add(1);
+  if (!expected && !expectedFault) {
+    unexpectedResponses.add(1);
+    console.error(JSON.stringify({ event: 'unexpected_payment_response', operation, status: response.status, code }));
+  }
   return { expected: expected || expectedFault, code };
 }
 
@@ -178,7 +181,7 @@ export function createIntent(base, reservationID, token, key, expectedStatuses =
     '{}',
     { headers: paymentHeaders(token, key), tags: { operation: 'payment_intent_create' } },
   );
-  record(response, expectedStatuses, ['payment_processing', 'payment_provider_unavailable']);
+  record(response, expectedStatuses, ['payment_processing', 'payment_provider_unavailable'], 'payment_intent_create');
   if (response.status === 202) paymentAccepted.add(1);
   return response;
 }
@@ -197,7 +200,7 @@ export function getIntent(base, intentID, token) {
   const response = http.get(`${base}/api/v1/payment-intents/${encodeURIComponent(intentID)}`, {
     headers: bearerHeaders(token), tags: { operation: 'payment_intent_get' },
   });
-  record(response, [200], ['payment_processing', 'payment_under_review']);
+  record(response, [200], ['payment_processing', 'payment_under_review'], 'payment_intent_get');
   return response;
 }
 
@@ -207,7 +210,7 @@ export function cancelIntent(base, intentID, token, key) {
     '{}',
     { headers: paymentHeaders(token, key), tags: { operation: 'payment_intent_cancel' } },
   );
-  record(response, [202], ['refund_processing', 'payment_processing', 'payment_under_review']);
+  record(response, [202], ['refund_processing', 'payment_processing', 'payment_under_review'], 'payment_intent_cancel');
   return response;
 }
 
@@ -220,7 +223,7 @@ export function authorizeHosted(hostedReference) {
     null,
     { tags: { operation: 'sandbox_hosted_authorize' } },
   );
-  record(response, [202]);
+  record(response, [202], [], 'sandbox_hosted_authorize');
   return response;
 }
 
@@ -250,7 +253,7 @@ export function listTicketOrders(base, token) {
   const response = http.get(`${base}/api/v1/ticket-orders?page=1&limit=100&sort=-created_at`, {
     headers: bearerHeaders(token), tags: { operation: 'ticket_order_list' },
   });
-  record(response, [200], ['ticket_issuance_processing']);
+  record(response, [200], ['ticket_issuance_processing'], 'ticket_order_list');
   return response;
 }
 
@@ -302,7 +305,7 @@ export function queueFault(operation, kind, delaySteps = 0) {
       tags: { operation: 'sandbox_fault_control', fault_kind: kind },
     },
   );
-  record(response, [204]);
+  record(response, [204], [], 'sandbox_fault_control');
   if (response.status === 204) faultHooksArmed.add(1);
   return response;
 }
@@ -319,7 +322,7 @@ export function advanceSandbox(steps = 1) {
       tags: { operation: 'sandbox_advance' },
     },
   );
-  record(response, [204]);
+  record(response, [204], [], 'sandbox_advance');
   return response;
 }
 
@@ -328,7 +331,7 @@ export function drainWebhooks() {
     headers: { 'X-Sandbox-Control-Token': required('SANDBOX_CONTROL_TOKEN') },
     tags: { operation: 'sandbox_webhook_drain' },
   });
-  record(response, [200]);
+  record(response, [200], [], 'sandbox_webhook_drain');
   if (response.status !== 200) return [];
   try {
     const value = response.json();
@@ -351,7 +354,7 @@ export function deliverWebhook(base, queued) {
     },
     tags: { operation: 'payment_webhook_ingest' },
   });
-  record(response, [200, 202], ['payment_webhook_conflict']);
+  record(response, [200, 202], ['payment_webhook_conflict'], 'payment_webhook_ingest');
   return response;
 }
 

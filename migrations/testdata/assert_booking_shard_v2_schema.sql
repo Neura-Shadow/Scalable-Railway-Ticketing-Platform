@@ -106,9 +106,19 @@ BEGIN
         WHERE n.nspname = 'public'
           AND t.relname = 'tickets'
           AND c.conname = 'tickets_opaque_code_check'
-          AND pg_get_constraintdef(c.oid) LIKE '%A-Za-z0-9_-%'
+          AND pg_get_constraintdef(c.oid) LIKE '%length(ticket_code)%16%64%'
     ) THEN
         RAISE EXCEPTION 'ticket state or opaque-code constraint is incomplete';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger AS trigger_row
+        JOIN pg_class AS table_row ON table_row.oid=trigger_row.tgrelid
+        WHERE NOT trigger_row.tgisinternal
+          AND table_row.relname='tickets'
+          AND trigger_row.tgname='tickets_guard_identity'
+    ) THEN
+        RAISE EXCEPTION 'ticket identity immutability trigger is missing';
     END IF;
 
     IF (SELECT count(DISTINCT event_object_table)

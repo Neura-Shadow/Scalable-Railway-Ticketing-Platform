@@ -253,6 +253,23 @@ func TestCapturedManualReviewWithoutTicketStillProducesFinding(t *testing.T) {
 	}
 }
 
+func TestAwaitingCustomerWithoutCaptureOrTicketIsClean(t *testing.T) {
+	control := ControlSnapshot{
+		Intent:     Intent{ID: uuid.New(), State: "awaiting_customer", AmountMinor: 700, Currency: "TWD"},
+		Saga:       Saga{State: "awaiting_provider", Step: "await_provider"},
+		Operations: []Operation{{Type: "create_checkout", State: "succeeded", AmountMinor: 700, Currency: "TWD"}},
+	}
+	shard := ShardSnapshot{
+		Found: true, DirectoryResolved: true, ReservationState: "payment_pending",
+		ReservationAmountMinor: 700, ReservationCurrency: "TWD", ReservationSeatCount: 1,
+	}
+	var findings []string
+	checkShard(ScopeAll, control, shard, func(code string, _ bool) { findings = append(findings, code) })
+	if containsString(findings, "captured_payment_without_ticket") {
+		t.Fatalf("uncaptured customer-action payment was misclassified: %v", findings)
+	}
+}
+
 func TestBeginReceiptFingerprintMismatchIsNotRepairable(t *testing.T) {
 	control := ControlSnapshot{Intent: Intent{ID: uuid.New(), State: "reservation_securing", AmountMinor: 700, Currency: "TWD", Fingerprint: sha256.Sum256([]byte("control"))}}
 	shard := ShardSnapshot{Found: true, DirectoryResolved: true, ReservationState: "payment_pending", ReservationAmountMinor: 700,

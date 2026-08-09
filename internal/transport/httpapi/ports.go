@@ -320,6 +320,7 @@ const (
 	RateLimitPassengerCreate   RateLimitScope = "passenger_create"
 	RateLimitPolicyMutation    RateLimitScope = "hot_train_policy_mutation"
 	RateLimitOperatorBooking   RateLimitScope = "operator_booking_mutation"
+	RateLimitPaymentWebhook    RateLimitScope = "payment_webhook"
 )
 
 type RateLimitRequest struct {

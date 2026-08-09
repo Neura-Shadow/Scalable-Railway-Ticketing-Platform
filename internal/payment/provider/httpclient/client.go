@@ -135,7 +135,7 @@ func (client *Client) CreateCheckout(ctx context.Context, request provider.Creat
 		return result, err
 	}
 	err := client.doJSON(ctx, http.MethodPost, "/v1/checkouts", request, &result, "create_checkout", true)
-	if err == nil && (!validIdentifier(result.ProviderPaymentID) || result.HostedReference == "" ||
+	if err == nil && (!validPersistedIdentifier(result.ProviderPaymentID) || !validHostedReference(result.HostedReference) ||
 		!validIdentifier(result.SyntheticToken) || result.Status != provider.StatusCreated ||
 		result.AmountMinor != request.AmountMinor || result.Currency != request.Currency) {
 		err = inconsistent("create_checkout", true)
@@ -149,7 +149,7 @@ func (client *Client) GetPaymentStatus(ctx context.Context, paymentID string) (p
 		return result, validation("query_status")
 	}
 	err := client.doJSON(ctx, http.MethodGet, "/v1/payments/"+url.PathEscape(paymentID), nil, &result, "query_status", false)
-	if err == nil && (!validIdentifier(result.ProviderPaymentID) || result.ProviderPaymentID != paymentID ||
+	if err == nil && (!validPersistedIdentifier(result.ProviderPaymentID) || result.ProviderPaymentID != paymentID ||
 		!validStatus(result.Status) || result.AmountMinor <= 0 || !validCurrency(result.Currency) ||
 		result.CapturedMinor < 0 || result.RefundedMinor < 0 || result.RefundedMinor > result.CapturedMinor ||
 		result.CapturedMinor > result.AmountMinor || result.ProviderUpdatedAt.IsZero()) {
@@ -189,8 +189,8 @@ func (client *Client) Refund(ctx context.Context, request provider.RefundRequest
 func (client *Client) operation(ctx context.Context, operation, paymentID string, request any, amount int64, currency string, exactMoney bool) (provider.OperationResult, error) {
 	var result provider.OperationResult
 	err := client.doJSON(ctx, http.MethodPost, "/v1/payments/"+url.PathEscape(paymentID)+"/"+operation, request, &result, operation, true)
-	if err == nil && (!validIdentifier(result.ProviderPaymentID) || result.ProviderPaymentID != paymentID ||
-		!validIdentifier(result.ProviderOperationID) || !validStatus(result.Status) ||
+	if err == nil && (!validPersistedIdentifier(result.ProviderPaymentID) || result.ProviderPaymentID != paymentID ||
+		!validPersistedIdentifier(result.ProviderOperationID) || !validStatus(result.Status) ||
 		(exactMoney && (result.AmountMinor != amount || result.Currency != currency)) ||
 		(!exactMoney && (result.AmountMinor <= 0 || !validCurrency(result.Currency)))) {
 		err = inconsistent(operation, true)
@@ -312,7 +312,15 @@ func validCommon(intentID, paymentID string, amount int64, currency, key string,
 }
 
 func validIdentifier(value string) bool {
-	if value == "" || len(value) > 160 {
+	return validBoundedIdentifier(value, 160)
+}
+
+func validPersistedIdentifier(value string) bool {
+	return validBoundedIdentifier(value, 128)
+}
+
+func validBoundedIdentifier(value string, maximum int) bool {
+	if value == "" || len(value) > maximum || !asciiAlphanumeric(value[0]) {
 		return false
 	}
 	for _, character := range value {
@@ -323,6 +331,15 @@ func validIdentifier(value string) bool {
 		return false
 	}
 	return true
+}
+
+func validHostedReference(value string) bool {
+	return validBoundedIdentifier(value, 256)
+}
+
+func asciiAlphanumeric(character byte) bool {
+	return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+		(character >= '0' && character <= '9')
 }
 
 func validKeyID(value string) bool {
@@ -362,7 +379,7 @@ func knownEventType(eventType provider.EventType) bool {
 }
 
 func validWebhookEvent(event provider.WebhookEvent) bool {
-	return validIdentifier(event.ProviderEventID) && validIdentifier(event.ProviderPaymentID) &&
+	return validPersistedIdentifier(event.ProviderEventID) && validPersistedIdentifier(event.ProviderPaymentID) &&
 		event.AmountMinor > 0 && validCurrency(event.Currency) && !event.OccurredAt.IsZero() && validStatus(event.Status)
 }
 

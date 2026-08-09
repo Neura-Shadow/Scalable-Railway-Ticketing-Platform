@@ -22,9 +22,11 @@ foreign keys. Installing version 2 never enables a writer or payment feature.
   `dirty=false`. The source must be clean at booking-shard version 1.
 - Take and restore-test an independent recovery point. Measure table sizes,
   locks, disk/WAL headroom and the per-shard/global pool budget.
-- Confirm control migration 10 is clean, payment remains disabled, and all API,
-  worker, migration and operator binaries understand both shard versions 1 and
-  2 before any shard is upgraded.
+- Confirm control migration 10 is clean and payment remains disabled. The M6
+  binaries intentionally require shard version 2; drain the old replicas and
+  keep the new replicas out of readiness until every enabled shard and its
+  catalog row are upgraded. This runbook does not claim mixed-version serving
+  or zero downtime.
 - Confirm the local fence and current control assignment identify at most one
   writer. Do not apply schema with a public/runtime credential; ordinary roles
   cannot disable triggers, alter fences, forge receipts or mutate apply
@@ -79,11 +81,11 @@ Validation must prove:
 
 ## Staged enablement and readiness
 
-Upgrade disabled/empty shards first, then retained/non-writing sources, then a
-bounded canary writer, and finally the remaining enabled shards. Do not enable
-M6 anywhere until **all** enabled/routable shards are clean at version 2; mixed
-versions may serve compatible non-payment behavior only if the binary readiness
-contract explicitly proves it.
+Within the coordinated maintenance boundary, upgrade disabled/empty shards
+first, then retained/non-writing sources, then the remaining enabled shards.
+Do not start the new writer or enable M6 anywhere until **all**
+enabled/routable shards and catalog entries are clean at version 2. Mixed
+versions are not a supported serving state for this release.
 
 For a canary payment, prove the following sequence and durable checkpoints:
 

@@ -278,7 +278,7 @@ ALTER TABLE public.tickets
         status IN ('pending', 'active', 'refund_pending', 'cancelled')
     ),
     ADD CONSTRAINT tickets_opaque_code_check CHECK (
-        ticket_code ~ '^[A-Za-z0-9_-]{16,64}$'
+        length(ticket_code) BETWEEN 16 AND 64
     );
 ALTER TABLE booking_shard_0.tickets
     DROP CONSTRAINT tickets_status_check,
@@ -286,7 +286,7 @@ ALTER TABLE booking_shard_0.tickets
         status IN ('pending', 'active', 'refund_pending', 'cancelled')
     ),
     ADD CONSTRAINT tickets_opaque_code_check CHECK (
-        ticket_code ~ '^[A-Za-z0-9_-]{16,64}$'
+        length(ticket_code) BETWEEN 16 AND 64
     );
 ALTER TABLE booking_shard_1.tickets
     DROP CONSTRAINT tickets_status_check,
@@ -294,8 +294,32 @@ ALTER TABLE booking_shard_1.tickets
         status IN ('pending', 'active', 'refund_pending', 'cancelled')
     ),
     ADD CONSTRAINT tickets_opaque_code_check CHECK (
-        ticket_code ~ '^[A-Za-z0-9_-]{16,64}$'
+        length(ticket_code) BETWEEN 16 AND 64
     );
+
+CREATE FUNCTION public.guard_ticket_identity()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $ticket_identity_guard$
+BEGIN
+    IF NEW.id IS DISTINCT FROM OLD.id
+       OR NEW.ticket_code IS DISTINCT FROM OLD.ticket_code THEN
+        RAISE EXCEPTION 'ticket identity is immutable'
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END
+$ticket_identity_guard$;
+
+CREATE TRIGGER tickets_guard_identity
+BEFORE UPDATE ON public.tickets
+FOR EACH ROW EXECUTE FUNCTION public.guard_ticket_identity();
+CREATE TRIGGER tickets_guard_identity
+BEFORE UPDATE ON booking_shard_0.tickets
+FOR EACH ROW EXECUTE FUNCTION public.guard_ticket_identity();
+CREATE TRIGGER tickets_guard_identity
+BEFORE UPDATE ON booking_shard_1.tickets
+FOR EACH ROW EXECUTE FUNCTION public.guard_ticket_identity();
 
 CREATE UNIQUE INDEX reservations_payment_intent_unique_idx
     ON public.reservations(payment_intent_id)
@@ -323,10 +347,11 @@ CREATE UNIQUE INDEX ticket_orders_payment_intent_unique_idx
 -- updating its locator without rewriting the global code claim.
 CREATE TABLE public.ticket_code_directory (
     ticket_code text PRIMARY KEY
-        CHECK (ticket_code ~ '^[A-Za-z0-9_-]{16,64}$'),
-    ticket_id uuid NOT NULL UNIQUE
-        REFERENCES public.ticket_shard_locators(ticket_id)
-        ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+        CHECK (length(ticket_code) BETWEEN 16 AND 64),
+    -- A claim intentionally precedes shard issuance, so it cannot require a
+    -- locator that is written only after the shard receipt commits. Abandoned
+    -- claims remain immutable tombstones and are never recycled.
+    ticket_id uuid NOT NULL UNIQUE,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
@@ -354,10 +379,10 @@ CREATE TRIGGER ticket_code_directory_guard
 BEFORE UPDATE OR DELETE ON public.ticket_code_directory
 FOR EACH ROW EXECUTE FUNCTION public.guard_ticket_code_directory_row();
 
--- Version-10 installation can safely backfill tickets still resident in the
--- three control-local layouts. Physical ticket codes are never guessed or
--- scanned here; all new physical issuance writes the claim with its locator in
--- one control transaction.
+-- Version-10 installation backfills tickets resident in the three control-
+-- local layouts. Existing external physical tickets keep the rollout gate
+-- pending until payment-admin reads each exact authoritative code and claims
+-- it; codes are never guessed or inferred from locators.
 INSERT INTO public.ticket_code_directory(ticket_code,ticket_id)
 SELECT ticket.ticket_code, locator.ticket_id
 FROM public.ticket_shard_locators AS locator
@@ -373,6 +398,66 @@ SELECT ticket.ticket_code, locator.ticket_id
 FROM public.ticket_shard_locators AS locator
 JOIN booking_shard_1.tickets AS ticket ON ticket.id=locator.ticket_id
 WHERE locator.shard_id='shard-1';
+
+-- Operators must explicitly scan and claim ticket identities already resident
+-- on independent physical shards. Payment creation and issuance fail closed
+-- until this singleton is ready and every control locator has a matching claim.
+CREATE TABLE public.ticket_code_claim_readiness (
+    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    state text NOT NULL CHECK (state IN ('pending','ready')),
+    claimed_ticket_count bigint NOT NULL DEFAULT 0 CHECK (claimed_ticket_count >= 0),
+    verified_at timestamptz,
+    CHECK ((state='ready') = (verified_at IS NOT NULL))
+);
+
+INSERT INTO public.ticket_code_claim_readiness(state,claimed_ticket_count,verified_at)
+SELECT CASE WHEN EXISTS (
+           SELECT 1 FROM public.ticket_shard_locators
+           WHERE shard_id IN ('physical-shard-0','physical-shard-1')
+       ) THEN 'pending' ELSE 'ready' END,
+       (SELECT count(*) FROM public.ticket_code_directory),
+       CASE WHEN EXISTS (
+           SELECT 1 FROM public.ticket_shard_locators
+           WHERE shard_id IN ('physical-shard-0','physical-shard-1')
+       ) THEN NULL ELSE clock_timestamp() END;
+
+CREATE FUNCTION public.lock_ticket_code_claims()
+RETURNS void
+LANGUAGE sql
+SET search_path = pg_catalog
+AS $ticket_code_claim_lock$
+    SELECT pg_advisory_xact_lock(804230051)
+$ticket_code_claim_lock$;
+
+-- Locator insertion is the authoritative point at which a previously issued
+-- ticket becomes visible to the control plane. Serialize it with the explicit
+-- backfill verifier so neither logical confirmation nor a physical command
+-- finalizer can publish an unclaimed ticket while the singleton remains ready.
+-- M6 issuance preclaims the ticket identity, so its locator does not disturb a
+-- ready singleton.
+CREATE FUNCTION public.mark_ticket_code_claims_pending_for_unclaimed_locator()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $ticket_code_claim_readiness_guard$
+BEGIN
+    PERFORM public.lock_ticket_code_claims();
+    IF NOT EXISTS (
+        SELECT 1
+        FROM public.ticket_code_directory AS directory
+        WHERE directory.ticket_id=NEW.ticket_id
+    ) THEN
+        UPDATE public.ticket_code_claim_readiness
+        SET state='pending',verified_at=NULL
+        WHERE singleton;
+    END IF;
+    RETURN NEW;
+END
+$ticket_code_claim_readiness_guard$;
+
+CREATE TRIGGER ticket_shard_locators_mark_unclaimed_code_pending
+AFTER INSERT OR UPDATE OF ticket_id ON public.ticket_shard_locators
+FOR EACH ROW EXECUTE FUNCTION public.mark_ticket_code_claims_pending_for_unclaimed_locator();
 
 CREATE FUNCTION public.guard_control_booking_payment_snapshot()
 RETURNS trigger

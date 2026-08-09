@@ -90,6 +90,11 @@ FOR UPDATE OF intent,saga`, request.ReservationID))
 		return paymentapp.IntentRecord{}, false, err
 	}
 
+	var ticketClaimsReady bool
+	if err := tx.QueryRow(ctx, reserveIntentReadinessSQL).Scan(&ticketClaimsReady); err != nil || !ticketClaimsReady {
+		return paymentapp.IntentRecord{}, false, paymentapp.ErrPaymentUnavailable
+	}
+
 	_, err = tx.Exec(ctx, `
 INSERT INTO public.payment_intents (
     payment_intent_id,reservation_id,train_run_id,owner_user_id,provider,
@@ -131,6 +136,10 @@ WHERE intent.payment_intent_id=$1`, request.PaymentIntentID))
 	}
 	return record, false, nil
 }
+
+const reserveIntentReadinessSQL = `SELECT readiness.state='ready'
+FROM public.ticket_code_claim_readiness AS readiness
+WHERE readiness.singleton`
 
 func (store *Store) MarkReservationSecured(
 	ctx context.Context,
@@ -212,6 +221,40 @@ WHERE intent.payment_intent_id=$1`, intentID))
 		return paymentapp.IntentRecord{}, paymentapp.ErrControlFinalizationDeferred
 	}
 	return record, nil
+}
+
+func (store *Store) FailReservationSecuring(
+	ctx context.Context,
+	intentID uuid.UUID,
+	fingerprint [sha256.Size]byte,
+) error {
+	if store == nil || store.db == nil || ctx == nil || intentID == uuid.Nil || zeroDigest(fingerprint) {
+		return paymentapp.ErrControlFinalizationDeferred
+	}
+	tx, err := store.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return paymentapp.ErrControlFinalizationDeferred
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+
+	intentTag, err := tx.Exec(ctx, `UPDATE public.payment_intents
+SET state='failed',completed_at=clock_timestamp()
+WHERE payment_intent_id=$1 AND state='reservation_securing'
+  AND request_fingerprint=$2`, intentID, fingerprint[:])
+	if err != nil || intentTag.RowsAffected() != 1 {
+		return paymentapp.ErrControlFinalizationDeferred
+	}
+	sagaTag, err := tx.Exec(ctx, `UPDATE public.payment_sagas
+SET state='failed',current_step='complete',bounded_error_category='reservation_not_payable',
+    completed_at=clock_timestamp(),lease_owner=NULL,lease_until=NULL
+WHERE payment_intent_id=$1 AND state='created' AND current_step='secure_reservation'`, intentID)
+	if err != nil || sagaTag.RowsAffected() != 1 {
+		return paymentapp.ErrControlFinalizationDeferred
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return paymentapp.ErrControlFinalizationDeferred
+	}
+	return nil
 }
 
 func (store *Store) GetOwnedIntent(ctx context.Context, ownerID, intentID uuid.UUID) (paymentapp.IntentRecord, error) {
@@ -310,6 +353,9 @@ WHERE payment_intent_id=$1 AND operation_type=$2`, request.PaymentIntentID, kind
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return paymentapp.IntentRecord{}, err
 	}
+	if !stateAllowsNewCancellation(record.State, kind) {
+		return paymentapp.IntentRecord{}, paymentapp.ErrPaymentConflict
+	}
 
 	if _, err = tx.Exec(ctx, `
 INSERT INTO public.payment_operations (
@@ -346,7 +392,7 @@ WHERE payment_intent_id=$1 AND operation_type=$2`, request.PaymentIntentID, kind
 		tag, err = tx.Exec(ctx, `
 UPDATE public.payment_intents SET state='refund_pending'
 WHERE payment_intent_id=$1
-  AND state IN ('captured','ticket_issue_pending','completed','manual_review')`, request.PaymentIntentID)
+  AND state='completed'`, request.PaymentIntentID)
 		if err == nil && tag.RowsAffected() != 1 {
 			return paymentapp.IntentRecord{}, paymentapp.ErrPaymentConflict
 		}
@@ -355,7 +401,7 @@ WHERE payment_intent_id=$1
 		tag, err = tx.Exec(ctx, `
 UPDATE public.payment_intents SET state='void_pending'
 WHERE payment_intent_id=$1
-  AND state IN ('awaiting_customer','authorized','manual_review')`, request.PaymentIntentID)
+  AND state IN ('awaiting_customer','authorized')`, request.PaymentIntentID)
 		if err == nil && tag.RowsAffected() != 1 {
 			return paymentapp.IntentRecord{}, paymentapp.ErrPaymentConflict
 		}
@@ -368,7 +414,8 @@ WHERE payment_intent_id=$1
 UPDATE public.payment_sagas
 SET state='compensating',current_step=$2,next_attempt_at=clock_timestamp(),completed_at=NULL
 WHERE payment_intent_id=$1
-  AND state IN ('awaiting_provider','authorized','captured','issuing_tickets','completed','manual_review')`, request.PaymentIntentID, kind); err != nil {
+  AND (($2='void' AND state IN ('awaiting_provider','authorized'))
+    OR ($2='refund' AND state='completed'))`, request.PaymentIntentID, kind); err != nil {
 		return paymentapp.IntentRecord{}, err
 	}
 	if sagaTag.RowsAffected() != 1 {
@@ -432,7 +479,7 @@ func validReserveRequest(request paymentapp.ReserveIntentRequest) bool {
 	return request.PaymentIntentID != uuid.Nil && request.SagaID != uuid.Nil &&
 		request.BeginCommandID != uuid.Nil && request.ReservationID != uuid.Nil &&
 		request.TrainRunID != uuid.Nil && request.OwnerID != uuid.Nil &&
-		providerPattern.MatchString(request.Provider) && request.AmountMinor >= 0 &&
+		providerPattern.MatchString(request.Provider) && request.AmountMinor > 0 &&
 		currencyPattern.MatchString(request.Currency) && !zeroDigest(request.IdempotencyKeyHash) &&
 		!zeroDigest(request.RequestFingerprint)
 }
@@ -478,6 +525,21 @@ func stateRequiresCapture(state string) bool {
 	switch state {
 	case "captured", "ticket_issue_pending", "completed", "refund_pending", "refunded":
 		return true
+	default:
+		return false
+	}
+}
+
+func stateAllowsNewCancellation(state, kind string) bool {
+	switch kind {
+	case "void":
+		return state == "awaiting_customer" || state == "authorized"
+	case "refund":
+		// Ticket issuance and its control finalization form one serialized
+		// boundary. A customer refund may start only after that boundary is
+		// durably complete, so a committed shard receipt can always be repaired
+		// before compensation begins.
+		return state == "completed"
 	default:
 		return false
 	}

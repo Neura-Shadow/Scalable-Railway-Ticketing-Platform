@@ -657,7 +657,7 @@ WHERE ticket_order_shard_locators.reservation_id=EXCLUDED.reservation_id
  AND ticket_order_shard_locators.owner_user_id=EXCLUDED.owner_user_id
  AND ticket_order_shard_locators.total_amount_minor=EXCLUDED.total_amount_minor
  AND ticket_order_shard_locators.currency=EXCLUDED.currency
- AND ticket_order_shard_locators.created_at=EXCLUDED.created_at`, receipt.TicketOrderID, e.ReservationID, trainRunID, shardID, generation, ownerID, e.AmountMinor, e.Currency, receipt.IssuedAt.UTC()); err != nil || tag.RowsAffected() != 1 {
+ AND ticket_order_shard_locators.created_at=EXCLUDED.created_at`, receipt.TicketOrderID, e.ReservationID, trainRunID, shardID, generation, ownerID, e.AmountMinor, e.Currency, receipt.OrderCreatedAt.UTC()); err != nil || tag.RowsAffected() != 1 {
 		return paymentreconcile.ErrRepairUnavailable
 	}
 	for index, ticketID := range receipt.TicketIDs {
@@ -738,14 +738,15 @@ func (r *Repairer) finalizeCompensation(ctx context.Context, e repairEvidence, c
 	if !validCompensationRepairReceipt(e, command, receipt) {
 		return paymentreconcile.ErrRepairUnavailable
 	}
-	return r.finalizeTerminalCompensation(ctx, e, "refunded", "refunding", receipt.TicketOrderID, true, leaseOwner)
+	return r.finalizeTerminalCompensation(ctx, e, "refunded", "refunding", receipt.TicketOrderID, receipt.CancelledTicketCount > 0, leaseOwner)
 }
 
 func validIssueRepairReceipt(e repairEvidence, command paymentshard.IssueTicketsCommand, receipt paymentshard.IssueTicketsReceipt) bool {
 	if receipt.CommandID != command.CommandID || receipt.IssuanceID != command.IssuanceID || receipt.PaymentIntentID != e.IntentID ||
 		receipt.ReservationID != e.ReservationID || receipt.TicketOrderID == uuid.Nil || len(receipt.TicketIDs) == 0 ||
 		len(receipt.TicketCodes) != len(receipt.TicketIDs) ||
-		receipt.AmountMinor != e.AmountMinor || receipt.Currency != e.Currency || receipt.IssuedAt.IsZero() {
+		receipt.AmountMinor != e.AmountMinor || receipt.Currency != e.Currency ||
+		receipt.OrderCreatedAt.IsZero() || receipt.IssuedAt.IsZero() {
 		return false
 	}
 	seen := make(map[uuid.UUID]struct{}, len(receipt.TicketIDs))
@@ -802,7 +803,7 @@ WHERE intent.payment_intent_id=$1 AND saga.saga_id=$2 FOR UPDATE OF intent,saga`
 	if orderID != uuid.Nil {
 		tag, err := tx.Exec(ctx, `UPDATE public.ticket_order_shard_locators SET status='cancelled'
 WHERE ticket_order_id=$1 AND reservation_id=$2 AND owner_user_id=$3`, orderID, e.ReservationID, e.OwnerID)
-		if err != nil || requireLocator && tag.RowsAffected() != 1 || !requireLocator && tag.RowsAffected() > 1 {
+		if err != nil || requireLocator && tag.RowsAffected() != 1 || !requireLocator && tag.RowsAffected() != 0 {
 			return paymentreconcile.ErrRepairUnavailable
 		}
 	} else if requireLocator {

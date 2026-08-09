@@ -388,7 +388,10 @@ func TestExecutorConfirmationEmitsOneDeterministicEventPerTicket(t *testing.T) {
 		{values: []any{uuid.NewSHA1(cmd.ID, []byte("ticket-order"))}}, {values: []any{created}},
 	}, queryRows: []pgx.Rows{
 		&scriptedRows{values: [][]any{{seatA}, {seatB}}},
-		&scriptedRows{values: [][]any{{uuid.NewSHA1(cmd.ID, seatA[:])}, {uuid.NewSHA1(cmd.ID, seatB[:])}}},
+		&scriptedRows{values: [][]any{
+			{uuid.NewSHA1(cmd.ID, seatA[:]), "TKT" + uuid.NewSHA1(cmd.ID, seatA[:]).String()},
+			{uuid.NewSHA1(cmd.ID, seatB[:]), "TKT" + uuid.NewSHA1(cmd.ID, seatB[:]).String()},
+		}},
 	}}
 	resolution.Handle = handleForTx(t, tx, true)
 	executor, _ := commandphysical.NewExecutor(&routeResolver{resolution: resolution}, commandphysical.Options{MaxHoldTTL: time.Hour})
@@ -430,7 +433,7 @@ func TestExecutorAlternateConfirmationKeyReplaysAuthoritativeTicketIDsWithoutDup
 		{values: []any{orderID}}, {values: []any{created}},
 	}, queryRows: []pgx.Rows{
 		&scriptedRows{values: [][]any{{seatA}, {seatB}}},
-		&scriptedRows{values: [][]any{{ticketA}, {ticketB}}},
+		&scriptedRows{values: [][]any{{ticketA, "TKT" + ticketA.String()}, {ticketB, "TKT" + ticketB.String()}}},
 	}}
 	resolution.Handle = handleForTx(t, tx, true)
 	executor, _ := commandphysical.NewExecutor(&routeResolver{resolution: resolution}, commandphysical.Options{MaxHoldTTL: time.Hour})

@@ -100,6 +100,7 @@ jobs:
           --health-retries 20
     env:
       CONTROL_DATABASE_URL: postgres://railway_control:control-ci-local@localhost:55430/railway_control?sslmode=disable
+      POPULATED_CONTROL_DATABASE_URL: postgres://railway_control:control-ci-local@localhost:55430/railway_control_populated?sslmode=disable
       BOOKING_SHARD_0_DATABASE_URL: postgres://railway_booking:shard-0-ci-local@localhost:55431/railway_booking?sslmode=disable
       BOOKING_SHARD_1_DATABASE_URL: postgres://railway_booking:shard-1-ci-local@localhost:55432/railway_booking?sslmode=disable
       TEST_CONTROL_DATABASE_URL: postgres://railway_control:control-ci-local@localhost:55430/railway_control?sslmode=disable
@@ -176,6 +177,30 @@ jobs:
             psql "$database_url" --set=ON_ERROR_STOP=1 \
               --file migrations/testdata/assert_booking_shard_v2_schema.sql
           done
+      - name: Rehearse populated v9 ticket-code backfill and collisions
+        shell: bash
+        run: |
+          psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --command 'CREATE DATABASE railway_control_populated'
+          mkdir -p "$RUNNER_TEMP/control-v7"
+          cp migrations/00000[1-7]_*.sql "$RUNNER_TEMP/control-v7/"
+          go run ./cmd/migrate -path "$RUNNER_TEMP/control-v7" \
+            -database "$POPULATED_CONTROL_DATABASE_URL" up
+          for fixture in \
+            populated_v5_fixture.sql \
+            seed_hot_train_v6_fixture.sql \
+            seed_read_model_v7_fixture.sql \
+            seed_milestone4_v7_fixture.sql
+          do
+            psql "$POPULATED_CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+              --file "migrations/testdata/$fixture"
+          done
+          go run ./cmd/migrate -path "$RUNNER_TEMP/control-v9" \
+            -database "$POPULATED_CONTROL_DATABASE_URL" up
+          go run ./cmd/migrate -path migrations \
+            -database "$POPULATED_CONTROL_DATABASE_URL" up
+          psql "$POPULATED_CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone6_v10_ticket_code_backfill.sql
       - name: Run live shard compensation and physical migration tests
         run: >-
           go test -p 1
@@ -185,9 +210,9 @@ jobs:
           -count=3 -timeout 420s
 
   payment-topology-regressions:
-    name: Multi-replica topology, load modules, and regressions
+    name: Multi-replica payment and migration evidence
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - name: Check out source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -198,6 +223,12 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: go.sum
+      - name: Generate disposable JWT signing key
+        shell: bash
+        run: |
+          jwt_secret="$(openssl rand -hex 32)"
+          echo "::add-mask::$jwt_secret"
+          echo "JWT_SECRET=$jwt_secret" >> "$GITHUB_ENV"
       - name: Validate payment multi-replica Compose topology
         run: >-
           docker compose
@@ -217,6 +248,22 @@ jobs:
             docker run --rm -v "$PWD/loadtest/k6:/scripts:ro" \
               grafana/k6:0.54.0 inspect "/scripts/$script" >/dev/null
           done
+      - name: Run complete bounded Milestone 6 payment evidence
+        shell: pwsh
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP 'milestone-6-payment-evidence'
+          ./scripts/run-milestone-6-payment-evidence.ps1 `
+            -ProjectName "railway-m6-ci-${{ github.run_id }}-${{ github.run_attempt }}" `
+            -EvidenceDirectory $evidence `
+            -IterationsPerScenario 1
+          Get-Content -Raw (Join-Path $evidence 'milestone-6-evidence-summary.json')
+      - name: Upload bounded Milestone 6 payment summaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: milestone-6-payment-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/milestone-6-payment-evidence/
+          if-no-files-found: error
+          retention-days: 14
       - name: Run payment-adjacent regression packages
         run: >-
           go test -p 1

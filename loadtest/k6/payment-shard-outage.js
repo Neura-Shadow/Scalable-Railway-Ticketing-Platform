@@ -9,6 +9,7 @@ import {
   iterationKey,
   pollIntent,
   positiveInteger,
+  publicErrorCode,
 } from './lib/payment.js';
 
 export const options = boundedScenario('paymentShardOutage');
@@ -25,6 +26,7 @@ export function paymentShardOutage() {
     apiURL(), healthy.reservationID, healthy.token, iterationKey('m6-healthy-shard'), [202],
   );
   const failedIntent = intentView(failedResponse);
+  const failedCode = publicErrorCode(failedResponse);
   const healthyIntent = intentView(healthyResponse);
   const failedObserved = failedIntent && pollIntent(
     apiURL(), failedIntent.id, failed.token,
@@ -33,7 +35,9 @@ export function paymentShardOutage() {
   );
   check(null, {
     'failed assignment returns bounded failure or durable pending intent': () => Boolean(
-      failedResponse.status === 503 || (failedIntent && failedObserved)
+      failedResponse.status === 503 ||
+      (failedResponse.status === 202 && failedCode === 'payment_processing' && !failedIntent) ||
+      (failedIntent && failedObserved)
     ),
     'healthy shard continues accepting payment intents': () => Boolean(
       healthyResponse.status === 202 && healthyIntent

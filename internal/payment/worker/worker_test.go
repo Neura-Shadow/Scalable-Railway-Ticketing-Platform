@@ -419,7 +419,8 @@ func TestRunOnceRetriesTicketIssuanceWithSameCommandIdentity(t *testing.T) {
 		CommandID: commandID, IssuanceID: claim.Issue.IssuanceID,
 		PaymentIntentID: claim.Issue.PaymentIntentID, ReservationID: claim.Issue.ReservationID,
 		AmountMinor: claim.Issue.AmountMinor, Currency: claim.Issue.Currency,
-		TicketOrderID: uuid.New(), TicketIDs: []uuid.UUID{uuid.New()}, TicketCodes: []string{"ticket_code_000001"}, IssuedAt: fixedNow,
+		TicketOrderID: uuid.New(), TicketIDs: []uuid.UUID{uuid.New()}, TicketCodes: []string{"ticket_code_000001"},
+		OrderCreatedAt: fixedNow.Add(-time.Minute), IssuedAt: fixedNow,
 	}
 	second, err := worker.RunOnce(context.Background())
 	if err != nil || second.ActionsDone != 1 || shards.lastIssue.CommandID != commandID {
@@ -495,7 +496,8 @@ func TestCommittedIssuanceControlFinalizeFailureNeverStartsRefund(t *testing.T) 
 		CommandID: claim.Issue.CommandID, IssuanceID: claim.Issue.IssuanceID,
 		PaymentIntentID: claim.Issue.PaymentIntentID, ReservationID: claim.Issue.ReservationID,
 		TicketOrderID: uuid.New(), TicketIDs: []uuid.UUID{ticketID}, AmountMinor: 100,
-		TicketCodes: []string{"ticket_code_000001"}, Currency: "TWD", IssuedAt: fixedNow,
+		TicketCodes: []string{"ticket_code_000001"}, Currency: "TWD",
+		OrderCreatedAt: fixedNow.Add(-time.Minute), IssuedAt: fixedNow,
 	}}
 	store := &storeFake{actions: []ActionClaim{claim}, completeActionErr: errors.New("control commit failed")}
 	value := newTestWorker(t, store, &providerFake{}, shards, 1)
@@ -869,6 +871,27 @@ func (client *countingProvider) mutationCalls(kind domain.OperationType) int32 {
 		return client.refundCalls.Load()
 	default:
 		return 0
+	}
+}
+
+func TestShardFailureCategoryPreservesBoundedTicketIssuancePhase(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		err  error
+		want string
+	}{
+		{err: errors.Join(shard.ErrTicketPlanUnavailable, shard.ErrShardPaymentUnavailable), want: "shard_ticket_plan_failed"},
+		{err: errors.Join(shard.ErrTicketClaimUnavailable, shard.ErrTicketClaimReadFailed), want: "shard_ticket_claim_read_failed"},
+		{err: errors.Join(shard.ErrTicketClaimUnavailable, shard.ErrTicketClaimUnauthorized), want: "shard_ticket_claim_unauthorized"},
+		{err: errors.Join(shard.ErrTicketClaimUnavailable, shard.ErrTicketClaimConflict), want: "shard_ticket_claim_conflict"},
+		{err: errors.Join(shard.ErrTicketClaimUnavailable, shard.ErrTicketClaimCommitFailed), want: "shard_ticket_claim_commit_failed"},
+		{err: errors.Join(shard.ErrTicketClaimUnavailable, shard.ErrShardPaymentUnavailable), want: "shard_ticket_claim_failed"},
+		{err: errors.Join(shard.ErrTicketIssueUnavailable, shard.ErrShardPaymentUnavailable), want: "shard_ticket_issue_failed"},
+		{err: shard.ErrShardPaymentUnavailable, want: "shard_command_failed"},
+	} {
+		if got := shardFailureCategory(test.err); got != test.want {
+			t.Fatalf("shardFailureCategory(%v) = %q, want %q", test.err, got, test.want)
+		}
 	}
 }
 
