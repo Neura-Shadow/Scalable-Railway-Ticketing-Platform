@@ -334,7 +334,7 @@ function Assert-Milestone4OperatorHealth {
         [string](Get-Milestone4OptionalPropertyValue -Object $envelope -Name 'status') -ne $expectedStatus -or
         -not [bool](Get-Milestone4OptionalPropertyValue -Object $envelope -Name 'read_only' -Default $false) -or
         [bool](Get-Milestone4OptionalPropertyValue -Object $result -Name 'ready' -Default (-not $ExpectedReady)) -ne $ExpectedReady -or
-        [int64](Get-Milestone4OptionalPropertyValue -Object $result -Name 'schema_version' -Default -1) -ne 9 -or
+        [int64](Get-Milestone4OptionalPropertyValue -Object $result -Name 'schema_version' -Default -1) -ne 10 -or
         [bool](Get-Milestone4OptionalPropertyValue -Object $result -Name 'schema_dirty' -Default $true) -or
         [int](Get-Milestone4OptionalPropertyValue -Object $result -Name 'shard_catalog_entries' -Default -1) -ne 3 -or
         [int](Get-Milestone4OptionalPropertyValue -Object $result -Name 'writable_active_shards' -Default -1) -ne $expectedWritable -or
@@ -345,7 +345,7 @@ function Assert-Milestone4OperatorHealth {
     }
     return [ordered]@{
         ready = $ExpectedReady
-        schema_version = 9
+        schema_version = 10
         shard_catalog_entries = 3
         writable_active_shards = $expectedWritable
         degraded_shards = $expectedDegraded

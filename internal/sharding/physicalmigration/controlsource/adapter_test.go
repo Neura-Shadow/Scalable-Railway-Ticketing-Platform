@@ -148,6 +148,32 @@ func TestReverseV2ValidationAccountsForEveryPhysicalTable(t *testing.T) {
 	}
 }
 
+func TestReverseDerivedValidationUsesTheStillAuthoritativeSourceAssignment(t *testing.T) {
+	t.Parallel()
+
+	rowID := uuid.New()
+	control := &fakeDB{rows: []pgx.Rows{&fakeRows{values: [][]any{{
+		rowID, []byte(`{"id":"` + rowID.String() + `"}`),
+	}}}}}
+	adapter, err := NewReverse(control, &fakeDB{}, SourceLegacy)
+	if err != nil {
+		t.Fatalf("NewReverse() error = %v", err)
+	}
+	record := physicalmigration.Record{
+		TrainRunID: uuid.New(), SourceShardID: "physical-shard-0", TargetShardID: SourceLegacy,
+		SourceGeneration: 7, TargetGeneration: 8,
+	}
+	if _, err := adapter.reverseDerivedTargetRows(context.Background(), record,
+		"train_run_booking_snapshots", 2); err != nil {
+		t.Fatalf("reverseDerivedTargetRows() error = %v", err)
+	}
+	if len(control.queryArgs) != 1 || len(control.queryArgs[0]) != 6 ||
+		control.queryArgs[0][1] != record.SourceShardID ||
+		control.queryArgs[0][2] != record.SourceGeneration {
+		t.Fatalf("derived validation args = %#v, want current source assignment", control.queryArgs)
+	}
+}
+
 func TestFareSnapshotUsesDurableControlSourceVersion(t *testing.T) {
 	t.Parallel()
 	if !strings.Contains(sourceFareSnapshotSQL, "fare.source_version") {

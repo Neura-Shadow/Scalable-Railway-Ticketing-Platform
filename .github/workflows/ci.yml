@@ -278,6 +278,18 @@ jobs:
         shell: bash
         run: |
           go run ./cmd/migrate \
+            -path "$RUNNER_TEMP/migrations-v9" \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            up
+          go run ./cmd/migrate \
+            -path "$RUNNER_TEMP/migrations-v9" \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            version
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone5_v9_schema.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone5_v9_data.sql
+          go run ./cmd/migrate \
             -path migrations \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             up
@@ -285,10 +297,6 @@ jobs:
             -path migrations \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             version
-          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
-            --file migrations/testdata/assert_milestone5_v9_schema.sql
-          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
-            --file migrations/testdata/assert_milestone5_v9_data.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone6_v10_schema.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \

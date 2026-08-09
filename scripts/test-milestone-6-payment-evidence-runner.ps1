@@ -57,6 +57,8 @@ $requiredGuardrails = @(
     "booking-shard-1-postgres",
     "Wait-Job -Job `$migrationJob -Timeout 180",
     "`$attempt -le 5",
+    "Docker evidence user identity is malformed",
+    "@('--user'",
     "--summary-export",
     "checks.fails",
     "-pool-metrics.prom",

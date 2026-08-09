@@ -501,8 +501,11 @@ func (adapter *ReverseAdapter) reverseDerivedTargetRows(ctx context.Context, rec
 	if !ok || !reverseIgnoredTable(table) || limit <= 0 {
 		return nil, physicalmigration.ErrInvalidInput
 	}
-	rows, err := adapter.control.Query(ctx, query, record.TrainRunID, adapter.targetID,
-		record.TargetGeneration, uuid.Nil, nil, limit)
+	// The assignment remains bound to the physical source until cutover. Derive
+	// catalog-backed target rows through that current assignment; canonical
+	// validation deliberately removes the generation and shard identity.
+	rows, err := adapter.control.Query(ctx, query, record.TrainRunID, record.SourceShardID,
+		record.SourceGeneration, uuid.Nil, nil, limit)
 	if err != nil {
 		return nil, fmt.Errorf("%w: derive reverse validation target", physicalpostgres.ErrShardOperation)
 	}

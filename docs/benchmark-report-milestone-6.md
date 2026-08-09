@@ -3,9 +3,9 @@
 ## Status and evidence boundary
 
 **Status: `passed` for bounded disposable correctness/recovery evidence.** The
-canonical local bundle is `railway-m6-full-20260809s`, with 384 indexed files
+canonical local bundle is `railway-m6-full-20260809u`, with 386 indexed files
 and bundle SHA-256
-`fd5cf8a225f54e95050c1ef5ebb95281f26f35a742be035470a9cea7fe82a399`.
+`c16993a8c9a2f8d6ac7402605911b394115dffaac7f806a6dbd6e84afa262b8b`.
 All ten scenarios, final reconciliation, invariant checks, secret scan and
 project-scoped teardown passed. This does not establish production capacity,
 a live-provider SLO, PCI scope, multi-region behavior or an RPO/RTO.
@@ -22,13 +22,13 @@ guardrail.
 
 | Field | Recorded value |
 |---|---|
-| Source commit / worktree state | `d820822fdcf140837b88f3fee442a467b9632723`; dirty 732-file scoped source inventory SHA-256 `ac69442d8f673167b0d50d47abbf7f884a0e0822f995d31c66ccc1e9660fab4f` |
-| Start / end | 2026-08-09 10:30:35Z / 10:34:31Z; 235.274 seconds |
-| Bundle | `railway-m6-full-20260809s`; 384 indexed files; SHA-256 above |
-| Compose hashes | wrapper `15aa2d15c83a928989606e49626fee0ef867439a5ff87a2fe6940682995592d3`; rendered config `e3188182f76511069205d600f8b10dd881dd3a332570e004f80e92d5dca87246` |
-| Fixture seed | `7708ec37a7`; one bounded iteration unless the fault scenario requires 2 or 3 |
+| Source commit / worktree state | `c12d7fc6e050abd597ea27e2e1e375c1d9464a43`; dirty 732-file scoped source inventory SHA-256 `e1ba2fbbcaf2f3cf7ba9e13d6100ead4ac4c4416847f9af58523f70bb0a27d7d` |
+| Start / end | 2026-08-09 11:09:18Z / 11:12:59Z; 221.777 seconds |
+| Bundle | `railway-m6-full-20260809u`; 386 indexed files; SHA-256 above |
+| Compose hashes | wrapper `15aa2d15c83a928989606e49626fee0ef867439a5ff87a2fe6940682995592d3`; rendered config `38adfa5821f418fb18bad5004111a9af8ec547273283baa2fc81c613f39ff044` |
+| Fixture seed | `81065939f4`; one bounded iteration unless the fault scenario requires 2 or 3 |
 | Topology | 3 APIs, 2 payment workers, 1 reconciler, sandbox, control PostgreSQL, 2 booking-shard PostgreSQL instances |
-| Host | Windows 10.0.22631; 24 logical processors; repository drive 2,048,390,066,176 bytes total / 1,275,440,156,672 free |
+| Host | Windows 10.0.22631; 24 logical processors; repository drive 2,048,390,066,176 bytes total / 1,275,199,926,272 free |
 | Docker engine | Docker Desktop x86_64; 24 CPUs; 16,619,581,440-byte memory limit |
 | Tools | Go 1.25.12; Docker 29.6.2; Compose 5.3.1; k6 0.55.0; PostgreSQL 16.14 |
 | PostgreSQL | `max_connections=100`, `shared_buffers=128MB`, `work_mem=4MB`, `wal_level=replica` |
@@ -48,16 +48,16 @@ rather than a convergence duration.
 
 | Scenario | Requests / iterations | Checks | HTTP p95 / p99 ms | Convergence p50 / p95 / p99 ms | Status |
 |---|---:|---:|---:|---:|---|
-| Payment intent create | 1 / 1 | 1/1 | 56.842 / 56.842 | - | `passed` |
-| Capture recovery | 17 / 1 | 3/3 | 16.542 / 22.859 | 1009.5 / 1689.45 / 1749.89 | `passed` |
-| Ticket issuance | 13 / 1 | 3/3 | 18.794 / 23.972 | 382.5 / 495.45 / 505.49 | `passed` |
-| Full refund | 23 / 1 | 4/4 | 15.426 / 20.285 | 506 / 1865.9 / 1986.78 | `passed` |
-| Multi-replica payment | 15 / 1 | 2/2 | 15.405 / 20.991 | 379.5 / 493.35 / 503.47 | `passed` |
-| Payment idempotency | 3 / 1 | 2/2 | 19.275 / 20.864 | - | `passed` |
-| Webhook burst | 19 / 2 | 6/6 | 15.731 / 18.531 | 254 / 254 / 254 | `passed` |
-| Provider outage | 9 / 3 | 6/6 | 23.124 / 24.272 | 1 / 1.9 / 1.98 | `passed` |
-| Shard outage | 2 / 1 | 2/2 | 1734.091 / 1805.989 | - | `passed` |
-| Payment during migration | 16 / 1 | 2/2 | 20.927 / 40.673 | 379 / 492.4 / 502.48 | `passed` |
+| Payment intent create | 1 / 1 | 1/1 | 41.085 / 41.085 | - | `passed` |
+| Capture recovery | 17 / 1 | 3/3 | 13.303 / 16.510 | 1009.5 / 1689.45 / 1749.89 | `passed` |
+| Ticket issuance | 13 / 1 | 3/3 | 14.228 / 16.465 | 382 / 495.4 / 505.48 | `passed` |
+| Full refund | 23 / 1 | 4/4 | 11.808 / 16.549 | 506 / 1874 / 1995.6 | `passed` |
+| Multi-replica payment | 15 / 1 | 2/2 | 13.956 / 16.586 | 379 / 492.4 / 502.48 | `passed` |
+| Payment idempotency | 3 / 1 | 2/2 | 15.408 / 16.700 | - | `passed` |
+| Webhook burst | 19 / 2 | 6/6 | 16.319 / 24.554 | 254 / 254 / 254 | `passed` |
+| Provider outage | 9 / 3 | 6/6 | 16.279 / 16.507 | 1 / 1 / 1 | `passed` |
+| Shard outage | 2 / 1 | 2/2 | 1727.464 / 1799.206 | - | `passed` |
+| Payment during migration | 16 / 1 | 2/2 | 17.082 / 28.026 | 379 / 492.4 / 502.48 | `passed` |
 
 The shard-outage latency includes the bounded failed-shard timeout. The paired
 healthy-shard request still returned a durable intent, and no fallback writer
@@ -70,20 +70,20 @@ Prometheus bucket upper bounds, not interpolated exact percentiles.
 
 | Measurement | Samples | Average ms | p50 / p95 / p99 upper-bound ms |
 |---|---:|---:|---:|
-| Provider create-checkout success | 13 | 10.429 | 10 / 25 / 25 |
-| Provider capture success | 7 | 10.392 | 10 / 25 / 25 |
-| Provider refund success | 1 | 11.638 | 25 / 25 / 25 |
-| Ticket issuance success | 7 | 32.746 | 25 / 100 / 100 |
-| Webhook processing success | 27 | 6.310 | 10 / 25 / 25 |
+| Provider create-checkout success | 13 | 9.320 | 10 / 25 / 25 |
+| Provider capture success | 7 | 11.078 | 25 / 25 / 25 |
+| Provider refund success | 1 | 7.778 | 10 / 10 / 10 |
+| Ticket issuance success | 7 | 31.359 | 50 / 100 / 100 |
+| Webhook processing success | 27 | 7.107 | 10 / 25 / 25 |
 
 Authorize, query-status and void did not produce a success histogram sample in
 this hosted-checkout bundle, so no percentile is invented for them. Their
 timeout/before-commit/after-commit/idempotency behavior is covered by focused
 sandbox, HTTP-adapter and worker integration tests.
 
-Pool evidence contains 1,620 bounded observations and 2,578 allowlisted payment
+Pool evidence contains 1,620 bounded observations and 2,443 allowlisted payment
 metric samples across three API and two worker processes. Final pgx totals were
-5,860 acquires, 0.099084 seconds cumulative acquire duration, 17 empty acquires,
+5,640 acquires, 0.103958 seconds cumulative acquire duration, 17 empty acquires,
 0 cancelled acquires and a maximum per-process/per-pool observed peak of 1.
 Every record includes total/acquired/idle/max plus only `database_role` and
 allowlisted `shard_id`; no DSN, host, port or entity identifier is a label.

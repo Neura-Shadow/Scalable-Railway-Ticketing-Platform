@@ -79,7 +79,16 @@ function New-M6CustomerReservation {
 function Invoke-M6K6 {
     param([string]$Script, [hashtable]$Environment)
     $network = "${ProjectName}_backend"
-    $arguments = @('run', '--rm', '--network', $network,
+    $userArguments = @()
+    if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
+        $uid = [string](@((Invoke-M6Native -Command { & id -u }).Output) | Select-Object -Last 1)
+        $gid = [string](@((Invoke-M6Native -Command { & id -g }).Output) | Select-Object -Last 1)
+        if ($uid.Trim() -notmatch '^[0-9]+$' -or $gid.Trim() -notmatch '^[0-9]+$') {
+            throw 'Docker evidence user identity is malformed'
+        }
+        $userArguments = @('--user', "$($uid.Trim()):$($gid.Trim())")
+    }
+    $arguments = @('run', '--rm') + $userArguments + @('--network', $network,
         '-v', "${root}:/repo:ro", '-v', "${EvidenceDirectory}:/evidence", '-w', '/repo')
     foreach ($entry in $Environment.GetEnumerator()) {
         $arguments += @('-e', "$($entry.Key)=$($entry.Value)")

@@ -246,7 +246,7 @@ jobs:
             payment-during-migration.js multi-replica-payment.js
           do
             docker run --rm -v "$PWD/loadtest/k6:/scripts:ro" \
-              grafana/k6:0.54.0 inspect "/scripts/$script" >/dev/null
+              grafana/k6:0.55.0 inspect "/scripts/$script" >/dev/null
           done
       - name: Run complete bounded Milestone 6 payment evidence
         shell: pwsh
