@@ -29,6 +29,15 @@ PostgreSQL remains the only seat and durable-quota authority.
   the shard-local transaction boundary.
 - Operator command identity and optimistic source version: serialize one
   bounded booking-state change across retries before its local receipt commits.
+- Payment operation row and provider idempotency hash: serialize one checkout,
+  capture, void, or full-refund identity while the provider call runs outside
+  every database transaction.
+- Payment saga/inbox leases: `FOR UPDATE SKIP LOCKED` assigns bounded work;
+  expired pre-call claims return to pending, while expired in-flight financial
+  calls become uncertain and must be queried before retry.
+- Shard-local payment/issuance/refund/compensation receipts: serialize stable
+  command replay in the same fenced transaction as reservation, ticket, outbox,
+  and exact inventory mutation.
 
 ## Allocation algorithm
 
@@ -76,6 +85,14 @@ Required cases:
 14. Wrong owner or request: token rejected before inventory mutation.
 15. One user under 100 quota attempts: configured held bounds are never exceeded.
 16. API/worker termination and Redis-finalize failure: transaction is atomic, lease recovery is bounded, and durable replay prevents duplication.
+17. One payment-intent key under 100 concurrent API requests: one intent, saga,
+    and begin-payment receipt.
+18. Duplicate/out-of-order webhooks and capture response loss: one capture,
+    query-before-retry, one issuance receipt, and one ticket per seat.
+19. Concurrent void/refund/issuance/compensation replays: no duplicate provider
+    effect, ticket, receipt, outbox event, or seat release.
+20. Payment during physical cutover/reverse: stale generations reject before
+    effect and all v2 payment state/receipts survive on the current authority.
 
 Critical cases run repeatedly and under the Go race detector. Reconciliation follows every database concurrency suite.
 

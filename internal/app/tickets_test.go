@@ -17,6 +17,7 @@ type ticketReadStoreFake struct {
 	id     uuid.UUID
 	page   TicketOrderRecords
 	record TicketOrderRecord
+	ticket TicketRecord
 	err    error
 }
 
@@ -27,6 +28,10 @@ func (f *ticketReadStoreFake) ListTicketOrderRecords(_ context.Context, owner uu
 func (f *ticketReadStoreFake) GetTicketOrderRecord(_ context.Context, owner, id uuid.UUID) (TicketOrderRecord, error) {
 	f.owner, f.id = owner, id
 	return f.record, f.err
+}
+func (f *ticketReadStoreFake) GetTicketRecord(_ context.Context, owner, id uuid.UUID) (TicketRecord, error) {
+	f.owner, f.id = owner, id
+	return f.ticket, f.err
 }
 
 func TestTicketQueriesKeepOwnerScopeAndMapNestedTickets(t *testing.T) {
@@ -53,6 +58,26 @@ func TestTicketQueriesHideCrossOwnerAndPersistenceDetails(t *testing.T) {
 	}
 }
 
+func TestTicketQueriesGetTicketKeepsOwnerScopeAndRejectsTicketCodeIdentity(t *testing.T) {
+	t.Parallel()
+	owner, ticketID := uuid.New(), uuid.New()
+	store := &ticketReadStoreFake{ticket: TicketRecord{
+		ID: ticketID.String(), TicketCode: "opaque-ticket-code", PassengerID: uuid.NewString(),
+		SeatID: uuid.NewString(), Status: "active",
+	}}
+	view, err := NewTicketQueries(store).GetTicket(context.Background(), owner.String(), ticketID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.owner != owner || store.id != ticketID || view.ID != ticketID.String() ||
+		view.TicketCode != "opaque-ticket-code" || view.Status != "active" {
+		t.Fatalf("owner=%s id=%s view=%+v", store.owner, store.id, view)
+	}
+	if _, err := NewTicketQueries(store).GetTicket(context.Background(), owner.String(), "opaque-ticket-code"); !errors.Is(err, httpapi.ErrInvalidInput) {
+		t.Fatalf("ticket code accepted as resource identity: %v", err)
+	}
+}
+
 func TestTicketQueriesBoundExtremePageNumbers(t *testing.T) {
 	owner := uuid.New()
 	store := &ticketReadStoreFake{page: TicketOrderRecords{Items: []TicketOrderRecord{}, Total: 0}}
@@ -63,5 +88,37 @@ func TestTicketQueriesBoundExtremePageNumbers(t *testing.T) {
 	}
 	if page.Page != querypostgres.MaxPage {
 		t.Fatalf("page=%d want=%d", page.Page, querypostgres.MaxPage)
+	}
+}
+
+func TestTicketOrderSummaryAcceptsOnlyIssuedPaymentAuthorityForConfirmedLocator(t *testing.T) {
+	t.Parallel()
+	createdAt := time.Now().UTC()
+	locator := TicketOrderRecord{
+		ID: uuid.NewString(), ReservationID: uuid.NewString(), Status: "confirmed",
+		TotalAmountMinor: 2500, Currency: "TWD", CreatedAt: createdAt,
+	}
+	authoritative := locator
+	authoritative.Status = "issued"
+	if !sameTicketOrderSummary(locator, authoritative) {
+		t.Fatal("confirmed locator did not accept issued payment authority")
+	}
+	for _, invalid := range []string{"payment_pending", "payment_captured", "cancelled"} {
+		authoritative.Status = invalid
+		if sameTicketOrderSummary(locator, authoritative) {
+			t.Fatalf("confirmed locator accepted non-issued authority %q", invalid)
+		}
+	}
+
+	locator.Status = "cancelled"
+	authoritative.Status = "refunded"
+	if !sameTicketOrderSummary(locator, authoritative) {
+		t.Fatal("cancelled locator did not accept refunded payment authority")
+	}
+	for _, invalid := range []string{"payment_pending", "payment_captured", "issued", "confirmed"} {
+		authoritative.Status = invalid
+		if sameTicketOrderSummary(locator, authoritative) {
+			t.Fatalf("cancelled locator accepted invalid authority %q", invalid)
+		}
 	}
 }

@@ -30,7 +30,7 @@ func TestBeginWriteRejectsStaleGenerationInsidePhysicalDatabase(t *testing.T) {
 	}
 }
 
-func TestBeginWriteUsesBookingShardV1FenceAndSnapshotColumns(t *testing.T) {
+func TestBeginWriteUsesBookingShardV2FenceAndSnapshotColumns(t *testing.T) {
 	t.Parallel()
 
 	tx := &writeTx{row: writeRow{values: []any{int64(7), true, "active", true, int64(3), "scheduled"}}}
@@ -46,7 +46,7 @@ func TestBeginWriteUsesBookingShardV1FenceAndSnapshotColumns(t *testing.T) {
 	}
 	if strings.Contains(tx.query, "fence.generation") || strings.Contains(tx.query, "snapshot.booking_state") ||
 		!strings.Contains(tx.query, "fence.assignment_generation") || !strings.Contains(tx.query, "snapshot.bookable") {
-		t.Fatalf("BeginWrite() query does not match booking-shard v1 schema: %s", tx.query)
+		t.Fatalf("BeginWrite() query does not match booking-shard v2 schema: %s", tx.query)
 	}
 }
 
@@ -68,7 +68,7 @@ func mustPhysicalHandle(t *testing.T, pool physical.Pool, writeEnabled bool) phy
 		StorageKind:     physical.StoragePostgres,
 		ConnectionRef:   "physical-shard-0",
 		ProtocolVersion: 1,
-		SchemaVersion:   1,
+		SchemaVersion:   physical.SupportedSchemaVersion,
 		Enabled:         true,
 		WriteEnabled:    writeEnabled,
 		HealthState:     physical.HealthHealthy,

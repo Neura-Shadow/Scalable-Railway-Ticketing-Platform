@@ -99,6 +99,8 @@ func rateLimitPolicy(scope httpapi.RateLimitScope) (string, redisx.RateLimit, bo
 		return "hot_train_policy_mutation", redisx.RateLimit{Limit: 20, Window: time.Hour}, true
 	case httpapi.RateLimitOperatorBooking:
 		return "operator_booking_mutation", redisx.RateLimit{Limit: 120, Window: time.Hour}, true
+	case httpapi.RateLimitPaymentWebhook:
+		return "payment_webhook", redisx.RateLimit{Limit: 600, Window: time.Minute}, true
 	default:
 		return "", redisx.RateLimit{}, false
 	}

@@ -14,7 +14,8 @@ var ErrInvalidCoalescerKey = errors.New("invalid cache singleflight key")
 const maxCoalescedFillDuration = 30 * time.Second
 
 type Coalescer struct {
-	group singleflight.Group
+	group  singleflight.Group
+	onJoin func()
 }
 
 func (coalescer *Coalescer) Do(
@@ -33,6 +34,9 @@ func (coalescer *Coalescer) Do(
 		defer cancel()
 		return fill(fillContext)
 	})
+	if coalescer.onJoin != nil {
+		coalescer.onJoin()
+	}
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err(), false

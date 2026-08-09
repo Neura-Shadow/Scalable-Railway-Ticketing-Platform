@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -316,6 +317,9 @@ func TestExecutorCancellationCommitsReceiptMutationOutboxAndEvidenceTogether(t *
 			t.Fatalf("missing %q in SQL: %s", fragment, joined)
 		}
 	}
+	if !slices.ContainsFunc(tx.queries, func(query string) bool { return strings.Contains(query, "payment_intent_id IS NULL") }) {
+		t.Fatal("legacy cancellation did not exclude payment-bound reservations")
+	}
 }
 
 func TestExecutorLifecycleDuplicateReturnsReceiptWithoutMutation(t *testing.T) {
@@ -384,7 +388,10 @@ func TestExecutorConfirmationEmitsOneDeterministicEventPerTicket(t *testing.T) {
 		{values: []any{uuid.NewSHA1(cmd.ID, []byte("ticket-order"))}}, {values: []any{created}},
 	}, queryRows: []pgx.Rows{
 		&scriptedRows{values: [][]any{{seatA}, {seatB}}},
-		&scriptedRows{values: [][]any{{uuid.NewSHA1(cmd.ID, seatA[:])}, {uuid.NewSHA1(cmd.ID, seatB[:])}}},
+		&scriptedRows{values: [][]any{
+			{uuid.NewSHA1(cmd.ID, seatA[:]), "TKT" + uuid.NewSHA1(cmd.ID, seatA[:]).String()},
+			{uuid.NewSHA1(cmd.ID, seatB[:]), "TKT" + uuid.NewSHA1(cmd.ID, seatB[:]).String()},
+		}},
 	}}
 	resolution.Handle = handleForTx(t, tx, true)
 	executor, _ := commandphysical.NewExecutor(&routeResolver{resolution: resolution}, commandphysical.Options{MaxHoldTTL: time.Hour})
@@ -426,7 +433,7 @@ func TestExecutorAlternateConfirmationKeyReplaysAuthoritativeTicketIDsWithoutDup
 		{values: []any{orderID}}, {values: []any{created}},
 	}, queryRows: []pgx.Rows{
 		&scriptedRows{values: [][]any{{seatA}, {seatB}}},
-		&scriptedRows{values: [][]any{{ticketA}, {ticketB}}},
+		&scriptedRows{values: [][]any{{ticketA, "TKT" + ticketA.String()}, {ticketB, "TKT" + ticketB.String()}}},
 	}}
 	resolution.Handle = handleForTx(t, tx, true)
 	executor, _ := commandphysical.NewExecutor(&routeResolver{resolution: resolution}, commandphysical.Options{MaxHoldTTL: time.Hour})
@@ -473,7 +480,7 @@ func handleForTx(t *testing.T, tx pgx.Tx, writeEnabled bool) shardphysical.Handl
 	t.Cleanup(registry.Close)
 	handle, err := registry.Resolve(shardphysical.CatalogEntry{
 		ShardID: sharding.ShardPhysicalZero, StorageKind: shardphysical.StoragePostgres, ConnectionRef: "physical-shard-0",
-		ProtocolVersion: 1, SchemaVersion: 1, Enabled: true, WriteEnabled: writeEnabled,
+		ProtocolVersion: 1, SchemaVersion: shardphysical.SupportedSchemaVersion, Enabled: true, WriteEnabled: writeEnabled,
 		HealthState: shardphysical.HealthHealthy, State: shardphysical.StateActive,
 	})
 	if err != nil {
@@ -510,13 +517,15 @@ type scriptedTx struct {
 	execs              []string
 	execArguments      [][]any
 	queryRows          []pgx.Rows
+	queries            []string
 	queryIndex         int
 	commits            int
 	rollbacks          int
 	affectedByContains map[string]int64
 }
 
-func (tx *scriptedTx) QueryRow(_ context.Context, _ string, _ ...any) pgx.Row {
+func (tx *scriptedTx) QueryRow(_ context.Context, query string, _ ...any) pgx.Row {
+	tx.queries = append(tx.queries, query)
 	row := tx.rows[tx.rowIndex]
 	tx.rowIndex++
 	return row

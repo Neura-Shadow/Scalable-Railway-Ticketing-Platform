@@ -8,10 +8,13 @@ import (
 type ReservationStatus string
 
 const (
-	ReservationStatusHeld      ReservationStatus = "held"
-	ReservationStatusConfirmed ReservationStatus = "confirmed"
-	ReservationStatusExpired   ReservationStatus = "expired"
-	ReservationStatusCancelled ReservationStatus = "cancelled"
+	ReservationStatusHeld           ReservationStatus = "held"
+	ReservationStatusConfirmed      ReservationStatus = "confirmed"
+	ReservationStatusExpired        ReservationStatus = "expired"
+	ReservationStatusCancelled      ReservationStatus = "cancelled"
+	ReservationStatusPaymentPending ReservationStatus = "payment_pending"
+	ReservationStatusPaymentReview  ReservationStatus = "payment_review"
+	ReservationStatusRefundPending  ReservationStatus = "refund_pending"
 )
 
 var (
@@ -74,4 +77,73 @@ func (r *Reservation) Cancel() (bool, error) {
 
 func (r *Reservation) Status() ReservationStatus {
 	return r.status
+}
+
+func (r *Reservation) BeginPayment(now time.Time) (bool, error) {
+	if r.status == ReservationStatusPaymentPending {
+		return false, nil
+	}
+	if r.status != ReservationStatusHeld {
+		return false, ErrInvalidReservationTransition
+	}
+	if !now.Before(r.expiresAt) {
+		return false, ErrReservationExpired
+	}
+	r.status = ReservationStatusPaymentPending
+	return true, nil
+}
+
+func (r *Reservation) ReviewPayment() (bool, error) {
+	if r.status == ReservationStatusPaymentReview {
+		return false, nil
+	}
+	if r.status != ReservationStatusPaymentPending {
+		return false, ErrInvalidReservationTransition
+	}
+	r.status = ReservationStatusPaymentReview
+	return true, nil
+}
+
+func (r *Reservation) ResumePayment() (bool, error) {
+	if r.status == ReservationStatusPaymentPending {
+		return false, nil
+	}
+	if r.status != ReservationStatusPaymentReview {
+		return false, ErrInvalidReservationTransition
+	}
+	r.status = ReservationStatusPaymentPending
+	return true, nil
+}
+
+func (r *Reservation) ConfirmPayment() (bool, error) {
+	if r.status == ReservationStatusConfirmed {
+		return false, nil
+	}
+	if r.status != ReservationStatusPaymentPending && r.status != ReservationStatusPaymentReview {
+		return false, ErrInvalidReservationTransition
+	}
+	r.status = ReservationStatusConfirmed
+	return true, nil
+}
+
+func (r *Reservation) BeginRefund() (bool, error) {
+	if r.status == ReservationStatusRefundPending {
+		return false, nil
+	}
+	if r.status != ReservationStatusConfirmed && r.status != ReservationStatusPaymentReview {
+		return false, ErrInvalidReservationTransition
+	}
+	r.status = ReservationStatusRefundPending
+	return true, nil
+}
+
+func (r *Reservation) CompleteCompensation() (bool, error) {
+	if r.status == ReservationStatusCancelled {
+		return false, nil
+	}
+	if r.status != ReservationStatusRefundPending {
+		return false, ErrInvalidReservationTransition
+	}
+	r.status = ReservationStatusCancelled
+	return true, nil
 }

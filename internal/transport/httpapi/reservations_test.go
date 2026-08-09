@@ -101,6 +101,50 @@ func TestReservationCreateDegradesOpenWhenRateLimiterBackendFails(t *testing.T) 
 	}
 }
 
+func TestPaidReservationCancellationRoutesThroughPaymentSaga(t *testing.T) {
+	t.Parallel()
+
+	parser := &tokenParserStub{identity: httpapi.Identity{Subject: "customer-1", Role: httpapi.RoleCustomer}}
+	reservations := &reservationServiceStub{result: httpapi.ReservationView{ID: "reservation-1", Status: "confirmed"}}
+	payments := &paymentServiceStub{result: httpapi.PaymentIntentView{ID: "intent-1", ReservationID: "reservation-1", State: "refund_pending"}}
+	router := httpapi.New(httpapi.Dependencies{
+		TokenParser: parser, Reservations: reservations, Payments: payments, PaymentRequiredForConfirm: true,
+	})
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/reservations/reservation-1/cancel", nil)
+	request.Header.Set("Authorization", "Bearer signed-token")
+	request.Header.Set("Idempotency-Key", "cancel-payment-1")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusAccepted || payments.reservationCancel.OwnerID != "customer-1" ||
+		payments.reservationCancel.ReservationID != "reservation-1" || payments.reservationCancel.IdempotencyKey != "cancel-payment-1" {
+		t.Fatalf("status=%d payment_command=%#v body=%s", response.Code, payments.reservationCancel, response.Body.String())
+	}
+	if reservations.mutation.ReservationID != "" {
+		t.Fatalf("legacy cancellation was called: %#v", reservations.mutation)
+	}
+}
+
+func TestUnpaidHeldCancellationFallsBackToLegacyPath(t *testing.T) {
+	t.Parallel()
+
+	parser := &tokenParserStub{identity: httpapi.Identity{Subject: "customer-1", Role: httpapi.RoleCustomer}}
+	reservations := &reservationServiceStub{result: httpapi.ReservationView{ID: "reservation-1", Status: "cancelled"}}
+	payments := &paymentServiceStub{err: httpapi.ErrNotFound}
+	router := httpapi.New(httpapi.Dependencies{
+		TokenParser: parser, Reservations: reservations, Payments: payments, PaymentRequiredForConfirm: true,
+	})
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/reservations/reservation-1/cancel", nil)
+	request.Header.Set("Authorization", "Bearer signed-token")
+	request.Header.Set("Idempotency-Key", "cancel-payment-1")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK || reservations.mutation.ReservationID != "reservation-1" {
+		t.Fatalf("status=%d mutation=%#v body=%s", response.Code, reservations.mutation, response.Body.String())
+	}
+}
+
 type metricsSpy struct {
 	method   string
 	path     string
@@ -251,5 +295,25 @@ func TestConfirmRequiresIdempotencyKeyAndPassesClaimsIdentity(t *testing.T) {
 	}
 	if reservations.mutation.OwnerID != "customer-1" || reservations.mutation.IdempotencyKey != "confirm-request-1" {
 		t.Fatalf("confirm command = %+v", reservations.mutation)
+	}
+}
+
+func TestDirectReservationConfirmationIsDisabledWhenPaymentIsRequired(t *testing.T) {
+	t.Parallel()
+	parser := &tokenParserStub{identity: httpapi.Identity{Subject: "customer-1", Role: httpapi.RoleCustomer}}
+	reservations := &reservationServiceStub{}
+	router := httpapi.New(httpapi.Dependencies{
+		TokenParser: parser, Reservations: reservations, PaymentRequiredForConfirm: true,
+	})
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/reservations/reservation-1/confirm", nil)
+	request.Header.Set("Authorization", "Bearer signed-token")
+	request.Header.Set("Idempotency-Key", "confirm-request-1")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if reservations.mutation.OwnerID != "" {
+		t.Fatalf("legacy confirm was invoked: %#v", reservations.mutation)
 	}
 }

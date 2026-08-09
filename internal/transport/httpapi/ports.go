@@ -61,6 +61,69 @@ type ReservationService interface {
 	CancelReservation(ctx context.Context, command ReservationMutationCommand) (ReservationView, error)
 }
 
+type CreatePaymentIntentCommand struct {
+	OwnerID        string
+	ReservationID  string
+	IdempotencyKey string
+}
+
+type CancelPaymentIntentCommand struct {
+	OwnerID         string
+	PaymentIntentID string
+	IdempotencyKey  string
+}
+
+type CancelReservationPaymentCommand struct {
+	OwnerID        string
+	ReservationID  string
+	IdempotencyKey string
+}
+
+// PaymentIntentView exposes only bounded customer-facing state. Provider
+// operation IDs, physical shard identity, and internal error details stay out
+// of the HTTP contract.
+type PaymentIntentView struct {
+	ID               string     `json:"id"`
+	ReservationID    string     `json:"reservation_id"`
+	State            string     `json:"state"`
+	AmountMinor      int64      `json:"amount_minor"`
+	Currency         string     `json:"currency"`
+	HostedSessionRef string     `json:"hosted_session_ref,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
+	CompletedAt      *time.Time `json:"completed_at,omitempty"`
+}
+
+type PaymentService interface {
+	CreatePaymentIntent(context.Context, CreatePaymentIntentCommand) (PaymentIntentView, error)
+	GetPaymentIntent(context.Context, string, string) (PaymentIntentView, error)
+	CancelPaymentIntent(context.Context, CancelPaymentIntentCommand) (PaymentIntentView, error)
+}
+
+type ReservationPaymentCancellationService interface {
+	CancelReservationPayment(context.Context, CancelReservationPaymentCommand) (PaymentIntentView, error)
+}
+
+type PaymentWebhookDisposition string
+
+const (
+	PaymentWebhookAccepted  PaymentWebhookDisposition = "accepted"
+	PaymentWebhookDuplicate PaymentWebhookDisposition = "duplicate"
+	PaymentWebhookIgnored   PaymentWebhookDisposition = "ignored"
+)
+
+type PaymentWebhookRequest struct {
+	Provider  string
+	KeyID     string
+	Timestamp string
+	Signature string
+	Body      []byte
+}
+
+type PaymentWebhookService interface {
+	IngestPaymentWebhook(context.Context, PaymentWebhookRequest) (PaymentWebhookDisposition, error)
+}
+
 type JoinWaitingRoomCommand struct {
 	OwnerID                string
 	TrainRunID             string
@@ -257,6 +320,7 @@ const (
 	RateLimitPassengerCreate   RateLimitScope = "passenger_create"
 	RateLimitPolicyMutation    RateLimitScope = "hot_train_policy_mutation"
 	RateLimitOperatorBooking   RateLimitScope = "operator_booking_mutation"
+	RateLimitPaymentWebhook    RateLimitScope = "payment_webhook"
 )
 
 type RateLimitRequest struct {
@@ -318,6 +382,7 @@ type TicketOrderPage struct {
 type TicketQueries interface {
 	ListTicketOrders(ctx context.Context, ownerID string, page PageRequest) (TicketOrderPage, error)
 	GetTicketOrder(ctx context.Context, ownerID, ticketOrderID string) (TicketOrderView, error)
+	GetTicket(ctx context.Context, ownerID, ticketID string) (TicketView, error)
 }
 
 type ResourceView struct {

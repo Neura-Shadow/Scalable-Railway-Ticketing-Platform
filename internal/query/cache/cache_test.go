@@ -78,9 +78,9 @@ func TestTTLPolicyReturnsOnlyBoundedPositiveJitter(t *testing.T) {
 }
 
 func TestCoalescerSharesIdenticalFillButDoesNotSerializeUnrelatedKeys(t *testing.T) {
-	coalescer := &Coalescer{}
+	joined := make(chan struct{}, 32)
+	coalescer := &Coalescer{onJoin: func() { joined <- struct{}{} }}
 	start := make(chan struct{})
-	ready := make(chan struct{}, 32)
 	release := make(chan struct{})
 	var identicalCalls atomic.Int64
 	var unrelatedCalls atomic.Int64
@@ -89,7 +89,6 @@ func TestCoalescerSharesIdenticalFillButDoesNotSerializeUnrelatedKeys(t *testing
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			ready <- struct{}{}
 			_, err, _ := coalescer.Do(context.Background(), "same", func(context.Context) (any, error) {
 				if identicalCalls.Add(1) == 1 {
 					close(start)
@@ -103,12 +102,9 @@ func TestCoalescerSharesIdenticalFillButDoesNotSerializeUnrelatedKeys(t *testing
 		}()
 	}
 	for index := 0; index < 32; index++ {
-		<-ready
+		<-joined
 	}
 	<-start
-	for attempt := 0; attempt < 1024; attempt++ {
-		runtime.Gosched()
-	}
 	_, err, shared := coalescer.Do(context.Background(), "different", func(context.Context) (any, error) {
 		unrelatedCalls.Add(1)
 		return "other", nil

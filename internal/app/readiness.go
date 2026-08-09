@@ -16,7 +16,7 @@ import (
 type readinessProbe func(context.Context) error
 type migrationProbe func(context.Context) (int, bool, error)
 
-const currentSchemaVersion = 9
+const currentSchemaVersion = 10
 
 const shardReadinessQuery = `
 SELECT

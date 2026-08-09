@@ -2,6 +2,7 @@ package controlsource
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -9,8 +10,42 @@ import (
 
 	physicalpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physicalmigration/postgres"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+func TestLiveReverseV2PreflightQueriesMatchInstalledSchemas(t *testing.T) {
+	controlURL := strings.TrimSpace(os.Getenv("CONTROL_TARGET_TEST_DATABASE_URL"))
+	sourceURL := strings.TrimSpace(os.Getenv("CONTROL_TARGET_TEST_SOURCE_DATABASE_URL"))
+	if controlURL == "" || sourceURL == "" {
+		t.Skip("reverse control-target PostgreSQL integration variables are not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	controlDB, err := pgxpool.New(ctx, controlURL)
+	if err != nil {
+		t.Fatalf("open control database: %v", err)
+	}
+	defer controlDB.Close()
+	sourceDB, err := pgxpool.New(ctx, sourceURL)
+	if err != nil {
+		t.Fatalf("open physical source: %v", err)
+	}
+	defer sourceDB.Close()
+
+	var ready bool
+	if err := sourceDB.QueryRow(ctx, reverseSourcePreflightSQL, uuid.New(), int64(1)).Scan(&ready); err != nil {
+		t.Fatalf("physical schema-v2 preflight query failed: %v", err)
+	}
+	if ready {
+		t.Fatal("unassigned physical source unexpectedly passed preflight")
+	}
+	err = controlDB.QueryRow(ctx, reverseTargetPreflightSQL, uuid.New(), "physical-shard-0",
+		int64(1), uuid.New(), SourceLegacy).Scan(&ready)
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("control schema-v10 preflight query error = %v, want no matching assignment", err)
+	}
+}
 
 func TestLiveReverseControlTargetHasEquivalentAuthoritativeRows(t *testing.T) {
 	controlURL := strings.TrimSpace(os.Getenv("CONTROL_TARGET_TEST_DATABASE_URL"))
@@ -47,14 +82,19 @@ func TestLiveReverseControlTargetHasEquivalentAuthoritativeRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new reverse adapter: %v", err)
 	}
-	for _, table := range []string{"seat_inventory", "reservations", "reservation_seats", "ticket_orders", "tickets", "idempotency_records", "outbox_events"} {
+	for _, table := range tableOrder {
 		sourceRows, err := adapter.reverseValidationRows(ctx, sourceDB,
 			reverseSourceValidationSQL(table), record, table, 100001, true)
 		if err != nil {
 			t.Fatalf("read source %s: %v", table, err)
 		}
-		targetRows, err := adapter.reverseValidationRows(ctx, controlDB,
-			reverseTargetValidationSQL(record.TargetShardID, table), record, table, 100001, false)
+		var targetRows []canonicalRow
+		if reverseIgnoredTable(table) {
+			targetRows, err = adapter.reverseDerivedTargetRows(ctx, record, table, 100001)
+		} else {
+			targetRows, err = adapter.reverseValidationRows(ctx, controlDB,
+				reverseTargetValidationSQL(record.TargetShardID, table), record, table, 100001, false)
+		}
 		if err != nil {
 			t.Fatalf("read target %s: %v", table, err)
 		}

@@ -144,9 +144,11 @@ jobs:
           mkdir -p "$RUNNER_TEMP/migrations-v6"
           mkdir -p "$RUNNER_TEMP/migrations-v7"
           mkdir -p "$RUNNER_TEMP/migrations-v8"
+          mkdir -p "$RUNNER_TEMP/migrations-v9"
           cp migrations/00000[1-6]_*.sql "$RUNNER_TEMP/migrations-v6/"
           cp migrations/00000[1-7]_*.sql "$RUNNER_TEMP/migrations-v7/"
           cp migrations/00000[1-8]_*.sql "$RUNNER_TEMP/migrations-v8/"
+          cp migrations/00000[1-9]_*.sql "$RUNNER_TEMP/migrations-v9/"
           go run ./cmd/migrate \
             -path "$RUNNER_TEMP/migrations-v6" \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
@@ -272,9 +274,21 @@ jobs:
             --file migrations/testdata/assert_milestone4_v8_schema.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone4_v8_data.sql
-      - name: Rehearse the populated version-8 to version-9 upgrade
+      - name: Rehearse the populated version-8 through version-10 upgrade
         shell: bash
         run: |
+          go run ./cmd/migrate \
+            -path "$RUNNER_TEMP/migrations-v9" \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            up
+          go run ./cmd/migrate \
+            -path "$RUNNER_TEMP/migrations-v9" \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            version
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone5_v9_schema.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone5_v9_data.sql
           go run ./cmd/migrate \
             -path migrations \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
@@ -284,16 +298,18 @@ jobs:
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             version
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
-            --file migrations/testdata/assert_milestone5_v9_schema.sql
+            --file migrations/testdata/assert_milestone6_v10_schema.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
-            --file migrations/testdata/assert_milestone5_v9_data.sql
+            --file migrations/testdata/assert_milestone6_v10_reverse_compat.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone6_v10_ticket_code_backfill.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_populated_v5_data.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_hot_train_v6_data.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_read_model_v7_data.sql
-      - name: Rehearse Milestone 5 one-step down and up with populated data
+      - name: Rehearse Milestone 6 one-step down to v9 and replay to v10
         shell: bash
         run: |
           go run ./cmd/migrate \
@@ -305,17 +321,29 @@ jobs:
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             version
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone5_v9_schema.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone5_v9_data.sql
+          go run ./cmd/migrate \
+            -path "$RUNNER_TEMP/migrations-v9" \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            down
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone4_v8_schema.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone4_v8_data.sql
+          go run ./cmd/migrate \
+            -path "$RUNNER_TEMP/migrations-v9" \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            up
           go run ./cmd/migrate \
             -path migrations \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             up
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
-            --file migrations/testdata/assert_milestone5_v9_schema.sql
+            --file migrations/testdata/assert_milestone6_v10_schema.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
-            --file migrations/testdata/assert_milestone5_v9_data.sql
+            --file migrations/testdata/assert_milestone6_v10_reverse_compat.sql
       - name: Apply migrations to an empty database
         run: go run ./cmd/migrate -path migrations up
       - name: Verify migration-up is safe to repeat
@@ -404,7 +432,13 @@ jobs:
           go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" up
           go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" version
           psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone6_v10_schema.sql
+          go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" down
+          psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone5_v9_schema.sql
+          go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" up
+          psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone6_v10_schema.sql
           for database_url in \
             "$BOOKING_SHARD_0_DATABASE_URL" \
             "$BOOKING_SHARD_1_DATABASE_URL"
@@ -416,13 +450,15 @@ jobs:
             go run ./cmd/migrate -path migrations/booking-shard \
               -database "$database_url" version
             psql "$database_url" --set=ON_ERROR_STOP=1 \
-              --file migrations/testdata/assert_booking_shard_v1_schema.sql
+              --file migrations/testdata/assert_booking_shard_v2_schema.sql
             go run ./cmd/migrate -path migrations/booking-shard \
               -database "$database_url" down
+            psql "$database_url" --set=ON_ERROR_STOP=1 \
+              --file migrations/testdata/assert_booking_shard_v1_schema.sql
             go run ./cmd/migrate -path migrations/booking-shard \
               -database "$database_url" up
             psql "$database_url" --set=ON_ERROR_STOP=1 \
-              --file migrations/testdata/assert_booking_shard_v1_schema.sql
+              --file migrations/testdata/assert_booking_shard_v2_schema.sql
           done
       - name: Run legacy to physical to legacy reverse acceptance
         shell: bash

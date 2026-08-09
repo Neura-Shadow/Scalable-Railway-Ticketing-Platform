@@ -13,11 +13,30 @@ import (
 
 type localTimeoutTestPool struct{ tx pgx.Tx }
 
+type migrationQueryPool interface {
+	Pool
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
 func (pool *localTimeoutTestPool) BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error) {
 	return pool.tx, nil
 }
 
 func (*localTimeoutTestPool) Close() {}
+
+func TestOpenPGXPoolExposesMigrationQueryBoundary(t *testing.T) {
+	pool, err := OpenPGXPool(context.Background(),
+		"postgres://unused:unused@127.0.0.1:1/unused?sslmode=disable",
+		PoolLimits{MaxOpenConns: 1, MaxIdleConns: 0, ConnectTimeout: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if _, ok := pool.(migrationQueryPool); !ok {
+		t.Fatal("physical pgx pool does not expose the bounded migration query boundary")
+	}
+}
 
 type localTimeoutTestTx struct {
 	pgx.Tx

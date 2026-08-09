@@ -19,8 +19,8 @@ func TestCatalogRouterRefreshesStaleRouteWithoutReadingAConnectionString(t *test
 
 	trainRunID := uuid.New()
 	db := &catalogDB{rows: []catalogRow{
-		{values: []any{"physical-shard-0", int64(3), "postgres", "physical-shard-0", int32(1), int32(1), true, true, "healthy", "active", int32(1)}},
-		{values: []any{"physical-shard-1", int64(4), "postgres", "physical-shard-1", int32(1), int32(1), true, true, "healthy", "active", int32(1)}},
+		{values: []any{"physical-shard-0", int64(3), "postgres", "physical-shard-0", int32(1), int32(2), true, true, "healthy", "active", int32(1)}},
+		{values: []any{"physical-shard-1", int64(4), "postgres", "physical-shard-1", int32(1), int32(2), true, true, "healthy", "active", int32(1)}},
 	}}
 	registry := mustCatalogRegistry(t)
 	router, err := physical.NewCatalogRouter(db, registry, time.Minute)
@@ -55,7 +55,7 @@ func TestCatalogRouterRejectsUnsupportedCatalogMetadata(t *testing.T) {
 	t.Parallel()
 
 	db := &catalogDB{rows: []catalogRow{{values: []any{
-		"physical-shard-0", int64(3), "postgres", "physical-shard-0", int32(2), int32(1), true, true, "healthy", "active", int32(1),
+		"physical-shard-0", int64(3), "postgres", "physical-shard-0", int32(2), int32(2), true, true, "healthy", "active", int32(1),
 	}}}}
 	router, err := physical.NewCatalogRouter(db, mustCatalogRegistry(t), time.Minute)
 	if err != nil {
@@ -71,7 +71,7 @@ func TestCatalogRouterMetricsUseBoundedOutcomeReasons(t *testing.T) {
 	trainRunID := uuid.New()
 	valid := []any{
 		"physical-shard-0", int64(3), "postgres", "physical-shard-0",
-		int32(1), int32(1), true, true, "healthy", "active", int32(1),
+		int32(1), int32(2), true, true, "healthy", "active", int32(1),
 	}
 	tests := []struct {
 		name        string
@@ -87,19 +87,19 @@ func TestCatalogRouterMetricsUseBoundedOutcomeReasons(t *testing.T) {
 		{name: "refresh", values: valid, refresh: true, wantSuccess: true, wantReason: "none", wantShard: "physical-shard-0", wantStorage: "postgres"},
 		{name: "catalog", values: []any{
 			"physical-shard-0", int64(3), "postgres://secret@untrusted", "physical-shard-0",
-			int32(1), int32(1), true, true, "healthy", "active", int32(1),
+			int32(1), int32(2), true, true, "healthy", "active", int32(1),
 		}, wantReason: "catalog", wantShard: "physical-shard-0", wantStorage: "unknown"},
 		{name: "schema", values: []any{
 			"physical-shard-0", int64(3), "postgres", "physical-shard-0",
-			int32(1), int32(2), true, true, "healthy", "active", int32(1),
+			int32(1), int32(1), true, true, "healthy", "active", int32(1),
 		}, wantReason: "schema", wantShard: "physical-shard-0", wantStorage: "postgres"},
 		{name: "protocol", values: []any{
 			"physical-shard-0", int64(3), "postgres", "physical-shard-0",
-			int32(2), int32(1), true, true, "healthy", "active", int32(1),
+			int32(2), int32(2), true, true, "healthy", "active", int32(1),
 		}, wantReason: "protocol", wantShard: "physical-shard-0", wantStorage: "postgres"},
 		{name: "unknown connection reference", values: []any{
 			"physical-shard-0", int64(3), "postgres", "postgres://secret@untrusted",
-			int32(1), int32(1), true, true, "healthy", "active", int32(1),
+			int32(1), int32(2), true, true, "healthy", "active", int32(1),
 		}, wantReason: "unknown_connection_ref", wantShard: "physical-shard-0", wantStorage: "postgres"},
 		{name: "database unavailable", scanErr: errors.New("postgres://secret@host/" + trainRunID.String()), wantReason: "database", wantShard: "unknown", wantStorage: "unknown"},
 	}

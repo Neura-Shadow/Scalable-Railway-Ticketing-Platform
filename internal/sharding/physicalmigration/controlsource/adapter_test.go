@@ -2,6 +2,7 @@ package controlsource
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,6 +13,166 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
+
+func TestReverseAdapterRejectsPhysicalV1RatherThanGuessingItsShape(t *testing.T) {
+	t.Parallel()
+
+	adapter, err := NewReverse(&fakeDB{}, &fakeDB{}, SourceLegacy)
+	if err != nil {
+		t.Fatalf("NewReverse() error = %v", err)
+	}
+	record := physicalmigration.Record{
+		MigrationID: uuid.New(), TrainRunID: uuid.New(), ReverseMigration: true,
+		SourceShardID: "physical-shard-0", TargetShardID: SourceLegacy,
+		SourceGeneration: 7, TargetGeneration: 8,
+		SourceProtocolVersion: 1, SourceSchemaVersion: 1,
+		TargetProtocolVersion: 1, TargetSchemaVersion: 8,
+	}
+	if err := adapter.Preflight(context.Background(), record); !errors.Is(err, physicalmigration.ErrCheckpointConflict) {
+		t.Fatalf("Preflight() error = %v, want fail-closed checkpoint conflict", err)
+	}
+}
+
+func TestV2CopyAndReversePreservePaymentFieldsAndReceiptTables(t *testing.T) {
+	t.Parallel()
+
+	for _, fragment := range []string{
+		"reservation.payment_intent_id", "reservation.payment_amount_minor",
+		"reservation.payment_currency", "reservation.payment_grace_expires_at",
+		"orders.payment_intent_id", "orders.authorized_amount_minor",
+		"orders.captured_amount_minor", "orders.refunded_amount_minor",
+	} {
+		if !strings.Contains(sourceReservationSQL+sourceTicketOrderSQL, fragment) {
+			t.Fatalf("control source transform omitted %q", fragment)
+		}
+	}
+	for _, table := range []string{
+		"booking_command_receipts", "payment_command_receipts",
+		"ticket_issuance_receipts", "payment_refund_receipts",
+		"payment_compensation_receipts",
+	} {
+		if _, ok := sourceQuery(table); !ok {
+			t.Fatalf("sourceQuery(%q) is not supported", table)
+		}
+		if _, ok := targetQuery(table); !ok {
+			t.Fatalf("targetQuery(%q) is not supported", table)
+		}
+		if !reverseSupportedTable(table) || reverseUpsertSQL(SourceLegacy, table) == "" ||
+			reverseDeleteSQL(SourceLegacy, table) == "" {
+			t.Fatalf("reverse v2 relation %q is incomplete", table)
+		}
+	}
+	for _, fragment := range []string{
+		"payment_intent_id=EXCLUDED.payment_intent_id",
+		"authorized_amount_minor=EXCLUDED.authorized_amount_minor",
+		"captured_amount_minor=EXCLUDED.captured_amount_minor",
+		"refunded_amount_minor=EXCLUDED.refunded_amount_minor",
+	} {
+		if !strings.Contains(reverseLegacyReservationUpsertSQL+reverseLegacyTicketOrderUpsertSQL, fragment) {
+			t.Fatalf("reverse upsert omitted %q", fragment)
+		}
+	}
+}
+
+func TestReverseV2PreflightRequiresSourceAndTargetReceiptCaptureReadiness(t *testing.T) {
+	t.Parallel()
+
+	for _, fragment := range []string{
+		"version=2 AND NOT dirty",
+		"payment_command_receipts_capture_mutation",
+		"ticket_issuance_receipts_capture_mutation",
+		"payment_refund_receipts_capture_mutation",
+		"payment_compensation_receipts_capture_mutation",
+	} {
+		if !strings.Contains(reverseSourcePreflightSQL, fragment) {
+			t.Fatalf("reverse source preflight omitted %q", fragment)
+		}
+	}
+	for _, fragment := range []string{
+		"version=10 AND NOT dirty",
+		"public.guard_control_booking_receipt_write()",
+		"public.capture_physical_source_receipt_mutation()",
+		"physical_target_write_guard",
+		"physical_source_capture",
+		"reservations_guard_payment_snapshot",
+		"ticket_orders_guard_payment_snapshot",
+	} {
+		if !strings.Contains(reverseTargetPreflightSQL, fragment) {
+			t.Fatalf("reverse target preflight omitted %q", fragment)
+		}
+	}
+	for _, schema := range []string{"public", "booking_shard_0", "booking_shard_1"} {
+		for _, table := range []string{
+			"booking_command_receipts", "payment_command_receipts",
+			"ticket_issuance_receipts", "payment_refund_receipts",
+			"payment_compensation_receipts",
+		} {
+			if !strings.Contains(reverseTargetPreflightSQL, schema+"."+table) {
+				t.Fatalf("reverse target preflight omitted %s.%s", schema, table)
+			}
+		}
+	}
+}
+
+func TestReverseV2ValidationAccountsForEveryPhysicalTable(t *testing.T) {
+	t.Parallel()
+
+	if len(tableOrder) != 15 {
+		t.Fatalf("physical table contract has %d tables, want 15", len(tableOrder))
+	}
+	sourceRows := make([]pgx.Rows, len(tableOrder))
+	targetRows := make([]pgx.Rows, len(tableOrder))
+	for index, table := range tableOrder {
+		sourceRows[index] = &fakeRows{}
+		targetRows[index] = &fakeRows{}
+		if reverseSupportedTable(table) == reverseIgnoredTable(table) {
+			t.Fatalf("table %q must be either copied or derived, but not both", table)
+		}
+	}
+	adapter, err := NewReverse(&fakeDB{rows: targetRows}, &fakeDB{rows: sourceRows}, SourceOne)
+	if err != nil {
+		t.Fatalf("NewReverse() error = %v", err)
+	}
+	result, err := adapter.Validate(context.Background(), physicalmigration.ValidationRequest{
+		Migration: physicalmigration.Record{
+			TrainRunID: uuid.New(), SourceGeneration: 7, TargetGeneration: 8,
+			TargetShardID: SourceOne,
+		},
+		MaxRows: 1, MaxTables: len(tableOrder),
+	})
+	if err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if !result.Passed || result.Truncated || result.Tables != len(tableOrder) {
+		t.Fatalf("Validate() = %+v, want all 15 tables passed", result)
+	}
+}
+
+func TestReverseDerivedValidationUsesTheStillAuthoritativeSourceAssignment(t *testing.T) {
+	t.Parallel()
+
+	rowID := uuid.New()
+	control := &fakeDB{rows: []pgx.Rows{&fakeRows{values: [][]any{{
+		rowID, []byte(`{"id":"` + rowID.String() + `"}`),
+	}}}}}
+	adapter, err := NewReverse(control, &fakeDB{}, SourceLegacy)
+	if err != nil {
+		t.Fatalf("NewReverse() error = %v", err)
+	}
+	record := physicalmigration.Record{
+		TrainRunID: uuid.New(), SourceShardID: "physical-shard-0", TargetShardID: SourceLegacy,
+		SourceGeneration: 7, TargetGeneration: 8,
+	}
+	if _, err := adapter.reverseDerivedTargetRows(context.Background(), record,
+		"train_run_booking_snapshots", 2); err != nil {
+		t.Fatalf("reverseDerivedTargetRows() error = %v", err)
+	}
+	if len(control.queryArgs) != 1 || len(control.queryArgs[0]) != 6 ||
+		control.queryArgs[0][1] != record.SourceShardID ||
+		control.queryArgs[0][2] != record.SourceGeneration {
+		t.Fatalf("derived validation args = %#v, want current source assignment", control.queryArgs)
+	}
+}
 
 func TestFareSnapshotUsesDurableControlSourceVersion(t *testing.T) {
 	t.Parallel()
@@ -260,11 +421,11 @@ func TestControlMigrationScopesReverseApplyAuthorizationToTheExactTransaction(t 
 	if tableStart < 0 {
 		t.Fatal("control migration omitted the reverse-apply authorization table")
 	}
-	tableEnd := strings.Index(sql[tableStart:], "\n);\n")
+	tableEnd := strings.Index(sql[tableStart:], "\n);")
 	if tableEnd < 0 {
 		t.Fatal("control migration omitted the reverse-apply authorization table")
 	}
-	tableSQL := sql[tableStart : tableStart+tableEnd+len("\n);\n")]
+	tableSQL := sql[tableStart : tableStart+tableEnd+len("\n);")]
 	for _, required := range []string{
 		"migration_id uuid NOT NULL",
 		"train_run_id uuid NOT NULL",

@@ -248,24 +248,35 @@ LIMIT 1`, bookingCommand.ReservationID, bookingCommand.OwnerUserID, status, rank
 
 func validConfirmationReceipt(receipt command.Receipt) bool {
 	if receipt.TicketOrderID == uuid.Nil || receipt.TicketCount < 1 ||
-		receipt.TicketCount > command.MaxReceiptTickets || len(receipt.TicketIDs) != receipt.TicketCount {
+		receipt.TicketCount > command.MaxReceiptTickets || len(receipt.TicketIDs) != receipt.TicketCount ||
+		len(receipt.TicketCodes) != receipt.TicketCount {
 		return false
 	}
 	seen := make(map[uuid.UUID]struct{}, len(receipt.TicketIDs))
-	for _, ticketID := range receipt.TicketIDs {
-		if ticketID == uuid.Nil {
+	seenCodes := make(map[string]struct{}, len(receipt.TicketCodes))
+	for index, ticketID := range receipt.TicketIDs {
+		ticketCode := receipt.TicketCodes[index]
+		if ticketID == uuid.Nil || len(ticketCode) < 16 || len(ticketCode) > 64 {
 			return false
 		}
 		if _, duplicate := seen[ticketID]; duplicate {
 			return false
 		}
 		seen[ticketID] = struct{}{}
+		if _, duplicate := seenCodes[ticketCode]; duplicate {
+			return false
+		}
+		seenCodes[ticketCode] = struct{}{}
 	}
 	return true
 }
 
 func insertTicketLocators(ctx context.Context, tx pgx.Tx, bookingCommand command.Command, receipt command.Receipt) error {
-	for _, ticketID := range receipt.TicketIDs {
+	var ticketCodeDirectoryAvailable bool
+	if err := tx.QueryRow(ctx, `SELECT to_regclass('public.ticket_code_directory') IS NOT NULL`).Scan(&ticketCodeDirectoryAvailable); err != nil {
+		return ErrControlWrite
+	}
+	for index, ticketID := range receipt.TicketIDs {
 		tag, err := tx.Exec(ctx, `
 INSERT INTO public.ticket_shard_locators(
  ticket_id,ticket_order_id,reservation_id,train_run_id,shard_id,assignment_generation,owner_user_id
@@ -280,6 +291,17 @@ WHERE ticket_shard_locators.ticket_order_id=EXCLUDED.ticket_order_id
 			ticketID, receipt.TicketOrderID, bookingCommand.ReservationID, bookingCommand.TrainRunID,
 			bookingCommand.Route.ShardID().String(), bookingCommand.Route.Generation().Int64(), bookingCommand.OwnerUserID)
 		if err != nil || tag.RowsAffected() != 1 {
+			return ErrControlWrite
+		}
+		if !ticketCodeDirectoryAvailable {
+			continue
+		}
+		codeTag, err := tx.Exec(ctx, `
+INSERT INTO public.ticket_code_directory(ticket_code,ticket_id)
+VALUES($1,$2)
+ON CONFLICT(ticket_code) DO UPDATE SET ticket_id=EXCLUDED.ticket_id
+WHERE ticket_code_directory.ticket_id=EXCLUDED.ticket_id`, receipt.TicketCodes[index], ticketID)
+		if err != nil || codeTag.RowsAffected() != 1 {
 			return ErrControlWrite
 		}
 	}

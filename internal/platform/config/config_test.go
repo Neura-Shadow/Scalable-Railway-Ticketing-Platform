@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"encoding/base64"
 	"fmt"
 	"reflect"
 	"strings"
@@ -65,7 +66,7 @@ func TestLoadFromForParsesSchemaPOCBookingShardControls(t *testing.T) {
 		"APP_ENV":                         "test",
 		"DATABASE_URL":                    "postgres://api@db.example/railway",
 		"REDIS_ADDRESS":                   "redis.example:6379",
-		"JWT_SECRET":                      "test-secret",
+		"JWT_SECRET":                      "test-secret-at-least-32-bytes-long",
 		"ADMISSION_TOKEN_KEYRING":         testAdmissionKeyring,
 		"ADMISSION_TOKEN_ISSUE_KEY_ID":    "current",
 		"ADMISSION_TOKEN_ACCEPT_KEY_IDS":  "current",
@@ -332,7 +333,7 @@ func validBookingShardAPIEnvironment() map[string]string {
 		"APP_ENV":                        "test",
 		"DATABASE_URL":                   "postgres://api@db.example/railway",
 		"REDIS_ADDRESS":                  "redis.example:6379",
-		"JWT_SECRET":                     "test-secret",
+		"JWT_SECRET":                     "test-secret-at-least-32-bytes-long",
 		"ADMISSION_TOKEN_KEYRING":        testAdmissionKeyring,
 		"ADMISSION_TOKEN_ISSUE_KEY_ID":   "current",
 		"ADMISSION_TOKEN_ACCEPT_KEY_IDS": "current",
@@ -352,7 +353,7 @@ func TestLoadFromForAPILoadsReservationProtectionAndSharedTokenKeyring(t *testin
 	env := map[string]string{
 		"DATABASE_URL":                          "postgres://api@db.example/railway",
 		"REDIS_ADDRESS":                         "redis.example:6379",
-		"JWT_SECRET":                            "test-secret",
+		"JWT_SECRET":                            "test-secret-at-least-32-bytes-long",
 		"RESERVATION_MAX_ACTIVE_HOLDS_PER_USER": "7",
 		"RESERVATION_MAX_ACTIVE_HOLDS_PER_USER_PER_TRAIN_RUN": "2",
 		"RESERVATION_MAX_ACTIVE_PASSENGERS_PER_USER":          "15",
@@ -563,6 +564,19 @@ func TestProductionRequiresSafeDependenciesAndSecret(t *testing.T) {
 	}
 	if strings.Contains(message, cfg.JWTSecret) {
 		t.Fatal("validation error exposed JWT secret")
+	}
+}
+
+func TestAPIRejectsShortJWTSecretInEveryEnvironment(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	cfg.DatabaseURL = "postgres://api@db.example/railway"
+	cfg.RedisAddress = "redis.example:6379"
+	cfg.JWTSecret = "short-secret"
+	setValidAdmissionTokenConfig(&cfg)
+	err := cfg.ValidateFor(config.ProcessAPI)
+	if err == nil || !strings.Contains(err.Error(), "JWT_SECRET must contain at least 32 bytes") {
+		t.Fatalf("ValidateFor(api) error = %v, want bounded JWT secret error", err)
 	}
 }
 
@@ -990,7 +1004,7 @@ func TestLoadFromEnvironmentOverridesDefaults(t *testing.T) {
 		"HTTP_ADDRESS":                   "127.0.0.1:9090",
 		"DATABASE_URL":                   "postgres://db.example/railway",
 		"REDIS_ADDRESS":                  "redis.example:6379",
-		"JWT_SECRET":                     "test-secret",
+		"JWT_SECRET":                     "test-secret-at-least-32-bytes-long",
 		"ADMISSION_TOKEN_KEYRING":        testAdmissionKeyring,
 		"ADMISSION_TOKEN_ISSUE_KEY_ID":   "current",
 		"ADMISSION_TOKEN_ACCEPT_KEY_IDS": "current",
@@ -1046,7 +1060,7 @@ func TestLoadFromSupportsCommittedEnvironmentContract(t *testing.T) {
 		"HTTP_ADDR":                         ":8181",
 		"REDIS_ADDR":                        "redis:6379",
 		"REDIS_PASSWORD":                    "sentinel-redis-secret",
-		"JWT_SECRET":                        "sentinel-test-secret",
+		"JWT_SECRET":                        "sentinel-test-secret-at-least-32-bytes",
 		"ADMISSION_TOKEN_KEYRING":           testAdmissionKeyring,
 		"ADMISSION_TOKEN_ISSUE_KEY_ID":      "current",
 		"ADMISSION_TOKEN_ACCEPT_KEY_IDS":    "current",
@@ -1200,7 +1214,7 @@ func TestLoadAPIUsesExplicitMilestoneThreeCacheControls(t *testing.T) {
 		"APP_ENV":                              "test",
 		"DATABASE_URL":                         "postgres://api@db.example/railway",
 		"REDIS_ADDR":                           "redis.example:6379",
-		"JWT_SECRET":                           "test",
+		"JWT_SECRET":                           "test-secret-at-least-32-bytes-long",
 		"ADMISSION_TOKEN_KEYRING":              "test=" + strings.Repeat("A", 43),
 		"ADMISSION_TOKEN_ISSUE_KEY_ID":         "test",
 		"ADMISSION_TOKEN_ACCEPT_KEY_IDS":       "test",
@@ -1229,6 +1243,106 @@ func TestLoadAPIUsesExplicitMilestoneThreeCacheControls(t *testing.T) {
 		cfg.SearchCacheJitter != 5*time.Second || cfg.AvailabilityCacheTTL != 8*time.Second ||
 		cfg.AvailabilityCacheJitter != time.Second || cfg.AvailabilityCacheMaxStale != 6*time.Second {
 		t.Fatalf("Milestone 3 cache controls = %+v", cfg)
+	}
+}
+
+func TestLoadPaymentWorkerUsesBoundedProcessOwnedSettings(t *testing.T) {
+	t.Parallel()
+	env := map[string]string{
+		"APP_ENV":                              "test",
+		"DATABASE_URL":                         "postgres://payment-worker@db.example/railway",
+		"PAYMENT_ENABLED":                      "true",
+		"PAYMENT_PROVIDER_TYPE":                "sandbox",
+		"PAYMENT_PROVIDER_BASE_URL":            "http://payment-sandbox:8099",
+		"PAYMENT_SAGA_WORKER_ENABLED":          "true",
+		"PAYMENT_WORKER_ENABLED":               "true",
+		"PAYMENT_WORKER_BATCH_SIZE":            "17",
+		"PAYMENT_WORKER_INTERVAL_MILLISECONDS": "400",
+		"PAYMENT_WORKER_MAX_ATTEMPTS":          "9",
+		"PAYMENT_WORKER_RETRY_BASE_SECONDS":    "2",
+		"PAYMENT_WORKER_LEASE_SECONDS":         "40",
+		"PAYMENT_PROCESSING_GRACE_SECONDS":     "600",
+		"PAYMENT_MANUAL_REVIEW_AFTER_SECONDS":  "1800",
+		"PAYMENT_MAX_UNCERTAIN_SECONDS":        "7200",
+		"JWT_SECRET":                           "unused-malformed",
+	}
+	cfg, err := config.LoadFromFor(func(key string) (string, bool) {
+		value, ok := env[key]
+		return value, ok
+	}, config.ProcessPaymentWorker)
+	if err != nil {
+		t.Fatalf("LoadFromFor(payment-worker) error = %v", err)
+	}
+	if !cfg.PaymentEnabled || cfg.PaymentProviderType != config.PaymentProviderSandbox ||
+		cfg.PaymentWorkerBatchSize != 17 || cfg.PaymentWorkerInterval != 400*time.Millisecond ||
+		cfg.PaymentWorkerMaxAttempts != 9 || cfg.PaymentWorkerRetryBase != 2*time.Second ||
+		cfg.PaymentWorkerLease != 40*time.Second || cfg.PaymentProcessingGrace != 10*time.Minute ||
+		cfg.PaymentManualReviewAfter != 30*time.Minute || cfg.PaymentMaxUncertain != 2*time.Hour {
+		t.Fatalf("payment worker settings = %+v", cfg)
+	}
+	if cfg.PaymentWebhookKeyring != "" || cfg.PaymentWebhookAcceptKeyIDs != "" {
+		t.Fatalf("payment worker unexpectedly loaded webhook verification key selection")
+	}
+}
+
+func TestPaymentReconcilerDoesNotRequireWebhookSecrets(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	cfg.DatabaseURL = "postgres://payment-reconciler@db.example/railway"
+	cfg.PaymentEnabled = true
+	cfg.PaymentProviderType = config.PaymentProviderSandbox
+	cfg.PaymentProviderBaseURL = "http://payment-sandbox:8099"
+	cfg.PaymentReconcilerEnabled = true
+	cfg.PaymentWebhookKeyring = ""
+	cfg.PaymentWebhookAcceptKeyIDs = ""
+	if err := cfg.ValidateFor(config.ProcessPaymentReconciler); err != nil {
+		t.Fatalf("ValidateFor(payment-reconciler) error = %v", err)
+	}
+	if err := cfg.ValidateFor(config.ProcessAPI); err == nil || !strings.Contains(err.Error(), "PAYMENT_WEBHOOK_KEYRING") {
+		t.Fatalf("ValidateFor(api) without webhook secrets error = %v", err)
+	}
+}
+
+func TestPaymentProductionPolicyFailsClosedWithoutLeakingSecrets(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	cfg.Environment = config.EnvironmentProduction
+	cfg.DatabaseURL = "postgres://api@db.example/railway"
+	cfg.RedisAddress = "redis.example:6379"
+	cfg.JWTSecret = strings.Repeat("s", 32)
+	setValidAdmissionTokenConfig(&cfg)
+	cfg.PaymentEnabled = true
+	cfg.PaymentProviderType = config.PaymentProviderSandbox
+	cfg.PaymentProviderBaseURL = "https://provider.example"
+	cfg.PaymentProviderAPIKey = "sentinel-provider-secret"
+	cfg.PaymentWebhookKeyring = "current=" + base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+	cfg.PaymentWebhookAcceptKeyIDs = "current"
+	err := cfg.ValidateFor(config.ProcessAPI)
+	if err == nil || !strings.Contains(err.Error(), "sandbox payment provider") {
+		t.Fatalf("ValidateFor(api) error = %v", err)
+	}
+	if strings.Contains(err.Error(), cfg.PaymentProviderAPIKey) || strings.Contains(err.Error(), cfg.PaymentWebhookKeyring) {
+		t.Fatal("payment validation exposed secret material")
+	}
+}
+
+func TestPaymentProductionOverrideStillRejectsPrivateProviderTargets(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	cfg.Environment = config.EnvironmentProduction
+	cfg.DatabaseURL = "postgres://api@db.example/railway"
+	cfg.RedisAddress = "redis.example:6379"
+	cfg.JWTSecret = strings.Repeat("s", 32)
+	setValidAdmissionTokenConfig(&cfg)
+	cfg.PaymentEnabled = true
+	cfg.PaymentProviderType = config.PaymentProviderSandbox
+	cfg.PaymentAllowSandboxInProductionDisposableTestOnly = true
+	cfg.PaymentProviderBaseURL = "https://payments.internal"
+	cfg.PaymentWebhookKeyring = "current=" + base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+	cfg.PaymentWebhookAcceptKeyIDs = "current"
+	err := cfg.ValidateFor(config.ProcessAPI)
+	if err == nil || !strings.Contains(err.Error(), "host is not allowed") {
+		t.Fatalf("ValidateFor(api) error = %v", err)
 	}
 }
 

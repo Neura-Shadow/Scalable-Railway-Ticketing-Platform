@@ -22,6 +22,10 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/reconcile ./cmd/reconcile && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/booking-command-reconciler ./cmd/booking-command-reconciler && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/physical-shard-admin ./cmd/physical-shard-admin && \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/payment-sandbox ./cmd/payment-sandbox && \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/payment-worker ./cmd/payment-worker && \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/payment-reconciler ./cmd/payment-reconciler && \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/payment-admin ./cmd/payment-admin && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/migrate ./cmd/migrate
 
 FROM alpine:3.22 AS runtime
@@ -38,6 +42,10 @@ COPY --from=build --chown=railway:railway /out/shard-admin /usr/local/bin/shard-
 COPY --from=build --chown=railway:railway /out/reconcile /usr/local/bin/reconcile
 COPY --from=build --chown=railway:railway /out/booking-command-reconciler /usr/local/bin/booking-command-reconciler
 COPY --from=build --chown=railway:railway /out/physical-shard-admin /usr/local/bin/physical-shard-admin
+COPY --from=build --chown=railway:railway /out/payment-sandbox /usr/local/bin/payment-sandbox
+COPY --from=build --chown=railway:railway /out/payment-worker /usr/local/bin/payment-worker
+COPY --from=build --chown=railway:railway /out/payment-reconciler /usr/local/bin/payment-reconciler
+COPY --from=build --chown=railway:railway /out/payment-admin /usr/local/bin/payment-admin
 
 USER railway:railway
 
@@ -93,5 +101,29 @@ ENTRYPOINT ["/usr/local/bin/shard-admin"]
 
 FROM runtime AS physical-shard-admin
 ENTRYPOINT ["/usr/local/bin/physical-shard-admin"]
+
+FROM runtime AS payment-sandbox
+USER root
+RUN install -d -o railway -g railway -m 0700 /var/lib/payment-sandbox
+USER railway:railway
+EXPOSE 8099
+HEALTHCHECK --interval=10s --timeout=3s --start-period=3s --retries=5 \
+    CMD wget -q -T 2 -O /dev/null http://127.0.0.1:8099/readyz || exit 1
+ENTRYPOINT ["/usr/local/bin/payment-sandbox"]
+
+FROM runtime AS payment-worker
+EXPOSE 9090
+HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget -q -T 2 -O /dev/null http://127.0.0.1:9090/livez || exit 1
+ENTRYPOINT ["/usr/local/bin/payment-worker"]
+
+FROM runtime AS payment-reconciler
+EXPOSE 9090
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD wget -q -T 2 -O /dev/null http://127.0.0.1:9090/livez || exit 1
+ENTRYPOINT ["/usr/local/bin/payment-reconciler"]
+
+FROM runtime AS payment-admin
+ENTRYPOINT ["/usr/local/bin/payment-admin"]
 
 FROM api AS final

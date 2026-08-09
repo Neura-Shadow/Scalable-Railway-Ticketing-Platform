@@ -477,7 +477,7 @@ func validEndpointVersion(shardID string, protocolVersion, schemaVersion int) bo
 	case "legacy", "shard-0", "shard-1":
 		return schemaVersion == 8
 	case "physical-shard-0", "physical-shard-1":
-		return schemaVersion == 1
+		return schemaVersion == 2
 	default:
 		return false
 	}

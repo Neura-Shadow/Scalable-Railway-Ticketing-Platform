@@ -19,8 +19,8 @@ func TestRuntimeUsesOnlyConfiguredCatalogHandlesAndValidatesSchema(t *testing.T)
 		"physical-shard-1": "configured-one",
 	}
 	pools := map[string]*queuePool{
-		"configured-zero": {transactions: []pgx.Tx{&recordingTx{row: fakeRow{values: []any{1, false}}}}},
-		"configured-one":  {transactions: []pgx.Tx{&recordingTx{row: fakeRow{values: []any{1, false}}}}},
+		"configured-zero": {transactions: []pgx.Tx{&recordingTx{row: fakeRow{values: []any{int(physical.SupportedSchemaVersion), false}}}}},
+		"configured-one":  {transactions: []pgx.Tx{&recordingTx{row: fakeRow{values: []any{int(physical.SupportedSchemaVersion), false}}}}},
 	}
 	catalog := &runtimeCatalog{rows: map[string]pgx.Row{
 		"physical-shard-0": runtimeCatalogRow("physical-shard-0", true),
@@ -61,7 +61,7 @@ func TestRuntimeUsesOnlyConfiguredCatalogHandlesAndValidatesSchema(t *testing.T)
 }
 
 func TestRuntimeReadinessRejectsDirtyOrWrongShardMigration(t *testing.T) {
-	for _, values := range [][]any{{0, false}, {1, true}} {
+	for _, values := range [][]any{{0, false}, {int(physical.SupportedSchemaVersion), true}} {
 		cfg := config.Defaults()
 		cfg.BookingShardMode = config.BookingShardModePhysical
 		cfg.BookingShardIDs = []string{"physical-shard-0"}
@@ -96,7 +96,7 @@ func (catalog *runtimeCatalog) QueryRow(_ context.Context, _ string, arguments .
 
 func runtimeCatalogRow(shardID string, writeEnabled bool) pgx.Row {
 	return fakeRow{values: []any{
-		shardID, "postgres", shardID, int32(1), int32(1), true,
+		shardID, "postgres", shardID, int32(1), physical.SupportedSchemaVersion, true,
 		writeEnabled, "healthy", "active",
 	}}
 }

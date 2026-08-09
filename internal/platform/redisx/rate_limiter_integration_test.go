@@ -40,6 +40,9 @@ func TestRateLimiterIntegrationUsesAtomicWindowAndHashedSubject(t *testing.T) {
 	if result, err := limiter.Allow(context.Background(), "hot_train_policy_mutation", "operator-id", RateLimit{Limit: 20, Window: time.Hour}); err != nil || !result.Allowed {
 		t.Fatalf("hot_train_policy_mutation policy integration = %#v, %v", result, err)
 	}
+	if result, err := limiter.Allow(context.Background(), "payment_webhook", "provider-ip", RateLimit{Limit: 600, Window: time.Minute}); err != nil || !result.Allowed {
+		t.Fatalf("payment_webhook policy integration = %#v, %v", result, err)
+	}
 
 	var (
 		keys   []string
@@ -62,11 +65,12 @@ func TestRateLimiterIntegrationUsesAtomicWindowAndHashedSubject(t *testing.T) {
 		}
 	}
 	joinedKeys := strings.Join(keys, "|")
-	if len(keys) != 3 ||
+	if len(keys) != 4 ||
 		strings.Contains(joinedKeys, rawSubject) ||
 		strings.Contains(joinedKeys, "customer-id") ||
-		strings.Contains(joinedKeys, "operator-id") {
-		t.Fatalf("rate limit keys = %q; expected three hashed keys with no raw subject", keys)
+		strings.Contains(joinedKeys, "operator-id") ||
+		strings.Contains(joinedKeys, "provider-ip") {
+		t.Fatalf("rate limit keys = %q; expected four hashed keys with no raw subject", keys)
 	}
 	_ = client.Del(context.Background(), keys...).Err()
 }

@@ -23,6 +23,9 @@ func registerCustomerRoutes(group *gin.RouterGroup, dependencies Dependencies) {
 	tickets := group.Group("/ticket-orders", authenticate(dependencies.TokenParser), authorize(RoleCustomer))
 	tickets.GET("", withPhysicalQueryTimeout(dependencies, listTicketOrdersHandler(dependencies))...)
 	tickets.GET("/:id", withPhysicalQueryTimeout(dependencies, getTicketOrderHandler(dependencies))...)
+
+	ticketItems := group.Group("/tickets", authenticate(dependencies.TokenParser), authorize(RoleCustomer))
+	ticketItems.GET("/:id", withPhysicalQueryTimeout(dependencies, getTicketHandler(dependencies))...)
 }
 
 func listPassengersHandler(dependencies Dependencies) gin.HandlerFunc {
@@ -147,6 +150,22 @@ func getTicketOrderHandler(dependencies Dependencies) gin.HandlerFunc {
 		}
 		identity, _ := identityFromContext(c)
 		result, err := dependencies.Tickets.GetTicketOrder(c.Request.Context(), identity.Subject, c.Param("id"))
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, result)
+	}
+}
+
+func getTicketHandler(dependencies Dependencies) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if dependencies.Tickets == nil {
+			writeError(c, ErrUnavailable)
+			return
+		}
+		identity, _ := identityFromContext(c)
+		result, err := dependencies.Tickets.GetTicket(c.Request.Context(), identity.Subject, c.Param("id"))
 		if err != nil {
 			writeError(c, err)
 			return

@@ -247,7 +247,7 @@ func TestOnlineValidationBeginsControlDrainBeforeSourceFencing(t *testing.T) {
 
 	record := testRecord(migration.PhysicalStateValidatingOnline)
 	control := &fakeControl{record: record}
-	shards := &fakeShards{validation: physicalmigration.ValidationResult{Passed: true, Tables: 11, Version: 1}}
+	shards := &fakeShards{validation: physicalmigration.ValidationResult{Passed: true, Tables: 15, Version: 1}}
 	control.events = &shards.events
 	engine := newTestEngine(t, control, shards)
 
@@ -448,9 +448,9 @@ func testRecord(state migration.PhysicalState) physicalmigration.Record {
 		SourceGeneration:      7,
 		TargetGeneration:      8,
 		SourceProtocolVersion: 1,
-		SourceSchemaVersion:   1,
+		SourceSchemaVersion:   2,
 		TargetProtocolVersion: 1,
-		TargetSchemaVersion:   1,
+		TargetSchemaVersion:   2,
 		State:                 state,
 	}
 }

@@ -18,6 +18,36 @@ type localTimeoutPool struct {
 	lockTimeout      time.Duration
 }
 
+type pgxPoolAdapter struct{ pool *pgxpool.Pool }
+
+func (pool *pgxPoolAdapter) BeginTx(ctx context.Context, options pgx.TxOptions) (pgx.Tx, error) {
+	return pool.pool.BeginTx(ctx, options)
+}
+
+func (pool *pgxPoolAdapter) Query(ctx context.Context, query string, arguments ...any) (pgx.Rows, error) {
+	return pool.pool.Query(ctx, query, arguments...)
+}
+
+func (pool *pgxPoolAdapter) QueryRow(ctx context.Context, query string, arguments ...any) pgx.Row {
+	return pool.pool.QueryRow(ctx, query, arguments...)
+}
+
+func (pool *pgxPoolAdapter) Close() { pool.pool.Close() }
+
+func (pool *pgxPoolAdapter) PoolSnapshot() PoolSnapshot {
+	stat := pool.pool.Stat()
+	return PoolSnapshot{
+		TotalConnections:      stat.TotalConns(),
+		AcquiredConnections:   stat.AcquiredConns(),
+		IdleConnections:       stat.IdleConns(),
+		MaxConnections:        stat.MaxConns(),
+		AcquireCount:          stat.AcquireCount(),
+		AcquireDuration:       stat.AcquireDuration(),
+		EmptyAcquireCount:     stat.EmptyAcquireCount(),
+		CancelledAcquireCount: stat.CanceledAcquireCount(),
+	}
+}
+
 func (pool *localTimeoutPool) BeginTx(ctx context.Context, options pgx.TxOptions) (pgx.Tx, error) {
 	tx, err := pool.delegate.BeginTx(ctx, options)
 	if err != nil {
@@ -35,6 +65,13 @@ SELECT set_config('statement_timeout', $1, true),
 }
 
 func (pool *localTimeoutPool) Close() { pool.delegate.Close() }
+
+func (pool *localTimeoutPool) PoolSnapshot() PoolSnapshot {
+	if source, ok := pool.delegate.(poolSnapshotSource); ok {
+		return source.PoolSnapshot()
+	}
+	return PoolSnapshot{}
+}
 
 // OpenPGXPool converts an already allowlisted secret into one bounded pool.
 // Parse and construction failures intentionally collapse to ErrInvalidRegistry
@@ -68,11 +105,12 @@ func OpenPGXPool(ctx context.Context, dsn string, limits PoolLimits) (Pool, erro
 	if err != nil {
 		return nil, ErrInvalidRegistry
 	}
+	adapter := &pgxPoolAdapter{pool: pool}
 	if limits.StatementTimeout == 0 {
-		return pool, nil
+		return adapter, nil
 	}
 	return &localTimeoutPool{
-		delegate: pool, statementTimeout: limits.StatementTimeout, lockTimeout: limits.LockTimeout,
+		delegate: adapter, statementTimeout: limits.StatementTimeout, lockTimeout: limits.LockTimeout,
 	}, nil
 }
 

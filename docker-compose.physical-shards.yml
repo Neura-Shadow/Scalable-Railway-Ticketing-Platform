@@ -289,10 +289,11 @@ services:
       - backend
     restart: "on-failure:3"
 
-  # Migration 9 intentionally creates physical catalog entries disabled. These
-  # one-shot gates independently verify each booking-shard schema before the
-  # evidence topology enables it; no worker starts against an unbootstrapped
-  # physical catalog row.
+  # Migration 9 creates physical catalog entries disabled and Migration 10
+  # advances their required contract to schema v2 while retaining that state.
+  # These one-shot gates independently verify each booking-shard schema before
+  # the evidence topology enables it; no worker starts against an
+  # unbootstrapped physical catalog row.
   bootstrap-booking-shard-0:
     <<: *app-security
     build:

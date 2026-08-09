@@ -108,3 +108,48 @@ docker compose -f docker-compose.physical-shards.yml start booking-shard-0-postg
 Remove the evidence topology while retaining database volumes with `down`.
 Use `down --volumes` only when intentionally discarding all local evidence
 data. A source retained for rollback or reverse migration must not be deleted.
+
+## Milestone 6 local payment topology
+
+`docker-compose.payment.yml` includes the physical-shard topology and overlays
+one deterministic payment sandbox, two payment workers, one detect-only payment
+reconciler, payment-enabled API configuration, and an opt-in `tools` profile
+for `payment-admin`. All build contexts resolve to this repository. Control and
+the two booking PostgreSQL instances retain separate volumes and network
+failure domains; the provider and either shard can be faulted independently.
+
+The committed API key, HMAC key, fault-control token, database passwords and
+JWT/admission values are synthetic disposable defaults. They must never be
+used in a shared or production environment. The sandbox is rejected by default
+in production and its authenticated fault endpoints are enabled only in this
+test overlay. The provider reference returned to a customer is not payment
+authority; verified webhook/status evidence advances the saga.
+
+The payment overlay counts all 13 persistent control pools and all six
+shard-aware worker replicas. With three API replicas, two fixed per-process
+shard pools and the existing reserves, the normal aggregate guard is 130
+connections against a configured ceiling of 140. The opt-in admin profile is
+budgeted separately as a transient fourteenth control pool and seventh
+shard-aware process, reaching but not exceeding 140. These are conservative
+configuration ceilings, not observed usage or capacity evidence.
+
+Validate without starting:
+
+```bash
+docker compose -f docker-compose.payment.yml config --quiet
+docker compose -f docker-compose.payment.yml --profile tools config --quiet
+```
+
+Start only after control Migration 10 and booking-shard Migration 2 have been
+reviewed:
+
+```bash
+docker compose -f docker-compose.payment.yml up --build --wait
+```
+
+The committed k6 scenarios require externally supplied bearer tokens,
+reservation/intent fixtures and controller fault steps. A passing HTTP script
+is insufficient: preserve and scan bounded logs/results, then prove provider,
+control, receipt, ticket, inventory, reconciliation and pool invariants before
+recording any result. Tear down explicitly; use `--volumes` only after retained
+migration/recovery evidence is no longer required.

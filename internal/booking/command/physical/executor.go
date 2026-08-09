@@ -410,7 +410,7 @@ GROUP BY ticket_order.id`, bookingCommand.ReservationID).Scan(
 			receipt.TicketCount > command.MaxReceiptTickets || len(receipt.Currency) != 3 || receipt.OrderCreatedAt.IsZero() {
 			return command.Receipt{}, false, ErrShardPersistence
 		}
-		receipt.TicketIDs, err = loadOrderTicketIDs(ctx, tx, receipt.TicketOrderID, receipt.TicketCount)
+		receipt.TicketIDs, receipt.TicketCodes, err = loadOrderTicketIdentities(ctx, tx, receipt.TicketOrderID, receipt.TicketCount)
 		if err != nil {
 			return command.Receipt{}, false, err
 		}

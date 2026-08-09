@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file. The project
 
 ### Added
 
+- Milestone 6 provider-neutral payment intents and sagas, stable checkout/
+  capture/void/full-refund operations, signed durable webhook inbox, bounded
+  uncertainty/manual-review state, and a deterministic fault-injectable local
+  sandbox. No raw card data or live production gateway is included.
+- Payment-aware booking-shard schema v2 with fenced begin-payment, ticket
+  issuance, refund-pending, void cancellation and refund compensation commands;
+  their receipts, exact inventory effects, tickets and outbox events commit
+  shard-locally and replay idempotently.
+- Two-replica payment worker, detect-first reconciler, private bounded admin
+  inspection, payment-aware physical migration/reverse migration, owner-scoped
+  ticket retrieval, payment metrics/readiness, Compose topology, documentation,
+  and ten bounded k6 scenario drivers with evidence still explicitly pending.
+
 - Milestone 5 bounded single-region physical PostgreSQL pilot with one control
   database, two fixed booking databases, allowlisted connection references,
   bounded pools, and database-local monotonic writer fences.
@@ -97,5 +110,7 @@ All notable changes to this project will be documented in this file. The project
 
 - Admission permits an attempt and does not guarantee a seat. Redis AOF does not guarantee queue continuity, token delivery is at-most-once, and account-level quota does not prevent Sybil identities.
 - Projection/cache state can lag or disappear; availability is hint-only and cold generations can amplify PostgreSQL read load across replicas.
-- No real payment integration, complete anti-bot platform, multi-region active-active writes, national-scale capacity evidence, or real passenger identity verification.
+- No live production payment gateway/settlement integration, complete anti-bot
+  platform, multi-region active-active writes, national-scale capacity
+  evidence, or real passenger identity verification.
 - Sustained load and multi-replica benchmark results remain unmeasured.

@@ -160,7 +160,7 @@ func adapterRouteResolver(t *testing.T, trainRunID uuid.UUID, shardID sharding.S
 	t.Cleanup(registry.Close)
 	handle, err := registry.Resolve(shardphysical.CatalogEntry{ShardID: shardID,
 		StorageKind: shardphysical.StoragePostgres, ConnectionRef: shardID.String(), ProtocolVersion: 1,
-		SchemaVersion: 1, Enabled: true, WriteEnabled: true, HealthState: shardphysical.HealthHealthy,
+		SchemaVersion: shardphysical.SupportedSchemaVersion, Enabled: true, WriteEnabled: true, HealthState: shardphysical.HealthHealthy,
 		State: shardphysical.StateActive})
 	if err != nil {
 		t.Fatal(err)

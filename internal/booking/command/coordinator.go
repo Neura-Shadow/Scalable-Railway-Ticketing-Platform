@@ -104,6 +104,7 @@ type Receipt struct {
 	TicketOrderID      uuid.UUID
 	TicketCount        int
 	TicketIDs          []uuid.UUID
+	TicketCodes        []string
 	ReleasedSeatCount  int
 	TotalAmountMinor   int64
 	Currency           string

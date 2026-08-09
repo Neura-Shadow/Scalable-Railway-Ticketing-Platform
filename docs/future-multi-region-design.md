@@ -1,8 +1,9 @@
 # Future Multi-Region Design
 
-This document records direction only. Milestone 5 implements none of these
-multi-region capabilities. Its two physical booking databases are a bounded
-single-region extraction pilot, not regional ownership.
+This document records direction only. Milestone 6 implements none of these
+multi-region capabilities. Its control database, two physical booking
+databases, payment workers, sandbox provider, and webhook ingress are one
+bounded single-region topology, not regional ownership or disaster recovery.
 
 ## Current truth
 
@@ -18,9 +19,13 @@ single-region extraction pilot, not regional ownership.
   are coordinated by one regional Redis authority. They are not globally fair
   or continuous across independent regional Redis deployments.
 - No multi-region active-active seat writes or global strong consistency exist.
+- Payment intent/saga authority, provider operations, webhook deduplication,
+  reconciliation checkpoints, and manual review are regional control-plane
+  state. There is no cross-region webhook ingress, payment failover, provider
+  routing, settlement replication, or demonstrated payment RPO/RTO.
 
-Milestone 5 may run multiple API, admission-worker, and read-model-worker
-replicas inside that one region. Redis Lua scripts make policy-generation
+Milestone 6 may run multiple API, admission-worker, read-model-worker, and
+payment-worker replicas inside that one region. Redis Lua scripts make policy-generation
 operations atomic, while the control database remains authoritative for route
 intent and global leases and the selected booking PostgreSQL remains seat
 authority. The command protocol is a saga, not a distributed transaction. This
@@ -39,12 +44,19 @@ single fenced authority.
 
 Each train-run shard must have exactly one write owner. A global routing directory may map `train_run_id` to an owner region and fenced epoch. All create/confirm/cancel/expire/status commands route to that owner.
 
-Any future regional admission design must route a train run's waiting-room
+Any future regional admission and payment design must route a train run's waiting-room
 joins and token lifecycle to the same fenced owner. A token issued under an old
 owner epoch cannot be accepted by a new owner merely because its HMAC and TTL
 remain valid. Cross-region FIFO, Redis continuity, token handoff, and draining
-outstanding leases require a separately reviewed protocol; Milestone 4 supplies
+outstanding leases require a separately reviewed protocol; Milestone 6 supplies
 none of them.
+
+Payment failover additionally requires fencing old control/worker authority,
+provider idempotency continuity, webhook key and event-ID continuity, status
+reconciliation before any financial replay, preserved manual-review evidence,
+and a proven current booking-shard route before ticket/refund compensation.
+Failing over API reads alone must never authorize capture, ticket issuance, or
+seat release.
 
 Failover requires:
 
@@ -80,7 +92,7 @@ zero-downtime operation, or production capacity.
 
 ## Evidence needed before implementation
 
-- accepted Milestone 4 routing, fencing, migration, failure, and reconciliation
+- accepted Milestone 6 routing, payment, fencing, migration, failure, and reconciliation
   evidence plus measured single-region bottlenecks and hot-run contention;
 - explicit availability, latency, RTO, and RPO objectives;
 - sustained multi-replica benchmarks;

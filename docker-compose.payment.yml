@@ -1,0 +1,9 @@
+name: scalable-railway-ticketing-platform-payment
+
+# Compose v2 includes and merges the proven three-PostgreSQL Milestone 5
+# topology with the payment-only overlay. The sandbox and its fault controls
+# exist solely in this disposable local evidence model.
+include:
+  - path:
+      - ./docker-compose.physical-shards.yml
+      - ./deploy/compose/payment.override.yml
