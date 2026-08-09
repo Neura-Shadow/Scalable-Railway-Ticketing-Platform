@@ -258,6 +258,7 @@ jobs:
             -IterationsPerScenario 1
           Get-Content -Raw (Join-Path $evidence 'milestone-6-evidence-summary.json')
       - name: Upload bounded Milestone 6 payment summaries
+        if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: milestone-6-payment-evidence-${{ github.run_id }}-${{ github.run_attempt }}

@@ -55,6 +55,8 @@ $requiredGuardrails = @(
     "issued_orders -lt 1",
     "reconciliationResult.truncated",
     "clean non-empty pass",
+    "final-reconciliation-result.json",
+    "boundedReconciliation",
     "booking-shard-1-postgres",
     "Wait-Job -Job `$migrationJob -Timeout 180",
     "`$attempt -le 5",

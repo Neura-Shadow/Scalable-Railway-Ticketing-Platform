@@ -681,6 +681,19 @@ RESET ROLE;
         throw 'final detect-only payment reconciliation omitted its JSON result'
     }
     $reconciliationResult = $reconciliationLine | ConvertFrom-Json
+    $reconciliationEvidence = [ordered]@{
+        status=[string]$reconciliationResult.status
+        scope=[string]$reconciliationResult.scope
+        read_only=[bool]$reconciliationResult.read_only
+        rows_examined=[int]$reconciliationResult.rows_examined
+        shard_rows_found=[int]$reconciliationResult.shard_rows_found
+        issued_orders=[int]$reconciliationResult.issued_orders
+        mismatch_count=[int]$reconciliationResult.mismatch_count
+        manual_reviews=[int]$reconciliationResult.manual_reviews
+        truncated=[bool]$reconciliationResult.truncated
+    }
+    $reconciliationEvidence | ConvertTo-Json -Depth 3 |
+        Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'final-reconciliation-result.json') -Encoding utf8
     if ([string]$reconciliationResult.status -ne 'completed' -or
         [int]$reconciliationResult.rows_examined -lt 1 -or
         [int]$reconciliationResult.shard_rows_found -lt 1 -or
@@ -689,7 +702,11 @@ RESET ROLE;
         [int]$reconciliationResult.manual_reviews -ne 0 -or
         [bool]$reconciliationResult.truncated -or
         -not [bool]$reconciliationResult.read_only) {
-        throw 'final detect-only payment reconciliation did not prove a clean non-empty pass'
+        $boundedReconciliation = 'status={0};read_only={1};rows={2};shard_rows={3};issued={4};mismatches={5};manual={6};truncated={7}' -f `
+            $reconciliationEvidence.status,$reconciliationEvidence.read_only,$reconciliationEvidence.rows_examined,
+            $reconciliationEvidence.shard_rows_found,$reconciliationEvidence.issued_orders,
+            $reconciliationEvidence.mismatch_count,$reconciliationEvidence.manual_reviews,$reconciliationEvidence.truncated
+        throw "final detect-only payment reconciliation did not prove a clean non-empty pass: $boundedReconciliation"
     }
     Assert-M6FinalInvariants
     Save-M6Snapshot -Prefix '99-final'
