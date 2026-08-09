@@ -1,9 +1,13 @@
 package sandbox_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -126,6 +130,346 @@ func TestUnknownCaptureOutcomeIsObservableAndReplayDoesNotCaptureTwice(t *testin
 	replayed, err := service.Capture(context.Background(), request)
 	if err != nil || replayed.Status != provider.StatusCaptured {
 		t.Fatalf("capture replay = %#v, %v", replayed, err)
+	}
+}
+
+func TestProviderStateSurvivesServiceRestartAfterCaptureResponseLoss(t *testing.T) {
+	t.Parallel()
+
+	statePath := filepath.Join(t.TempDir(), "provider-state.jsonl")
+	store, err := sandbox.NewFileStateStore(statePath, 1<<20)
+	if err != nil {
+		t.Fatalf("new file state store: %v", err)
+	}
+	faults := sandbox.NewScript()
+	service := newServiceWithStore(t, faults, store)
+	checkout := createCheckout(t, service)
+	authorize(t, service, checkout)
+	faults.Push(sandbox.OperationCapture, sandbox.Fault{Kind: sandbox.FaultResponseLoss})
+	request := provider.CaptureRequest{
+		PaymentIntentID: "intent-123", ProviderPaymentID: checkout.ProviderPaymentID,
+		AmountMinor: 12500, Currency: "TWD", IdempotencyKey: "capture:intent-123:v1",
+	}
+	_, err = service.Capture(context.Background(), request)
+	var providerErr *provider.Error
+	if !errors.As(err, &providerErr) || !providerErr.Uncertain {
+		t.Fatalf("capture response-loss error = %#v, want uncertain", providerErr)
+	}
+
+	reopened, err := sandbox.NewFileStateStore(statePath, 1<<20)
+	if err != nil {
+		t.Fatalf("reopen file state store: %v", err)
+	}
+	restarted := newServiceWithStore(t, nil, reopened)
+	status, err := restarted.GetPaymentStatus(context.Background(), checkout.ProviderPaymentID)
+	if err != nil || status.Status != provider.StatusCaptured || status.CapturedMinor != 12500 {
+		t.Fatalf("status after provider restart = %#v, %v", status, err)
+	}
+	replayed, err := restarted.Capture(context.Background(), request)
+	if err != nil || replayed.Status != provider.StatusCaptured || replayed.ProviderOperationID == "" {
+		t.Fatalf("capture replay after provider restart = %#v, %v", replayed, err)
+	}
+
+	reopenedAgain, err := sandbox.NewFileStateStore(statePath, 1<<20)
+	if err != nil {
+		t.Fatalf("reopen file state store again: %v", err)
+	}
+	restartedAgain := newServiceWithStore(t, nil, reopenedAgain)
+	replayedAgain, err := restartedAgain.Capture(context.Background(), request)
+	if err != nil || replayedAgain != replayed {
+		t.Fatalf("second restart replay = %#v, %v; want %#v", replayedAgain, err, replayed)
+	}
+}
+
+func TestProviderStateSurvivesServiceRestartAfterRefundResponseLoss(t *testing.T) {
+	t.Parallel()
+
+	statePath := filepath.Join(t.TempDir(), "provider-state.jsonl")
+	store, err := sandbox.NewFileStateStore(statePath, 1<<20)
+	if err != nil {
+		t.Fatalf("new file state store: %v", err)
+	}
+	faults := sandbox.NewScript()
+	service := newServiceWithStore(t, faults, store)
+	checkout := createCheckout(t, service)
+	authorize(t, service, checkout)
+	if _, err = service.Capture(context.Background(), provider.CaptureRequest{
+		PaymentIntentID: "intent-123", ProviderPaymentID: checkout.ProviderPaymentID,
+		AmountMinor: 12500, Currency: "TWD", IdempotencyKey: "capture:intent-123:v1",
+	}); err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	faults.Push(sandbox.OperationRefund, sandbox.Fault{Kind: sandbox.FaultResponseLoss})
+	request := provider.RefundRequest{
+		PaymentIntentID: "intent-123", ProviderPaymentID: checkout.ProviderPaymentID,
+		AmountMinor: 12500, Currency: "TWD", IdempotencyKey: "refund:intent-123:v1",
+	}
+	_, err = service.Refund(context.Background(), request)
+	var providerErr *provider.Error
+	if !errors.As(err, &providerErr) || !providerErr.Uncertain {
+		t.Fatalf("refund response-loss error = %#v, want uncertain", providerErr)
+	}
+
+	reopened, err := sandbox.NewFileStateStore(statePath, 1<<20)
+	if err != nil {
+		t.Fatalf("reopen file state store: %v", err)
+	}
+	restarted := newServiceWithStore(t, nil, reopened)
+	status, err := restarted.GetPaymentStatus(context.Background(), checkout.ProviderPaymentID)
+	if err != nil || status.Status != provider.StatusRefunded || status.RefundedMinor != 12500 {
+		t.Fatalf("status after refund restart = %#v, %v", status, err)
+	}
+	replayed, err := restarted.Refund(context.Background(), request)
+	if err != nil || replayed.Status != provider.StatusRefunded || replayed.ProviderOperationID == "" {
+		t.Fatalf("refund replay after restart = %#v, %v", replayed, err)
+	}
+}
+
+func TestProviderStateSurvivesRestartBeforeAuthorizedWebhookDelivery(t *testing.T) {
+	t.Parallel()
+
+	statePath := filepath.Join(t.TempDir(), "provider-state.jsonl")
+	store, err := sandbox.NewFileStateStore(statePath, 1<<20)
+	if err != nil {
+		t.Fatalf("new file state store: %v", err)
+	}
+	service := newServiceWithStore(t, nil, store)
+	checkout := createCheckout(t, service)
+	authorize(t, service, checkout)
+
+	reopened, err := sandbox.NewFileStateStore(statePath, 1<<20)
+	if err != nil {
+		t.Fatalf("reopen file state store: %v", err)
+	}
+	restarted := newServiceWithStore(t, nil, reopened)
+	queued := restarted.DrainWebhooks()
+	if len(queued) != 2 {
+		t.Fatalf("queued webhooks after restart = %d, want checkout and authorization", len(queued))
+	}
+	foundAuthorized := false
+	for _, item := range queued {
+		event, verifyErr := restarted.VerifyWebhook(context.Background(), item.Headers, item.Body)
+		if verifyErr != nil {
+			t.Fatalf("verify restored webhook: %v", verifyErr)
+		}
+		if event.Type == provider.EventAuthorized && event.ProviderPaymentID == checkout.ProviderPaymentID {
+			foundAuthorized = true
+		}
+	}
+	if !foundAuthorized {
+		t.Fatal("authorized webhook was not restored after provider restart")
+	}
+}
+
+func TestRestoredWebhookUsesCurrentActiveSigningKey(t *testing.T) {
+	t.Parallel()
+
+	statePath := filepath.Join(t.TempDir(), "provider-state.jsonl")
+	store, err := sandbox.NewFileStateStore(statePath, 1<<20)
+	if err != nil {
+		t.Fatalf("new file state store: %v", err)
+	}
+	now := time.Date(2026, time.August, 5, 12, 0, 0, 0, time.UTC)
+	oldKey := testWebhookKey("old")
+	newKey := testWebhookKey("new")
+	service, err := sandbox.New(sandbox.Config{
+		Environment: "test", Now: func() time.Time { return now },
+		WebhookKeys: map[string][]byte{"old": oldKey}, IssueKeyID: "old", StateStore: store,
+	})
+	if err != nil {
+		t.Fatalf("new old-key sandbox: %v", err)
+	}
+	createCheckout(t, service)
+
+	reopened, err := sandbox.NewFileStateStore(statePath, 1<<20)
+	if err != nil {
+		t.Fatalf("reopen file state store: %v", err)
+	}
+	restarted, err := sandbox.New(sandbox.Config{
+		Environment: "test", Now: func() time.Time { return now },
+		WebhookKeys: map[string][]byte{"old": oldKey, "new": newKey}, IssueKeyID: "new", StateStore: reopened,
+	})
+	if err != nil {
+		t.Fatalf("new rotated-key sandbox: %v", err)
+	}
+	queued := restarted.DrainWebhooks()
+	if len(queued) != 1 || queued[0].Headers.KeyID != "new" {
+		t.Fatalf("restored webhook headers = %#v, want current key", queued)
+	}
+	if _, err = restarted.VerifyWebhook(context.Background(), queued[0].Headers, queued[0].Body); err != nil {
+		t.Fatalf("verify re-signed webhook: %v", err)
+	}
+}
+
+func TestAdvancedDelayedWebhookRemainsDeliverableAfterRestart(t *testing.T) {
+	t.Parallel()
+
+	statePath := filepath.Join(t.TempDir(), "provider-state.jsonl")
+	store, err := sandbox.NewFileStateStore(statePath, 1<<20)
+	if err != nil {
+		t.Fatalf("new file state store: %v", err)
+	}
+	faults := sandbox.NewScript()
+	service := newServiceWithStore(t, faults, store)
+	faults.Push(sandbox.OperationCreateCheckout, sandbox.Fault{Kind: sandbox.FaultDelayedWebhook, DelaySteps: 2})
+	createCheckout(t, service)
+	if webhooks := service.DrainWebhooks(); len(webhooks) != 0 {
+		t.Fatalf("delayed webhook delivered before advance: %#v", webhooks)
+	}
+	if err = service.Advance(2); err != nil {
+		t.Fatalf("advance webhook clock: %v", err)
+	}
+
+	reopened, err := sandbox.NewFileStateStore(statePath, 1<<20)
+	if err != nil {
+		t.Fatalf("reopen file state store: %v", err)
+	}
+	restarted := newServiceWithStore(t, nil, reopened)
+	if webhooks := restarted.DrainWebhooks(); len(webhooks) != 1 {
+		t.Fatalf("delayed webhooks after restart = %#v, want one", webhooks)
+	}
+}
+
+func TestProviderMutationRollsBackWhenDurableStateCannotCommit(t *testing.T) {
+	t.Parallel()
+
+	store := &failingStateStore{}
+	service := newServiceWithStore(t, nil, store)
+	checkout := createCheckout(t, service)
+	authorize(t, service, checkout)
+	store.fail = true
+	request := provider.CaptureRequest{
+		PaymentIntentID: "intent-123", ProviderPaymentID: checkout.ProviderPaymentID,
+		AmountMinor: 12500, Currency: "TWD", IdempotencyKey: "capture:intent-123:v1",
+	}
+	_, err := service.Capture(context.Background(), request)
+	var providerErr *provider.Error
+	if !errors.As(err, &providerErr) || providerErr.Category != provider.ErrorUnavailable || !providerErr.Retryable {
+		t.Fatalf("capture with failed durable state = %#v, want retryable unavailable", providerErr)
+	}
+	if service.Ready() {
+		t.Fatal("sandbox remained ready after durable state failure")
+	}
+	status, err := service.GetPaymentStatus(context.Background(), checkout.ProviderPaymentID)
+	if err != nil || status.Status != provider.StatusAuthorized || status.CapturedMinor != 0 {
+		t.Fatalf("status after failed durable commit = %#v, %v; want authorized and uncaptured", status, err)
+	}
+}
+
+func TestProviderStateFileRejectsParseableTamperingAndStoresHashedKeys(t *testing.T) {
+	t.Parallel()
+
+	statePath := filepath.Join(t.TempDir(), "provider-state.jsonl")
+	store, err := sandbox.NewFileStateStore(statePath, 1<<20)
+	if err != nil {
+		t.Fatalf("new file state store: %v", err)
+	}
+	service := newServiceWithStore(t, nil, store)
+	checkout := createCheckout(t, service)
+	authorize(t, service, checkout)
+	request := provider.CaptureRequest{
+		PaymentIntentID: "intent-123", ProviderPaymentID: checkout.ProviderPaymentID,
+		AmountMinor: 12500, Currency: "TWD", IdempotencyKey: "capture:intent-123:v1",
+	}
+	if _, err := service.Capture(context.Background(), request); err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	contents, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read provider state: %v", err)
+	}
+	for _, rawKey := range [][]byte{[]byte("checkout:intent-123:v1"), []byte("authorize:intent-123:v1"), []byte("capture:intent-123:v1")} {
+		if bytes.Contains(contents, rawKey) {
+			t.Fatalf("provider state contains raw idempotency key %q", rawKey)
+		}
+	}
+	tampered := bytes.ReplaceAll(contents, []byte(`"amount_minor":12500`), []byte(`"amount_minor":12501`))
+	if bytes.Equal(tampered, contents) {
+		t.Fatal("test failed to produce parseable state tampering")
+	}
+	if err := os.WriteFile(statePath, tampered, 0o600); err != nil {
+		t.Fatalf("write tampered provider state: %v", err)
+	}
+	reopened, err := sandbox.NewFileStateStore(statePath, 1<<20)
+	if err != nil {
+		t.Fatalf("reopen file state store: %v", err)
+	}
+	if _, err := sandbox.New(sandbox.Config{
+		Environment: "test", Now: func() time.Time { return time.Date(2026, time.August, 5, 12, 0, 0, 0, time.UTC) },
+		WebhookKeys: map[string][]byte{"test-key": testWebhookKey("default")}, IssueKeyID: "test-key", StateStore: reopened,
+	}); err == nil {
+		t.Fatal("parseable tampered provider state unexpectedly loaded")
+	}
+}
+
+func TestProviderStateFileKeepsOneBoundedSnapshot(t *testing.T) {
+	t.Parallel()
+
+	const stateLimit = 128 << 10
+	statePath := filepath.Join(t.TempDir(), "provider-state.jsonl")
+	store, err := sandbox.NewFileStateStore(statePath, stateLimit)
+	if err != nil {
+		t.Fatalf("new file state store: %v", err)
+	}
+	service := newServiceWithStore(t, nil, store)
+	var last provider.Checkout
+	for index := 0; index < 128; index++ {
+		intentID := fmt.Sprintf("intent-bounded-%03d", index)
+		last, err = service.CreateCheckout(context.Background(), provider.CreateCheckoutRequest{
+			PaymentIntentID: intentID, MerchantReference: intentID,
+			AmountMinor: 12500, Currency: "TWD", IdempotencyKey: "checkout:" + intentID + ":v1",
+		})
+		if err != nil {
+			t.Fatalf("create checkout %d: %v", index, err)
+		}
+	}
+	info, err := os.Stat(statePath)
+	if err != nil {
+		t.Fatalf("stat provider state: %v", err)
+	}
+	if info.Size() <= 0 || info.Size() > stateLimit {
+		t.Fatalf("provider state size = %d, want 1..%d", info.Size(), stateLimit)
+	}
+	reopened, err := sandbox.NewFileStateStore(statePath, stateLimit)
+	if err != nil {
+		t.Fatalf("reopen file state store: %v", err)
+	}
+	restarted := newServiceWithStore(t, nil, reopened)
+	status, err := restarted.GetPaymentStatus(context.Background(), last.ProviderPaymentID)
+	if err != nil || status.Status != provider.StatusCreated {
+		t.Fatalf("last payment after bounded restart = %#v, %v", status, err)
+	}
+}
+
+func TestProviderStateFileIgnoresOnlyAnIncompleteTrailingWrite(t *testing.T) {
+	t.Parallel()
+
+	statePath := filepath.Join(t.TempDir(), "provider-state.jsonl")
+	store, err := sandbox.NewFileStateStore(statePath, 1<<20)
+	if err != nil {
+		t.Fatalf("new file state store: %v", err)
+	}
+	service := newServiceWithStore(t, nil, store)
+	checkout := createCheckout(t, service)
+	file, err := os.OpenFile(statePath, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open provider state: %v", err)
+	}
+	if _, err = file.WriteString(`{"version":1,"state":`); err != nil {
+		_ = file.Close()
+		t.Fatalf("append incomplete provider state: %v", err)
+	}
+	if err = file.Close(); err != nil {
+		t.Fatalf("close incomplete provider state: %v", err)
+	}
+	reopened, err := sandbox.NewFileStateStore(statePath, 1<<20)
+	if err != nil {
+		t.Fatalf("reopen file state store: %v", err)
+	}
+	restarted := newServiceWithStore(t, nil, reopened)
+	status, err := restarted.GetPaymentStatus(context.Background(), checkout.ProviderPaymentID)
+	if err != nil || status.Status != provider.StatusCreated {
+		t.Fatalf("payment after incomplete trailing write = %#v, %v", status, err)
 	}
 }
 
@@ -294,7 +638,9 @@ func TestWebhookFaultsAreDeterministicWithoutSleeping(t *testing.T) {
 	if webhooks := service.DrainWebhooks(); len(webhooks) != 0 {
 		t.Fatalf("delayed webhook delivered early: %#v", webhooks)
 	}
-	service.Advance(2)
+	if err := service.Advance(2); err != nil {
+		t.Fatalf("advance webhook clock: %v", err)
+	}
 	if webhooks := service.DrainWebhooks(); len(webhooks) != 1 {
 		t.Fatalf("delayed webhooks after advance = %#v", webhooks)
 	}
@@ -348,6 +694,11 @@ func authorize(t *testing.T, service *sandbox.Service, checkout provider.Checkou
 
 func newService(t *testing.T, faults sandbox.FaultPlan) *sandbox.Service {
 	t.Helper()
+	return newServiceWithStore(t, faults, nil)
+}
+
+func newServiceWithStore(t *testing.T, faults sandbox.FaultPlan, store sandbox.StateStore) *sandbox.Service {
+	t.Helper()
 	service, err := sandbox.New(sandbox.Config{
 		Environment: "test",
 		Now: func() time.Time {
@@ -356,6 +707,7 @@ func newService(t *testing.T, faults sandbox.FaultPlan) *sandbox.Service {
 		WebhookKeys: map[string][]byte{"test-key": testWebhookKey("default")},
 		IssueKeyID:  "test-key",
 		Faults:      faults,
+		StateStore:  store,
 	})
 	if err != nil {
 		t.Fatalf("new sandbox: %v", err)
@@ -375,4 +727,21 @@ func newServiceAt(t *testing.T, now time.Time, issueKeyID string, keys map[strin
 func testWebhookKey(label string) []byte {
 	sum := sha256.Sum256([]byte("payment-sandbox-test:" + label))
 	return append([]byte(nil), sum[:]...)
+}
+
+type failingStateStore struct {
+	state []byte
+	fail  bool
+}
+
+func (s *failingStateStore) Load() ([]byte, error) {
+	return append([]byte(nil), s.state...), nil
+}
+
+func (s *failingStateStore) Save(state []byte) error {
+	if s.fail {
+		return errors.New("injected durable state failure")
+	}
+	s.state = append(s.state[:0], state...)
+	return nil
 }

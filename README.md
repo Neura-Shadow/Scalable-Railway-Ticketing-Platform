@@ -378,10 +378,11 @@ correctness gates. [benchmark-report-milestone-4.md](docs/benchmark-report-miles
 records every Milestone 4 result as pending until a controlled run is accepted.
 A smoke run is not physical-shard, production, or national-scale evidence.
 
-Milestone 6 adds ten bounded payment correctness/recovery scripts. Their
-committed benchmark report remains `not_run` until a sanitized canonical bundle
-and post-run provider/control/shard invariants exist; scripts alone cannot prove
-no duplicate charge, refund, ticket, or production capacity. See
+Milestone 6 adds ten bounded payment correctness/recovery scripts. Its committed
+benchmark report records the last accepted disposable run, but any change to the
+scoped source requires a new source-bound bundle before publication; scripts or
+stale evidence alone cannot prove no duplicate charge, refund, or ticket and
+never establish production capacity. See
 [Milestone 6 load testing](docs/milestone-6-load-testing.md).
 
 ## Deployment

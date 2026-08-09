@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -184,6 +185,7 @@ func TestConfigurationRequiresWebhookSecretAndRejectsProductionSandbox(t *testin
 		"PAYMENT_SANDBOX_ENVIRONMENT":          "production",
 		"PAYMENT_SANDBOX_WEBHOOK_KEYRING":      "key=" + base64.StdEncoding.EncodeToString(commandTestKey("configuration")),
 		"PAYMENT_SANDBOX_WEBHOOK_ISSUE_KEY_ID": "key",
+		"PAYMENT_SANDBOX_STATE_PATH":           filepath.Join(t.TempDir(), "provider-state.jsonl"),
 	}
 	config, err := loadConfig(func(key string) string { return values[key] })
 	if err != nil {

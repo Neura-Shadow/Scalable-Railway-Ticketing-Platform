@@ -99,6 +99,23 @@ The disposable sandbox keeps its synthetic token inside the provider boundary:
 the hosted action endpoint returns only `processing`, then emits the same signed
 webhook/current-status evidence used by every other authorization path.
 
+## Disposable sandbox restart contract
+
+The sandbox stores synthetic provider payments, counters, operation results,
+and SHA-256 identities of stable idempotency keys in one bounded, versioned,
+atomic snapshot on its project-scoped named volume. It never persists raw
+idempotency keys, webhook signatures, card data, provider credentials, JWTs, or
+passenger PII. Invalid or unavailable state fails startup; a later durable-save
+failure makes `/readyz` fail closed and rejects new mutations.
+
+Undelivered synthetic webhook facts persist as normalized bounded events, not
+old signed envelopes. On restart they are re-signed with the configured active
+key and may be delivered more than once. Workers must still resolve any
+uncertain capture, void, or refund with the durable provider object/status and
+the original operation identity before replay. This proves a disposable
+recovery contract only; it does not model production provider storage,
+replication, retention, or settlement.
+
 ## Future adapter gate
 
 A real provider adapter remains future work. It needs an explicit status and

@@ -2,7 +2,7 @@
 
 Status: Design research; no production payment provider selected
 
-Last updated: 2026-08-05
+Last updated: 2026-08-09
 
 ## Research boundary
 
@@ -87,6 +87,14 @@ Sources:
 
 Idempotency reduces duplicate effects; it does not make an external call part
 of a database transaction or justify an exactly-once claim.
+
+Adyen also states that an idempotency implementation relies on a consistent,
+stateful data store. The local sandbox therefore cannot treat process memory as
+provider authority: its synthetic payment objects, operation results, and
+hashed idempotency identities must survive a sandbox process restart. The
+disposable adapter uses a bounded atomic state snapshot and status-query
+recovery. This is test infrastructure, not evidence about a future provider's
+retention or disaster-recovery guarantees.
 
 ### Webhook authenticity, replay, duplicates, and ordering
 

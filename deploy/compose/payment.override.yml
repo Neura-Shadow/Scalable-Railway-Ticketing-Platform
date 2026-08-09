@@ -230,6 +230,10 @@ services:
       PAYMENT_SANDBOX_WEBHOOK_REPLAY_SECONDS: 300
       PAYMENT_SANDBOX_FAULT_CONTROL_ENABLED: "true"
       PAYMENT_SANDBOX_FAULT_CONTROL_TOKEN: ${PAYMENT_SANDBOX_FAULT_CONTROL_TOKEN:-synthetic-disposable-fault-token}
+      PAYMENT_SANDBOX_STATE_PATH: /var/lib/payment-sandbox/provider-state.jsonl
+      PAYMENT_SANDBOX_STATE_MAX_BYTES: 16777216
+    volumes:
+      - payment-sandbox-state:/var/lib/payment-sandbox
 
   hold-expirer:
     environment:
@@ -294,3 +298,6 @@ services:
       POSTGRES_MAX_CONNECTIONS_LIMIT: 140
     depends_on: *payment-dependencies
     restart: "no"
+
+volumes:
+  payment-sandbox-state:

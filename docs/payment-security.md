@@ -62,6 +62,11 @@ Authentication failures stop and alert rather than retrying indefinitely.
 The sandbox is a separate test/development process. Fault/admin endpoints exist
 only in a disposable profile and must not appear in production manifests or
 readiness. It rejects raw card/authentication fields even in test requests.
+Its project-scoped volume retains only bounded synthetic provider state and
+hashed stable-key identities across process restart; corrupt or unavailable
+state fails closed. The checksum detects accidental corruption, not a malicious
+host able to rewrite both state and digest. Sandbox host/volume compromise is
+therefore outside customer-facing trust and is never production evidence.
 
 ## Secrets and sensitive output
 

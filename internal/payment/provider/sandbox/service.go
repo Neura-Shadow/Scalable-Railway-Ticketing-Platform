@@ -1,6 +1,7 @@
-// Package sandbox provides a deterministic, in-memory payment provider for
-// tests and disposable development environments. It accepts opaque synthetic
-// tokens only and is rejected in production by default.
+// Package sandbox provides a deterministic payment provider for tests and
+// disposable development environments. It accepts opaque synthetic tokens
+// only, persists bounded synthetic provider state when configured, and is
+// rejected in production by default.
 package sandbox
 
 import (
@@ -37,6 +38,7 @@ type Config struct {
 	WebhookReplayTolerance                        time.Duration
 	MaxQueuedWebhooks                             int
 	Faults                                        FaultPlan
+	StateStore                                    StateStore
 }
 
 type paymentRecord struct {
@@ -62,6 +64,7 @@ type QueuedWebhook struct {
 	Body         []byte
 	Sequence     uint64
 	DeliverAfter uint64
+	event        provider.WebhookEvent
 }
 
 type Service struct {
@@ -80,6 +83,8 @@ type Service struct {
 	nextEvent       uint64
 	step            uint64
 	webhooks        []QueuedWebhook
+	stateStore      StateStore
+	stateFailed     bool
 }
 
 func New(config Config) (*Service, error) {
@@ -124,7 +129,10 @@ func New(config Config) (*Service, error) {
 	if _, ok := keys[config.IssueKeyID]; !ok || config.IssueKeyID == "" {
 		return nil, errors.New("payment sandbox issue key is invalid")
 	}
-	return &Service{
+	if config.StateStore == nil {
+		config.StateStore = NewMemoryStateStore()
+	}
+	service := &Service{
 		now:             config.Now,
 		faults:          config.Faults,
 		payments:        make(map[string]*paymentRecord),
@@ -134,7 +142,24 @@ func New(config Config) (*Service, error) {
 		maxWebhookBody:  config.WebhookMaxBodyBytes,
 		maxWebhooks:     config.MaxQueuedWebhooks,
 		replayTolerance: config.WebhookReplayTolerance,
-	}, nil
+		stateStore:      config.StateStore,
+	}
+	if err := service.loadDurableState(); err != nil {
+		return nil, err
+	}
+	return service, nil
+}
+
+// Ready reports whether the sandbox can durably accept another provider
+// mutation. Reads remain available after a save failure so callers can inspect
+// the last authoritative in-memory state, but readiness fails closed.
+func (s *Service) Ready() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.stateFailed
 }
 
 func (s *Service) CreateCheckout(ctx context.Context, request provider.CreateCheckoutRequest) (provider.Checkout, error) {
@@ -147,7 +172,11 @@ func (s *Service) CreateCheckout(ctx context.Context, request provider.CreateChe
 	fingerprint := fingerprint(request)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if replay, ok := s.idempotency[request.IdempotencyKey]; ok {
+	if s.stateFailed {
+		return provider.Checkout{}, stateUnavailableError(OperationCreateCheckout)
+	}
+	keyIdentity := idempotencyIdentity(request.IdempotencyKey)
+	if replay, ok := s.idempotency[keyIdentity]; ok {
 		if replay.fingerprint != fingerprint {
 			return provider.Checkout{}, conflictError(OperationCreateCheckout)
 		}
@@ -157,13 +186,19 @@ func (s *Service) CreateCheckout(ctx context.Context, request provider.CreateChe
 	if err := beforeFault(OperationCreateCheckout, fault); err != nil {
 		return provider.Checkout{}, err
 	}
+	previous := s.mutableStateLocked()
 	s.nextPayment++
 	id := fmt.Sprintf("pay_sandbox_%012d", s.nextPayment)
 	token := fmt.Sprintf("tok_sandbox_%012d", s.nextPayment)
 	checkout := provider.Checkout{ProviderPaymentID: id, HostedReference: "sandbox-checkout:" + id, SyntheticToken: token, Status: provider.StatusCreated, AmountMinor: request.AmountMinor, Currency: normalizeCurrency(request.Currency)}
 	s.payments[id] = &paymentRecord{id: id, intentID: request.PaymentIntentID, token: token, status: provider.StatusCreated, amount: request.AmountMinor, currency: checkout.Currency, updatedAt: s.now().UTC()}
-	s.idempotency[request.IdempotencyKey] = idempotentResult{fingerprint: fingerprint, checkout: checkout}
+	s.idempotency[keyIdentity] = idempotentResult{fingerprint: fingerprint, checkout: checkout}
 	s.enqueueWebhook(s.payments[id], provider.EventCheckoutCreated, fault)
+	if err := s.persistLocked(); err != nil {
+		s.restoreMutableStateLocked(previous)
+		s.stateFailed = true
+		return provider.Checkout{}, stateUnavailableError(OperationCreateCheckout)
+	}
 	if err := afterFault(OperationCreateCheckout, fault); err != nil {
 		return provider.Checkout{}, err
 	}
@@ -261,7 +296,11 @@ func (s *Service) transition(ctx context.Context, operation Operation, intentID,
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if replay, ok := s.idempotency[idempotencyKey]; ok {
+	if s.stateFailed {
+		return provider.OperationResult{}, stateUnavailableError(operation)
+	}
+	keyIdentity := idempotencyIdentity(idempotencyKey)
+	if replay, ok := s.idempotency[keyIdentity]; ok {
 		if replay.fingerprint != fingerprint {
 			return provider.OperationResult{}, conflictError(operation)
 		}
@@ -271,6 +310,7 @@ func (s *Service) transition(ctx context.Context, operation Operation, intentID,
 	if err := beforeFault(operation, fault); err != nil {
 		return provider.OperationResult{}, err
 	}
+	previous := s.mutableStateLocked()
 	record, ok := s.payments[paymentID]
 	if !ok {
 		return provider.OperationResult{}, validationError(operation, "provider payment was not found")
@@ -299,8 +339,13 @@ func (s *Service) transition(ctx context.Context, operation Operation, intentID,
 	if operation == OperationRefund {
 		record.refunded = amount
 	}
-	s.idempotency[idempotencyKey] = idempotentResult{fingerprint: fingerprint, operation: result}
+	s.idempotency[keyIdentity] = idempotentResult{fingerprint: fingerprint, operation: result}
 	s.enqueueWebhook(record, eventType, fault)
+	if err := s.persistLocked(); err != nil {
+		s.restoreMutableStateLocked(previous)
+		s.stateFailed = true
+		return provider.OperationResult{}, stateUnavailableError(operation)
+	}
 	if err := afterFault(operation, fault); err != nil {
 		return provider.OperationResult{}, err
 	}
@@ -447,6 +492,10 @@ func transportError(operation Operation, uncertain bool) *provider.Error {
 	return &provider.Error{Category: provider.ErrorTransport, Operation: string(operation), Retryable: !uncertain, Uncertain: uncertain, Message: "payment provider transport failure"}
 }
 
+func stateUnavailableError(operation Operation) *provider.Error {
+	return &provider.Error{Category: provider.ErrorUnavailable, Operation: string(operation), Retryable: true, Message: "payment provider state unavailable"}
+}
+
 func withOperation(err error, operation Operation) error {
 	var providerErr *provider.Error
 	if errors.As(err, &providerErr) {
@@ -474,6 +523,7 @@ func (s *Service) enqueueWebhook(record *paymentRecord, eventType provider.Event
 	event := provider.WebhookEvent{ProviderEventID: fmt.Sprintf("evt_sandbox_%012d", s.nextEvent), Type: eventType, ProviderPaymentID: record.id, Status: record.status, AmountMinor: record.amount, Currency: record.currency, OccurredAt: record.updatedAt}
 	body, _ := json.Marshal(event)
 	queued, _ := s.sign(body, s.now().UTC())
+	queued.event = event
 	queued.Sequence = s.step
 	if fault.Kind == FaultDelayedWebhook {
 		queued.DeliverAfter = s.step + max(fault.DelaySteps, 1)
@@ -490,11 +540,22 @@ func (s *Service) enqueueWebhook(record *paymentRecord, eventType provider.Event
 	}
 }
 
-// Advance moves the sandbox logical delivery clock without sleeping.
-func (s *Service) Advance(steps uint64) {
+// Advance moves and durably records the sandbox logical delivery clock without
+// sleeping. An error leaves the prior clock and queue authoritative.
+func (s *Service) Advance(steps uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.stateFailed || steps == 0 || steps > 10000 || ^uint64(0)-s.step < steps {
+		return errors.New("payment sandbox state is unavailable")
+	}
+	previous := s.mutableStateLocked()
 	s.step += steps
+	if err := s.persistLocked(); err != nil {
+		s.restoreMutableStateLocked(previous)
+		s.stateFailed = true
+		return err
+	}
+	return nil
 }
 
 // DrainWebhooks returns currently deliverable signed webhooks in deterministic

@@ -61,6 +61,14 @@ response fingerprint, different amount/currency, second provider operation ID,
 or impossible terminal sequence becomes a conflict and cannot cause another
 financial call.
 
+For the deterministic sandbox, provider payment state and the hashed stable-key
+result map survive a process restart. A response-loss or timeout-after-commit
+test may restart the sandbox before observation; status query and same-key
+replay must return the single installed capture/refund result. Webhook delivery
+itself remains at least once: normalized undelivered events survive restart and
+may be delivered again, while old signatures are regenerated. Webhook presence
+is still never the only recovery mechanism.
+
 ## Invariants
 
 - One logical financial operation has one stable provider idempotency identity

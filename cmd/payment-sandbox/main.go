@@ -98,6 +98,14 @@ func loadConfig(getenv func(string) string) (commandConfig, error) {
 	if faultControlEnabled && (strings.EqualFold(environment, "production") || len(faultControlToken) < 16) {
 		return commandConfig{}, errors.New("payment sandbox fault control invalid")
 	}
+	stateMaxBytes, err := positiveInt64(valueOr(getenv("PAYMENT_SANDBOX_STATE_MAX_BYTES"), "16777216"), 64<<20)
+	if err != nil {
+		return commandConfig{}, errors.New("payment sandbox state configuration invalid")
+	}
+	stateStore, err := sandbox.NewFileStateStore(getenv("PAYMENT_SANDBOX_STATE_PATH"), stateMaxBytes)
+	if err != nil {
+		return commandConfig{}, errors.New("payment sandbox state configuration invalid")
+	}
 	return commandConfig{
 		address:             address,
 		maxBodyBytes:        maxBodyBytes,
@@ -110,6 +118,7 @@ func loadConfig(getenv func(string) string) (commandConfig, error) {
 			IssueKeyID:             issueKeyID,
 			WebhookMaxBodyBytes:    int(maxBodyBytes),
 			WebhookReplayTolerance: time.Duration(replaySeconds) * time.Second,
+			StateStore:             stateStore,
 		},
 	}, nil
 }
@@ -159,7 +168,7 @@ func publicReason(err error) string {
 		return "none"
 	}
 	switch err.Error() {
-	case "payment sandbox webhook keyring invalid", "payment sandbox body limit invalid", "payment sandbox replay tolerance invalid", "payment sandbox fault control invalid", "payment sandbox is disabled in production", "payment sandbox environment is invalid", "payment sandbox webhook body limit is invalid", "payment sandbox replay tolerance is invalid", "payment sandbox webhook queue limit is invalid", "payment sandbox webhook keyring is invalid", "payment sandbox issue key is invalid", "payment sandbox HTTP configuration invalid", "payment sandbox fault control configuration invalid", "payment sandbox HTTP server failed":
+	case "payment sandbox webhook keyring invalid", "payment sandbox body limit invalid", "payment sandbox replay tolerance invalid", "payment sandbox fault control invalid", "payment sandbox state configuration invalid", "payment sandbox state is invalid", "payment sandbox state is unavailable", "payment sandbox is disabled in production", "payment sandbox environment is invalid", "payment sandbox webhook body limit is invalid", "payment sandbox replay tolerance is invalid", "payment sandbox webhook queue limit is invalid", "payment sandbox webhook keyring is invalid", "payment sandbox issue key is invalid", "payment sandbox HTTP configuration invalid", "payment sandbox fault control configuration invalid", "payment sandbox HTTP server failed":
 		return err.Error()
 	default:
 		return "payment sandbox failure"

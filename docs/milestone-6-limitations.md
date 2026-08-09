@@ -17,6 +17,12 @@ sandbox, fixtures, fault schedule, tool versions, and workload.
 - Webhooks and outbox delivery are at least once. Inbox IDs, operation
   idempotency, receipts, fingerprints, and reconciliation prevent duplicate
   logical effects; they do not create exactly-once transport.
+- The disposable sandbox persists synthetic provider financial state and hashed
+  idempotency identities across process restart in a bounded named-volume
+  snapshot. Normalized undelivered synthetic webhook facts also survive and are
+  re-signed after restart, but delivery remains at least once. Financial
+  convergence still relies on provider status query and stable-key replay. This
+  is neither a production provider datastore nor backup/DR evidence.
 - Unknown capture/void/refund outcomes can retain seats in `payment_review` or
   `refund_pending`. This conservative policy reduces double-sale risk at an
   inventory cost and requires alerting and staffed manual review.

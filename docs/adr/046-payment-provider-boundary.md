@@ -60,6 +60,16 @@ and fault hooks needed to prove recovery. It does not simulate handling real
 card data and must be rejected by production-mode configuration. A real
 production provider adapter is future deployment-specific work under ADR 055.
 
+Synthetic provider payment objects, financial outcomes, monotonic counters, and
+hashed idempotency identities persist in a bounded, versioned atomic snapshot
+on a disposable named volume. Corrupt, oversized, unavailable, or semantically
+invalid state fails startup or readiness; a mutation is not reported as applied
+until its snapshot is installed. Undelivered synthetic webhook facts persist in
+normalized form and are re-signed with the active sandbox key after restart;
+old raw signatures are not retained. Delivery remains at least once, and the
+control saga still converges through durable operation identity and current
+provider-status query without issuing a second side effect.
+
 Authorization followed by capture is the preferred sandbox flow. It permits the
 platform to secure the reservation before capture, void an unused authorization,
 and demonstrate a distinct refund compensation path after capture. It does not
@@ -88,6 +98,8 @@ authorization windows or semantics.
   rather than leaking provider-specific strings through the platform.
 - The sandbox supplies reproducible correctness evidence but is neither a live
   payment integration nor production-readiness or PCI-compliance evidence.
+- Bounded snapshot storage is suitable only for disposable acceptance fixtures;
+  capacity, backup, replication, and retention belong to a future provider.
 
 ## Rejected alternatives
 

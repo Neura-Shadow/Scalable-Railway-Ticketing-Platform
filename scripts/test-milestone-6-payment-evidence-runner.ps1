@@ -50,6 +50,23 @@ $requiredGuardrails = @(
     "payment-reconciler','--once'",
     "@('run','--rm','--no-deps'",
     "@('stop','payment-reconciler')",
+    "@('restart','-t','15','payment-sandbox')",
+    "Wait-M6PaymentSandboxReady -Context `$context",
+    "payment-sandbox did not become ready after restart",
+    "provider-restart-result.json",
+    "provider restart did not preserve the single captured result",
+    "response_loss",
+    "state='uncertain'",
+    "recovery_mode='status_query_before_retry'",
+    "provider restart recovery duplicated capture or failed ticket issuance",
+    "'PAYMENT_WORKER_INTERVAL_MILLISECONDS=5000','payment-worker-1'",
+    "database value is not exactly one row",
+    "`$eventList = [System.Collections.Generic.List[object]]::new()",
+    "'--post-file=-'",
+    "`$_.PSObject.Properties['operation']",
+    "count(DISTINCT ticket_order.id)",
+    "ticket.ticket_order_id=ticket_order.id",
+    "ticket_order.status='issued'",
     "PAYMENT_PROCESSING_GRACE_SECONDS=1",
     "rows_examined -lt 1",
     "shard_rows_found -lt 1",
@@ -180,6 +197,21 @@ if (-not [string]::IsNullOrWhiteSpace($EvidenceDirectory)) {
         [int]$reconciliation.issued_orders -lt 1 -or [int]$reconciliation.mismatch_count -ne 0 -or
         [int]$reconciliation.manual_reviews -ne 0 -or [bool]$reconciliation.truncated) {
         throw 'publication evidence reconciliation is not clean and non-empty'
+    }
+    if ([string]$summary.provider_restart.status -ne 'passed' -or
+        [string]$summary.provider_restart.before_state -ne 'captured' -or
+        [string]$summary.provider_restart.after_state -ne 'captured' -or
+        [string]$summary.provider_restart.recovery_mode -ne 'status_query_before_retry' -or
+        [int]$summary.provider_restart.capture_result_count -ne 1 -or
+        -not [bool]$summary.provider_restart.provider_operation_id_stable -or
+        [int]$summary.provider_restart.control_capture_operations -ne 1 -or
+        [int]$summary.provider_restart.control_capture_succeeded -ne 1 -or
+        [string]$summary.provider_restart.final_intent_state -ne 'completed' -or
+        [string]$summary.provider_restart.final_saga_state -ne 'completed' -or
+        [int]$summary.provider_restart.issued_ticket_orders -ne 1 -or
+        [int]$summary.provider_restart.active_tickets -ne 1 -or
+        -not [bool]$summary.provider_restart.capture_webhook_not_delivered_before_recovery) {
+        throw 'publication evidence provider restart is not durable and clean'
     }
     $publicationTokens = @(
         $bundleName,

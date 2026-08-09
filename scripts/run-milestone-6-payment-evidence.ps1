@@ -44,6 +44,7 @@ $context = [pscustomobject]@{
 $started = $false
 $migrationJob = $null
 $scenarioResults = [ordered]@{}
+$providerRestartEvidence = $null
 $sensitiveValues = [System.Collections.Generic.List[string]]::new()
 $originalJWTSecret = $env:JWT_SECRET
 try {
@@ -116,6 +117,191 @@ function New-M6CustomerReservations {
 function Join-M6FixtureValues {
     param([string[]]$Values)
     return ($Values -join ',')
+}
+
+function Get-M6ProviderInspectionState {
+    param([Parameter(Mandatory=$true)][object]$Result)
+    if ($Result.ExitCode -ne 0) { throw 'provider inspection failed' }
+    $line = [string](@($Result.Output | Where-Object {
+        ([string]$_).TrimStart().StartsWith('{')
+    }) | Select-Object -Last 1)
+    if ([string]::IsNullOrWhiteSpace($line)) { throw 'provider inspection omitted its JSON result' }
+    $envelope = $line | ConvertFrom-Json
+    $items = @($envelope.result.items)
+    if ([string]$envelope.status -ne 'completed' -or -not [bool]$envelope.read_only -or
+        [int]$envelope.result.count -ne 1 -or $items.Count -ne 1 -or
+        [string]$items[0].kind -ne 'provider_status' -or
+        [string]::IsNullOrWhiteSpace([string]$items[0].state)) {
+        throw 'provider inspection result is invalid'
+    }
+    return [string]$items[0].state
+}
+
+function Wait-M6PaymentSandboxReady {
+    param([Parameter(Mandatory=$true)][object]$Context)
+    for ($attempt = 1; $attempt -le 60; $attempt++) {
+        $probe = Invoke-Milestone5DriverCompose -Context $Context -AllowFailure -Arguments @(
+            'exec','-T','payment-sandbox','wget','-q','-T','2','-O','/dev/null','http://127.0.0.1:8099/readyz'
+        )
+        if ($probe.ExitCode -eq 0) { return }
+        Start-Sleep -Seconds 1
+    }
+    throw 'payment-sandbox did not become ready after restart'
+}
+
+function Wait-M6PaymentWorkersReady {
+    param([Parameter(Mandatory=$true)][object]$Context)
+    foreach ($service in @('payment-worker-1','payment-worker-2')) {
+        $ready = $false
+        for ($attempt = 1; $attempt -le 60; $attempt++) {
+            $probe = Invoke-Milestone5DriverCompose -Context $Context -AllowFailure -Arguments @(
+                'exec','-T',$service,'wget','-q','-T','2','-O','/dev/null','http://127.0.0.1:9090/readyz'
+            )
+            if ($probe.ExitCode -eq 0) { $ready = $true; break }
+            Start-Sleep -Seconds 1
+        }
+        if (-not $ready) { throw "$service did not become ready" }
+    }
+}
+
+function Get-M6DatabaseValue {
+    param(
+        [Parameter(Mandatory=$true)][object]$Context,
+        [Parameter(Mandatory=$true)][string]$Service,
+        [Parameter(Mandatory=$true)][string]$SQL,
+        [Parameter(Mandatory=$true)][string]$Artifact
+    )
+    $result = Invoke-Milestone5DriverPSQL -Context $Context -Service $Service -SQL $SQL -Artifact $Artifact
+    $values = @($result.Output | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -ne '' })
+    if ($values.Count -ne 1) { throw "database value is not exactly one row for $Artifact" }
+    return [string]$values[0]
+}
+
+function Start-M6RestartPhaseWorker {
+    param(
+        [Parameter(Mandatory=$true)][object]$Context,
+        [Parameter(Mandatory=$true)][string]$Name,
+        [Parameter(Mandatory=$true)][string]$Artifact
+    )
+    Invoke-Milestone5DriverCompose -Context $Context -Arguments @(
+        '--profile','tools','run','--rm','-d','--name',$Name,'--no-deps',
+        '-e','PAYMENT_WORKER_INTERVAL_MILLISECONDS=5000','payment-worker-1'
+    ) -Artifact $Artifact | Out-Null
+}
+
+function Stop-M6RestartPhaseWorker {
+    param(
+        [Parameter(Mandatory=$true)][object]$Context,
+        [Parameter(Mandatory=$true)][string]$Name,
+        [Parameter(Mandatory=$true)][string]$Artifact
+    )
+    $result = Invoke-M6Native -AllowFailure -Command { & docker stop -t 5 $Name }
+    $result.Output | Set-Content -LiteralPath (Join-Path $Context.RawDirectory $Artifact) -Encoding utf8
+    if ($result.ExitCode -ne 0) { throw "restart phase worker $Name did not stop cleanly" }
+}
+
+function Wait-M6ControlScalar {
+    param(
+        [Parameter(Mandatory=$true)][object]$Context,
+        [Parameter(Mandatory=$true)][string]$SQL,
+        [Parameter(Mandatory=$true)][string]$Expected,
+        [Parameter(Mandatory=$true)][string]$Artifact
+    )
+    for ($attempt = 1; $attempt -le 120; $attempt++) {
+        $value = Get-M6DatabaseValue -Context $Context -Service 'control-postgres' -Artifact $Artifact -SQL $SQL
+        if ($value -eq $Expected) { return $value }
+        Start-Sleep -Milliseconds 250
+    }
+    throw "control state did not converge to $Expected for $Artifact"
+}
+
+function Queue-M6SandboxFault {
+    param(
+        [Parameter(Mandatory=$true)][object]$Context,
+        [Parameter(Mandatory=$true)][string]$Operation,
+        [Parameter(Mandatory=$true)][string]$Kind,
+        [Parameter(Mandatory=$true)][string]$ControlToken,
+        [Parameter(Mandatory=$true)][string]$Artifact
+    )
+    $body = @{ operation=$Operation; kind=$Kind; delay_steps=0 } | ConvertTo-Json -Compress
+    $composeArguments = [string[]]@($Context.ComposeArguments)
+    $result = Invoke-M6Native -AllowFailure -Command {
+        $body | & docker @composeArguments exec -T payment-sandbox wget -q -O /dev/null `
+            '--header=Content-Type: application/json' "--header=X-Sandbox-Control-Token: $ControlToken" `
+            '--post-file=-' 'http://127.0.0.1:8099/_sandbox/faults'
+    }
+    $result.Output | Set-Content -LiteralPath (Join-Path $Context.RawDirectory $Artifact) -Encoding utf8
+    if ($result.ExitCode -ne 0) { throw 'sandbox fault injection failed' }
+}
+
+function Invoke-M6HostedAuthorization {
+    param(
+        [Parameter(Mandatory=$true)][object]$Context,
+        [Parameter(Mandatory=$true)][string]$ProviderPaymentID,
+        [Parameter(Mandatory=$true)][string]$Artifact
+    )
+    Invoke-Milestone5DriverCompose -Context $Context -Arguments @(
+        'exec','-T','payment-sandbox','wget','-q','-O','/dev/null','--post-data=',
+        "http://127.0.0.1:8099/hosted/checkouts/$ProviderPaymentID/authorize"
+    ) -Artifact $Artifact | Out-Null
+}
+
+function Deliver-M6SandboxWebhooks {
+    param(
+        [Parameter(Mandatory=$true)][object]$Context,
+        [Parameter(Mandatory=$true)][string]$BaseURL,
+        [Parameter(Mandatory=$true)][string]$ControlToken
+    )
+    $drained = Invoke-Milestone5DriverCompose -Context $Context -Arguments @(
+        'exec','-T','payment-sandbox','wget','-q','-O','-',
+        "--header=X-Sandbox-Control-Token: $ControlToken",'http://127.0.0.1:8099/_sandbox/webhooks'
+    )
+    $parsed = ($drained.Output -join "`n") | ConvertFrom-Json
+    $eventList = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in $parsed) {
+        if ($item -is [System.Array]) {
+            foreach ($nested in $item) { $eventList.Add($nested) }
+        } else {
+            $eventList.Add($item)
+        }
+    }
+    $events = @($eventList.ToArray())
+    if ($events.Count -lt 1 -or $events.Count -gt 100) { throw 'sandbox webhook drain is outside the evidence bound' }
+    foreach ($event in $events) {
+        $body = [Convert]::FromBase64String([string]$event.Body)
+        $response = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseURL/webhooks/payments/sandbox" `
+            -ContentType 'application/json' -Body $body -Headers @{
+                'X-Payment-Key-ID'=[string]$event.Headers.key_id
+                'X-Payment-Timestamp'=[string]$event.Headers.timestamp
+                'X-Payment-Signature'=[string]$event.Headers.signature
+            }
+        if ([int]$response.StatusCode -notin @(200,202)) { throw 'sandbox webhook delivery failed' }
+    }
+}
+
+function Get-M6SandboxOperationEvidence {
+    param(
+        [Parameter(Mandatory=$true)][object]$Context,
+        [Parameter(Mandatory=$true)][string]$ProviderPaymentID,
+        [Parameter(Mandatory=$true)][string]$Status
+    )
+    $snapshot = Invoke-Milestone5DriverCompose -Context $Context -Arguments @(
+        'exec','-T','payment-sandbox','cat','/var/lib/payment-sandbox/provider-state.jsonl'
+    )
+    $record = ($snapshot.Output -join "`n") | ConvertFrom-Json
+    $matches = @($record.state.idempotency | Where-Object {
+        $operationProperty = $_.PSObject.Properties['operation']
+        $null -ne $operationProperty -and
+        [string]$operationProperty.Value.provider_payment_id -eq $ProviderPaymentID -and
+        [string]$operationProperty.Value.status -eq $Status
+    })
+    if ($matches.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$matches[0].operation.provider_operation_id)) {
+        throw "sandbox state did not contain exactly one $Status operation result"
+    }
+    return [pscustomobject]@{
+        Count=$matches.Count
+        ProviderOperationID=[string]$matches[0].operation.provider_operation_id
+    }
 }
 
 function Get-M6MetricValues {
@@ -569,6 +755,131 @@ ORDER BY 1;
         Save-M6Snapshot -Prefix ([System.IO.Path]::GetFileNameWithoutExtension($script))
     }
 
+    $restartFixture = New-M6CustomerReservations -BaseURL $baseURL -TrainRunID $trainA -Count 1 -FixtureIndex $fixtureIndex
+    $fixtureIndex++
+    $restartReservationID = [string]$restartFixture.ReservationIDs[0]
+    $restartIntentID = ''
+    $restartWorkersStopped = $false
+    Invoke-Milestone5DriverCompose -Context $context -Arguments @(
+        'stop','-t','15','payment-worker-1','payment-worker-2'
+    ) -Artifact 'provider-restart-workers-stop.log' | Out-Null
+    $restartWorkersStopped = $true
+    try {
+        $created = Invoke-Milestone5DriverAPI -BaseURL $baseURL -Method POST `
+            -Path "/api/v1/reservations/$restartReservationID/payment-intents" `
+            -Token $restartFixture.Token -IdempotencyKey "m6-provider-restart-$suffix" `
+            -Body @{} -ExpectedStatus @(202)
+        $restartIntentID = [string]$created.Body.id
+        if ($restartIntentID -notmatch '^[0-9a-fA-F-]{36}$') { throw 'provider restart intent identity is invalid' }
+
+        $checkoutWorker = "$ProjectName-restart-checkout"
+        Start-M6RestartPhaseWorker -Context $context -Name $checkoutWorker -Artifact 'provider-restart-checkout-worker.log'
+        $hostedReference = Wait-M6ControlScalar -Context $context -Expected 'sandbox-checkout:pay_sandbox_' `
+            -Artifact 'provider-restart-hosted-reference.log' -SQL @"
+SELECT CASE WHEN hosted_session_ref LIKE 'sandbox-checkout:pay_sandbox_%'
+            THEN 'sandbox-checkout:pay_sandbox_' ELSE coalesce(hosted_session_ref,'missing') END
+FROM public.payment_intents WHERE payment_intent_id='$restartIntentID'::uuid;
+"@
+        Stop-M6RestartPhaseWorker -Context $context -Name $checkoutWorker -Artifact 'provider-restart-checkout-worker-stop.log'
+        $providerPaymentID = Get-M6DatabaseValue -Context $context -Service 'control-postgres' `
+            -Artifact 'provider-restart-provider-payment-id.log' -SQL @"
+SELECT provider_payment_id FROM public.payment_intents WHERE payment_intent_id='$restartIntentID'::uuid;
+"@
+        if ($providerPaymentID -notmatch '^pay_sandbox_[0-9]{12}$') { throw 'provider restart payment identity is invalid' }
+
+        Invoke-M6HostedAuthorization -Context $context -ProviderPaymentID $providerPaymentID `
+            -Artifact 'provider-restart-authorize.log'
+        Deliver-M6SandboxWebhooks -Context $context -BaseURL $baseURL -ControlToken $common.SANDBOX_CONTROL_TOKEN
+
+        $webhookWorker = "$ProjectName-restart-webhook"
+        Start-M6RestartPhaseWorker -Context $context -Name $webhookWorker -Artifact 'provider-restart-webhook-worker.log'
+        Wait-M6ControlScalar -Context $context -Expected '1' -Artifact 'provider-restart-capture-pending.log' -SQL @"
+SELECT count(*) FROM public.payment_operations
+WHERE payment_intent_id='$restartIntentID'::uuid AND operation_type='capture' AND state='pending';
+"@ | Out-Null
+        Stop-M6RestartPhaseWorker -Context $context -Name $webhookWorker -Artifact 'provider-restart-webhook-worker-stop.log'
+
+        Queue-M6SandboxFault -Context $context -Operation 'capture' -Kind 'response_loss' `
+            -ControlToken $common.SANDBOX_CONTROL_TOKEN -Artifact 'provider-restart-capture-fault.log'
+        $captureWorker = "$ProjectName-restart-capture"
+        Start-M6RestartPhaseWorker -Context $context -Name $captureWorker -Artifact 'provider-restart-capture-worker.log'
+        Wait-M6ControlScalar -Context $context -Expected '1' -Artifact 'provider-restart-capture-uncertain.log' -SQL @"
+SELECT count(*) FROM public.payment_operations
+WHERE payment_intent_id='$restartIntentID'::uuid AND operation_type='capture' AND state='uncertain';
+"@ | Out-Null
+        Stop-M6RestartPhaseWorker -Context $context -Name $captureWorker -Artifact 'provider-restart-capture-worker-stop.log'
+
+        $beforeRestart = Invoke-Milestone5DriverCompose -Context $context -AllowFailure `
+            -Arguments @('--profile','tools','run','--rm','--no-deps','payment-admin','inspect-provider-status','--payment-intent-id',$restartIntentID) `
+            -Artifact 'provider-restart-before.json.log'
+        $beforeRestartState = Get-M6ProviderInspectionState -Result $beforeRestart
+        $beforeOperation = Get-M6SandboxOperationEvidence -Context $context `
+            -ProviderPaymentID $providerPaymentID -Status 'captured'
+        Invoke-Milestone5DriverCompose -Context $context -Arguments @('restart','-t','15','payment-sandbox') `
+            -Artifact 'provider-restart-container.log' | Out-Null
+        Wait-M6PaymentSandboxReady -Context $context
+        $afterRestart = Invoke-Milestone5DriverCompose -Context $context -AllowFailure `
+            -Arguments @('--profile','tools','run','--rm','--no-deps','payment-admin','inspect-provider-status','--payment-intent-id',$restartIntentID) `
+            -Artifact 'provider-restart-after.json.log'
+        $afterRestartState = Get-M6ProviderInspectionState -Result $afterRestart
+        $afterOperation = Get-M6SandboxOperationEvidence -Context $context `
+            -ProviderPaymentID $providerPaymentID -Status 'captured'
+        if ($beforeRestartState -ne 'captured' -or $afterRestartState -ne $beforeRestartState -or
+            $beforeOperation.Count -ne 1 -or $afterOperation.Count -ne 1 -or
+            $beforeOperation.ProviderOperationID -ne $afterOperation.ProviderOperationID) {
+            throw 'provider restart did not preserve the single captured result'
+        }
+
+        Invoke-Milestone5DriverCompose -Context $context -Arguments @(
+            'start','payment-worker-1','payment-worker-2'
+        ) -Artifact 'provider-restart-workers-start.log' | Out-Null
+        Wait-M6PaymentWorkersReady -Context $context
+        $restartWorkersStopped = $false
+        Wait-M6ControlScalar -Context $context -Expected 'completed|completed' `
+            -Artifact 'provider-restart-saga-completed.log' -SQL @"
+SELECT intent.state||'|'||saga.state
+FROM public.payment_intents AS intent
+JOIN public.payment_sagas AS saga ON saga.payment_intent_id=intent.payment_intent_id
+WHERE intent.payment_intent_id='$restartIntentID'::uuid;
+"@ | Out-Null
+        $controlCapture = Get-M6DatabaseValue -Context $context -Service 'control-postgres' `
+            -Artifact 'provider-restart-control-capture.log' -SQL @"
+SELECT count(*)||'|'||count(*) FILTER (WHERE state='succeeded')
+FROM public.payment_operations
+WHERE payment_intent_id='$restartIntentID'::uuid AND operation_type='capture';
+"@
+        $shardIssuance = Get-M6DatabaseValue -Context $context -Service 'booking-shard-0-postgres' `
+            -Artifact 'provider-restart-shard-issuance.log' -SQL @"
+SELECT count(DISTINCT ticket_order.id)||'|'||count(ticket.id)
+FROM public.ticket_orders AS ticket_order
+JOIN public.tickets AS ticket ON ticket.ticket_order_id=ticket_order.id
+WHERE ticket_order.payment_intent_id='$restartIntentID'::uuid
+  AND ticket_order.status='issued' AND ticket.status='active';
+"@
+        if ($controlCapture -ne '1|1' -or $shardIssuance -ne '1|1') {
+            throw 'provider restart recovery duplicated capture or failed ticket issuance'
+        }
+        $providerRestartEvidence = [ordered]@{
+            status='passed'; payment_intent_id=$restartIntentID
+            before_state=$beforeRestartState; after_state=$afterRestartState
+            recovery_mode='status_query_before_retry'; capture_result_count=1
+            provider_operation_id_stable=$true; control_capture_operations=1
+            control_capture_succeeded=1; final_intent_state='completed'
+            final_saga_state='completed'; issued_ticket_orders=1; active_tickets=1
+            capture_webhook_not_delivered_before_recovery=$true
+        }
+        $providerRestartEvidence | ConvertTo-Json -Depth 3 |
+            Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'provider-restart-result.json') -Encoding utf8
+        Save-M6Snapshot -Prefix 'provider-restart'
+    } finally {
+        if ($restartWorkersStopped) {
+            Invoke-Milestone5DriverCompose -Context $context -Arguments @(
+                'start','payment-worker-1','payment-worker-2'
+            ) -Artifact 'provider-restart-workers-recovery-start.log' | Out-Null
+            Wait-M6PaymentWorkersReady -Context $context
+        }
+    }
+
     $paired = New-M6CustomerReservations -BaseURL $baseURL -TrainRunID $trainA -Count ($IterationsPerScenario * 2) -FixtureIndex $fixtureIndex
     $fixtureIndex++
     $env = @{} + $common; $env.CUSTOMER_TOKENS=$paired.Token; $env.RESERVATION_IDS=Join-M6FixtureValues $paired.ReservationIDs
@@ -728,6 +1039,7 @@ RESET ROLE;
         build_mode=if ($SkipBuild) {'prebuilt-image-digests'} else {'source-build'}
         topology=[ordered]@{ api_replicas=3; payment_workers=2; reconciler=1; physical_shards=2 }
         scenarios=$scenarioResults; final_control_violations=0; final_shard_violations=0
+        provider_restart=$providerRestartEvidence
         final_reconciliation=[ordered]@{
             scope=[string]$reconciliationResult.scope
             read_only=[bool]$reconciliationResult.read_only

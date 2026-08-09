@@ -33,6 +33,10 @@ func newHandler(service *sandbox.Service, config handlerConfig) (http.Handler, e
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if !service.Ready() {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable"})
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	})
 	mux.HandleFunc("POST /v1/checkouts", func(w http.ResponseWriter, r *http.Request) {
@@ -138,7 +142,10 @@ func newHandler(service *sandbox.Service, config handlerConfig) (http.Handler, e
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_advance"})
 				return
 			}
-			service.Advance(request.Steps)
+			if err := service.Advance(request.Steps); err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "state_unavailable"})
+				return
+			}
 			w.WriteHeader(http.StatusNoContent)
 		})
 		mux.HandleFunc("GET /_sandbox/webhooks", func(w http.ResponseWriter, r *http.Request) {

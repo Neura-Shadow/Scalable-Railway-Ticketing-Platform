@@ -15,7 +15,7 @@ proof that the Milestone 6 controls described here are implemented or tested.
 
 ## Scope and assumptions
 
-In scope are the planned payment-intent and ticket APIs, webhook endpoint,
+In scope are the implemented payment-intent and ticket APIs, webhook endpoint,
 payment provider adapter and deterministic sandbox, control-plane saga and
 webhook tables, payment worker and reconciler, physical-shard reservation,
 ticket, refund and outbox transitions, migrations 10 and booking-shard 2,
@@ -232,6 +232,7 @@ flowchart LR
 | TM-068 | Stolen customer token, stale role or over-privileged operator | Owner/RBAC checks are absent or reconciler/admin can mutate authoritative shard state | Read another customer's payment/ticket data, cancel their intent, or directly repair seats/tickets | Cross-customer disclosure, integrity compromise | Payment/ticket data, operator authority | Existing JWT parsing reloads active role and token version; customer routes use authentication/RBAC (`internal/accounts/application/jwt.go`, `internal/transport/httpapi/auth.go`) | New endpoints, admin privileges and reconciler write boundaries are untested | Authoritative owner checks at control and shard; customer-only mutation routes; private least-privilege admin; reconciler detect-only by default and never directly mutates seats/tickets; audit trusted operator identity | Owner-denial tests; admin/reconciler audit; alert on attempted direct repair or cross-owner lookup | medium | high | high |
 | TM-069 | Remote burst, provider outage or one failed shard | Claims are held during network I/O, worksets/retries are unbounded or one shard monopolizes workers | Exhaust connections, goroutines, inbox storage or retry budget and starve healthy work | Payment/ticket availability loss and long repair time | Worker/pool capacity, inbox, saga availability | Existing workers use bounded batches, `SKIP LOCKED`, timeouts and failed-shard isolation patterns (`internal/eventrelay/`, `internal/sharding/physicalworker/`) | M6 worker fairness, leases, backoff and quotas are absent | Short claim/CAS transactions; external I/O outside transaction; expiring leases; capped exponential backoff/jitter; bounded webhook body/rate/storage; fair shard/provider queues; graceful shutdown without leaked leases/connections | Queue depth/age, retry/manual-review counts, provider latency, pgx pool acquired/empty/cancelled/acquire duration by bounded labels | high | medium | high |
 | TM-070 | Runtime defect or observability consumer | Secrets, IDs, URLs or unbounded values enter logs/labels/admin output | Exfiltrate payment metadata or create telemetry cardinality denial | Confidentiality loss and monitoring outage | Secrets, references, logs/metrics | Existing safe errors and bounded physical metric normalization (`internal/platform/safeerror/`, `internal/platform/metrics/physical.go`) | M6 redaction/cardinality tests absent | Allow only finite provider/state/result/reason labels and allowlisted `shard_id`; never label IDs, DSNs, host/port, `connection_ref`, request body, signature, token or operation key; sanitize admin output and evidence | Cardinality budget tests; synthetic sentinel scan across logs/artifacts; telemetry scrape size alert | medium | medium | medium |
+| TM-071 | Process crash, storage failure, or test-host operator | Sandbox commits a financial effect only in memory, loses stable-key history or an undelivered normalized webhook on restart, or accepts corrupt state | Inject response loss after capture/refund or restart before hosted authorization delivery, then query/replay the original operation | Duplicate synthetic financial effect, contradictory recovery evidence, dropped authorization progress, or stalled saga | Sandbox provider objects, hashed idempotency identities, normalized webhook facts, acceptance evidence | Stable provider keys and query-before-retry are implemented in the worker | Process-local sandbox state and webhook queue did not survive restart | Persist bounded versioned atomic snapshots on a project-scoped volume; hash stored idempotency identities; persist normalized undelivered webhook facts and re-sign them with the active key; reject corrupt/oversized state; fail readiness after save failure; query status and replay only with the original identity | Capture/refund response-loss restart tests; restart-before-authorization-delivery and signing-key-rotation tests; non-root container write/restart probe; full active-saga restart artifact; secret scan | medium | high | high |
 
 ## Milestone 6 implementation status
 
@@ -313,17 +314,17 @@ raise TM-059, TM-062, TM-063 or TM-068 to critical.
 | Path | Why it matters | Related Threat IDs |
 |---|---|---|
 | `internal/transport/httpapi/` | Payment/webhook parsing, raw-body limit, ownership, authentication and safe errors enter here | TM-059, TM-060, TM-061, TM-068, TM-069 |
-| Planned `internal/payment/provider/` | Provider URL, credential, idempotency, timeout, redirect and response boundary | TM-059, TM-062, TM-063 |
-| Planned `internal/payment/webhook/` | Exact-body HMAC, timestamp/key rotation, event identity/hash conflict and ordering | TM-060, TM-061, TM-069 |
-| Planned `internal/payment/application/` | Saga transition graph, unknown outcomes, cancellation and compensation ordering | TM-061, TM-063, TM-064, TM-066 |
-| Planned `internal/payment/postgres/` | Control claims, immutable amount/currency, provider observations and receipts | TM-061, TM-063, TM-064, TM-069 |
-| Planned shard-local payment executor | Captured proof, ticket/refund transaction, stable receipt and local outbox | TM-064, TM-065, TM-066, TM-067 |
+| `internal/payment/provider/` | Provider URL, credential, restart durability, idempotency, timeout, redirect and response boundary | TM-059, TM-062, TM-063, TM-071 |
+| `internal/payment/webhook/` | Exact-body HMAC, timestamp/key rotation, event identity/hash conflict and ordering | TM-060, TM-061, TM-069 |
+| `internal/payment/application/` | Saga transition graph, unknown outcomes, cancellation and compensation ordering | TM-061, TM-063, TM-064, TM-066 |
+| `internal/payment/postgres/` | Control claims, immutable amount/currency, provider observations and receipts | TM-061, TM-063, TM-064, TM-069 |
+| Shard-local payment executor | Captured proof, ticket/refund transaction, stable receipt and local outbox | TM-064, TM-065, TM-066, TM-067 |
 | `internal/sharding/physical/` | Route/generation/fence and allowlisted connection selection protect every shard effect | TM-062, TM-064, TM-067 |
 | `internal/sharding/physicalmigration/` | Copy/journal/replay/validation/reverse must include every M6 state transition | TM-067 |
 | `migrations/000010*` | Control constraints, inbox hashes, operation uniqueness, immutable money and least privilege | TM-059 through TM-064, TM-068, TM-069 |
 | `migrations/booking-shard/000002*` | Local payment/ticket/refund constraints, receipts, outbox and migration capture coverage | TM-064 through TM-067 |
 | `cmd/payment-worker/`, `cmd/payment-reconciler/`, `cmd/payment-admin/` | Lease safety, provider I/O boundaries, detect-only defaults and operator authorization | TM-062 through TM-070 |
-| `cmd/payment-sandbox/` and `docker-compose.payment.yml` | Synthetic-only enforcement, failure hooks, private ports and secret isolation | TM-059, TM-060, TM-062 |
+| `cmd/payment-sandbox/` and `docker-compose.payment.yml` | Synthetic-only enforcement, restart durability, failure hooks, private ports and secret isolation | TM-059, TM-060, TM-062, TM-071 |
 | `internal/platform/metrics/` and `internal/platform/safeerror/` | Secret-free bounded payment and pool observability | TM-070 |
 | `.github/workflows/ci.yml` | Migration, security, race, failure-injection and artifact scanning are release gates | TM-059 through TM-070 |
 
@@ -335,8 +336,8 @@ raise TM-059, TM-062, TM-063 or TM-068 to critical.
 - Represented Internet/API, provider/webhook, worker/provider,
   runtime/control, runtime/shard, source/target and runtime/operator trust
   boundaries in concrete threats.
-- Distinguished current M5 evidence from unimplemented or unverified M6
-  requirements; this document is not runtime, security-scan or benchmark proof.
+- Distinguished implemented M6 controls from source review and evidence gates;
+  this document itself is not runtime, security-scan or benchmark proof.
 - Kept the deterministic sandbox and CI/dev failure hooks separate from a
   future production provider and production deployment controls.
 - Explicitly modeled raw-card-data exclusion, webhook hash conflict,

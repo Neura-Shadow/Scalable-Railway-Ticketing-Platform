@@ -1,10 +1,10 @@
 # Milestone 6: Payment Saga and Durable Ticket Issuance
 
-Status: Design baseline; implementation and acceptance evidence pending
+Status: Implemented; bounded acceptance evidence refresh in progress
 
 Target: Milestone 6
 
-Last updated: 2026-08-05
+Last updated: 2026-08-09
 
 ## Problem statement
 

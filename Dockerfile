@@ -103,6 +103,9 @@ FROM runtime AS physical-shard-admin
 ENTRYPOINT ["/usr/local/bin/physical-shard-admin"]
 
 FROM runtime AS payment-sandbox
+USER root
+RUN install -d -o railway -g railway -m 0700 /var/lib/payment-sandbox
+USER railway:railway
 EXPOSE 8099
 HEALTHCHECK --interval=10s --timeout=3s --start-period=3s --retries=5 \
     CMD wget -q -T 2 -O /dev/null http://127.0.0.1:8099/readyz || exit 1
