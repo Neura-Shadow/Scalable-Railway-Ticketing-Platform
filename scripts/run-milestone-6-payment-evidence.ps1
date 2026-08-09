@@ -508,6 +508,10 @@ try {
         if ($service -notin $runningServices) { throw "required service $service is not running" }
     }
     Wait-Milestone5DriverReady -Context $context
+    # Prove the scheduled reconciler is healthy, then drain it so its periodic
+    # payment-all checkpoints cannot consume the candidates reserved for the
+    # final explicit publication scan.
+    Invoke-Milestone5DriverCompose -Context $context -Arguments @('stop','payment-reconciler') -Artifact 'scheduled-reconciler-stop.log' | Out-Null
     if (-not $SkipBuild) {
         Invoke-Milestone5DriverCompose -Context $context -Arguments @('--profile','tools','build','physical-shard-admin') -Artifact 'physical-shard-admin-build.log' | Out-Null
     } else {

@@ -48,6 +48,7 @@ $requiredGuardrails = @(
     "public.users','SELECT",
     "Assert-M6EvidenceIsSecretSafe",
     "payment-reconciler','--once'",
+    "@('stop','payment-reconciler')",
     "PAYMENT_PROCESSING_GRACE_SECONDS=1",
     "rows_examined -lt 1",
     "shard_rows_found -lt 1",
