@@ -91,13 +91,15 @@ type Operation struct {
 }
 
 type ControlSnapshot struct {
-	Intent                     Intent
-	Saga                       Saga
-	Operations                 []Operation
-	DuplicateProviderEventIDs  int
-	ProviderEventHashConflicts int
-	OpenManualReviewCases      int
-	ActiveReconciliationCases  int
+	Intent                      Intent
+	Saga                        Saga
+	Operations                  []Operation
+	SucceededPartialRefundMinor int64
+	CompletedPartialRefundMinor int64
+	DuplicateProviderEventIDs   int
+	ProviderEventHashConflicts  int
+	OpenManualReviewCases       int
+	ActiveReconciliationCases   int
 }
 
 type ShardSnapshot struct {
@@ -111,6 +113,7 @@ type ShardSnapshot struct {
 	TicketOrderID              uuid.UUID
 	TicketOrderState           string
 	TicketOrderAmountMinor     int64
+	TicketOrderRefundedMinor   int64
 	TicketOrderCurrency        string
 	IssuanceReceiptFound       bool
 	IssuancePaymentIntentID    uuid.UUID

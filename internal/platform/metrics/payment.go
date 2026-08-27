@@ -9,7 +9,7 @@ import (
 const maximumPaymentMetricDuration = 30 * 24 * time.Hour
 
 var (
-	allowedPaymentProviders  = set("disabled", "sandbox")
+	allowedPaymentProviders  = set("disabled", "sandbox", "stripe")
 	allowedPaymentOperations = set("create_checkout", "query_status", "authorize", "capture", "void", "refund", "issue_tickets", "compensate", "process_webhook")
 	allowedPaymentResults    = set("success", "failure", "conflict", "duplicate", "ignored", "retry", "uncertain", "manual_review", "replay", "skipped", "superseded")
 	allowedPaymentStates     = set(
@@ -117,9 +117,23 @@ func (m *Metrics) RecordPaymentSagaFailure(category string, manualReview bool) {
 }
 
 func (m *Metrics) RecordPaymentOperation(provider, operation, result string, duration time.Duration, uncertain bool) {
+	reason := "none"
+	if uncertain {
+		reason = "uncertain"
+	} else if result != "success" {
+		reason = result
+	}
+	m.RecordPaymentOperationWithReason(provider, operation, result, reason, duration, uncertain)
+}
+
+// RecordPaymentOperationWithReason preserves the bounded provider failure
+// category observed at the worker boundary instead of deriving it from the
+// coarser result label.
+func (m *Metrics) RecordPaymentOperationWithReason(provider, operation, result, reason string, duration time.Duration, uncertain bool) {
 	provider = normalize(provider, allowedPaymentProviders, "unknown")
 	operation = normalize(operation, allowedPaymentOperations, "unknown")
 	result = normalize(result, allowedPaymentResults, "unknown")
+	m.RecordProviderAdapter(provider, operation, result, normalizePaymentProviderReason(reason), duration)
 	m.payment.operationTotal.WithLabelValues(provider, operation, result).Inc()
 	m.payment.operationDuration.WithLabelValues(provider, operation, result).Observe(boundedPaymentSeconds(duration))
 	if uncertain {
@@ -132,6 +146,35 @@ func (m *Metrics) RecordPaymentOperation(provider, operation, result string, dur
 		m.payment.voidTotal.WithLabelValues(provider, result).Inc()
 	case "refund":
 		m.payment.refundTotal.WithLabelValues(provider, result).Inc()
+	}
+}
+
+func normalizePaymentProviderReason(reason string) string {
+	switch reason {
+	case "none":
+		return "none"
+	case "transport_retryable":
+		return "transport"
+	case "timeout_unknown", "provider_outcome_unknown":
+		return "timeout"
+	case "authentication":
+		return "authentication"
+	case "provider_unavailable":
+		return "provider_unavailable"
+	case "rate_limited":
+		return "rate_limited"
+	case "validation_permanent", "invalid_claim", "invalid_action":
+		return "validation"
+	case "conflict", "provider_state_conflict", "receipt_conflict", "shard_receipt_conflict":
+		return "conflict"
+	case "database", "database_finalize_failed":
+		return "database"
+	case "invariant_mismatch", "inconsistent_response":
+		return "invariant_mismatch"
+	case "uncertain":
+		return "uncertain"
+	default:
+		return "unknown"
 	}
 }
 

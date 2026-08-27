@@ -42,6 +42,10 @@ var allowedPaths = map[string]string{
 	"/api/v1/passengers/:id":                         "/api/v1/passengers/:passenger_id",
 	"/api/v1/ticket-orders":                          "/api/v1/ticket-orders",
 	"/api/v1/ticket-orders/:id":                      "/api/v1/ticket-orders/:ticket_order_id",
+	"/api/v1/ticket-orders/:id/refunds":              "/api/v1/ticket-orders/:ticket_order_id/refunds",
+	"/api/v1/ticket-orders/:ticket_order_id/refunds": "/api/v1/ticket-orders/:ticket_order_id/refunds",
+	"/api/v1/ticket-refunds/:id":                     "/api/v1/ticket-refunds/:refund_request_id",
+	"/api/v1/ticket-refunds/:refund_request_id":      "/api/v1/ticket-refunds/:refund_request_id",
 	"/api/v1/tickets/:id":                            "/api/v1/tickets/:ticket_id",
 	"/api/v1/payment-intents/:id":                    "/api/v1/payment-intents/:payment_intent_id",
 	"/api/v1/payment-intents/:id/cancel":             "/api/v1/payment-intents/:payment_intent_id/cancel",
@@ -153,10 +157,30 @@ type Metrics struct {
 	sharding            *shardingMetrics
 	physical            *physicalMetrics
 	payment             *paymentMetrics
+	operations          *operationsMetrics
 }
 
 // New registers the platform's bounded metric families.
 func New(registerer prometheus.Registerer) (*Metrics, error) {
+	return newMetrics(registerer, true, false)
+}
+
+// NewEventMetrics registers process-local metrics while reserving durable M7
+// family names for NewDurableOperationsCollector in a long-lived read model.
+func NewEventMetrics(registerer prometheus.Registerer) (*Metrics, error) {
+	return newMetrics(registerer, false, false)
+}
+
+// NewSettlementEventMetrics registers process-local metrics plus the two
+// settlement-import families emitted by the settlement worker. Those families
+// intentionally remain absent from NewEventMetrics because the payment
+// reconciler registers their durable read-model equivalents in the same
+// registry.
+func NewSettlementEventMetrics(registerer prometheus.Registerer) (*Metrics, error) {
+	return newMetrics(registerer, false, true)
+}
+
+func newMetrics(registerer prometheus.Registerer, includeDurableOperations, includeSettlementEvents bool) (*Metrics, error) {
 	if registerer == nil {
 		return nil, errors.New("metrics: nil Prometheus registerer")
 	}
@@ -165,6 +189,7 @@ func New(registerer prometheus.Registerer) (*Metrics, error) {
 	sharding := newShardingMetrics()
 	physical := newPhysicalMetrics()
 	payment := newPaymentMetrics()
+	operations := newOperationsMetrics()
 	m := &Metrics{
 		httpRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "http_requests_total",
@@ -187,10 +212,11 @@ func New(registerer prometheus.Registerer) (*Metrics, error) {
 			Name: "outbox_operations_total",
 			Help: "Outbox operations by bounded operation, event type, result, and reason.",
 		}, []string{"operation", "event_type", "result", "reason"}),
-		admission: admission,
-		sharding:  sharding,
-		physical:  physical,
-		payment:   payment,
+		admission:  admission,
+		sharding:   sharding,
+		physical:   physical,
+		payment:    payment,
+		operations: operations,
 	}
 
 	for _, collector := range []prometheus.Collector{
@@ -242,6 +268,17 @@ func New(registerer prometheus.Registerer) (*Metrics, error) {
 	for _, collector := range m.payment.collectors() {
 		if err := registerer.Register(collector); err != nil {
 			return nil, fmt.Errorf("metrics: register payment collector: %w", err)
+		}
+	}
+	operationsCollectors := m.operations.eventCollectors()
+	if includeDurableOperations {
+		operationsCollectors = m.operations.collectors()
+	} else if includeSettlementEvents {
+		operationsCollectors = m.operations.settlementEventCollectors()
+	}
+	for _, collector := range operationsCollectors {
+		if err := registerer.Register(collector); err != nil {
+			return nil, fmt.Errorf("metrics: register Milestone 7 collector: %w", err)
 		}
 	}
 	return m, nil

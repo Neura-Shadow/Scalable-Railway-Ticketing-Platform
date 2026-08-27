@@ -105,3 +105,32 @@ func TestPaymentMetricDurationsAreNonNegativeAndCapped(t *testing.T) {
 		}
 	}
 }
+
+func TestPaymentOperationPreservesBoundedProviderFailureReason(t *testing.T) {
+	t.Parallel()
+	registry := prometheus.NewRegistry()
+	metrics, err := platformmetrics.New(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics.RecordPaymentOperationWithReason("stripe", "capture", "failure", "rate_limited", time.Second, false)
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		if family.GetName() != "provider_adapter_error_total" {
+			continue
+		}
+		for _, metric := range family.Metric {
+			labels := map[string]string{}
+			for _, label := range metric.Label {
+				labels[label.GetName()] = label.GetValue()
+			}
+			if labels["provider"] == "stripe" && labels["operation"] == "capture" && labels["reason"] == "rate_limited" && metric.GetCounter().GetValue() == 1 {
+				return
+			}
+		}
+	}
+	t.Fatal("actual bounded provider reason was not gathered")
+}

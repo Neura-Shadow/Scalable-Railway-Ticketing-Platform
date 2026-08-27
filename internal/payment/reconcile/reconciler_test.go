@@ -199,6 +199,91 @@ func TestCheckShardAcceptsHealthyRefundedTerminalStateWithRetainedReceipts(t *te
 	}
 }
 
+func TestCheckShardAcceptsCompletedPartialRefundWithExactShardTotal(t *testing.T) {
+	intentID := uuid.New()
+	control := ControlSnapshot{
+		Intent: Intent{ID: intentID, State: "completed", AmountMinor: 1_000, Currency: "TWD"},
+		Saga:   Saga{State: "completed", Step: "complete"},
+		Operations: []Operation{
+			{Type: "capture", State: "succeeded", AmountMinor: 1_000, Currency: "TWD"},
+		},
+		SucceededPartialRefundMinor: 300,
+		CompletedPartialRefundMinor: 300,
+	}
+	shard := ShardSnapshot{
+		Found: true, DirectoryResolved: true,
+		ReservationState: "partially_refunded", ReservationAmountMinor: 1_000,
+		ReservationCurrency: "TWD", ReservationSeatCount: 2,
+		TicketOrderFound: true, TicketOrderState: "partially_refunded",
+		TicketOrderAmountMinor: 1_000, TicketOrderRefundedMinor: 300, TicketOrderCurrency: "TWD",
+		IssuanceReceiptFound: true, IssuancePaymentIntentID: intentID,
+		ActiveTicketCount: 1, CancelledTicketCount: 1,
+	}
+	var findings []string
+	checkShard(ScopeAll, control, shard, func(code string, _ bool) { findings = append(findings, code) })
+	if len(findings) != 0 {
+		t.Fatalf("healthy partial refund findings=%v", findings)
+	}
+}
+
+func TestCheckProviderAcceptsStripeUnknownWithExactPartialRefundTotal(t *testing.T) {
+	control := ControlSnapshot{
+		Intent: Intent{Provider: "stripe", ProviderPaymentID: "pi_partial", State: "completed", AmountMinor: 1_000, Currency: "TWD"},
+		Operations: []Operation{
+			{Type: "capture", State: "succeeded", AmountMinor: 1_000, Currency: "TWD"},
+		},
+		SucceededPartialRefundMinor: 300,
+		CompletedPartialRefundMinor: 300,
+	}
+	client := &fakeProvider{payment: provider.Payment{
+		Status: provider.StatusUnknown, AmountMinor: 1_000, Currency: "TWD",
+		CapturedMinor: 1_000, RefundedMinor: 300,
+	}}
+	var findings []string
+	checkProvider(context.Background(), fakeRegistry{client: client}, control, func(code string, _ bool) {
+		findings = append(findings, code)
+	})
+	if len(findings) != 0 {
+		t.Fatalf("healthy Stripe partial refund findings=%v", findings)
+	}
+}
+
+func TestReconcileAllAcceptsCompletedPartialRefundEndToEnd(t *testing.T) {
+	intentID := uuid.New()
+	store := &fakeStore{
+		candidates: []uuid.UUID{intentID},
+		control: ControlSnapshot{
+			Intent: Intent{ID: intentID, ReservationID: uuid.New(), Provider: "stripe", ProviderPaymentID: "pi_partial",
+				State: "completed", AmountMinor: 1_000, Currency: "TWD", ActiveForReservation: 1},
+			Saga: Saga{ID: uuid.New(), State: "completed", Step: "complete", ActiveCount: 1},
+			Operations: []Operation{
+				{ID: uuid.New(), Type: "capture", State: "succeeded", ProviderOperationID: "ch_partial", AmountMinor: 1_000, Currency: "TWD"},
+			},
+			SucceededPartialRefundMinor: 300,
+			CompletedPartialRefundMinor: 300,
+		},
+		shard: ShardSnapshot{
+			Found: true, DirectoryResolved: true, ReservationState: "partially_refunded",
+			ReservationAmountMinor: 1_000, ReservationCurrency: "TWD", ReservationSeatCount: 2,
+			TicketOrderFound: true, TicketOrderState: "partially_refunded", TicketOrderAmountMinor: 1_000,
+			TicketOrderRefundedMinor: 300, TicketOrderCurrency: "TWD", IssuanceReceiptFound: true,
+			IssuancePaymentIntentID: intentID, ActiveTicketCount: 1, CancelledTicketCount: 1,
+		},
+	}
+	client := &fakeProvider{payment: provider.Payment{
+		Status: provider.StatusUnknown, AmountMinor: 1_000, Currency: "TWD",
+		CapturedMinor: 1_000, RefundedMinor: 300,
+	}}
+	reconciler := newTestReconciler(t, store, fakeRegistry{client: client}, nil)
+	result, err := reconciler.ReconcileAll(context.Background(), Options{Scope: ScopeAll, Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.MismatchCount != 0 || len(result.Reports) != 1 || len(result.Reports[0].Findings) != 0 || client.calls != 1 {
+		t.Fatalf("partial refund reconciliation result=%+v provider_calls=%d", result, client.calls)
+	}
+}
+
 func TestControlFinalizeIncompleteRequiresExactStepOrBoundedManualReview(t *testing.T) {
 	base := ControlSnapshot{Intent: Intent{State: "ticket_issue_pending"}, Saga: Saga{State: "issuing_tickets", Step: "issue_tickets"}}
 	if !controlFinalizeIncomplete(base, "ticket_issue_pending", "issuing_tickets", "issue_tickets", true) {
@@ -367,6 +452,23 @@ func TestProviderErrorIsReducedToBoundedFinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := findingCodes(report); !reflect.DeepEqual(got, []string{"provider_status_query_failed"}) {
+		t.Fatalf("findings = %v", got)
+	}
+}
+
+func TestReconciliationRejectsContradictoryProviderFinancialObservation(t *testing.T) {
+	id := uuid.New()
+	store := healthyStore(id)
+	client := &fakeProvider{payment: provider.Payment{
+		Status: provider.StatusAuthorized, AmountMinor: 700, Currency: "TWD", CapturedMinor: 700,
+	}}
+	reconciler := newTestReconciler(t, store, fakeRegistry{client: client}, nil)
+
+	report, err := reconciler.InspectPayment(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := findingCodes(report); !reflect.DeepEqual(got, []string{"provider_financial_observation_inconsistent"}) {
 		t.Fatalf("findings = %v", got)
 	}
 }
