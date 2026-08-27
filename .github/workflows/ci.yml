@@ -279,6 +279,9 @@ jobs:
       - name: Rehearse the populated version-8 through version-11 upgrade
         shell: bash
         run: |
+          mkdir -p "$RUNNER_TEMP/migrations-v10"
+          cp migrations/00000[1-9]_*.sql migrations/000010_*.sql \
+            "$RUNNER_TEMP/migrations-v10/"
           go run ./cmd/migrate \
             -path "$RUNNER_TEMP/migrations-v9" \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
@@ -292,11 +295,11 @@ jobs:
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone5_v9_data.sql
           go run ./cmd/migrate \
-            -path migrations \
+            -path "$RUNNER_TEMP/migrations-v10" \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             up
           go run ./cmd/migrate \
-            -path migrations \
+            -path "$RUNNER_TEMP/migrations-v10" \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             version
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
@@ -305,6 +308,10 @@ jobs:
             --file migrations/testdata/assert_milestone6_v10_reverse_compat.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone6_v10_ticket_code_backfill.sql
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            up
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone7_v11_schema.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
@@ -351,13 +358,17 @@ jobs:
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             up
           go run ./cmd/migrate \
-            -path migrations \
+            -path "$RUNNER_TEMP/migrations-v10" \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             up
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone6_v10_schema.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone6_v10_reverse_compat.sql
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            up
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone7_v11_schema.sql
       - name: Apply migrations to an empty database
@@ -446,11 +457,15 @@ jobs:
       - name: Apply and verify independent migration histories
         shell: bash
         run: |
-          go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" up
-          go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" up
-          go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" version
+          mkdir -p "$RUNNER_TEMP/control-v10"
+          cp migrations/00000[1-9]_*.sql migrations/000010_*.sql \
+            "$RUNNER_TEMP/control-v10/"
+          go run ./cmd/migrate -path "$RUNNER_TEMP/control-v10" -database "$CONTROL_DATABASE_URL" up
+          go run ./cmd/migrate -path "$RUNNER_TEMP/control-v10" -database "$CONTROL_DATABASE_URL" up
+          go run ./cmd/migrate -path "$RUNNER_TEMP/control-v10" -database "$CONTROL_DATABASE_URL" version
           psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone6_v10_schema.sql
+          go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" up
           psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone7_v11_schema.sql
           go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" down
@@ -459,9 +474,10 @@ jobs:
           go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" down
           psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone5_v9_schema.sql
-          go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" up
+          go run ./cmd/migrate -path "$RUNNER_TEMP/control-v10" -database "$CONTROL_DATABASE_URL" up
           psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone6_v10_schema.sql
+          go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" up
           psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone7_v11_schema.sql
           for database_url in \

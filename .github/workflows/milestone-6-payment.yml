@@ -130,17 +130,22 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/control-v9"
           cp migrations/00000[1-9]_*.sql "$RUNNER_TEMP/control-v9/"
+          mkdir -p "$RUNNER_TEMP/control-v10"
+          cp migrations/00000[1-9]_*.sql migrations/000010_*.sql \
+            "$RUNNER_TEMP/control-v10/"
           go run ./cmd/migrate -path "$RUNNER_TEMP/control-v9" \
             -database "$CONTROL_DATABASE_URL" up
           psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone5_v9_schema.sql
 
-          go run ./cmd/migrate -path migrations \
+          go run ./cmd/migrate -path "$RUNNER_TEMP/control-v10" \
             -database "$CONTROL_DATABASE_URL" up
           psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone6_v10_schema.sql
           psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone6_v10_reverse_compat.sql
+          go run ./cmd/migrate -path migrations \
+            -database "$CONTROL_DATABASE_URL" up
           psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone7_v11_schema.sql
           psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
@@ -154,10 +159,14 @@ jobs:
             -database "$CONTROL_DATABASE_URL" down
           psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone5_v9_schema.sql
-          go run ./cmd/migrate -path migrations \
+          go run ./cmd/migrate -path "$RUNNER_TEMP/control-v10" \
             -database "$CONTROL_DATABASE_URL" up
           psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone6_v10_schema.sql
+          psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone6_v10_reverse_compat.sql
+          go run ./cmd/migrate -path migrations \
+            -database "$CONTROL_DATABASE_URL" up
           psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone7_v11_schema.sql
       - name: Rehearse populated booking-shard v2 and v3 up, down, and replay

@@ -2,6 +2,8 @@ package postgres_test
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -103,8 +105,8 @@ func TestPgBackRestRunnerRestoreFailsClosedWhenIndependentFactsAreMissing(t *tes
 	executor := &fakeExecutor{}
 	runner, err := protectionpostgres.New(protectionpostgres.Config{
 		Binary: "pgbackrest", Stanzas: recovery.NewDatabaseSet("railway-control", "railway-shard-0", "railway-shard-1"),
-		Repositories: map[string]int{"repo-dr": 1}, ValidationRoot: `D:\pgbackrest-validation`,
-		ValidationTargets: map[string]string{"validation-control": `D:\pgbackrest-validation\control`},
+		Repositories: map[string]int{"repo-dr": 1}, ValidationRoot: validationRoot(),
+		ValidationTargets: map[string]string{"validation-control": validationTarget()},
 		MaxOutputBytes:    64 << 10, RestoreVerifier: invalidRestoreVerifier{},
 	}, executor)
 	if err != nil {
@@ -154,8 +156,8 @@ func TestPgBackRestRunnerAcceptsOnlyNamedBinaryOrSecretWrapper(t *testing.T) {
 		config := protectionpostgres.Config{
 			Binary:       binary,
 			Stanzas:      recovery.NewDatabaseSet("railway-control", "railway-shard-0", "railway-shard-1"),
-			Repositories: map[string]int{"repo-dr": 1}, ValidationRoot: `D:\pgbackrest-validation`,
-			ValidationTargets: map[string]string{"validation-control": `D:\pgbackrest-validation\control`},
+			Repositories: map[string]int{"repo-dr": 1}, ValidationRoot: validationRoot(),
+			ValidationTargets: map[string]string{"validation-control": validationTarget()},
 			MaxOutputBytes:    64 << 10,
 			RestoreVerifier:   validRestoreVerifier{},
 		}
@@ -219,9 +221,9 @@ func mustPgBackRestRunner(t *testing.T, executor protectionpostgres.Executor) *p
 		Binary:         "pgbackrest",
 		Stanzas:        recovery.NewDatabaseSet("railway-control", "railway-shard-0", "railway-shard-1"),
 		Repositories:   map[string]int{"repo-dr": 1},
-		ValidationRoot: `D:\pgbackrest-validation`,
+		ValidationRoot: validationRoot(),
 		ValidationTargets: map[string]string{
-			"validation-control": `D:\pgbackrest-validation\control`,
+			"validation-control": validationTarget(),
 		},
 		MaxOutputBytes:  64 << 10,
 		RestoreVerifier: validRestoreVerifier{},
@@ -233,6 +235,14 @@ func mustPgBackRestRunner(t *testing.T, executor protectionpostgres.Executor) *p
 }
 
 type validRestoreVerifier struct{}
+
+func validationRoot() string {
+	return filepath.Join(os.TempDir(), "pgbackrest-validation")
+}
+
+func validationTarget() string {
+	return filepath.Join(validationRoot(), "control")
+}
 
 func (validRestoreVerifier) Observe(context.Context, protectionpostgres.RestoreObservationRequest) (protectionpostgres.RestoreObservation, error) {
 	return protectionpostgres.RestoreObservation{
