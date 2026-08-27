@@ -45,6 +45,9 @@ printf 'hostssl replication %s %s scram-sha-256\n' \
   "$DR_REPLICATION_USER" "$DR_REPLICATION_SOURCE_CIDR" > "$hba_include_tmp"
 chmod 0600 "$hba_include_tmp"
 mv -f "$hba_include_tmp" "$hba_include"
+if [ "$(id -u)" = '0' ]; then
+  chown postgres:postgres "$hba_include"
+fi
 if ! grep -Fqx "include_if_exists 'pg_hba.replication.conf'" "$PGDATA/pg_hba.conf"; then
   printf "\ninclude_if_exists 'pg_hba.replication.conf'\n" >> "$PGDATA/pg_hba.conf"
 fi

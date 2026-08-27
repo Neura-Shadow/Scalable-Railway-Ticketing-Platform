@@ -1379,7 +1379,9 @@ FROM pg_roles WHERE rolname='railway_runtime'
         $replicationHBAEvidence = [System.Collections.Generic.List[object]]::new()
         foreach ($database in $databases) {
             Invoke-M7Compose -Arguments @('exec','-T',$database.Primary,'sh','/etc/railway/configure-replication.sh') | Out-Null
-            $loadedRules = [int](Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL @"
+            $loadedRules = 0
+            for ($attempt = 0; $attempt -lt 20; $attempt++) {
+                $loadedRules = [int](Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL @"
 SELECT count(*)
 FROM pg_hba_file_rules
 WHERE type='hostssl'
@@ -1388,6 +1390,9 @@ WHERE type='hostssl'
   AND auth_method='scram-sha-256'
   AND error IS NULL
 "@)
+                if ($loadedRules -eq 1) { break }
+                Start-Sleep -Milliseconds 250
+            }
             if ($loadedRules -ne 1) { throw "managed replication HBA rule was not loaded for $($database.Name)" }
             $replicationHBAEvidence.Add([ordered]@{
                 database=$database.Name; replication_identity=$database.ReplicationUser;

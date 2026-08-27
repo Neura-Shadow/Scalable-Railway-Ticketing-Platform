@@ -40,6 +40,7 @@ $source = Get-Content -Raw -LiteralPath $runnerPath
 foreach ($replicationBootstrapGuard in @(
     '/etc/railway/configure-replication.sh',
     'pg_hba_file_rules',
+    'for ($attempt = 0; $attempt -lt 20; $attempt++)',
     "database @> ARRAY['replication']::text[]",
     "auth_method='scram-sha-256'",
     'replication-hba-rules.json',
