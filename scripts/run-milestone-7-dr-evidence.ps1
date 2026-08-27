@@ -1532,8 +1532,12 @@ FROM pg_replication_slots WHERE slot_name='$($database.Slot)' AND slot_type='phy
             if ($archiveObservation.Count -ne 4 -or [int64]$archiveObservation[0] -lt 1 -or ([int64]$archiveObservation[3] -gt [int64]$archiveObservation[2])) {
                 throw "WAL archive freshness was not healthy for $($database.Name)"
             }
+            $replayFreshnessMarkerEpoch = [int64](Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL "UPDATE public.dr_evidence_markers SET created_at=clock_timestamp() WHERE marker=1 RETURNING extract(epoch FROM created_at)::bigint::text")
+            if ($replayFreshnessMarkerEpoch -le 0) { throw "replay freshness marker did not commit for $($database.Name)" }
+            $replayFreshnessLSN = Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL 'SELECT pg_current_wal_lsn()::text'
+            Wait-M7Replay -Service $database.Standby -User $database.ReplicationUser -Database $database.Database -LSN $replayFreshnessLSN
             $standbyObservation = (Get-M7Scalar -Service $database.Standby -User $database.ReplicationUser -Database $database.Database -SQL "SELECT coalesce((SELECT status FROM pg_stat_wal_receiver LIMIT 1),'')||'|'||coalesce(pg_last_wal_replay_lsn()::text,'')||'|'||coalesce(extract(epoch FROM pg_last_xact_replay_timestamp())::bigint,0)::text||'|'||((pg_control_checkpoint()).timeline_id)::text") -split '\|'
-            if ($standbyObservation.Count -ne 4 -or $standbyObservation[0] -ne 'streaming' -or [string]::IsNullOrWhiteSpace($standbyObservation[1]) -or [int64]$standbyObservation[2] -le 0 -or [int]$standbyObservation[3] -le 0) {
+            if ($standbyObservation.Count -ne 4 -or $standbyObservation[0] -ne 'streaming' -or [string]::IsNullOrWhiteSpace($standbyObservation[1]) -or [int64]$standbyObservation[2] -lt $replayFreshnessMarkerEpoch -or [int]$standbyObservation[3] -le 0) {
                 throw "standby replay freshness or timeline was not observable for $($database.Name)"
             }
             $replicationEvidence.Add([ordered]@{
@@ -1542,7 +1546,8 @@ FROM pg_replication_slots WHERE slot_name='$($database.Slot)' AND slot_type='phy
                 slot_safe_wal_bytes=[int64]$slotObservation[3]; retained_wal_bytes=[int64]$slotObservation[4];
                 archived_wal_count=[int64]$archiveObservation[0]; archive_failed_count=[int64]$archiveObservation[1];
                 last_archived_at_epoch=[int64]$archiveObservation[2]; last_archive_failure_at_epoch=[int64]$archiveObservation[3];
-                wal_receiver_state=$standbyObservation[0]; replay_lsn=$standbyObservation[1]; last_replay_at_epoch=[int64]$standbyObservation[2]; timeline=[int]$standbyObservation[3]
+                wal_receiver_state=$standbyObservation[0]; replay_lsn=$standbyObservation[1]; replay_freshness_marker_lsn=$replayFreshnessLSN;
+                replay_freshness_marker_epoch=$replayFreshnessMarkerEpoch; last_replay_at_epoch=[int64]$standbyObservation[2]; timeline=[int]$standbyObservation[3]
             })
             $infoResult = Invoke-M7Compose -Arguments @('exec','-T',$database.Primary,'/etc/railway/pgbackrest-secret.sh',"--stanza=$($database.Stanza)",'--log-level-console=off','--output=json','info')
             $infoText = $infoResult.Output -join "`n"

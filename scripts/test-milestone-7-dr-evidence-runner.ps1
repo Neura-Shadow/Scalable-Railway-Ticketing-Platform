@@ -61,6 +61,15 @@ foreach ($topologyPreflightGuard in @(
 )) {
     if (-not $source.Contains($topologyPreflightGuard)) { throw "Milestone 7 runner is missing topology preflight guard: $topologyPreflightGuard" }
 }
+foreach ($replayFreshnessGuard in @(
+    'replayFreshnessMarkerEpoch',
+    'replayFreshnessLSN',
+    'Wait-M7Replay -Service $database.Standby',
+    'replay_freshness_marker_lsn',
+    'replay_freshness_marker_epoch'
+)) {
+    if (-not $source.Contains($replayFreshnessGuard)) { throw "Milestone 7 runner is missing replay freshness proof: $replayFreshnessGuard" }
+}
 $requiredGuardrails = @(
     'ConfirmDestructiveDrill',
     'EvidenceDirectory must be outside the source repository',
