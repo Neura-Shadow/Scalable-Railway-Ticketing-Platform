@@ -131,17 +131,18 @@ admin start-reverse-migration --migration-id "$reverse_id" --confirm
 
 # A normal or cross-transaction legacy writer remains fenced while physical is
 # authoritative. Test it before target preparation clears the retained rows so
-# success cannot be hidden by a zero-row update. A residual authorization row
-# is inert outside its own txid.
-psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 -c \
-  "INSERT INTO public.physical_control_target_apply_authorizations(migration_id,train_run_id,target_shard_id,target_generation,transaction_id) VALUES('$reverse_id','$run_id','legacy',3,txid_current())"
+# success cannot be hidden by a zero-row update. Transaction-bound target
+# authorization must not survive a transaction without being consumed.
+if psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 -c \
+  "INSERT INTO public.physical_control_target_apply_authorizations(migration_id,train_run_id,target_shard_id,target_generation,transaction_id) VALUES('$reverse_id','$run_id','legacy',3,txid_current())"; then
+  echo 'unconsumed physical target authorization unexpectedly committed' >&2
+  exit 1
+fi
 if psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 -c \
   "UPDATE public.seat_inventory SET version=version+1 WHERE train_run_id='$run_id'"; then
   echo 'cross-transaction legacy write unexpectedly succeeded' >&2
   exit 1
 fi
-psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 -c \
-  "DELETE FROM public.physical_control_target_apply_authorizations WHERE migration_id='$reverse_id'"
 
 admin enable-capture --migration-id "$reverse_id" --confirm
 admin enable-capture --migration-id "$reverse_id" --confirm
