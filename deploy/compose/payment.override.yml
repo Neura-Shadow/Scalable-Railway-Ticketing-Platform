@@ -159,6 +159,8 @@ services:
     depends_on:
       migrate-control:
         condition: service_completed_successfully
+      runtime-control-role:
+        condition: service_completed_successfully
     networks: [backend]
     restart: "no"
 
@@ -183,6 +185,8 @@ services:
     depends_on:
       migrate-booking-shard-0:
         condition: service_completed_successfully
+      runtime-booking-shard-0-role:
+        condition: service_completed_successfully
     networks: [backend]
     restart: "no"
 
@@ -206,6 +210,8 @@ services:
         done
     depends_on:
       migrate-booking-shard-1:
+        condition: service_completed_successfully
+      runtime-booking-shard-1-role:
         condition: service_completed_successfully
     networks: [backend]
     restart: "no"
