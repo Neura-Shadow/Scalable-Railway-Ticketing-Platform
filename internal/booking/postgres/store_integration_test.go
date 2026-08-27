@@ -1424,6 +1424,15 @@ func applyMigrationsThrough(t *testing.T, ctx context.Context, pool *pgxpool.Poo
 				continue
 			}
 		}
+		if migrationName == "000011_payment_ops_dr.up.sql" {
+			var installed bool
+			if err := pool.QueryRow(ctx, `SELECT to_regclass('public.regional_write_authority') IS NOT NULL`).Scan(&installed); err != nil {
+				t.Fatalf("inspect payment operations and DR migration state: %v", err)
+			}
+			if installed {
+				continue
+			}
+		}
 		applyMigrationPath(t, ctx, pool, path)
 	}
 }

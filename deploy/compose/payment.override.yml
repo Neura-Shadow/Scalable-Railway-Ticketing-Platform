@@ -144,14 +144,18 @@ services:
       - sh
       - -ec
       - |
-        if ! psql -h control-postgres -U railway_control -d railway_control -tAc "SELECT 1 FROM pg_roles WHERE rolname='payment_reconciler'" | grep -qx 1; then
-          psql -h control-postgres -U railway_control -d railway_control -v ON_ERROR_STOP=1 -c "CREATE ROLE payment_reconciler LOGIN PASSWORD 'reconciler-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
-        fi
-        psql -h control-postgres -U railway_control -d railway_control -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_control TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM payment_reconciler; GRANT SELECT ON public.schema_migrations,public.booking_shards,public.train_run_shard_assignments,public.payment_intents,public.payment_sagas,public.payment_operations,public.payment_webhook_inbox,public.payment_provider_event_conflicts,public.payment_reconciliation_checkpoints,public.payment_manual_review_cases,public.ticket_code_directory,public.ticket_shard_locators,public.reservations,public.reservation_seats,public.ticket_orders,public.tickets,public.ticket_issuance_receipts,public.payment_command_receipts,public.payment_compensation_receipts,public.financial_ledger_transactions,public.financial_ledger_reversals,public.provider_balance_transactions,public.provider_settlement_batches,public.provider_settlement_lines,public.provider_payouts,public.provider_payout_lines,public.provider_settlement_import_conflicts,public.settlement_reconciliation_runs,public.settlement_reconciliation_mismatches,public.payment_provider_capabilities,public.payment_webhook_key_versions,public.regional_write_authority,public.regional_failover_operations,public.backup_artifacts,public.backup_verifications,public.restore_validations TO payment_reconciler; GRANT INSERT,UPDATE ON public.payment_reconciliation_checkpoints TO payment_reconciler; GRANT INSERT ON public.payment_manual_review_cases TO payment_reconciler; REVOKE UPDATE ON public.payment_manual_review_cases FROM payment_reconciler"
-        if psql -h control-postgres -U railway_control -d railway_control -tAc "SELECT has_table_privilege('payment_reconciler','public.users','SELECT')" | grep -qx t; then
-          echo 'payment_reconciler must not read account credentials' >&2
-          exit 1
-        fi
+        for attempt in 1 2 3 4 5; do
+        if (
+          if ! psql -h control-postgres -U railway_control -d railway_control -tAc "SELECT 1 FROM pg_roles WHERE rolname='payment_reconciler'" | grep -qx 1; then
+            psql -h control-postgres -U railway_control -d railway_control -v ON_ERROR_STOP=1 -c "CREATE ROLE payment_reconciler LOGIN PASSWORD 'reconciler-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT" || exit 1
+          fi
+          psql -h control-postgres -U railway_control -d railway_control -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_control TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM payment_reconciler; GRANT SELECT ON public.schema_migrations,public.booking_shards,public.train_run_shard_assignments,public.payment_intents,public.payment_sagas,public.payment_operations,public.payment_webhook_inbox,public.payment_provider_event_conflicts,public.payment_reconciliation_checkpoints,public.payment_manual_review_cases,public.ticket_code_directory,public.ticket_shard_locators,public.reservations,public.reservation_seats,public.ticket_orders,public.tickets,public.ticket_issuance_receipts,public.payment_command_receipts,public.payment_compensation_receipts,public.financial_ledger_transactions,public.financial_ledger_reversals,public.provider_balance_transactions,public.provider_settlement_batches,public.provider_settlement_lines,public.provider_payouts,public.provider_payout_lines,public.provider_settlement_import_conflicts,public.settlement_reconciliation_runs,public.settlement_reconciliation_mismatches,public.payment_provider_capabilities,public.payment_webhook_key_versions,public.regional_write_authority,public.regional_failover_operations,public.backup_artifacts,public.backup_verifications,public.restore_validations TO payment_reconciler; GRANT INSERT,UPDATE ON public.payment_reconciliation_checkpoints TO payment_reconciler; GRANT INSERT ON public.payment_manual_review_cases TO payment_reconciler; REVOKE UPDATE ON public.payment_manual_review_cases FROM payment_reconciler" || exit 1
+          credential_access="$$(psql -h control-postgres -U railway_control -d railway_control -v ON_ERROR_STOP=1 -tAc "SELECT has_table_privilege('payment_reconciler','public.users','SELECT')")" || exit 1
+          test "$$credential_access" = f
+        ); then exit 0; fi
+        test "$$attempt" -lt 5
+        sleep 1
+        done
     depends_on:
       migrate-control:
         condition: service_completed_successfully
@@ -166,10 +170,16 @@ services:
       - sh
       - -ec
       - |
-        if ! psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -tAc "SELECT 1 FROM pg_roles WHERE rolname='payment_reconciler'" | grep -qx 1; then
-          psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "CREATE ROLE payment_reconciler LOGIN PASSWORD 'reconciler-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
-        fi
-        psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_booking TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM payment_reconciler; GRANT SELECT ON public.schema_migrations,public.regional_write_authority,public.reservations,public.reservation_seats,public.ticket_orders,public.tickets,public.ticket_issuance_receipts,public.payment_command_receipts,public.payment_compensation_receipts TO payment_reconciler"
+        for attempt in 1 2 3 4 5; do
+        if (
+          if ! psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -tAc "SELECT 1 FROM pg_roles WHERE rolname='payment_reconciler'" | grep -qx 1; then
+            psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "CREATE ROLE payment_reconciler LOGIN PASSWORD 'reconciler-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT" || exit 1
+          fi
+          psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_booking TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM payment_reconciler; GRANT SELECT ON public.schema_migrations,public.regional_write_authority,public.reservations,public.reservation_seats,public.ticket_orders,public.tickets,public.ticket_issuance_receipts,public.payment_command_receipts,public.payment_compensation_receipts TO payment_reconciler" || exit 1
+        ); then exit 0; fi
+        test "$$attempt" -lt 5
+        sleep 1
+        done
     depends_on:
       migrate-booking-shard-0:
         condition: service_completed_successfully
@@ -184,10 +194,16 @@ services:
       - sh
       - -ec
       - |
-        if ! psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -tAc "SELECT 1 FROM pg_roles WHERE rolname='payment_reconciler'" | grep -qx 1; then
-          psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "CREATE ROLE payment_reconciler LOGIN PASSWORD 'reconciler-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
-        fi
-        psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_booking TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM payment_reconciler; GRANT SELECT ON public.schema_migrations,public.regional_write_authority,public.reservations,public.reservation_seats,public.ticket_orders,public.tickets,public.ticket_issuance_receipts,public.payment_command_receipts,public.payment_compensation_receipts TO payment_reconciler"
+        for attempt in 1 2 3 4 5; do
+        if (
+          if ! psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -tAc "SELECT 1 FROM pg_roles WHERE rolname='payment_reconciler'" | grep -qx 1; then
+            psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "CREATE ROLE payment_reconciler LOGIN PASSWORD 'reconciler-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT" || exit 1
+          fi
+          psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_booking TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM payment_reconciler; GRANT SELECT ON public.schema_migrations,public.regional_write_authority,public.reservations,public.reservation_seats,public.ticket_orders,public.tickets,public.ticket_issuance_receipts,public.payment_command_receipts,public.payment_compensation_receipts TO payment_reconciler" || exit 1
+        ); then exit 0; fi
+        test "$$attempt" -lt 5
+        sleep 1
+        done
     depends_on:
       migrate-booking-shard-1:
         condition: service_completed_successfully
