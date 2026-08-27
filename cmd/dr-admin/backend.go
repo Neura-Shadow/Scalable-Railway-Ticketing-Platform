@@ -183,11 +183,14 @@ func (backend *runtimeBackend) validateTopology(ctx context.Context, sourceRegio
 	if backend.source == nil || backend.target == nil || sourceEpoch.Uint64() == 0 {
 		return errRuntimeWiring
 	}
-	source, err := backend.source.Observe(ctx)
+	// Observe the replica first and the primary second. A streaming replica can
+	// advance between samples; the reverse order can compare a fresh replica
+	// position with a stale primary position and reject a healthy topology.
+	target, err := backend.target.Observe(ctx)
 	if err != nil {
 		return errTopologyPrecondition
 	}
-	target, err := backend.target.Observe(ctx)
+	source, err := backend.source.Observe(ctx)
 	if err != nil {
 		return errTopologyPrecondition
 	}

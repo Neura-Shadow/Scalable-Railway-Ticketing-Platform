@@ -52,6 +52,14 @@ foreach ($replicationBootstrapGuard in @(
         throw "DR runner omits live replication HBA proof: $replicationBootstrapGuard"
     }
 }
+foreach ($topologyPreflightGuard in @(
+    'topology-preflight.json',
+    "Add-M7Phase 'topology-preflight-synchronized'",
+    "'--reason','region_failure','--dry-run','--timeout','2m'",
+    'typed failover dry-run preflight did not validate the synchronized topology'
+)) {
+    if (-not $source.Contains($topologyPreflightGuard)) { throw "Milestone 7 runner is missing topology preflight guard: $topologyPreflightGuard" }
+}
 $requiredGuardrails = @(
     'ConfirmDestructiveDrill',
     'EvidenceDirectory must be outside the source repository',

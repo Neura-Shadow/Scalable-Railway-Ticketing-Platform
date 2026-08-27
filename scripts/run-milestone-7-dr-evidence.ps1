@@ -1437,9 +1437,57 @@ SELECT json_build_object(
         foreach ($database in $databases) { Wait-M7Role -Service $database.Standby -User $database.ReplicationUser -Database $database.Database -Recovery $true }
         Add-M7Phase 'async-streaming-established'
 
+        $topologyPreflight = [System.Collections.Generic.List[object]]::new()
+        foreach ($database in $databases) {
+            Invoke-M7SQL -Service $database.Primary -User $database.User -Database $database.Database -SQL @"
+CREATE TABLE IF NOT EXISTS public.dr_evidence_markers(marker bigint PRIMARY KEY, created_at timestamptz NOT NULL DEFAULT clock_timestamp());
+INSERT INTO public.dr_evidence_markers(marker) VALUES (1) ON CONFLICT DO NOTHING;
+"@
+            $sourceLSN = Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL 'SELECT pg_current_wal_lsn()::text'
+            Wait-M7Replay -Service $database.Standby -User $database.ReplicationUser -Database $database.Database -LSN $sourceLSN
+            $observationSQL = @"
+SELECT pg_is_in_recovery()::text||'|'||
+       pg_wal_lsn_diff(CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() ELSE pg_current_wal_lsn() END,'0/0')::bigint::text||'|'||
+       ((pg_control_checkpoint()).timeline_id)::text||'|'||authority.region||'|'||authority.epoch::text||'|'||
+       authority.state||'|'||authority.writes_enabled::text||'|'||migrations.version::text||'|'||migrations.dirty::text
+FROM public.regional_write_authority AS authority
+CROSS JOIN public.schema_migrations AS migrations
+WHERE authority.singleton
+LIMIT 1
+"@
+            $targetObservation = (Get-M7Scalar -Service $database.Standby -User $database.User -Database $database.Database -SQL $observationSQL) -split '\|'
+            $sourceObservation = (Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL $observationSQL) -split '\|'
+            if ($sourceObservation.Count -ne 9 -or $targetObservation.Count -ne 9 -or
+                $sourceObservation[0] -ne 'false' -or $targetObservation[0] -ne 'true' -or
+                [int64]$sourceObservation[1] -le 0 -or [int64]$targetObservation[1] -le 0 -or
+                [int64]$targetObservation[1] -gt [int64]$sourceObservation[1] -or
+                $targetObservation[2] -ne $sourceObservation[2] -or
+                $sourceObservation[3] -ne 'region-a' -or $targetObservation[3] -ne 'region-a' -or
+                $sourceObservation[4] -ne '1' -or $targetObservation[4] -ne '1' -or
+                $sourceObservation[5] -ne 'active' -or $targetObservation[5] -ne 'active' -or
+                $sourceObservation[6] -ne 'true' -or $targetObservation[6] -ne 'true' -or
+                [int]$sourceObservation[7] -ne $database.ExpectedVersion -or $targetObservation[7] -ne $sourceObservation[7] -or
+                $sourceObservation[8] -ne 'false' -or $targetObservation[8] -ne 'false') {
+                throw "typed failover topology preflight failed for $($database.Name): source=$($sourceObservation -join '|') target=$($targetObservation -join '|')"
+            }
+            $topologyPreflight.Add([ordered]@{
+                database=$database.Name; source_role='primary'; target_role='standby'; source_wal=[int64]$sourceObservation[1];
+                target_wal=[int64]$targetObservation[1]; timeline=[int]$sourceObservation[2]; authority_region='region-a';
+                authority_epoch=1; authority_state='active'; writes_enabled=$true; schema_version=[int]$sourceObservation[7]; schema_dirty=$false
+            })
+        }
+        Write-M7JSON -Name 'topology-preflight.json' -Value ([ordered]@{databases=$topologyPreflight})
+        Add-M7Phase 'topology-preflight-synchronized'
+
         $env:DR_RECOVERY_EPOCH = '1'
         $env:DR_JOURNAL_REGION = 'region-a'
         $env:DR_JOURNAL_DATABASE_URL = 'postgresql://railway_control:control-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3'
+        $preflight = Invoke-M7DRAdmin -Arguments @(
+            'failover','--operation-id',$failoverOperationID,'--incident-id',$failoverIncidentID,
+            '--from','region-a','--to','region-b','--source-epoch','1','--operator','operator:local-dr',
+            '--reason','region_failure','--dry-run','--timeout','2m'
+        )
+        if ([string]$preflight.result.stage -ne 'planned' -or [string]$preflight.status -ne 'dry-run') { throw 'typed failover dry-run preflight did not validate the synchronized topology' }
         $planned = Invoke-M7DRAdmin -Arguments @(
             'failover','--operation-id',$failoverOperationID,'--incident-id',$failoverIncidentID,
             '--from','region-a','--to','region-b','--source-epoch','1','--operator','operator:local-dr',
@@ -1449,12 +1497,6 @@ SELECT json_build_object(
         Add-M7Phase 'typed-failover-planned'
 
         foreach ($database in $databases) {
-            Invoke-M7SQL -Service $database.Primary -User $database.User -Database $database.Database -SQL @"
-CREATE TABLE IF NOT EXISTS public.dr_evidence_markers(marker bigint PRIMARY KEY, created_at timestamptz NOT NULL DEFAULT clock_timestamp());
-INSERT INTO public.dr_evidence_markers(marker) VALUES (1) ON CONFLICT DO NOTHING;
-"@
-            $sourceLSN = Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL 'SELECT pg_current_wal_lsn()::text'
-            Wait-M7Replay -Service $database.Standby -User $database.ReplicationUser -Database $database.Database -LSN $sourceLSN
             $replicationCount = [int](Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL "SELECT count(*) FROM pg_stat_replication WHERE application_name<>'' AND state='streaming'")
             if ($replicationCount -lt 1) { throw "streaming replication was not observed for $($database.Name)" }
             $tlsReplicationCount = [int](Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL "SELECT count(*) FROM pg_stat_replication AS replication JOIN pg_stat_ssl AS tls USING(pid) WHERE replication.application_name='$($database.Slot)' AND replication.state='streaming' AND tls.ssl")

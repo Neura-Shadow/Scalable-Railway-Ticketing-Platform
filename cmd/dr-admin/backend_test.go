@@ -62,6 +62,28 @@ func TestRuntimeBackendRejectsTargetThatIsAlreadyWritable(t *testing.T) {
 	}
 }
 
+func TestRuntimeBackendSamplesTargetBeforeSource(t *testing.T) {
+	t.Parallel()
+
+	sourceRegion := mustBackendRegion(t, "region-a")
+	targetRegion := mustBackendRegion(t, "region-b")
+	epoch, _ := authority.NewEpoch(7)
+	calls := []string{}
+	backend := &runtimeBackend{
+		source: orderedTopologySource{label: "source", calls: &calls, evidence: backendTopology(t, recovery.DatabaseRolePrimary, sourceRegion, epoch, true)},
+		target: orderedTopologySource{label: "target", calls: &calls, evidence: backendTopology(t, recovery.DatabaseRoleStandby, sourceRegion, epoch, true)},
+		store:  &runtimePlanStore{},
+		now:    time.Now,
+	}
+	_, err := backend.Execute(context.Background(), request{
+		Command: "failover", OperationID: uuid.New(), IncidentID: uuid.New(), From: sourceRegion, To: targetRegion,
+		SourceEpoch: epoch, OperatorID: "operator:test", Reason: "region_failure", DryRun: true,
+	})
+	if err != nil || len(calls) != 2 || calls[0] != "target" || calls[1] != "source" {
+		t.Fatalf("Execute() calls/error = %v/%v, want [target source]/nil", calls, err)
+	}
+}
+
 func TestOpenBackendBuildsFixedRegionPoolsWithoutConnecting(t *testing.T) {
 	t.Parallel()
 
@@ -168,6 +190,17 @@ func TestCrashAfterLoadHookRequiresExplicitTestGatesAndExactStage(t *testing.T) 
 type topologySource struct {
 	evidence recovery.DatabaseSet[recoverypostgres.DatabaseObservation]
 	err      error
+}
+
+type orderedTopologySource struct {
+	label    string
+	calls    *[]string
+	evidence recovery.DatabaseSet[recoverypostgres.DatabaseObservation]
+}
+
+func (source orderedTopologySource) Observe(context.Context) (recovery.DatabaseSet[recoverypostgres.DatabaseObservation], error) {
+	*source.calls = append(*source.calls, source.label)
+	return source.evidence, nil
 }
 
 func (source topologySource) Observe(context.Context) (recovery.DatabaseSet[recoverypostgres.DatabaseObservation], error) {
