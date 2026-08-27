@@ -83,7 +83,7 @@ Set `APP_ENV=production` and validate process-owned settings:
   limits, webhook keyring, processing/review/uncertainty deadlines, physical
   mode, and no provider credential in public output;
 - payment-worker: explicit enablement, bounded batch/lease/retry/pass settings,
-  control schema v10, booking-shard schema v2, provider and configured-shard
+  control schema v11, booking-shard schema v3, provider and configured-shard
   readiness;
 - payment-reconciler: detect-only scope/batch/interval/timeout with bounded
   control/current-shard/provider reads, SELECT-only shard roles, and a control
