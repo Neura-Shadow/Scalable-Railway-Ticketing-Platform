@@ -50,6 +50,7 @@ foreach ($operatorRole in @(
     }
 }
 foreach ($reconciliationReadTable in @(
+    'public.payment_saga_actions',
     'public.ticket_refund_requests',
     'public.ticket_refund_operations'
 )) {
