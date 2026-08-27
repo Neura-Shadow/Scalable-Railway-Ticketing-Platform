@@ -213,10 +213,12 @@ jobs:
               -database "$database_url" down
             psql "$database_url" --set=ON_ERROR_STOP=1 \
               --file migrations/testdata/assert_booking_shard_v1_schema.sql
-            go run ./cmd/migrate -path migrations/booking-shard \
+            go run ./cmd/migrate -path "$RUNNER_TEMP/booking-shard-v2" \
               -database "$database_url" up
             psql "$database_url" --set=ON_ERROR_STOP=1 \
               --file migrations/testdata/assert_booking_shard_v2_schema.sql
+            go run ./cmd/migrate -path migrations/booking-shard \
+              -database "$database_url" up
             psql "$database_url" --set=ON_ERROR_STOP=1 \
               --file migrations/testdata/assert_booking_shard_v3_schema.sql
             psql "$database_url" --set=ON_ERROR_STOP=1 \

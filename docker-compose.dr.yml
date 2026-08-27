@@ -2,12 +2,6 @@ name: scalable-railway-ticketing-platform-dr
 
 # Disposable same-host DR laboratory. Docker networks model bounded failure
 # domains only; they are not represented as production regions.
-include:
-  - path:
-      - ./docker-compose.physical-shards.yml
-      - ./deploy/compose/payment.override.yml
-      - ./deploy/compose/dr-app.override.yml
-
 x-dr-primary-common: &dr-primary-common
   build: {context: ., target: postgres-dr}
   image: scalable-railway-ticketing-postgres-dr:local

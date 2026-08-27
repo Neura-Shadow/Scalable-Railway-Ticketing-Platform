@@ -123,10 +123,16 @@ foreach ($required in @(
     'control-postgres-region-b', 'booking-shard-0-postgres-region-b',
     'booking-shard-1-postgres-region-b', 'synchronous_commit=local',
     'start-standby.sh', 'pgbackrest-control-repository', 'pgbackrest-shard-0-repository', 'pgbackrest-shard-1-repository', 'PGBACKREST_CIPHER_FILE', 'archive-push',
-    'dr-replication', 'dr-control', 'region-a-app', 'region-a-data', 'region-b-app', 'region-b-data', 'deploy/compose/dr-app.override.yml',
-    'docker-compose.physical-shards.yml', 'deploy/compose/payment.override.yml'
+    'dr-replication', 'dr-control', 'region-a-app', 'region-a-data', 'region-b-app', 'region-b-data'
 )) {
     if (-not $compose.Contains($required)) { throw "DR Compose omits required topology token: $required" }
+}
+if ($compose -match '(?m)^include:\s*$') { throw 'DR Compose must use ordered -f overlays rather than conflicting imported resources' }
+foreach ($required in @(
+    'docker-compose.physical-shards.yml', 'deploy/compose/payment.override.yml',
+    'docker-compose.dr.yml', 'deploy/compose/dr-app.override.yml'
+)) {
+    if (-not $source.Contains($required)) { throw "DR runner omits required Compose layer: $required" }
 }
 
 $appComposePath = Join-Path $root 'deploy/compose/dr-app.override.yml'

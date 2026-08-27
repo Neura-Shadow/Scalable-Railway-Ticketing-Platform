@@ -16,6 +16,12 @@ if (-not $ConfirmDestructiveDrill) {
 
 $root = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $composeFile = Join-Path $root 'docker-compose.dr.yml'
+$composeFiles = @(
+    (Join-Path $root 'docker-compose.physical-shards.yml'),
+    (Join-Path $root 'deploy/compose/payment.override.yml'),
+    $composeFile,
+    (Join-Path $root 'deploy/compose/dr-app.override.yml')
+)
 $driverPath = Join-Path $PSScriptRoot 'milestone-5-physical-shard-evidence-driver.ps1'
 . $driverPath
 $suffix = [guid]::NewGuid().ToString('N').Substring(0, 10)
@@ -187,7 +193,8 @@ if ($env:GITHUB_ACTIONS -eq 'true') {
     foreach ($value in $sensitiveValues) { Write-Output "::add-mask::$value" }
 }
 
-$composeArguments = @('compose','-p',$ProjectName,'-f',$composeFile)
+$composeArguments = @('compose','-p',$ProjectName)
+foreach ($file in $composeFiles) { $composeArguments += @('-f',$file) }
 $driverContext = [pscustomobject]@{
     RepositoryPath=$root; RawDirectory=$EvidenceDirectory; ProjectName=$ProjectName
     ComposeFile=$composeFile; ComposeArguments=[string[]]$composeArguments
