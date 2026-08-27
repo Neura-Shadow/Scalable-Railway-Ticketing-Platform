@@ -68,6 +68,15 @@ foreach ($token in @(
 )) {
     Require-Token $compose $token "compose replication contract is missing $token"
 }
+foreach ($replicationDNS in @(
+    'control-postgres-replication', 'control-postgres-region-b-replication', 'control-postgres-region-a-reseed-replication',
+    'booking-shard-0-postgres-replication', 'booking-shard-0-postgres-region-b-replication', 'booking-shard-0-postgres-region-a-reseed-replication',
+    'booking-shard-1-postgres-replication', 'booking-shard-1-postgres-region-b-replication', 'booking-shard-1-postgres-region-a-reseed-replication'
+)) {
+    Require-Token $compose $replicationDNS "compose must give each PostgreSQL endpoint an unambiguous replication-network DNS alias: $replicationDNS"
+    Require-Token $evidenceRunner "ReplicationDNS='$replicationDNS'" "replication TLS certificate must cover the isolated DNS alias: $replicationDNS"
+}
+Require-Token $evidenceRunner 'subjectAltName=DNS:$($endpoint.DNS),DNS:$($endpoint.ReplicationDNS)' 'replication certificate SANs must authenticate both service and isolated replication DNS names'
 foreach ($token in @(
     'pgbackrest-control-repository', 'pgbackrest-shard-0-repository', 'pgbackrest-shard-1-repository',
     'pgbackrest_control_cipher_pass', 'pgbackrest_shard_0_cipher_pass', 'pgbackrest_shard_1_cipher_pass',

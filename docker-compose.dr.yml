@@ -61,6 +61,12 @@ x-restore-common: &restore-common
 services:
   control-postgres:
     <<: *dr-primary-common
+    networks:
+      backend: {}
+      region-a-data: {}
+      dr-replication:
+        aliases: [control-postgres-replication]
+      dr-control: {}
     environment:
       POSTGRES_INITDB_ARGS: --data-checksums
       DR_REPLICATION_USER: railway_control_replicator
@@ -104,6 +110,12 @@ services:
 
   booking-shard-0-postgres:
     <<: *dr-primary-common
+    networks:
+      backend: {}
+      region-a-data: {}
+      dr-replication:
+        aliases: [booking-shard-0-postgres-replication]
+      dr-control: {}
     environment:
       POSTGRES_INITDB_ARGS: --data-checksums
       DR_REPLICATION_USER: railway_shard_0_replicator
@@ -147,6 +159,12 @@ services:
 
   booking-shard-1-postgres:
     <<: *dr-primary-common
+    networks:
+      backend: {}
+      region-a-data: {}
+      dr-replication:
+        aliases: [booking-shard-1-postgres-replication]
+      dr-control: {}
     environment:
       POSTGRES_INITDB_ARGS: --data-checksums
       DR_REPLICATION_USER: railway_shard_1_replicator
@@ -190,11 +208,16 @@ services:
 
   control-postgres-region-b:
     <<: *dr-standby-common
+    networks:
+      region-b-data: {}
+      dr-replication:
+        aliases: [control-postgres-region-b-replication]
+      dr-control: {}
     environment:
       POSTGRES_DB: railway_control
       POSTGRES_USER: railway_control_replicator
       POSTGRES_PASSWORD_FILE: /run/secrets/dr_control_replication_password
-      PRIMARY_HOST: ${CONTROL_PRIMARY_HOST:-control-postgres}
+      PRIMARY_HOST: ${CONTROL_PRIMARY_HOST:-control-postgres-replication}
       REPLICATION_SLOT: control_region_b
       PGBACKREST_STANZA: railway-control
       DR_REPLICATION_TLS_CERT_FILE: /run/secrets/dr_control_region_b_tls_cert
@@ -215,11 +238,16 @@ services:
 
   booking-shard-0-postgres-region-b:
     <<: *dr-standby-common
+    networks:
+      region-b-data: {}
+      dr-replication:
+        aliases: [booking-shard-0-postgres-region-b-replication]
+      dr-control: {}
     environment:
       POSTGRES_DB: railway_booking
       POSTGRES_USER: railway_shard_0_replicator
       POSTGRES_PASSWORD_FILE: /run/secrets/dr_shard_0_replication_password
-      PRIMARY_HOST: ${SHARD_0_PRIMARY_HOST:-booking-shard-0-postgres}
+      PRIMARY_HOST: ${SHARD_0_PRIMARY_HOST:-booking-shard-0-postgres-replication}
       REPLICATION_SLOT: shard_0_region_b
       PGBACKREST_STANZA: railway-shard-0
       DR_REPLICATION_TLS_CERT_FILE: /run/secrets/dr_shard_0_region_b_tls_cert
@@ -240,11 +268,16 @@ services:
 
   booking-shard-1-postgres-region-b:
     <<: *dr-standby-common
+    networks:
+      region-b-data: {}
+      dr-replication:
+        aliases: [booking-shard-1-postgres-region-b-replication]
+      dr-control: {}
     environment:
       POSTGRES_DB: railway_booking
       POSTGRES_USER: railway_shard_1_replicator
       POSTGRES_PASSWORD_FILE: /run/secrets/dr_shard_1_replication_password
-      PRIMARY_HOST: ${SHARD_1_PRIMARY_HOST:-booking-shard-1-postgres}
+      PRIMARY_HOST: ${SHARD_1_PRIMARY_HOST:-booking-shard-1-postgres-replication}
       REPLICATION_SLOT: shard_1_region_b
       PGBACKREST_STANZA: railway-shard-1
       DR_REPLICATION_TLS_CERT_FILE: /run/secrets/dr_shard_1_region_b_tls_cert
@@ -270,7 +303,7 @@ services:
       POSTGRES_DB: railway_control
       POSTGRES_USER: railway_control_replicator
       POSTGRES_PASSWORD_FILE: /run/secrets/dr_control_replication_password
-      PRIMARY_HOST: control-postgres-region-b
+      PRIMARY_HOST: control-postgres-region-b-replication
       REPLICATION_SLOT: control_region_a_reseed
       PGBACKREST_STANZA: railway-control
       DR_REPLICATION_TLS_CERT_FILE: /run/secrets/dr_control_region_a_reseed_tls_cert
@@ -286,7 +319,11 @@ services:
       - ./deploy/postgres/dr/standby-health.sh:/etc/railway/standby-health.sh:ro
       - ./deploy/postgres/dr/pgbackrest-secret.sh:/etc/railway/pgbackrest-secret.sh:ro
       - ./deploy/postgres/dr/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
-    networks: [region-a-data, dr-replication, dr-control]
+    networks:
+      region-a-data: {}
+      dr-replication:
+        aliases: [control-postgres-region-a-reseed-replication]
+      dr-control: {}
     depends_on:
       control-postgres-region-b: {condition: service_healthy}
 
@@ -297,7 +334,7 @@ services:
       POSTGRES_DB: railway_booking
       POSTGRES_USER: railway_shard_0_replicator
       POSTGRES_PASSWORD_FILE: /run/secrets/dr_shard_0_replication_password
-      PRIMARY_HOST: booking-shard-0-postgres-region-b
+      PRIMARY_HOST: booking-shard-0-postgres-region-b-replication
       REPLICATION_SLOT: shard_0_region_a_reseed
       PGBACKREST_STANZA: railway-shard-0
       DR_REPLICATION_TLS_CERT_FILE: /run/secrets/dr_shard_0_region_a_reseed_tls_cert
@@ -313,7 +350,11 @@ services:
       - ./deploy/postgres/dr/standby-health.sh:/etc/railway/standby-health.sh:ro
       - ./deploy/postgres/dr/pgbackrest-secret.sh:/etc/railway/pgbackrest-secret.sh:ro
       - ./deploy/postgres/dr/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
-    networks: [region-a-data, dr-replication, dr-control]
+    networks:
+      region-a-data: {}
+      dr-replication:
+        aliases: [booking-shard-0-postgres-region-a-reseed-replication]
+      dr-control: {}
     depends_on:
       booking-shard-0-postgres-region-b: {condition: service_healthy}
 
@@ -324,7 +365,7 @@ services:
       POSTGRES_DB: railway_booking
       POSTGRES_USER: railway_shard_1_replicator
       POSTGRES_PASSWORD_FILE: /run/secrets/dr_shard_1_replication_password
-      PRIMARY_HOST: booking-shard-1-postgres-region-b
+      PRIMARY_HOST: booking-shard-1-postgres-region-b-replication
       REPLICATION_SLOT: shard_1_region_a_reseed
       PGBACKREST_STANZA: railway-shard-1
       DR_REPLICATION_TLS_CERT_FILE: /run/secrets/dr_shard_1_region_a_reseed_tls_cert
@@ -340,7 +381,11 @@ services:
       - ./deploy/postgres/dr/standby-health.sh:/etc/railway/standby-health.sh:ro
       - ./deploy/postgres/dr/pgbackrest-secret.sh:/etc/railway/pgbackrest-secret.sh:ro
       - ./deploy/postgres/dr/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
-    networks: [region-a-data, dr-replication, dr-control]
+    networks:
+      region-a-data: {}
+      dr-replication:
+        aliases: [booking-shard-1-postgres-region-a-reseed-replication]
+      dr-control: {}
     depends_on:
       booking-shard-1-postgres-region-b: {condition: service_healthy}
 

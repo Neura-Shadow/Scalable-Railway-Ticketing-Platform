@@ -46,15 +46,15 @@ $shard1ReplicationSecretPath = Join-Path $secretDirectory 'shard-1-replication-p
 $replicationCAKeyPath = Join-Path $secretDirectory 'replication-ca.key'
 $replicationCACertPath = Join-Path $secretDirectory 'replication-ca.crt'
 $tlsEndpointSpecs = @(
-    [pscustomobject]@{ Prefix='CONTROL_REGION_A'; File='control-region-a'; DNS='control-postgres' },
-    [pscustomobject]@{ Prefix='CONTROL_REGION_B'; File='control-region-b'; DNS='control-postgres-region-b' },
-    [pscustomobject]@{ Prefix='CONTROL_REGION_A_RESEED'; File='control-region-a-reseed'; DNS='control-postgres-region-a-reseed' },
-    [pscustomobject]@{ Prefix='SHARD_0_REGION_A'; File='shard-0-region-a'; DNS='booking-shard-0-postgres' },
-    [pscustomobject]@{ Prefix='SHARD_0_REGION_B'; File='shard-0-region-b'; DNS='booking-shard-0-postgres-region-b' },
-    [pscustomobject]@{ Prefix='SHARD_0_REGION_A_RESEED'; File='shard-0-region-a-reseed'; DNS='booking-shard-0-postgres-region-a-reseed' },
-    [pscustomobject]@{ Prefix='SHARD_1_REGION_A'; File='shard-1-region-a'; DNS='booking-shard-1-postgres' },
-    [pscustomobject]@{ Prefix='SHARD_1_REGION_B'; File='shard-1-region-b'; DNS='booking-shard-1-postgres-region-b' },
-    [pscustomobject]@{ Prefix='SHARD_1_REGION_A_RESEED'; File='shard-1-region-a-reseed'; DNS='booking-shard-1-postgres-region-a-reseed' }
+    [pscustomobject]@{ Prefix='CONTROL_REGION_A'; File='control-region-a'; DNS='control-postgres'; ReplicationDNS='control-postgres-replication' },
+    [pscustomobject]@{ Prefix='CONTROL_REGION_B'; File='control-region-b'; DNS='control-postgres-region-b'; ReplicationDNS='control-postgres-region-b-replication' },
+    [pscustomobject]@{ Prefix='CONTROL_REGION_A_RESEED'; File='control-region-a-reseed'; DNS='control-postgres-region-a-reseed'; ReplicationDNS='control-postgres-region-a-reseed-replication' },
+    [pscustomobject]@{ Prefix='SHARD_0_REGION_A'; File='shard-0-region-a'; DNS='booking-shard-0-postgres'; ReplicationDNS='booking-shard-0-postgres-replication' },
+    [pscustomobject]@{ Prefix='SHARD_0_REGION_B'; File='shard-0-region-b'; DNS='booking-shard-0-postgres-region-b'; ReplicationDNS='booking-shard-0-postgres-region-b-replication' },
+    [pscustomobject]@{ Prefix='SHARD_0_REGION_A_RESEED'; File='shard-0-region-a-reseed'; DNS='booking-shard-0-postgres-region-a-reseed'; ReplicationDNS='booking-shard-0-postgres-region-a-reseed-replication' },
+    [pscustomobject]@{ Prefix='SHARD_1_REGION_A'; File='shard-1-region-a'; DNS='booking-shard-1-postgres'; ReplicationDNS='booking-shard-1-postgres-replication' },
+    [pscustomobject]@{ Prefix='SHARD_1_REGION_B'; File='shard-1-region-b'; DNS='booking-shard-1-postgres-region-b'; ReplicationDNS='booking-shard-1-postgres-region-b-replication' },
+    [pscustomobject]@{ Prefix='SHARD_1_REGION_A_RESEED'; File='shard-1-region-a-reseed'; DNS='booking-shard-1-postgres-region-a-reseed'; ReplicationDNS='booking-shard-1-postgres-region-a-reseed-replication' }
 )
 $controlCipherSecretPath = Join-Path $secretDirectory 'pgbackrest-control-cipher-pass'
 $shard0CipherSecretPath = Join-Path $secretDirectory 'pgbackrest-shard-0-cipher-pass'
@@ -83,7 +83,7 @@ foreach ($endpoint in $tlsEndpointSpecs) {
     $csrPath = Join-Path $secretDirectory "$($endpoint.File).csr"
     $certPath = Join-Path $secretDirectory "$($endpoint.File).crt"
     $extPath = Join-Path $secretDirectory "$($endpoint.File).ext"
-    [System.IO.File]::WriteAllText($extPath, "basicConstraints=critical,CA:FALSE`nkeyUsage=critical,digitalSignature,keyEncipherment`nextendedKeyUsage=serverAuth`nsubjectAltName=DNS:$($endpoint.DNS)`n")
+    [System.IO.File]::WriteAllText($extPath, "basicConstraints=critical,CA:FALSE`nkeyUsage=critical,digitalSignature,keyEncipherment`nextendedKeyUsage=serverAuth`nsubjectAltName=DNS:$($endpoint.DNS),DNS:$($endpoint.ReplicationDNS)`n")
     & $openssl.Source genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out $keyPath 2>$null
     if ($LASTEXITCODE -ne 0) { throw "failed to generate the ephemeral replication TLS key for $($endpoint.DNS)" }
     & $openssl.Source req -new -sha256 -key $keyPath -subj "/CN=$($endpoint.DNS)" -out $csrPath 2>$null
@@ -2692,9 +2692,9 @@ WHERE ledger.event_id IN ('partial_refund:$providerRefundOperationID','partial_r
 
         Invoke-M7Compose -Arguments (@('rm','-sf') + @($databases.Standby)) | Out-Null
         foreach ($database in $databases) { Remove-M7ProjectVolume -Suffix $database.StandbyVolume }
-        $env:CONTROL_PRIMARY_HOST = 'control-postgres-region-a-reseed'
-        $env:SHARD_0_PRIMARY_HOST = 'booking-shard-0-postgres-region-a-reseed'
-        $env:SHARD_1_PRIMARY_HOST = 'booking-shard-1-postgres-region-a-reseed'
+        $env:CONTROL_PRIMARY_HOST = 'control-postgres-region-a-reseed-replication'
+        $env:SHARD_0_PRIMARY_HOST = 'booking-shard-0-postgres-region-a-reseed-replication'
+        $env:SHARD_1_PRIMARY_HOST = 'booking-shard-1-postgres-region-a-reseed-replication'
         $finalStandbyUp = @('up','-d','--no-deps')
         if ($SkipBuild) { $finalStandbyUp += '--no-build' }
         $finalStandbyUp += @($databases.Standby)
