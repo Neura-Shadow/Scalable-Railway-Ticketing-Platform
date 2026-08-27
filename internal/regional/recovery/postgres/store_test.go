@@ -34,7 +34,8 @@ func TestCheckpointStoreCreatesLoadsAndCASUpdatesTypedFailover(t *testing.T) {
 	}, now); err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
-	if !containsSQL(db.execSQL[0], "regional_failover_operations") || !containsSQL(db.execSQL[0], "checkpoint") {
+	if !containsSQL(db.execSQL[0], "regional_failover_operations") || !containsSQL(db.execSQL[0], "checkpoint") ||
+		!containsSQL(db.execSQL[0], "jsonb_build_object($10::text,$13::timestamptz)") {
 		t.Fatalf("create SQL = %s", db.execSQL[0])
 	}
 	payload, ok := db.execArgs[0][10].([]byte)
@@ -60,7 +61,8 @@ func TestCheckpointStoreCreatesLoadsAndCASUpdatesTypedFailover(t *testing.T) {
 		t.Fatalf("Save() error = %v", err)
 	}
 	if nextVersion != 2 || !containsSQL(db.execSQL[1], "checkpoint_version=$2") ||
-		!containsSQL(db.execSQL[1], "phase_timestamps") {
+		!containsSQL(db.execSQL[1], "phase_timestamps") ||
+		!containsSQL(db.execSQL[1], "jsonb_build_object($3::text,$6::timestamptz)") {
 		t.Fatalf("save version/SQL = %d/%s", nextVersion, db.execSQL[1])
 	}
 }
@@ -96,6 +98,9 @@ func TestCheckpointStorePlansOnceAndReturnsAnIdempotentExistingPlan(t *testing.T
 	planned, created, err := store.Plan(context.Background(), operation, metadata, now)
 	if err != nil || !created || planned.Version != 1 || planned.Operation.Stage() != recovery.StagePlanned {
 		t.Fatalf("Plan(first) = %+v/%v/%v", planned, created, err)
+	}
+	if !containsSQL(db.execSQL[0], "jsonb_build_object($10::text,$13::timestamptz)") {
+		t.Fatalf("plan SQL leaves polymorphic JSON parameters untyped: %s", db.execSQL[0])
 	}
 	payload := db.execArgs[0][10].([]byte)
 	db.row = scanRow{values: []any{payload, int64(1), string(recoverypostgres.OperationFailover), "region_failure", (*int64)(nil)}}

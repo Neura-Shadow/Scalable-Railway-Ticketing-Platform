@@ -326,7 +326,7 @@ INSERT INTO public.regional_failover_operations(
  declared_at,updated_at
 ) VALUES(
  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
- jsonb_build_object($10,$13),$12,$13
+ jsonb_build_object($10::text,$13::timestamptz),$12,$13
 )`
 
 const planCheckpointSQL = `
@@ -336,7 +336,7 @@ INSERT INTO public.regional_failover_operations(
  declared_at,updated_at
 ) VALUES(
  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
- jsonb_build_object($10,$13),$12,$13
+ jsonb_build_object($10::text,$13::timestamptz),$12,$13
 )
 ON CONFLICT DO NOTHING`
 
@@ -356,7 +356,7 @@ SET stage=$3,
     target_epoch=$4,
     checkpoint=$5,
     checkpoint_version=checkpoint_version+1,
-    phase_timestamps=phase_timestamps || jsonb_build_object($3,$6),
+    phase_timestamps=phase_timestamps || jsonb_build_object($3::text,$6::timestamptz),
     updated_at=$6,
     completed_at=CASE WHEN $7 THEN $6 ELSE completed_at END
 WHERE operation_id=$1
