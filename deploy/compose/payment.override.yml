@@ -417,6 +417,12 @@ services:
       PAYMENT_RECONCILER_TIMEOUT: 30s
     depends_on:
       <<: *payment-dependencies
+      payment-operator-control-role:
+        condition: service_completed_successfully
+      payment-operator-shard-0-role:
+        condition: service_completed_successfully
+      payment-operator-shard-1-role:
+        condition: service_completed_successfully
       payment-reconciler-control-role:
         condition: service_completed_successfully
       payment-reconciler-shard-0-role:

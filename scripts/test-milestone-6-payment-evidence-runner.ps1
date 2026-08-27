@@ -40,6 +40,15 @@ foreach ($operatorBinding in @(
         throw "payment Compose omits the private operator binding: $operatorBinding"
     }
 }
+foreach ($operatorRole in @(
+    'payment-operator-control-role:',
+    'payment-operator-shard-0-role:',
+    'payment-operator-shard-1-role:'
+)) {
+    if ([regex]::Matches($paymentCompose, [regex]::Escape($operatorRole)).Count -lt 3) {
+        throw "payment operator role is not provisioned before reconciler and admin startup: $operatorRole"
+    }
+}
 $requiredScripts = @(
     'payment-intent-create.js',
     'payment-idempotency.js',
