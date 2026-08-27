@@ -1393,7 +1393,30 @@ WHERE type='hostssl'
                 if ($loadedRules -eq 1) { break }
                 Start-Sleep -Milliseconds 250
             }
-            if ($loadedRules -ne 1) { throw "managed replication HBA rule was not loaded for $($database.Name)" }
+            if ($loadedRules -ne 1) {
+                $hbaDiagnostics = Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL @"
+SELECT json_build_object(
+  'hba_file', current_setting('hba_file'),
+  'managed_rules', COALESCE((
+    SELECT json_agg(json_build_object(
+      'file_name', file_name,
+      'line_number', line_number,
+      'type', type,
+      'database', database,
+      'user_name', user_name,
+      'address', address,
+      'netmask', netmask,
+      'auth_method', auth_method,
+      'error', error
+    ) ORDER BY rule_number NULLS LAST, line_number)
+    FROM pg_hba_file_rules
+    WHERE file_name LIKE '%pg_hba.replication.conf' OR error IS NOT NULL
+  ), '[]'::json)
+)::text
+"@
+                Write-Warning "managed replication HBA diagnostics for $($database.Name): $hbaDiagnostics"
+                throw "managed replication HBA rule count was $loadedRules for $($database.Name), expected 1"
+            }
             $replicationHBAEvidence.Add([ordered]@{
                 database=$database.Name; replication_identity=$database.ReplicationUser;
                 managed_rule_count=$loadedRules; tls_required=$true; auth_method='scram-sha-256'

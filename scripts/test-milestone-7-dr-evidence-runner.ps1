@@ -41,6 +41,8 @@ foreach ($replicationBootstrapGuard in @(
     '/etc/railway/configure-replication.sh',
     'pg_hba_file_rules',
     'for ($attempt = 0; $attempt -lt 20; $attempt++)',
+    'managed replication HBA diagnostics',
+    "WHERE file_name LIKE '%pg_hba.replication.conf' OR error IS NOT NULL",
     "database @> ARRAY['replication']::text[]",
     "auth_method='scram-sha-256'",
     'replication-hba-rules.json',
