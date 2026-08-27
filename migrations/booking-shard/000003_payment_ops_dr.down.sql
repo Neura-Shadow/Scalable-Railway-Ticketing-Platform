@@ -211,6 +211,7 @@ DROP TABLE migration_evidence_mutation_authorizations;
 
 DROP TRIGGER regional_write_authority_guard_transition
     ON regional_write_authority;
+DROP FUNCTION public.lock_regional_write_authority();
 DROP FUNCTION booking_shard_guard_regional_write_authority();
 DROP TABLE regional_write_authority;
 

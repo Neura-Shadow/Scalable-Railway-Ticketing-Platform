@@ -182,6 +182,29 @@ INSERT INTO regional_write_authority(
     singleton, region, epoch, state, writes_enabled
 ) VALUES (true, 'region-a', 1, 'active', true);
 
+-- Row-locking SELECT requires table UPDATE privilege in PostgreSQL. Keep the
+-- authority table non-writable to application roles while still taking a
+-- transaction-scoped shared lock through this narrowly scoped owner function.
+CREATE FUNCTION public.lock_regional_write_authority()
+RETURNS TABLE (
+    region text,
+    epoch bigint,
+    state text,
+    writes_enabled boolean
+)
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $lock_regional_write_authority$
+    SELECT authority.region, authority.epoch, authority.state,
+           authority.writes_enabled
+      FROM public.regional_write_authority AS authority
+     WHERE authority.singleton
+     FOR SHARE
+$lock_regional_write_authority$;
+
+REVOKE ALL ON FUNCTION public.lock_regional_write_authority() FROM PUBLIC;
+
 CREATE FUNCTION booking_shard_guard_regional_write_authority()
 RETURNS trigger
 LANGUAGE plpgsql
