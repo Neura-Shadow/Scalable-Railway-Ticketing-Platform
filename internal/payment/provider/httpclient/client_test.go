@@ -14,8 +14,103 @@ import (
 	"time"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider/conformance"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider/httpclient"
 )
+
+func TestHTTPProviderConformance(t *testing.T) {
+	conformance.RunHTTP(t, conformance.HTTPHarness{
+		NewClient: func(t *testing.T, origin string, maxResponseBytes int64) provider.Client {
+			t.Helper()
+			return mustClient(t, origin, maxResponseBytes)
+		},
+		ValidCreateCheckout: provider.CreateCheckoutRequest{
+			PaymentIntentID: "intent-conformance", MerchantReference: "booking-conformance",
+			AmountMinor: 12500, Currency: "TWD", IdempotencyKey: "checkout-conformance",
+		},
+		WriteCreateCheckoutSuccess: func(w http.ResponseWriter) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(provider.Checkout{
+				ProviderPaymentID: "pay_1", HostedReference: "sandbox-checkout:pay_1",
+				SyntheticToken: "tok_1", Status: provider.StatusCreated, AmountMinor: 12500, Currency: "TWD",
+			})
+		},
+		Expected5xx:        conformance.ExpectedHTTPError{Category: provider.ErrorTimeoutUnknown},
+		ExpectedUnreadable: conformance.ExpectedHTTPError{Category: provider.ErrorInconsistentResponse},
+		MutatingOperations: []conformance.HTTPMutation{
+			{
+				Name: "authorize",
+				Invoke: func(ctx context.Context, client provider.Client) error {
+					_, err := client.Authorize(ctx, provider.AuthorizeRequest{
+						PaymentIntentID: "intent-conformance", ProviderPaymentID: "pay_1",
+						SyntheticToken: "tok_1", AmountMinor: 12500, Currency: "TWD",
+						IdempotencyKey: "authorize-conformance",
+					})
+					return err
+				},
+				WriteSuccess: func(w http.ResponseWriter) {
+					writeConformanceOperation(w, "authorize_1", provider.StatusAuthorized, 12500)
+				},
+			},
+			{
+				Name: "capture",
+				Invoke: func(ctx context.Context, client provider.Client) error {
+					_, err := client.Capture(ctx, provider.CaptureRequest{
+						PaymentIntentID: "intent-conformance", ProviderPaymentID: "pay_1",
+						AmountMinor: 12500, Currency: "TWD", IdempotencyKey: "capture-conformance",
+					})
+					return err
+				},
+				WriteSuccess: func(w http.ResponseWriter) { writeConformanceOperation(w, "capture_1", provider.StatusCaptured, 12500) },
+			},
+			{
+				Name: "void",
+				Invoke: func(ctx context.Context, client provider.Client) error {
+					_, err := client.Void(ctx, provider.VoidRequest{
+						PaymentIntentID: "intent-conformance", ProviderPaymentID: "pay_1",
+						IdempotencyKey: "void-conformance",
+					})
+					return err
+				},
+				WriteSuccess: func(w http.ResponseWriter) { writeConformanceOperation(w, "void_1", provider.StatusVoided, 12500) },
+			},
+			{
+				Name: "full refund",
+				Invoke: func(ctx context.Context, client provider.Client) error {
+					_, err := client.Refund(ctx, provider.RefundRequest{
+						PaymentIntentID: "intent-conformance", ProviderPaymentID: "pay_1",
+						AmountMinor: 12500, Currency: "TWD", IdempotencyKey: "refund-conformance-full",
+					})
+					return err
+				},
+				WriteSuccess: func(w http.ResponseWriter) {
+					writeConformanceOperation(w, "refund_full_1", provider.StatusRefunded, 12500)
+				},
+			},
+			{
+				Name: "partial refund",
+				Invoke: func(ctx context.Context, client provider.Client) error {
+					_, err := client.Refund(ctx, provider.RefundRequest{
+						PaymentIntentID: "intent-conformance", ProviderPaymentID: "pay_1",
+						AmountMinor: 2500, Currency: "TWD", IdempotencyKey: "refund-conformance-partial",
+					})
+					return err
+				},
+				WriteSuccess: func(w http.ResponseWriter) {
+					writeConformanceOperation(w, "refund_partial_1", provider.StatusRefunded, 2500)
+				},
+			},
+		},
+	})
+}
+
+func writeConformanceOperation(w http.ResponseWriter, operationID string, status provider.Status, amount int64) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(provider.OperationResult{
+		ProviderPaymentID: "pay_1", ProviderOperationID: operationID,
+		Status: status, AmountMinor: amount, Currency: "TWD",
+	})
+}
 
 func TestClientUsesFixedEndpointBoundedResponsesAndNoRedirects(t *testing.T) {
 	t.Parallel()
@@ -160,6 +255,32 @@ func TestClientClassifiesMutationResponseLossAsUncertain(t *testing.T) {
 	assertProviderError(t, err, provider.ErrorTimeoutUnknown, false, true)
 }
 
+func TestClientClassifiesMutatingServerFailuresAsOutcomeUnknown(t *testing.T) {
+	t.Parallel()
+	for _, status := range []int{
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout,
+	} {
+		status := status
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+
+			client := mustClient(t, server.URL, 1024)
+			_, err := client.Capture(context.Background(), provider.CaptureRequest{
+				PaymentIntentID: "intent_1", ProviderPaymentID: "pay_1", AmountMinor: 100,
+				Currency: "TWD", IdempotencyKey: "capture-intent-1",
+			})
+			assertProviderError(t, err, provider.ErrorTimeoutUnknown, false, true)
+		})
+	}
+}
+
 func TestClientVoidValidatesProviderReturnedOriginalMoney(t *testing.T) {
 	t.Parallel()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -180,6 +301,62 @@ func TestClientVoidValidatesProviderReturnedOriginalMoney(t *testing.T) {
 	if err != nil || result.AmountMinor != 100 || result.Currency != "TWD" {
 		t.Fatalf("Void() = %#v, %v", result, err)
 	}
+}
+
+func TestClientLooksUpExactRefundWithoutReplayingMutation(t *testing.T) {
+	t.Parallel()
+	request := provider.RefundLookupRequest{
+		PaymentIntentID: "intent_1", ProviderPaymentID: "pay_1", AmountMinor: 50,
+		Currency: "TWD", IdempotencyKey: "fixture", Limit: 100,
+		Metadata: provider.Metadata{
+			"refund_request_id": "request-1", "refund_operation_id": "operation-1",
+			"refund_idempotency_key": "fixture",
+		},
+	}
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/refund-lookups" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		var got provider.RefundLookupRequest
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil || got.IdempotencyKey != request.IdempotencyKey || got.Limit != 100 {
+			t.Fatalf("lookup request = %#v, %v", got, err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(provider.RefundLookupResult{
+			Found: true, Definitive: true,
+			Refund: provider.OperationResult{ProviderPaymentID: "pay_1", ProviderOperationID: "refund_1", Status: provider.StatusRefunded, AmountMinor: 50, Currency: "TWD"},
+		})
+	}))
+	defer server.Close()
+
+	client := mustClient(t, server.URL, 2048)
+	reader, ok := any(client).(provider.RefundLookupReader)
+	if !ok {
+		t.Fatal("HTTP sandbox client does not expose exact refund lookup")
+	}
+	result, err := reader.LookupRefund(context.Background(), request)
+	if err != nil || !result.Found || !result.Definitive || result.Refund.ProviderOperationID != "refund_1" || calls != 1 {
+		t.Fatalf("LookupRefund() = %#v, %v; calls=%d", result, err, calls)
+	}
+}
+
+func TestClientRejectsContradictoryAuthorizedFinancialObservation(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(provider.Payment{
+			ProviderPaymentID: "pay_1", Status: provider.StatusAuthorized,
+			AmountMinor: 100, Currency: "TWD", CapturedMinor: 100,
+			ProviderUpdatedAt: time.Now().UTC(),
+		})
+	}))
+	defer server.Close()
+
+	client := mustClient(t, server.URL, 1024)
+	_, err := client.GetPaymentStatus(context.Background(), "pay_1")
+	assertProviderError(t, err, provider.ErrorInconsistentResponse, false, false)
 }
 
 func TestClientRejectsMalformedAndOversizedProviderResponses(t *testing.T) {

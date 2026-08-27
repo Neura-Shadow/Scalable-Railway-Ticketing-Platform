@@ -15,9 +15,11 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider"
@@ -48,6 +50,17 @@ type Client struct {
 	webhookKeys      map[string][]byte
 	webhookClockSkew time.Duration
 	now              func() time.Time
+}
+
+func (client *Client) Descriptor() provider.Descriptor {
+	return Descriptor()
+}
+
+func Descriptor() provider.Descriptor {
+	capabilities := provider.SagaCapabilities()
+	capabilities.PartialRefund = true
+	capabilities.WebhookKeyRotation = true
+	return provider.Descriptor{Name: "sandbox", APIVersion: "v1", Capabilities: capabilities}
 }
 
 // Ready probes only the fixed provider readiness endpoint and validates a
@@ -150,9 +163,14 @@ func (client *Client) GetPaymentStatus(ctx context.Context, paymentID string) (p
 	}
 	err := client.doJSON(ctx, http.MethodGet, "/v1/payments/"+url.PathEscape(paymentID), nil, &result, "query_status", false)
 	if err == nil && (!validPersistedIdentifier(result.ProviderPaymentID) || result.ProviderPaymentID != paymentID ||
-		!validStatus(result.Status) || result.AmountMinor <= 0 || !validCurrency(result.Currency) ||
-		result.CapturedMinor < 0 || result.RefundedMinor < 0 || result.RefundedMinor > result.CapturedMinor ||
-		result.CapturedMinor > result.AmountMinor || result.ProviderUpdatedAt.IsZero()) {
+		!validStatus(result.Status) || result.ProviderUpdatedAt.IsZero() ||
+		provider.EvaluateFinancialObservation(
+			provider.FinancialExpectation{AmountMinor: result.AmountMinor, Currency: result.Currency},
+			provider.FinancialObservation{
+				Status: result.Status, AmountMinor: result.AmountMinor, Currency: result.Currency,
+				CapturedMinor: result.CapturedMinor, RefundedMinor: result.RefundedMinor,
+			},
+		) != nil) {
 		err = inconsistent("query_status", false)
 	}
 	return result, err
@@ -186,6 +204,34 @@ func (client *Client) Refund(ctx context.Context, request provider.RefundRequest
 	return client.operation(ctx, "refund", request.ProviderPaymentID, request, request.AmountMinor, request.Currency, true)
 }
 
+// LookupRefund performs a bounded read-only lookup through the sandbox HTTP
+// contract. It never calls the refund mutation endpoint.
+func (client *Client) LookupRefund(ctx context.Context, request provider.RefundLookupRequest) (provider.RefundLookupResult, error) {
+	var result provider.RefundLookupResult
+	if !validCommon(request.PaymentIntentID, request.ProviderPaymentID, request.AmountMinor, request.Currency, request.IdempotencyKey, request.Metadata) ||
+		request.Limit < 1 || request.Limit > 100 {
+		return result, validation("lookup_refund")
+	}
+	if err := client.doJSON(ctx, http.MethodPost, "/v1/refund-lookups", request, &result, "lookup_refund", false); err != nil {
+		return provider.RefundLookupResult{}, err
+	}
+	if !validRefundLookupResult(request, result) {
+		return provider.RefundLookupResult{}, inconsistent("lookup_refund", false)
+	}
+	return result, nil
+}
+
+func validRefundLookupResult(request provider.RefundLookupRequest, result provider.RefundLookupResult) bool {
+	if !result.Found {
+		return result.Refund == (provider.OperationResult{})
+	}
+	return validPersistedIdentifier(result.Refund.ProviderPaymentID) &&
+		result.Refund.ProviderPaymentID == request.ProviderPaymentID &&
+		validPersistedIdentifier(result.Refund.ProviderOperationID) &&
+		result.Refund.Status == provider.StatusRefunded && result.Refund.AmountMinor == request.AmountMinor &&
+		result.Refund.Currency == request.Currency
+}
+
 func (client *Client) operation(ctx context.Context, operation, paymentID string, request any, amount int64, currency string, exactMoney bool) (provider.OperationResult, error) {
 	var result provider.OperationResult
 	err := client.doJSON(ctx, http.MethodPost, "/v1/payments/"+url.PathEscape(paymentID)+"/"+operation, request, &result, operation, true)
@@ -212,6 +258,10 @@ func (client *Client) doJSON(ctx context.Context, method, path string, input, ou
 	}
 	requestContext, cancel := context.WithTimeout(ctx, client.requestTimeout)
 	defer cancel()
+	var dispatched atomic.Bool
+	requestContext = httptrace.WithClientTrace(requestContext, &httptrace.ClientTrace{
+		WroteHeaders: func() { dispatched.Store(true) },
+	})
 	request, err := http.NewRequestWithContext(requestContext, method, client.baseURL+path, body)
 	if err != nil {
 		return validation(operation)
@@ -220,12 +270,17 @@ func (client *Client) doJSON(ctx context.Context, method, path string, input, ou
 	if input != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
+	if mutating {
+		if key := mutationIdempotencyKey(input); key != "" {
+			request.Header.Set("Idempotency-Key", key)
+		}
+	}
 	if client.apiKey != "" {
 		request.Header.Set("Authorization", "Bearer "+client.apiKey)
 	}
 	response, err := client.http.Do(request)
 	if err != nil {
-		return transportFailure(operation, mutating)
+		return transportFailure(operation, mutating && dispatched.Load())
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -249,6 +304,23 @@ func (client *Client) doJSON(ctx context.Context, method, path string, input, ou
 		return inconsistent(operation, mutating)
 	}
 	return nil
+}
+
+func mutationIdempotencyKey(input any) string {
+	switch request := input.(type) {
+	case provider.CreateCheckoutRequest:
+		return request.IdempotencyKey
+	case provider.AuthorizeRequest:
+		return request.IdempotencyKey
+	case provider.CaptureRequest:
+		return request.IdempotencyKey
+	case provider.VoidRequest:
+		return request.IdempotencyKey
+	case provider.RefundRequest:
+		return request.IdempotencyKey
+	default:
+		return ""
+	}
 }
 
 func (client *Client) VerifyWebhook(ctx context.Context, headers provider.WebhookHeaders, body []byte) (provider.WebhookEvent, error) {
@@ -384,6 +456,9 @@ func validWebhookEvent(event provider.WebhookEvent) bool {
 }
 
 func statusError(operation string, status int, mutating bool) *provider.Error {
+	if mutating && status >= http.StatusInternalServerError {
+		return &provider.Error{Category: provider.ErrorTimeoutUnknown, Operation: operation, Uncertain: true, Message: "payment provider outcome is unknown"}
+	}
 	switch status {
 	case http.StatusBadRequest:
 		return &provider.Error{Category: provider.ErrorPermanentValidation, Operation: operation, Message: "payment provider rejected request"}
@@ -425,3 +500,4 @@ func inconsistent(operation string, uncertain bool) *provider.Error {
 }
 
 var _ provider.Client = (*Client)(nil)
+var _ provider.RefundLookupReader = (*Client)(nil)

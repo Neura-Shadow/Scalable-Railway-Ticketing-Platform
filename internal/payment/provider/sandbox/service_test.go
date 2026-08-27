@@ -12,8 +12,96 @@ import (
 	"time"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider/conformance"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider/sandbox"
 )
+
+func TestProviderOperationConformance(t *testing.T) {
+	conformance.RunOperations(t, conformance.OperationHarness{
+		NewClient: func(t *testing.T) provider.Client {
+			t.Helper()
+			return newService(t, nil)
+		},
+		ValidCreateCheckout: provider.CreateCheckoutRequest{
+			PaymentIntentID: "intent-conformance", MerchantReference: "booking-conformance",
+			AmountMinor: 12500, Currency: "TWD", IdempotencyKey: "checkout:intent-conformance:v1",
+		},
+		AuthorizeRequest: func(checkout provider.Checkout) provider.AuthorizeRequest {
+			return provider.AuthorizeRequest{
+				PaymentIntentID: "intent-conformance", ProviderPaymentID: checkout.ProviderPaymentID,
+				SyntheticToken: checkout.SyntheticToken, AmountMinor: 12500, Currency: "TWD",
+				IdempotencyKey: "authorize:intent-conformance:v1",
+			}
+		},
+		CaptureRequest: func(checkout provider.Checkout) provider.CaptureRequest {
+			return provider.CaptureRequest{
+				PaymentIntentID: "intent-conformance", ProviderPaymentID: checkout.ProviderPaymentID,
+				AmountMinor: 12500, Currency: "TWD", IdempotencyKey: "capture:intent-conformance:v1",
+			}
+		},
+		VoidRequest: func(checkout provider.Checkout) provider.VoidRequest {
+			return provider.VoidRequest{
+				PaymentIntentID: "intent-conformance", ProviderPaymentID: checkout.ProviderPaymentID,
+				IdempotencyKey: "void:intent-conformance:v1",
+			}
+		},
+		FullRefundRequest: func(checkout provider.Checkout) provider.RefundRequest {
+			return provider.RefundRequest{
+				PaymentIntentID: "intent-conformance", ProviderPaymentID: checkout.ProviderPaymentID,
+				AmountMinor: 12500, Currency: "TWD", IdempotencyKey: "refund:intent-conformance:full:v1",
+			}
+		},
+		PartialRefundRequest: func(checkout provider.Checkout) provider.RefundRequest {
+			return provider.RefundRequest{
+				PaymentIntentID: "intent-conformance", ProviderPaymentID: checkout.ProviderPaymentID,
+				AmountMinor: 2500, Currency: "TWD", IdempotencyKey: "refund:intent-conformance:partial:v1",
+				Metadata: provider.Metadata{"refund_request_id": "request-conformance-partial", "refund_operation_id": "operation-conformance-partial", "refund_idempotency_key": "refund:intent-conformance:partial:v1"},
+			}
+		},
+		StatusAfterCheckout: []provider.Status{provider.StatusCreated},
+	})
+}
+
+func TestProviderEvidenceConformance(t *testing.T) {
+	conformance.RunEvidence(t, conformance.EvidenceHarness{
+		NewClient: func(t *testing.T) provider.Described {
+			t.Helper()
+			return newService(t, nil)
+		},
+	})
+}
+
+func TestProviderWebhookConformance(t *testing.T) {
+	now := time.Date(2026, time.August, 5, 12, 0, 0, 0, time.UTC)
+	event := provider.WebhookEvent{
+		ProviderEventID: "evt-conformance", Type: provider.EventCaptured,
+		ProviderPaymentID: "pay-conformance", Status: provider.StatusCaptured,
+		AmountMinor: 12500, Currency: "TWD", OccurredAt: now,
+	}
+	oldKey := testWebhookKey("conformance-old")
+	newKey := testWebhookKey("conformance-new")
+	makeCase := func(t *testing.T, verifier *sandbox.Service) conformance.WebhookCase {
+		t.Helper()
+		signer := newServiceAt(t, now, "old", map[string][]byte{"old": oldKey})
+		headers, body, err := signer.SignWebhook(event)
+		if err != nil {
+			t.Fatalf("SignWebhook: %v", err)
+		}
+		return conformance.WebhookCase{Verifier: verifier, Headers: headers, Body: body, Expected: event}
+	}
+	conformance.RunWebhook(t, conformance.WebhookHarness{
+		Descriptor: newService(t, nil).Descriptor(),
+		Current: func(t *testing.T) conformance.WebhookCase {
+			return makeCase(t, newServiceAt(t, now, "old", map[string][]byte{"old": oldKey}))
+		},
+		Rotated: func(t *testing.T) conformance.WebhookCase {
+			return makeCase(t, newServiceAt(t, now, "new", map[string][]byte{"old": oldKey, "new": newKey}))
+		},
+		Retired: func(t *testing.T) conformance.WebhookCase {
+			return makeCase(t, newServiceAt(t, now, "new", map[string][]byte{"new": newKey}))
+		},
+	})
+}
 
 func TestCreateCheckoutReplaysSameResultAndRejectsFingerprintConflict(t *testing.T) {
 	t.Parallel()
@@ -85,13 +173,22 @@ func TestAuthorizeCaptureAndFullRefundAreIdempotent(t *testing.T) {
 	}
 
 	partialRefund := provider.RefundRequest{PaymentIntentID: "intent-123", ProviderPaymentID: checkout.ProviderPaymentID, AmountMinor: 100, Currency: "TWD", IdempotencyKey: "refund:intent-123:partial"}
-	_, err = service.Refund(context.Background(), partialRefund)
-	var providerErr *provider.Error
-	if !errors.As(err, &providerErr) || providerErr.Category != provider.ErrorConflict {
-		t.Fatalf("partial refund error = %v, want conflict", err)
+	partialResult, err := service.Refund(context.Background(), partialRefund)
+	if err != nil || partialResult.Status != provider.StatusRefunded || partialResult.AmountMinor != 100 {
+		t.Fatalf("partial refund = %#v, %v", partialResult, err)
+	}
+	partialStatus, err := service.GetPaymentStatus(context.Background(), checkout.ProviderPaymentID)
+	if err != nil || partialStatus.Status != provider.StatusUnknown || partialStatus.CapturedMinor != 12500 || partialStatus.RefundedMinor != 100 {
+		t.Fatalf("partial refund status = %#v, %v", partialStatus, err)
+	}
+	if err := provider.EvaluateFinancialObservation(
+		provider.FinancialExpectation{AmountMinor: 12500, Currency: "TWD"},
+		provider.FinancialObservation{Status: partialStatus.Status, AmountMinor: partialStatus.AmountMinor, Currency: partialStatus.Currency, CapturedMinor: partialStatus.CapturedMinor, RefundedMinor: partialStatus.RefundedMinor},
+	); err != nil {
+		t.Fatalf("partial refund observation: %v", err)
 	}
 
-	refundRequest := provider.RefundRequest{PaymentIntentID: "intent-123", ProviderPaymentID: checkout.ProviderPaymentID, AmountMinor: 12500, Currency: "TWD", IdempotencyKey: "refund:intent-123:v1"}
+	refundRequest := provider.RefundRequest{PaymentIntentID: "intent-123", ProviderPaymentID: checkout.ProviderPaymentID, AmountMinor: 12400, Currency: "TWD", IdempotencyKey: "refund:intent-123:v1"}
 	firstRefund, err := service.Refund(context.Background(), refundRequest)
 	if err != nil {
 		t.Fatalf("refund: %v", err)
@@ -222,6 +319,72 @@ func TestProviderStateSurvivesServiceRestartAfterRefundResponseLoss(t *testing.T
 	replayed, err := restarted.Refund(context.Background(), request)
 	if err != nil || replayed.Status != provider.StatusRefunded || replayed.ProviderOperationID == "" {
 		t.Fatalf("refund replay after restart = %#v, %v", replayed, err)
+	}
+}
+
+func TestPartialRefundLookupIsExactReadOnlyAndSurvivesRestart(t *testing.T) {
+	t.Parallel()
+
+	statePath := filepath.Join(t.TempDir(), "provider-state.jsonl")
+	store, err := sandbox.NewFileStateStore(statePath, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	faults := sandbox.NewScript()
+	service := newServiceWithStore(t, faults, store)
+	checkout := createCheckout(t, service)
+	authorize(t, service, checkout)
+	if _, err := service.Capture(context.Background(), provider.CaptureRequest{
+		PaymentIntentID: "intent-123", ProviderPaymentID: checkout.ProviderPaymentID,
+		AmountMinor: 12500, Currency: "TWD", IdempotencyKey: "capture:intent-123:v1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metadata := provider.Metadata{
+		"refund_request_id": "request-a", "refund_operation_id": "operation-a",
+		"refund_idempotency_key": "refund:operation-a",
+	}
+	faults.Push(sandbox.OperationRefund, sandbox.Fault{Kind: sandbox.FaultResponseLoss})
+	request := provider.RefundRequest{
+		PaymentIntentID: "intent-123", ProviderPaymentID: checkout.ProviderPaymentID,
+		AmountMinor: 200, Currency: "TWD", IdempotencyKey: "refund:operation-a", Metadata: metadata,
+	}
+	if _, err := service.Refund(context.Background(), request); err == nil {
+		t.Fatal("response-loss refund unexpectedly returned success")
+	}
+
+	reopened, err := sandbox.NewFileStateStore(statePath, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := newServiceWithStore(t, nil, reopened)
+	lookupRequest := provider.RefundLookupRequest{
+		PaymentIntentID: request.PaymentIntentID, ProviderPaymentID: request.ProviderPaymentID,
+		AmountMinor: request.AmountMinor, Currency: request.Currency, IdempotencyKey: request.IdempotencyKey,
+		Metadata: request.Metadata, Limit: 100,
+	}
+	found, err := restarted.LookupRefund(context.Background(), lookupRequest)
+	if err != nil || !found.Found || !found.Definitive || found.Refund.ProviderOperationID == "" || found.Refund.AmountMinor != 200 {
+		t.Fatalf("lookup after restart = %#v, %v", found, err)
+	}
+	status, err := restarted.GetPaymentStatus(context.Background(), checkout.ProviderPaymentID)
+	if err != nil || status.Status != provider.StatusUnknown || status.RefundedMinor != 200 {
+		t.Fatalf("partial aggregate = %#v, %v", status, err)
+	}
+	conflicting := lookupRequest
+	conflicting.AmountMinor = 201
+	if _, err := restarted.LookupRefund(context.Background(), conflicting); err == nil {
+		t.Fatal("same idempotency identity with different refund fingerprint was accepted")
+	}
+
+	lookupRequest.IdempotencyKey = "refund:operation-b"
+	lookupRequest.Metadata = provider.Metadata{
+		"refund_request_id": "request-b", "refund_operation_id": "operation-b",
+		"refund_idempotency_key": "refund:operation-b",
+	}
+	absent, err := restarted.LookupRefund(context.Background(), lookupRequest)
+	if err != nil || absent.Found || !absent.Definitive {
+		t.Fatalf("equal absent refund lookup = %#v, %v", absent, err)
 	}
 }
 

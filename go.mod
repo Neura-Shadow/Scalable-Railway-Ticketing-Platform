@@ -1,6 +1,6 @@
 module github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform
 
-go 1.25.12
+go 1.25.13
 
 require (
 	github.com/gin-gonic/gin v1.12.0
@@ -11,6 +11,7 @@ require (
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	github.com/redis/go-redis/v9 v9.21.0
+	github.com/stripe/stripe-go/v86 v86.2.0
 	golang.org/x/crypto v0.54.0
 	golang.org/x/sync v0.22.0
 )
