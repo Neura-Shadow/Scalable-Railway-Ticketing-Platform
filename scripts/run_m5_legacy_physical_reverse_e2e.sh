@@ -5,6 +5,11 @@ set -euo pipefail
 : "${BOOKING_SHARD_0_DATABASE_URL:?BOOKING_SHARD_0_DATABASE_URL is required}"
 : "${BOOKING_SHARD_1_DATABASE_URL:?BOOKING_SHARD_1_DATABASE_URL is required}"
 
+# Milestone 7 write guards require every application-shaped write to identify
+# the durable active authority. This acceptance fixture operates against the
+# migration's initial Region A, epoch 1 authority.
+export PGOPTIONS="${PGOPTIONS:-} -c railway.deployment_region=region-a -c railway.deployment_role=active -c railway.region_epoch=1 -c railway.regional_writes_enabled=true"
+
 run_id=86000000-0000-4000-8000-000000000001
 forward_id=86000000-0000-4000-8000-000000000002
 reverse_id=86000000-0000-4000-8000-000000000003

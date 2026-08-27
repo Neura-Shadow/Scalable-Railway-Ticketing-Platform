@@ -211,7 +211,7 @@ services:
 
   payment-stripe-contract:
     profiles: ["dr-app"]
-    build: {context: ../.., target: payment-stripe-contract}
+    build: {context: ., target: payment-stripe-contract}
     image: scalable-railway-ticketing-payment-stripe-contract:local
     environment:
       PAYMENT_STRIPE_CONTRACT_TEST_ONLY: "true"
@@ -241,7 +241,7 @@ services:
   stripe-webhook-api-region-a:
     profiles: ["dr-app"]
     extends: {service: api-1}
-    build: {context: ../.., target: api}
+    build: {context: ., target: api}
     ports: !override []
     security_opt: !override [no-new-privileges:true]
     cap_drop: !override [ALL]
@@ -253,7 +253,7 @@ services:
   stripe-webhook-api-region-b:
     profiles: ["dr-app"]
     extends: {service: api-1}
-    build: {context: ../.., target: api}
+    build: {context: ., target: api}
     ports: !override []
     security_opt: !override [no-new-privileges:true]
     cap_drop: !override [ALL]
@@ -264,7 +264,7 @@ services:
 
   settlement-worker-region-a:
     profiles: ["dr-app"]
-    build: {context: ../.., target: settlement-worker}
+    build: {context: ., target: settlement-worker}
     image: scalable-railway-ticketing-settlement-worker:local
     environment:
       APP_ENV: test
@@ -302,7 +302,7 @@ services:
 
   settlement-admin:
     profiles: ["dr-tools"]
-    build: {context: ../.., target: settlement-admin}
+    build: {context: ., target: settlement-admin}
     image: scalable-railway-ticketing-settlement-admin:local
     environment:
       DATABASE_URL: ${SETTLEMENT_ADMIN_DATABASE_URL:-postgresql://railway_control:control-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3}
@@ -328,39 +328,39 @@ services:
   api-region-b-1:
     <<: *region-b-app
     extends: {service: api-1}
-    build: {context: ../.., target: api}
+    build: {context: ., target: api}
     environment:
       <<: [*region-b-control, *region-b-shards, *region-b-payment, *region-b-api, *region-b-role]
   api-region-b-2:
     <<: *region-b-app
     extends: {service: api-2}
-    build: {context: ../.., target: api}
+    build: {context: ., target: api}
     environment:
       <<: [*region-b-control, *region-b-shards, *region-b-payment, *region-b-api, *region-b-role]
   api-region-b-3:
     <<: *region-b-app
     extends: {service: api-3}
-    build: {context: ../.., target: api}
+    build: {context: ., target: api}
     environment:
       <<: [*region-b-control, *region-b-shards, *region-b-payment, *region-b-api, *region-b-role]
 
   payment-worker-region-b-1:
     <<: *region-b-app
     extends: {service: payment-worker-1}
-    build: {context: ../.., target: payment-worker}
+    build: {context: ., target: payment-worker}
     environment:
       <<: [*region-b-control, *region-b-shards, *region-b-payment, *region-b-worker, *region-b-role]
   payment-worker-region-b-2:
     <<: *region-b-app
     extends: {service: payment-worker-2}
-    build: {context: ../.., target: payment-worker}
+    build: {context: ., target: payment-worker}
     environment:
       <<: [*region-b-control, *region-b-shards, *region-b-payment, *region-b-worker, *region-b-role]
 
   payment-reconciler-region-b:
     <<: *region-b-app
     extends: {service: payment-reconciler}
-    build: {context: ../.., target: payment-reconciler}
+    build: {context: ., target: payment-reconciler}
     environment:
       <<: [*region-b-shards, *region-b-payment, *region-b-reconciler, *region-b-role]
       DATABASE_URL: postgresql://payment_reconciler:reconciler-local-only@control-postgres-region-b:5432/railway_control?sslmode=disable&connect_timeout=3
@@ -377,61 +377,61 @@ services:
   admission-worker-region-b-1:
     <<: *region-b-app
     extends: {service: admission-worker-1}
-    build: {context: ../.., target: admission-worker}
+    build: {context: ., target: admission-worker}
     environment:
       <<: [*region-b-control, *region-b-shards, *region-b-role]
   admission-worker-region-b-2:
     <<: *region-b-app
     extends: {service: admission-worker-2}
-    build: {context: ../.., target: admission-worker}
+    build: {context: ., target: admission-worker}
     environment:
       <<: [*region-b-control, *region-b-shards, *region-b-role]
   read-model-worker-region-b-1:
     <<: *region-b-app
     extends: {service: read-model-worker-1}
-    build: {context: ../.., target: read-model-worker}
+    build: {context: ., target: read-model-worker}
     environment:
       <<: [*region-b-control, *region-b-shards, *region-b-role]
   read-model-worker-region-b-2:
     <<: *region-b-app
     extends: {service: read-model-worker-2}
-    build: {context: ../.., target: read-model-worker}
+    build: {context: ., target: read-model-worker}
     environment:
       <<: [*region-b-control, *region-b-shards, *region-b-role]
   hold-expirer-region-b:
     <<: *region-b-app
     extends: {service: hold-expirer}
-    build: {context: ../.., target: hold-expirer}
+    build: {context: ., target: hold-expirer}
     environment:
       <<: [*region-b-control, *region-b-shards, *region-b-role]
   outbox-worker-region-b:
     <<: *region-b-app
     extends: {service: outbox-worker}
-    build: {context: ../.., target: outbox-worker}
+    build: {context: ., target: outbox-worker}
     environment:
       <<: [*region-b-control, *region-b-shards, *region-b-role]
   booking-command-reconciler-region-b:
     <<: *region-b-app
     extends: {service: booking-command-reconciler}
-    build: {context: ../.., target: booking-command-reconciler}
+    build: {context: ., target: booking-command-reconciler}
     environment:
       <<: [*region-b-control, *region-b-shards, *region-b-role]
 
   proxy-region-a:
     <<: *dr-proxy
-    build: {context: ../.., dockerfile: deploy/nginx/Dockerfile.dr, target: region-a}
+    build: {context: ., dockerfile: deploy/nginx/Dockerfile.dr, target: region-a}
     image: scalable-railway-ticketing-proxy-region-a:local
     networks: [region-a-app, dr-test-ingress]
 
   proxy-region-b:
     <<: *dr-proxy
-    build: {context: ../.., dockerfile: deploy/nginx/Dockerfile.dr, target: region-b}
+    build: {context: ., dockerfile: deploy/nginx/Dockerfile.dr, target: region-b}
     image: scalable-railway-ticketing-proxy-region-b:local
     networks: [region-b-app, dr-test-ingress]
 
   global-test-ingress:
     <<: *dr-proxy
-    build: {context: ../.., dockerfile: deploy/nginx/Dockerfile.dr, target: global}
+    build: {context: ., dockerfile: deploy/nginx/Dockerfile.dr, target: global}
     image: scalable-railway-ticketing-global-test-ingress:local
     environment:
       ACTIVE_REGION_UPSTREAM: ${ACTIVE_REGION_UPSTREAM:-proxy-region-a}

@@ -48,7 +48,8 @@ RUN apk add --no-cache build-base bzip2-dev curl libssh2-dev libxml2-dev lz4-dev
     && test "$(/out/pgbackrest version)" = "pgBackRest ${PGBACKREST_VERSION}"
 
 FROM postgres:16.14-alpine AS postgres-dr
-RUN apk add --no-cache jq libbz2 libssh2 libxml2 lz4-libs openssl zstd-libs \
+RUN apk upgrade --no-cache libcrypto3 libssl3 \
+    && apk add --no-cache jq libbz2 libssh2 libxml2 lz4-libs openssl zstd-libs \
     && install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrest \
     && install -d -o postgres -g postgres -m 0700 /var/lib/postgresql/restore
 COPY --from=pgbackrest-build --chown=root:root --chmod=0555 /out/pgbackrest /usr/bin/pgbackrest
@@ -57,7 +58,8 @@ COPY --chmod=0555 deploy/postgres/dr/restore-validation.sh /etc/railway/restore-
 COPY --chmod=0444 deploy/postgres/dr/pgbackrest.conf /etc/pgbackrest/pgbackrest.conf
 
 FROM alpine:3.22 AS runtime
-RUN apk add --no-cache ca-certificates tzdata \
+RUN apk upgrade --no-cache libcrypto3 libssl3 \
+    && apk add --no-cache ca-certificates tzdata \
     && addgroup -S railway \
     && adduser -S -G railway -h /nonexistent -s /sbin/nologin railway
 COPY --from=build --chown=railway:railway /out/api /usr/local/bin/railway-api

@@ -153,8 +153,8 @@ services:
       - -ec
       - |
         psql -h control-postgres -U railway_control -d railway_control -v ON_ERROR_STOP=1 <<'SQL'
-        DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='railway_runtime') THEN CREATE ROLE railway_runtime LOGIN PASSWORD 'runtime-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT; END IF; END $$;
-        DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='railway_backup_admin') THEN CREATE ROLE railway_backup_admin LOGIN PASSWORD 'backup-admin-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION; END IF; END $$;
+        DO $$$$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='railway_runtime') THEN CREATE ROLE railway_runtime LOGIN PASSWORD 'runtime-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT; END IF; END $$$$;
+        DO $$$$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='railway_backup_admin') THEN CREATE ROLE railway_backup_admin LOGIN PASSWORD 'backup-admin-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION; END IF; END $$$$;
         GRANT CONNECT ON DATABASE railway_control TO railway_runtime;
         GRANT USAGE ON SCHEMA public TO railway_runtime;
         GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO railway_runtime;
@@ -181,7 +181,7 @@ services:
       - -ec
       - |
         psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 <<'SQL'
-        DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='railway_runtime') THEN CREATE ROLE railway_runtime LOGIN PASSWORD 'runtime-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT; END IF; END $$;
+        DO $$$$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='railway_runtime') THEN CREATE ROLE railway_runtime LOGIN PASSWORD 'runtime-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT; END IF; END $$$$;
         GRANT CONNECT ON DATABASE railway_booking TO railway_runtime;
         GRANT USAGE ON SCHEMA public TO railway_runtime;
         GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO railway_runtime;
@@ -203,7 +203,7 @@ services:
       - -ec
       - |
         psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 <<'SQL'
-        DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='railway_runtime') THEN CREATE ROLE railway_runtime LOGIN PASSWORD 'runtime-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT; END IF; END $$;
+        DO $$$$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='railway_runtime') THEN CREATE ROLE railway_runtime LOGIN PASSWORD 'runtime-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT; END IF; END $$$$;
         GRANT CONNECT ON DATABASE railway_booking TO railway_runtime;
         GRANT USAGE ON SCHEMA public TO railway_runtime;
         GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO railway_runtime;

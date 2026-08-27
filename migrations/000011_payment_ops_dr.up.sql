@@ -230,7 +230,6 @@ CREATE TABLE public.financial_ledger_postings (
     side text NOT NULL CHECK (side IN ('debit', 'credit')),
     amount_minor bigint NOT NULL CHECK (amount_minor > 0),
     currency text NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
-    eligibility_cutoff_at timestamptz NOT NULL,
     CONSTRAINT financial_ledger_postings_transaction_index_key
         PRIMARY KEY (transaction_id, posting_index)
 );
