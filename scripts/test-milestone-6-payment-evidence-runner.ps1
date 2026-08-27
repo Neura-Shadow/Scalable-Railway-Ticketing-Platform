@@ -49,6 +49,14 @@ foreach ($operatorRole in @(
         throw "payment operator role is not provisioned before reconciler and admin startup: $operatorRole"
     }
 }
+foreach ($reconciliationReadTable in @(
+    'public.ticket_refund_requests',
+    'public.ticket_refund_operations'
+)) {
+    if (-not $paymentCompose.Contains($reconciliationReadTable)) {
+        throw "payment reconciler control role cannot read M7 reconciliation state: $reconciliationReadTable"
+    }
+}
 $requiredScripts = @(
     'payment-intent-create.js',
     'payment-idempotency.js',
