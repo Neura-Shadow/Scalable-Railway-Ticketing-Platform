@@ -22,6 +22,24 @@ if ($parseErrors.Count -ne 0) {
 }
 
 $source = Get-Content -Raw -LiteralPath $runnerPath
+$paymentComposePath = Join-Path $root 'deploy/compose/payment.override.yml'
+if (-not (Test-Path -LiteralPath $paymentComposePath)) { throw 'payment Compose overlay is missing' }
+$paymentCompose = Get-Content -Raw -LiteralPath $paymentComposePath
+foreach ($operatorBinding in @(
+    'x-payment-operator-control: &payment-operator-control',
+    'x-payment-operator-shards: &payment-operator-shards',
+    'payment-operator-control-role:',
+    'payment-operator-shard-0-role:',
+    'payment-operator-shard-1-role:',
+    "CREATE ROLE payment_operator LOGIN PASSWORD 'operator-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT",
+    'GRANT railway_runtime TO payment_operator',
+    'GRANT operator TO payment_operator',
+    '<<: [*payment-operator-control, *payment-operator-shards, *payment-settings, *payment-provider-outbound]'
+)) {
+    if (-not $paymentCompose.Contains($operatorBinding)) {
+        throw "payment Compose omits the private operator binding: $operatorBinding"
+    }
+}
 $requiredScripts = @(
     'payment-intent-create.js',
     'payment-idempotency.js',
