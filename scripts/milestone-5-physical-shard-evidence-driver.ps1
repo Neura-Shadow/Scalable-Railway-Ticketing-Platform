@@ -107,13 +107,15 @@ function Invoke-Milestone5DriverPSQL {
     )
     $identity = Get-Milestone5DriverDatabaseIdentity -Service $Service
     $composeArguments = [string[]]@($Context.ComposeArguments)
+    $regionalPGOptions = '-c railway.deployment_region=region-a -c railway.deployment_role=active -c railway.region_epoch=1 -c railway.regional_writes_enabled=true'
     if ($AsInput) {
         $result = Invoke-Milestone5DriverNative -AllowFailure -Command {
-            $SQL | & docker @composeArguments exec -T $Service psql -U $identity[0] -d $identity[1] -v ON_ERROR_STOP=1
+            $SQL | & docker @composeArguments exec -T -e "PGOPTIONS=$regionalPGOptions" $Service psql -U $identity[0] -d $identity[1] -v ON_ERROR_STOP=1
         }
     } else {
         $result = Invoke-Milestone5DriverCompose -Context $Context -AllowFailure -Arguments @(
-            'exec', '-T', $Service, 'psql', '-U', $identity[0], '-d', $identity[1],
+            'exec', '-T', '-e', "PGOPTIONS=$regionalPGOptions", $Service,
+            'psql', '-U', $identity[0], '-d', $identity[1],
             '-v', 'ON_ERROR_STOP=1', '-At', '-c', $SQL
         )
     }

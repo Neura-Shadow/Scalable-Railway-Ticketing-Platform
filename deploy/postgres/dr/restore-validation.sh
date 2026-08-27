@@ -11,7 +11,7 @@ if [ "$PGDATA" != '/var/lib/postgresql/restore' ]; then
 fi
 if [ "$(id -u)" = '0' ]; then
   install -d -o postgres -g postgres -m 0700 "$PGDATA"
-  exec gosu postgres "$0" "$@"
+  exec gosu postgres sh "$0" "$@"
 fi
 if [ "$RESTORE_CONFIRM" != 'restore-to-isolated-validation' ]; then
   echo 'isolated restore confirmation is invalid' >&2

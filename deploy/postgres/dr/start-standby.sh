@@ -20,7 +20,7 @@ if [ "$(id -u)" = '0' ]; then
       exit 1
     fi
   done
-  exec gosu postgres "$0" "$@"
+  exec gosu postgres sh "$0" "$@"
 fi
 
 for identity in "$PRIMARY_HOST" "$POSTGRES_USER" "$POSTGRES_DB" "$REPLICATION_SLOT" "$PGBACKREST_STANZA"; do

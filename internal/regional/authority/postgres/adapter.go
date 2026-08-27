@@ -101,7 +101,7 @@ func (tx ControlTx) RegionalAuthority(ctx context.Context) (authority.Snapshot, 
 		stateText     string
 		writesEnabled bool
 	)
-	if err := tx.QueryRow(ctx, regionalAuthorityForUpdateSQL).Scan(
+	if err := tx.QueryRow(ctx, regionalAuthorityForShareSQL).Scan(
 		&regionText,
 		&epochValue,
 		&stateText,
@@ -381,11 +381,11 @@ func AuthorizeShardTransaction(
 	return deployment.AuthorizeShard(route, fence)
 }
 
-const regionalAuthorityForUpdateSQL = `
+const regionalAuthorityForShareSQL = `
 SELECT region,epoch,state,writes_enabled
 FROM public.regional_write_authority
 WHERE singleton=true
-FOR UPDATE`
+FOR SHARE`
 
 const trainRunFenceForUpdateSQL = `
 SELECT train_run_id,assignment_generation,state,write_enabled

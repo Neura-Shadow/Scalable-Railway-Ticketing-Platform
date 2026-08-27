@@ -169,7 +169,7 @@ services:
         if ! psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -tAc "SELECT 1 FROM pg_roles WHERE rolname='payment_reconciler'" | grep -qx 1; then
           psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "CREATE ROLE payment_reconciler LOGIN PASSWORD 'reconciler-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
         fi
-        psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_booking TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM payment_reconciler; GRANT SELECT ON public.schema_migrations,public.reservations,public.reservation_seats,public.ticket_orders,public.tickets,public.ticket_issuance_receipts,public.payment_command_receipts,public.payment_compensation_receipts TO payment_reconciler"
+        psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_booking TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM payment_reconciler; GRANT SELECT ON public.schema_migrations,public.regional_write_authority,public.reservations,public.reservation_seats,public.ticket_orders,public.tickets,public.ticket_issuance_receipts,public.payment_command_receipts,public.payment_compensation_receipts TO payment_reconciler"
     depends_on:
       migrate-booking-shard-0:
         condition: service_completed_successfully
@@ -187,7 +187,7 @@ services:
         if ! psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -tAc "SELECT 1 FROM pg_roles WHERE rolname='payment_reconciler'" | grep -qx 1; then
           psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "CREATE ROLE payment_reconciler LOGIN PASSWORD 'reconciler-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
         fi
-        psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_booking TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM payment_reconciler; GRANT SELECT ON public.schema_migrations,public.reservations,public.reservation_seats,public.ticket_orders,public.tickets,public.ticket_issuance_receipts,public.payment_command_receipts,public.payment_compensation_receipts TO payment_reconciler"
+        psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_booking TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM payment_reconciler; GRANT SELECT ON public.schema_migrations,public.regional_write_authority,public.reservations,public.reservation_seats,public.ticket_orders,public.tickets,public.ticket_issuance_receipts,public.payment_command_receipts,public.payment_compensation_receipts TO payment_reconciler"
     depends_on:
       migrate-booking-shard-1:
         condition: service_completed_successfully

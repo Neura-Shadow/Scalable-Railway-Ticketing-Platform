@@ -37,7 +37,7 @@ func TestControlAdapterLocksRegionalAuthorityAndCommitsTheLocalProgram(t *testin
 		t.Fatalf("snapshot = region %s epoch %d state %s writes %v", snapshot.Region(), snapshot.Epoch().Uint64(), snapshot.State(), snapshot.WritesEnabled())
 	}
 	if tx.commits != 1 || tx.rollbacks != 0 || len(tx.queries) != 1 ||
-		!strings.Contains(tx.queries[0], "FOR UPDATE") || !strings.Contains(tx.queries[0], "regional_write_authority") {
+		!strings.Contains(tx.queries[0], "FOR SHARE") || !strings.Contains(tx.queries[0], "regional_write_authority") {
 		t.Fatalf("tx commits/rollbacks/queries = %d/%d/%v", tx.commits, tx.rollbacks, tx.queries)
 	}
 }

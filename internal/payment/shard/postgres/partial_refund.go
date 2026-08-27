@@ -821,7 +821,7 @@ func lockRegionalAuthority(ctx context.Context, tx pgx.Tx, expectedRegion string
 	var epoch int64
 	var writesEnabled bool
 	if err := tx.QueryRow(ctx, `SELECT region,epoch,state,writes_enabled
-FROM public.regional_write_authority WHERE singleton FOR UPDATE`).Scan(&region, &epoch, &state, &writesEnabled); err != nil {
+FROM public.regional_write_authority WHERE singleton FOR SHARE`).Scan(&region, &epoch, &state, &writesEnabled); err != nil {
 		return paymentshard.ErrShardPaymentUnavailable
 	}
 	if region != expectedRegion || epoch != expectedEpoch || state != "active" || !writesEnabled {

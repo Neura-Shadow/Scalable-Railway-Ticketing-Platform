@@ -127,6 +127,7 @@ SQL
 
 admin plan-reverse-migration --migration-id "$forward_id" \
   --reverse-migration-id "$reverse_id" --generation 3 --confirm
+admin start-reverse-migration --migration-id "$reverse_id" --confirm
 
 # A normal or cross-transaction legacy writer remains fenced while physical is
 # authoritative. Test it before target preparation clears the retained rows so
