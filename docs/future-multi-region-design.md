@@ -58,6 +58,16 @@ and a proven current booking-shard route before ticket/refund compensation.
 Failing over API reads alone must never authorize capture, ticket issuance, or
 seat release.
 
+Milestone 7 implements a bounded active-passive pilot for exactly the control,
+booking-shard-0, and booking-shard-1 PostgreSQL databases. It adds typed regional
+authority/epoch guards, async standbys, crash-resumable operator checkpoints,
+pool reset and primary-role validation, pgBackRest backup/PITR, isolated restore
+checks, reconciliation-before-activation, and reseed-before-failback. The pilot
+still requires an external operator/fencing system and does not implement
+health-triggered promotion, global consensus, automatic DNS failover, or
+active-active writes. Same-host Docker evidence is not a production failure-
+domain or capacity claim.
+
 Failover requires:
 
 1. stop or fence the old owner;
@@ -103,3 +113,10 @@ zero-downtime operation, or production capacity.
 Kafka, service meshes, Kubernetes Operators, or consensus systems may be
 evaluated later, but none replaces the authoritative reservation transaction
 or supplies a physical-shard consistency protocol by itself.
+
+For any expansion beyond the bounded Milestone 7 pilot, required evidence now
+includes separately measured per-database streaming/archive RPO, end-to-end RTO,
+old-writer fence proof, pool reconnection to the new primary, payment/refund/
+ticket/ledger/settlement convergence, independently booted restores, and a full
+reseeded failback at a higher epoch. Zero RPO/RTO and active-active operation
+remain explicit non-goals.

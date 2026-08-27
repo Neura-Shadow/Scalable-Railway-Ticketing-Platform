@@ -188,7 +188,7 @@ Redis provides bounded-TTL read hints, rate limits, and optional event transport
 
 ### Operability
 
-- Use Go 1.25.12, the verified secure patch of the local stable toolchain line, and document that it differs from the preferred 1.26.x baseline.
+- Use Go 1.25.13, the verified secure patch of the local stable toolchain line, and document that it differs from the preferred 1.26.x baseline.
 - Target PostgreSQL 16+, Redis 7+, Gin, pgx/v5/pgxpool, golang-migrate, Prometheus `client_golang`, k6, and Docker Compose.
 - Build a multi-stage non-root container with a minimal runtime image and read-only-root-filesystem support.
 - Keep production secrets environment-driven and local-development defaults explicitly scoped.

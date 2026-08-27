@@ -266,7 +266,7 @@ default image remains the API.
 
 Requirements:
 
-- Go 1.25.12+
+- Go 1.25.13+
 - Docker Engine with Compose v2
 - GNU Make for the documented shortcuts (or run the underlying Go/Docker commands)
 
@@ -385,6 +385,20 @@ stale evidence alone cannot prove no duplicate charge, refund, or ticket and
 never establish production capacity. See
 [Milestone 6 load testing](docs/milestone-6-load-testing.md).
 
+Milestone 7 adds a production-oriented Stripe adapter behind a typed provider
+capability and conformance boundary, an operational balanced financial ledger,
+bounded settlement/payout evidence import, complete-selected-ticket refunds,
+durable webhook-key lifecycle metadata, and a one-writer active-passive
+PostgreSQL DR pilot. The sandbox remains synthetic, Stripe test mode is optional
+and secret-gated, and no raw card data enters this repository. The DR topology
+uses asynchronous replication, external fencing evidence, encrypted pgBackRest
+backup/WAL archives, isolated restore validation, and reseed-before-failback; it
+does not claim active-active writes, automatic consensus, zero RPO/RTO, PCI
+certification, statutory accounting, or production capacity. See the
+[Milestone 7 PRD](docs/prd/milestone-7-payment-ops-dr.md) and
+[Milestone 7 limitations](docs/milestone-7-limitations.md). Runtime results
+remain `not_run` until the project-scoped evidence runner and verifier pass.
+
 ## Deployment
 
 [production-deployment.md](docs/production-deployment.md) defines the single-region release, migration, secret, health, monitoring, backup, and rollback contract. `deploy/kubernetes/base` supplies a hardened baseline that requires a production overlay and externally managed secrets.
@@ -402,19 +416,19 @@ never establish production capacity. See
 - Redis AOF reduces loss risk but does not guarantee waiting-room continuity; hot-run Redis loss fails closed.
 - Admission does not guarantee a seat and token delivery is at-most-once.
 - Projection lag and cache staleness are possible; availability remains hint-only and cache loss increases PostgreSQL read load.
-- Only the deterministic sandbox payment provider is implemented; there is no
-  live gateway, settlement, dispute, partial-refund, PCI-certification, or
-  production-capacity evidence.
+- Stripe is implemented as a production-oriented adapter, but there is no live
+  production deployment, PCI-certification claim, dispute workflow, or
+  production-capacity evidence. Standard evidence remains synthetic unless an
+  optional Stripe test-mode run is explicitly identified.
 - No complete anti-bot/fraud system or real identity proof; account quotas do not prevent Sybil identities.
 - No multi-region active-active booking writes.
 - No accepted sustained benchmark or national-scale capacity claim.
 - No government-ID or real passenger identity verification.
 
 The complete list is in
-[milestone-6-limitations.md](docs/milestone-6-limitations.md). Multi-region
-ideas are design direction only in
-[future-multi-region-design.md](docs/future-multi-region-design.md); none are
-implemented in Milestone 6.
+[milestone-7-limitations.md](docs/milestone-7-limitations.md). Milestone 7's
+active-passive topology is a bounded one-writer DR pilot, not active-active
+regional booking or a production multi-region certification.
 
 ## License
 

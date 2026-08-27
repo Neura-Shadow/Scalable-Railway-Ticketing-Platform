@@ -338,8 +338,8 @@ raise TM-059, TM-062, TM-063 or TM-068 to critical.
   boundaries in concrete threats.
 - Distinguished implemented M6 controls from source review and evidence gates;
   this document itself is not runtime, security-scan or benchmark proof.
-- Kept the deterministic sandbox and CI/dev failure hooks separate from a
-  future production provider and production deployment controls.
+- Kept the deterministic sandbox and CI/dev failure hooks separate from the
+  production-oriented adapter and live deployment controls.
 - Explicitly modeled raw-card-data exclusion, webhook hash conflict,
   out-of-order delivery, stable provider operation identity, unknown outcomes,
   control finalization, ticket issuance, full-refund compensation, migration,
@@ -347,3 +347,30 @@ raise TM-059, TM-062, TM-063 or TM-068 to critical.
 - Open questions and ranking-sensitive deployment assumptions are recorded;
   the supplied Milestone 6 scope resolves the application-level context needed
   for this pre-implementation model.
+
+## Milestone 7 security delta
+
+Milestone 7 selects a production-oriented Stripe adapter without claiming a
+live deployment. Hosted checkout preserves a scope-minimizing boundary: no API,
+DTO, log, trace, queue, database, backup, or evidence artifact may accept PAN,
+CVC, track, PIN, or raw payment credentials. Provider API, endpoint-specific
+webhook, settlement-read, regional runtime, replication, backup-write,
+restore/decryption, and fence/promotion credentials are separate trust domains.
+
+Webhook ingress authenticates the untouched bounded body, accepts at most the
+configured current and previous key during a durable retirement grace, writes
+immutable normalized evidence in a region-authorized transaction, and returns
+2xx only after commit. A provider status observation, webhook, synchronous
+response, and reconciliation query all pass through the same amount, currency,
+captured, and refunded evaluator before financial, ticket, seat, or ledger
+effects.
+
+Regional threats include stale-pool writes, forged fence attestations,
+split-brain old primaries, premature readiness, backup target substitution,
+repository/key co-compromise, and evidence deletion. Database epochs are not
+consensus: independently verified external fencing must precede promotion and
+ingress switching. Audit and ledger rows are insert-only to runtime roles, but
+a database owner is still trusted; high-assurance deployments must export
+signed checkpoints to separately administered append-only storage. Exact abuse
+paths and residual assumptions are in
+[Scalable-Railway-Ticketing-Platform-threat-model.md](Scalable-Railway-Ticketing-Platform-threat-model.md).

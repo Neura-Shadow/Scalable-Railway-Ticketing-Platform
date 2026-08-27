@@ -211,3 +211,26 @@ The added assignment/fence locks and routing queries have measurable overhead,
 and quiesced cutover has a measurable retryable interruption. Both remain
 pending until controlled Milestone 4 runtime evidence is accepted. Logical
 schema results are not physical-shard or production-capacity evidence.
+
+## Milestone 7 concurrency boundaries
+
+Regional authority adds a database-local lock before every control mutation and
+before each shard's existing train-run generation fence. The order is regional
+authority, assignment/catalog ownership, train-run fence, then existing domain
+rows. A stale, passive, or recovery process fails before domain DML; this is
+defense in depth and never replaces external fencing of an isolated old primary.
+
+Payment action attempts are scoped to stable action identities instead of a
+shared saga counter. One provider query or earlier shard step cannot exhaust a
+later ticket-issuance retry budget. Mutating provider 5xx outcomes are uncertain
+and query-before-retry, and one shared observation evaluator rejects
+contradictory capture/refund totals before tickets, seats, or ledger postings.
+
+Ledger event identity, settlement cursor pages, refund request keys, shard
+commands, and receipt identities are exact-replay boundaries. Importers perform
+provider I/O outside transactions, then atomically persist one bounded page and
+its cursor. Complete-ticket refunds lock authoritative ownership, fare, prior
+refund totals, regional authority, and shard generation; concurrent duplicate
+requests replay or conflict without double provider, ticket, seat, or ledger
+effects. These properties are correctness and amplification bounds, not a
+sustained throughput or production-capacity result.
