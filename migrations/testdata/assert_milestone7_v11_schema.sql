@@ -279,11 +279,35 @@ BEGIN
     ) OR to_regprocedure(
         'public.guard_regional_application_write()'
     ) IS NULL OR to_regprocedure(
+        'public.lock_regional_write_authority()'
+    ) IS NULL OR to_regprocedure(
         'public.guard_regional_operational_write()'
     ) IS NULL OR to_regprocedure(
         'public.guard_regional_authority_command()'
     ) IS NULL THEN
         RAISE EXCEPTION 'control v11 regional DML coverage is incomplete';
+    END IF;
+
+    IF NOT (
+        SELECT function_row.prosecdef
+          FROM pg_catalog.pg_proc AS function_row
+         WHERE function_row.oid =
+               'public.lock_regional_write_authority()'::regprocedure
+    ) OR EXISTS (
+        SELECT 1
+          FROM pg_catalog.pg_proc AS function_row
+          CROSS JOIN LATERAL pg_catalog.aclexplode(
+              COALESCE(
+                  function_row.proacl,
+                  pg_catalog.acldefault('f', function_row.proowner)
+              )
+          ) AS privilege_row
+         WHERE function_row.oid =
+               'public.lock_regional_write_authority()'::regprocedure
+           AND privilege_row.grantee = 0
+           AND privilege_row.privilege_type = 'EXECUTE'
+    ) THEN
+        RAISE EXCEPTION 'regional authority lock function privilege boundary is incomplete';
     END IF;
 
     IF NOT EXISTS (

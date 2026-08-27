@@ -795,6 +795,7 @@ DROP TABLE public.regional_failover_operations;
 
 DROP TRIGGER regional_write_authority_guard_transition
     ON public.regional_write_authority;
+DROP FUNCTION public.lock_regional_write_authority();
 DROP FUNCTION public.guard_regional_write_authority();
 DROP TABLE public.regional_write_authority;
 

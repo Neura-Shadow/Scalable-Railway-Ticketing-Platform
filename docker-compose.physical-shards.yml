@@ -164,11 +164,13 @@ services:
         ALTER DEFAULT PRIVILEGES FOR ROLE railway_control IN SCHEMA public GRANT USAGE,SELECT ON SEQUENCES TO railway_runtime;
         REVOKE ALL ON public.regional_write_authority,public.regional_failover_operations,public.backup_artifacts,public.backup_operations,public.backup_verifications,public.restore_validations,public.backup_expiration_operations FROM railway_runtime;
         GRANT SELECT ON public.schema_migrations,public.regional_write_authority TO railway_runtime;
+        GRANT EXECUTE ON FUNCTION public.lock_regional_write_authority() TO railway_runtime;
         GRANT CONNECT ON DATABASE railway_control TO railway_backup_admin;
         GRANT USAGE ON SCHEMA public TO railway_backup_admin;
         REVOKE ALL ON ALL TABLES IN SCHEMA public FROM railway_backup_admin;
         GRANT SELECT,INSERT,UPDATE ON public.backup_artifacts,public.backup_operations,public.backup_verifications,public.restore_validations,public.backup_expiration_operations TO railway_backup_admin;
         GRANT SELECT ON public.schema_migrations,public.regional_write_authority TO railway_backup_admin;
+        GRANT EXECUTE ON FUNCTION public.lock_regional_write_authority() TO railway_backup_admin;
         SQL
         then exit 0; fi
         test "$$attempt" -lt 5
@@ -196,6 +198,7 @@ services:
         ALTER DEFAULT PRIVILEGES FOR ROLE railway_booking IN SCHEMA public GRANT USAGE,SELECT ON SEQUENCES TO railway_runtime;
         REVOKE ALL ON public.regional_write_authority FROM railway_runtime;
         GRANT SELECT ON public.schema_migrations,public.regional_write_authority TO railway_runtime;
+        GRANT EXECUTE ON FUNCTION public.lock_regional_write_authority() TO railway_runtime;
         SQL
         then exit 0; fi
         test "$$attempt" -lt 5
@@ -223,6 +226,7 @@ services:
         ALTER DEFAULT PRIVILEGES FOR ROLE railway_booking IN SCHEMA public GRANT USAGE,SELECT ON SEQUENCES TO railway_runtime;
         REVOKE ALL ON public.regional_write_authority FROM railway_runtime;
         GRANT SELECT ON public.schema_migrations,public.regional_write_authority TO railway_runtime;
+        GRANT EXECUTE ON FUNCTION public.lock_regional_write_authority() TO railway_runtime;
         SQL
         then exit 0; fi
         test "$$attempt" -lt 5

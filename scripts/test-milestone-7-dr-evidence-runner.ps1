@@ -189,6 +189,7 @@ foreach ($required in @(
     'runtime-control-role:', 'runtime-booking-shard-0-role:', 'runtime-booking-shard-1-role:',
     'CREATE ROLE railway_runtime LOGIN PASSWORD', 'NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT',
     'REVOKE ALL ON public.regional_write_authority', 'public.backup_expiration_operations FROM railway_runtime',
+    'GRANT EXECUTE ON FUNCTION public.lock_regional_write_authority() TO railway_runtime',
     'postgresql://railway_runtime:runtime-local-only@'
 )) {
     if (-not $physicalCompose.Contains($required)) { throw "physical Compose omits bounded runtime role contract: $required" }

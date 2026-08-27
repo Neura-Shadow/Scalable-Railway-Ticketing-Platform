@@ -383,9 +383,7 @@ func AuthorizeShardTransaction(
 
 const regionalAuthorityForShareSQL = `
 SELECT region,epoch,state,writes_enabled
-FROM public.regional_write_authority
-WHERE singleton=true
-FOR SHARE`
+FROM public.lock_regional_write_authority()`
 
 const trainRunFenceForUpdateSQL = `
 SELECT train_run_id,assignment_generation,state,write_enabled
