@@ -56,7 +56,8 @@ foreach ($topologyPreflightGuard in @(
     'topology-preflight.json',
     "Add-M7Phase 'topology-preflight-synchronized'",
     "'--reason','region_failure','--dry-run','--timeout','2m'",
-    'typed failover dry-run preflight did not validate the synchronized topology'
+    'typed failover dry-run preflight did not validate the synchronized topology',
+    'sanitized failover-plan PostgreSQL diagnostics'
 )) {
     if (-not $source.Contains($topologyPreflightGuard)) { throw "Milestone 7 runner is missing topology preflight guard: $topologyPreflightGuard" }
 }

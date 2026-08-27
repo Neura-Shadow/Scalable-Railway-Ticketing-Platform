@@ -1488,11 +1488,17 @@ LIMIT 1
             '--reason','region_failure','--dry-run','--timeout','2m'
         )
         if ([string]$preflight.result.stage -ne 'planned' -or [string]$preflight.status -ne 'dry-run') { throw 'typed failover dry-run preflight did not validate the synchronized topology' }
-        $planned = Invoke-M7DRAdmin -Arguments @(
-            'failover','--operation-id',$failoverOperationID,'--incident-id',$failoverIncidentID,
-            '--from','region-a','--to','region-b','--source-epoch','1','--operator','operator:local-dr',
-            '--reason','region_failure','--confirm','--timeout','2m'
-        )
+        try {
+            $planned = Invoke-M7DRAdmin -Arguments @(
+                'failover','--operation-id',$failoverOperationID,'--incident-id',$failoverIncidentID,
+                '--from','region-a','--to','region-b','--source-epoch','1','--operator','operator:local-dr',
+                '--reason','region_failure','--confirm','--timeout','2m'
+            )
+        } catch {
+            $journalLogs = Invoke-M7Compose -AllowFailure -Arguments @('logs','--no-color','--tail','160','control-postgres')
+            Write-Warning "sanitized failover-plan PostgreSQL diagnostics:`n$(Protect-M7Diagnostic -Lines $journalLogs.Output)"
+            throw
+        }
         if ([string]$planned.result.stage -ne 'planned') { throw 'typed failover operation was not durably planned' }
         Add-M7Phase 'typed-failover-planned'
 
