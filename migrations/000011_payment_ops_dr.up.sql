@@ -2969,9 +2969,7 @@ BEGIN
            authority.writes_enabled
       INTO authority_region, authority_epoch, authority_state,
            authority_writes_enabled
-      FROM public.regional_write_authority AS authority
-     WHERE authority.singleton
-     FOR SHARE;
+      FROM public.lock_regional_write_authority() AS authority;
     IF NOT FOUND
        OR authority_state <> 'active'
        OR NOT authority_writes_enabled
@@ -3047,9 +3045,7 @@ BEGIN
            authority.writes_enabled
       INTO authority_region, authority_epoch, authority_state,
            authority_writes_enabled
-      FROM public.regional_write_authority AS authority
-     WHERE authority.singleton
-     FOR SHARE;
+      FROM public.lock_regional_write_authority() AS authority;
     IF NOT FOUND OR (
         deployment_role = 'active'
         AND (

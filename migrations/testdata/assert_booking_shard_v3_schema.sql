@@ -150,6 +150,20 @@ BEGIN
         RAISE EXCEPTION 'regional authority lock function privilege boundary is incomplete';
     END IF;
 
+    IF pg_catalog.strpos(
+        pg_catalog.pg_get_functiondef(
+            'public.booking_shard_guard_regional_application_write()'::regprocedure
+        ),
+        'public.lock_regional_write_authority()'
+    ) = 0 OR pg_catalog.strpos(
+        pg_catalog.pg_get_functiondef(
+            'public.booking_shard_guard_regional_operational_write()'::regprocedure
+        ),
+        'public.lock_regional_write_authority()'
+    ) = 0 THEN
+        RAISE EXCEPTION 'regional write guards must acquire authority through the privileged lock function';
+    END IF;
+
     IF NOT EXISTS (
         SELECT 1
           FROM pg_catalog.pg_trigger
