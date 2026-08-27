@@ -163,7 +163,7 @@ FROM public.payment_intents AS intent
 JOIN public.payment_sagas AS saga ON saga.payment_intent_id=intent.payment_intent_id
 WHERE intent.state='awaiting_customer'
   AND intent.provider_payment_id IS NOT NULL
-  AND intent.updated_at<=$1-($2::bigint*interval '1 millisecond')
+  AND intent.updated_at<=$1::timestamptz-($2::bigint*interval '1 millisecond')
   AND saga.state='awaiting_provider' AND saga.current_step='await_provider'
   AND NOT EXISTS (
     SELECT 1 FROM public.payment_operations AS operation

@@ -120,7 +120,8 @@ func TestClaimOperationsQueuesBoundedStaleAwaitingCustomerStatusQuery(t *testing
 	joined := strings.Join(tx.execs, "\n")
 	if !strings.Contains(joined, "INSERT INTO public.payment_operations") ||
 		!strings.Contains(joined, "'query_status'") ||
-		!strings.Contains(strings.Join(tx.queries, "\n"), "intent.state='awaiting_customer'") {
+		!strings.Contains(strings.Join(tx.queries, "\n"), "intent.state='awaiting_customer'") ||
+		!strings.Contains(strings.Join(tx.queries, "\n"), "$1::timestamptz-") {
 		t.Fatalf("stale recovery did not enqueue a durable query operation:\nqueries=%s\nexecs=%s",
 			strings.Join(tx.queries, "\n"), joined)
 	}
