@@ -13,6 +13,7 @@ services:
       POSTGRES_DB: railway
       POSTGRES_USER: railway
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-railway-local}
+      PGOPTIONS: -c railway.deployment_region=region-a -c railway.deployment_role=active -c railway.region_epoch=1 -c railway.regional_writes_enabled=true
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U railway -d railway"]
       interval: 5s
