@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/clock"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/control"
 	controlpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/control/postgres"
@@ -18,7 +19,7 @@ import (
 )
 
 const (
-	maxAdminConnections       = int32(4)
+	maxAdminConnections       = 4
 	maxCheckpointSummaryBytes = 128
 )
 
@@ -139,18 +140,11 @@ type healthResult struct {
 	ActiveMigrationsTruncated bool  `json:"active_migrations_truncated"`
 }
 
-func newPostgresBackend(ctx context.Context, databaseURL string) (adminBackend, error) {
+func newPostgresBackend(ctx context.Context, databaseURL string, session postgresx.RegionalSession) (adminBackend, error) {
 	if ctx == nil || databaseURL == "" {
 		return nil, control.ErrInvalidInput
 	}
-	configuration, err := pgxpool.ParseConfig(databaseURL)
-	if err != nil {
-		return nil, controlpostgres.ErrPersistence
-	}
-	configuration.MaxConns = maxAdminConnections
-	configuration.MinConns = 0
-
-	pool, err := pgxpool.NewWithConfig(ctx, configuration)
+	pool, err := postgresx.NewRegionalBoundedPool(ctx, databaseURL, maxAdminConnections, session)
 	if err != nil {
 		return nil, controlpostgres.ErrPersistence
 	}
@@ -562,7 +556,7 @@ FROM (
 		activeMigrations = maxRowCap
 	}
 	result.ActiveMigrationsObserved = activeMigrations
-	result.Ready = result.SchemaVersion == 10 && !result.SchemaDirty && complete &&
+	result.Ready = result.SchemaVersion == 11 && !result.SchemaDirty && complete &&
 		result.ShardCatalogEntries == maxShardLimit && result.WritableActiveShards == maxShardLimit &&
 		!result.ActiveMigrationsTruncated
 	if !result.Ready {

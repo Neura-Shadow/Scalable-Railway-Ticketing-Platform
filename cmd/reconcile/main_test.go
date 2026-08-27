@@ -12,12 +12,15 @@ import (
 	admissionpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/admission/postgres"
 	admissionredis "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/admission/redis"
 	offeringdomain "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/offering/domain"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
 	"github.com/google/uuid"
 )
 
 type fakePolicyPager struct {
 	policies []admissiondomain.HotTrainPolicy
 }
+
+var testRegionalSession = postgresx.RegionalSession{Region: "region-a", Role: "active", Epoch: 1, WritesEnabled: true}
 
 func (fake *fakePolicyPager) ListPoliciesPage(
 	_ context.Context,
@@ -93,6 +96,20 @@ func TestRunRejectsMissingCommandAndSecretFreeConfigurationError(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), "do-not-leak") {
 		t.Fatal("usage output leaked database credential")
+	}
+}
+
+func TestRunDatabaseCommandRequiresRegionalSessionWithoutLeakingInputs(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	exitCode := run(context.Background(), []string{"seat-inventory"}, mapLookup(map[string]string{
+		"DATABASE_URL":      "postgres://user:do-not-leak@localhost/railway",
+		"DEPLOYMENT_REGION": "do-not-leak-regional-input",
+	}), &stdout, &stderr)
+	if exitCode != 2 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "regional database session is required") {
+		t.Fatalf("exit=%d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), "do-not-leak") {
+		t.Fatal("configuration error leaked database or regional input")
 	}
 }
 
@@ -259,25 +276,25 @@ func TestShardScopesRejectInvalidBoundsBeforeDatabaseAccess(t *testing.T) {
 		{
 			name: "assignments row limit",
 			run: func() (resultEnvelope, error) {
-				return runShardAssignments(context.Background(), "postgres://do-not-connect", []string{"--max-rows", "0"})
+				return runShardAssignments(context.Background(), "postgres://do-not-connect", testRegionalSession, []string{"--max-rows", "0"})
 			},
 		},
 		{
 			name: "assignments timeout upper bound",
 			run: func() (resultEnvelope, error) {
-				return runShardAssignments(context.Background(), "postgres://do-not-connect", []string{"--timeout", "5m1ns"})
+				return runShardAssignments(context.Background(), "postgres://do-not-connect", testRegionalSession, []string{"--timeout", "5m1ns"})
 			},
 		},
 		{
 			name: "locators page size",
 			run: func() (resultEnvelope, error) {
-				return runShardLocators(context.Background(), "postgres://do-not-connect", []string{"--page-size", "1001"})
+				return runShardLocators(context.Background(), "postgres://do-not-connect", testRegionalSession, []string{"--page-size", "1001"})
 			},
 		},
 		{
 			name: "migration page limit",
 			run: func() (resultEnvelope, error) {
-				return runShardMigration(context.Background(), "postgres://do-not-connect", []string{
+				return runShardMigration(context.Background(), "postgres://do-not-connect", testRegionalSession, []string{
 					"--migration-id", uuid.NewString(), "--max-pages", "10001",
 				})
 			},
@@ -285,7 +302,7 @@ func TestShardScopesRejectInvalidBoundsBeforeDatabaseAccess(t *testing.T) {
 		{
 			name: "repair mode is not exposed",
 			run: func() (resultEnvelope, error) {
-				return runShardAssignments(context.Background(), "postgres://do-not-connect", []string{"--repair"})
+				return runShardAssignments(context.Background(), "postgres://do-not-connect", testRegionalSession, []string{"--repair"})
 			},
 		},
 	}
@@ -324,6 +341,7 @@ func TestShardScopesRequireCanonicalUUIDs(t *testing.T) {
 	if _, err := runShardLocators(
 		context.Background(),
 		"postgres://do-not-connect",
+		testRegionalSession,
 		[]string{"--train-run-id", "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"},
 	); err == nil || !strings.Contains(err.Error(), "canonical UUID") {
 		t.Fatalf("uppercase locator UUID error = %v", err)
@@ -331,6 +349,7 @@ func TestShardScopesRequireCanonicalUUIDs(t *testing.T) {
 	if _, err := runShardMigration(
 		context.Background(),
 		"postgres://do-not-connect",
+		testRegionalSession,
 		[]string{"--migration-id", ""},
 	); err == nil || !strings.Contains(err.Error(), "canonical UUID") {
 		t.Fatalf("empty migration UUID error = %v", err)

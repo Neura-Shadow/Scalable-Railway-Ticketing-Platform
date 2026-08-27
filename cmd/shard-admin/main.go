@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/control"
 	controlpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/control/postgres"
@@ -115,7 +116,7 @@ type adminBackend interface {
 	InspectHealth(context.Context) (any, error)
 }
 
-type backendFactory func(context.Context, string) (adminBackend, error)
+type backendFactory func(context.Context, string, postgresx.RegionalSession) (adminBackend, error)
 
 type invocation struct {
 	command        string
@@ -191,10 +192,24 @@ func runWithFactory(
 		fmt.Fprintln(stderr, "shard-admin configuration invalid")
 		return 2
 	}
+	session, err := postgresx.ParseRegionalSession(
+		environmentValue(lookup, "DEPLOYMENT_REGION"),
+		environmentValue(lookup, "DEPLOYMENT_ROLE"),
+		environmentValue(lookup, "REGION_EPOCH"),
+		environmentValue(lookup, "REGIONAL_WRITES_ENABLED"),
+	)
+	if err != nil {
+		_ = writeEnvelope(stdout, outputEnvelope{
+			Command: request.command, Status: "rejected", ReadOnly: request.readOnly || request.dryRun,
+			Error: "configuration_invalid",
+		})
+		fmt.Fprintln(stderr, "shard-admin configuration invalid")
+		return 2
+	}
 
 	ctx, cancel := context.WithTimeout(parent, request.timeout)
 	defer cancel()
-	backend, err := factory(ctx, databaseURL)
+	backend, err := factory(ctx, databaseURL, session)
 	if err != nil {
 		err = authoritativeContextError(ctx, err)
 		_ = writeEnvelope(stdout, outputEnvelope{
@@ -237,6 +252,11 @@ func runWithFactory(
 		return 1
 	}
 	return 0
+}
+
+func environmentValue(lookup func(string) (string, bool), name string) string {
+	value, _ := lookup(name)
+	return strings.TrimSpace(value)
 }
 
 func executeInvocation(ctx context.Context, backend adminBackend, request invocation) (any, error) {

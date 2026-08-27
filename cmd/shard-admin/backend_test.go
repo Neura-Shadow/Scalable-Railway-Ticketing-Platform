@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/control"
 	controlpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/control/postgres"
@@ -104,7 +105,7 @@ func TestReconciliationErrorsMapToBoundedOperatorCategories(t *testing.T) {
 
 func TestPlanRejectsSubsecondRollbackWindowBeforeBackendOpen(t *testing.T) {
 	var opened int
-	factory := func(_ context.Context, _ string) (adminBackend, error) {
+	factory := func(_ context.Context, _ string, _ postgresx.RegionalSession) (adminBackend, error) {
 		opened++
 		return &fakeAdminBackend{}, nil
 	}

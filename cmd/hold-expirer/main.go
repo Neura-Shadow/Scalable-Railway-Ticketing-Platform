@@ -39,7 +39,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := postgresx.NewBoundedPool(ctx, cfg.DatabaseURL, cfg.ControlDatabaseMaxOpenConns)
+	pool, err := postgresx.NewRegionalBoundedPool(ctx, cfg.DatabaseURL, cfg.ControlDatabaseMaxOpenConns, holdExpirerRegionalSession(cfg))
 	if err != nil {
 		logger.Error("hold expirer database unavailable")
 		os.Exit(1)
@@ -55,7 +55,7 @@ func main() {
 		defer physicalRuntime.Close()
 	}
 	registry := prometheus.NewRegistry()
-	metrics, err := platformmetrics.New(registry)
+	metrics, err := platformmetrics.NewEventMetrics(registry)
 	if err != nil {
 		logger.Error("hold expirer metrics initialization failed")
 		os.Exit(1)
@@ -133,6 +133,10 @@ func main() {
 	run := func() {
 		passContext, cancel := context.WithTimeout(ctx, cfg.WorkerPassTimeout)
 		defer cancel()
+		if !holdExpirerPassEnabled(cfg) || postgresx.CheckRegionalReadiness(passContext, pool, holdExpirerRegionalSession(cfg)) != nil || (physicalRuntime != nil && physicalRuntime.Ready(passContext) != nil) {
+			logger.Info("hold expirer retained without regional claim authority", "deployment_role", cfg.DeploymentRole)
+			return
+		}
 		var physical func(context.Context) (physicalworker.Result, error)
 		if physicalExpirer != nil {
 			physical = physicalExpirer.RunOnce
@@ -178,6 +182,9 @@ func holdExpirerReadiness(pool *pgxpool.Pool, cfg config.Config, physicalRuntime
 		if err := pool.Ping(ctx); err != nil {
 			return errors.New("hold expirer dependency unavailable")
 		}
+		if !holdExpirerPassEnabled(cfg) || postgresx.CheckRegionalReadiness(ctx, pool, holdExpirerRegionalSession(cfg)) != nil {
+			return errors.New("hold expirer regional authority unavailable")
+		}
 		var version int
 		var dirty bool
 		if err := pool.QueryRow(ctx, `SELECT version, dirty FROM schema_migrations LIMIT 1`).Scan(
@@ -208,6 +215,14 @@ WHERE shard_id IN ('legacy', 'shard-0', 'shard-1')`, sharding.SupportedFencingPr
 		}
 		return nil
 	}
+}
+
+func holdExpirerPassEnabled(cfg config.Config) bool {
+	return cfg.HoldExpirerEnabled && cfg.DeploymentRole == config.DeploymentRoleActive && cfg.RegionalWritesEnabled
+}
+
+func holdExpirerRegionalSession(cfg config.Config) postgresx.RegionalSession {
+	return postgresx.RegionalSession{Region: string(cfg.DeploymentRegion), Role: string(cfg.DeploymentRole), Epoch: cfg.RegionEpoch, WritesEnabled: cfg.RegionalWritesEnabled}
 }
 
 func physicalWorkerConfig(cfg config.Config, shardCount int) physicalworker.Config {

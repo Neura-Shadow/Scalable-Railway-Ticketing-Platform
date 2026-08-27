@@ -28,7 +28,7 @@ import (
 const (
 	readModelStream                = "railway:outbox:v1"
 	readModelDLQ                   = "railway:outbox:v1:read-model:dlq"
-	schemaVersion                  = 10
+	schemaVersion                  = 11
 	projectionLagObservationPeriod = 5 * time.Second
 )
 
@@ -50,7 +50,7 @@ func run(logger *slog.Logger) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	pool, err := postgresx.NewBoundedPool(ctx, cfg.DatabaseURL, cfg.ControlDatabaseMaxOpenConns)
+	pool, err := postgresx.NewRegionalBoundedPool(ctx, cfg.DatabaseURL, cfg.ControlDatabaseMaxOpenConns, readModelRegionalSession(cfg))
 	if err != nil {
 		return errors.New("read-model worker database unavailable")
 	}
@@ -122,6 +122,10 @@ func run(logger *slog.Logger) error {
 	runPass := func() {
 		passContext, cancel := context.WithTimeout(ctx, cfg.WorkerPassTimeout)
 		defer cancel()
+		if !readModelPassEnabled(cfg) || postgresx.CheckRegionalReadiness(passContext, pool, readModelRegionalSession(cfg)) != nil {
+			logger.Info("read-model worker retained without regional claim authority", "deployment_role", cfg.DeploymentRole)
+			return
+		}
 		result, passErr := worker.RunOnce(passContext)
 		if passErr != nil {
 			logger.Warn("read-model pass completed with handled failures",
@@ -202,6 +206,9 @@ func readModelReadiness(
 		if err := pool.Ping(ctx); err != nil {
 			return errors.New("read-model worker dependency unavailable")
 		}
+		if !readModelPassEnabled(cfg) || postgresx.CheckRegionalReadiness(ctx, pool, readModelRegionalSession(cfg)) != nil {
+			return errors.New("read-model worker regional authority unavailable")
+		}
 		if err := client.Ping(ctx).Err(); err != nil {
 			return errors.New("read-model worker dependency unavailable")
 		}
@@ -212,6 +219,14 @@ func readModelReadiness(
 		}
 		return nil
 	}
+}
+
+func readModelPassEnabled(cfg config.Config) bool {
+	return cfg.ReadModelWorkerEnabled && cfg.DeploymentRole == config.DeploymentRoleActive && cfg.RegionalWritesEnabled
+}
+
+func readModelRegionalSession(cfg config.Config) postgresx.RegionalSession {
+	return postgresx.RegionalSession{Region: string(cfg.DeploymentRegion), Role: string(cfg.DeploymentRole), Epoch: cfg.RegionEpoch, WritesEnabled: cfg.RegionalWritesEnabled}
 }
 
 func readModelReadinessTimeout(cfg config.Config) time.Duration {

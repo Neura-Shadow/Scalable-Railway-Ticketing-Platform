@@ -14,7 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func TestLiveReverseV2PreflightQueriesMatchInstalledSchemas(t *testing.T) {
+func TestLiveReverseV3PreflightQueriesMatchInstalledSchemas(t *testing.T) {
 	controlURL := strings.TrimSpace(os.Getenv("CONTROL_TARGET_TEST_DATABASE_URL"))
 	sourceURL := strings.TrimSpace(os.Getenv("CONTROL_TARGET_TEST_SOURCE_DATABASE_URL"))
 	if controlURL == "" || sourceURL == "" {
@@ -35,7 +35,7 @@ func TestLiveReverseV2PreflightQueriesMatchInstalledSchemas(t *testing.T) {
 
 	var ready bool
 	if err := sourceDB.QueryRow(ctx, reverseSourcePreflightSQL, uuid.New(), int64(1)).Scan(&ready); err != nil {
-		t.Fatalf("physical schema-v2 preflight query failed: %v", err)
+		t.Fatalf("physical schema-v3 preflight query failed: %v", err)
 	}
 	if ready {
 		t.Fatal("unassigned physical source unexpectedly passed preflight")

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
 	"github.com/google/uuid"
 )
 
@@ -86,7 +87,7 @@ func TestMutatingCommandsRequireConfirmationBeforeBackendOpen(t *testing.T) {
 
 	for _, args := range tests {
 		var opened int
-		factory := func(context.Context, string) (adminBackend, error) {
+		factory := func(context.Context, string, postgresx.RegionalSession) (adminBackend, error) {
 			opened++
 			return &fakeAdminBackend{}, nil
 		}
@@ -100,7 +101,7 @@ func TestMutatingCommandsRequireConfirmationBeforeBackendOpen(t *testing.T) {
 
 func TestDryRunAndConfirmAreMutuallyExclusive(t *testing.T) {
 	var opened int
-	factory := func(context.Context, string) (adminBackend, error) {
+	factory := func(context.Context, string, postgresx.RegionalSession) (adminBackend, error) {
 		opened++
 		return &fakeAdminBackend{}, nil
 	}
@@ -126,7 +127,7 @@ func TestBoundsFailBeforeBackendOpen(t *testing.T) {
 
 	for _, args := range tests {
 		var opened int
-		factory := func(context.Context, string) (adminBackend, error) {
+		factory := func(context.Context, string, postgresx.RegionalSession) (adminBackend, error) {
 			opened++
 			return &fakeAdminBackend{}, nil
 		}
@@ -141,7 +142,7 @@ func TestBoundsFailBeforeBackendOpen(t *testing.T) {
 func TestPlanRejectsNonAllowlistedShardBeforeBackendOpen(t *testing.T) {
 	malicious := `booking_shard_0;DROP TABLE users`
 	var opened int
-	factory := func(context.Context, string) (adminBackend, error) {
+	factory := func(context.Context, string, postgresx.RegionalSession) (adminBackend, error) {
 		opened++
 		return &fakeAdminBackend{}, nil
 	}
@@ -179,7 +180,7 @@ func TestDependencyErrorsAreSanitized(t *testing.T) {
 
 func TestBackendFactoryErrorsAreSanitized(t *testing.T) {
 	secret := "postgres://operator:secret@example/private booking_shard_1 SELECT owner_user_id"
-	factory := func(context.Context, string) (adminBackend, error) {
+	factory := func(context.Context, string, postgresx.RegionalSession) (adminBackend, error) {
 		return nil, errors.New(secret)
 	}
 	var stdout, stderr bytes.Buffer
@@ -264,15 +265,56 @@ func TestMissingDatabaseURLDoesNotEchoConfiguration(t *testing.T) {
 	}
 }
 
+func TestRegionalSessionIsRequiredBeforeBackendConstruction(t *testing.T) {
+	lookup := func(key string) (string, bool) {
+		if key == "DATABASE_URL" {
+			return "postgres://user:do-not-leak@unused.invalid/railway", true
+		}
+		return "", false
+	}
+	called := false
+	factory := func(context.Context, string, postgresx.RegionalSession) (adminBackend, error) {
+		called = true
+		return &fakeAdminBackend{}, nil
+	}
+	var stdout, stderr bytes.Buffer
+	exitCode := runWithFactory(context.Background(), []string{"list-shards"}, lookup, &stdout, &stderr, factory)
+	if exitCode != 2 || called || !strings.Contains(stdout.String(), `"error":"configuration_invalid"`) ||
+		strings.Contains(stdout.String()+stderr.String(), "do-not-leak") {
+		t.Fatalf("exit/called/stdout/stderr=%d/%t/%q/%q", exitCode, called, stdout.String(), stderr.String())
+	}
+}
+
+func TestRegionalSessionIsPassedToBackendFactory(t *testing.T) {
+	var got postgresx.RegionalSession
+	factory := func(_ context.Context, _ string, session postgresx.RegionalSession) (adminBackend, error) {
+		got = session
+		return &fakeAdminBackend{}, nil
+	}
+	var stdout, stderr bytes.Buffer
+	exitCode := runWithFactory(context.Background(), []string{"list-shards"}, databaseLookup, &stdout, &stderr, factory)
+	want := postgresx.RegionalSession{Region: "region-a", Role: "active", Epoch: 1, WritesEnabled: true}
+	if exitCode != 0 || got != want {
+		t.Fatalf("exit/session/stdout/stderr=%d/%+v/%q/%q", exitCode, got, stdout.String(), stderr.String())
+	}
+}
+
 func databaseLookup(key string) (string, bool) {
-	if key == "DATABASE_URL" {
-		return "postgres://unused.invalid/railway", true
+	values := map[string]string{
+		"DATABASE_URL":            "postgres://unused.invalid/railway",
+		"DEPLOYMENT_REGION":       "region-a",
+		"DEPLOYMENT_ROLE":         "active",
+		"REGION_EPOCH":            "1",
+		"REGIONAL_WRITES_ENABLED": "true",
+	}
+	if value, ok := values[key]; ok {
+		return value, true
 	}
 	return "", false
 }
 
 func fakeFactory(backend adminBackend) backendFactory {
-	return func(context.Context, string) (adminBackend, error) { return backend, nil }
+	return func(context.Context, string, postgresx.RegionalSession) (adminBackend, error) { return backend, nil }
 }
 
 type fakeAdminBackend struct {

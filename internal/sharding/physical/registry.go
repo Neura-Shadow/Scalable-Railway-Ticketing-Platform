@@ -22,7 +22,7 @@ var (
 
 const (
 	SupportedProtocolVersion int32 = 1
-	SupportedSchemaVersion   int32 = 2
+	SupportedSchemaVersion   int32 = 3
 )
 
 type StorageKind string
@@ -230,6 +230,25 @@ func (r *Registry) PoolSnapshots() map[sharding.ShardID]PoolSnapshot {
 		if source, ok := connection.pool.(poolSnapshotSource); ok {
 			result[connection.shardID] = source.PoolSnapshot()
 		}
+	}
+	return result
+}
+
+// ReadOnlyPools exposes the fixed, configured pool set to operational
+// observers. Callers must use read-only transactions; no DSN or mutable
+// registry state crosses this boundary.
+func (r *Registry) ReadOnlyPools() map[sharding.ShardID]Pool {
+	result := make(map[sharding.ShardID]Pool, 2)
+	if r == nil {
+		return result
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed {
+		return result
+	}
+	for _, connection := range r.connections {
+		result[connection.shardID] = connection.pool
 	}
 	return result
 }

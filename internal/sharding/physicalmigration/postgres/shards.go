@@ -75,7 +75,7 @@ func NewDefaultShards(source, target DB) (*Shards, error) {
 
 func (shards *Shards) Preflight(ctx context.Context, record physicalmigration.Record) error {
 	if record.SourceProtocolVersion != 1 || record.TargetProtocolVersion != 1 ||
-		record.SourceSchemaVersion != 2 || record.TargetSchemaVersion != 2 {
+		record.SourceSchemaVersion != 3 || record.TargetSchemaVersion != 3 {
 		return physicalmigration.ErrCheckpointConflict
 	}
 	var sourceReady bool
@@ -83,7 +83,7 @@ func (shards *Shards) Preflight(ctx context.Context, record physicalmigration.Re
 SELECT current_setting('server_version_num')::integer >= 160000
 	AND EXISTS (
 	    SELECT 1 FROM public.schema_migrations
-	    WHERE version = 2 AND NOT dirty
+	    WHERE version = 3 AND NOT dirty
 	)
    AND to_regclass('public.train_run_booking_snapshots') IS NOT NULL
    AND to_regclass('public.train_run_mutation_journal') IS NOT NULL
@@ -92,6 +92,14 @@ SELECT current_setting('server_version_num')::integer >= 160000
 	AND to_regclass('public.ticket_issuance_receipts') IS NOT NULL
 	AND to_regclass('public.payment_refund_receipts') IS NOT NULL
 	AND to_regclass('public.payment_compensation_receipts') IS NOT NULL
+	AND to_regclass('public.ticket_refund_prepare_receipts') IS NOT NULL
+	AND to_regclass('public.ticket_refund_compensation_receipts') IS NOT NULL
+	AND to_regclass('public.selected_ticket_refund_receipts') IS NOT NULL
+	AND to_regclass('public.migration_evidence_mutation_authorizations') IS NOT NULL
+	AND EXISTS (
+	    SELECT 1 FROM public.regional_write_authority
+	    WHERE singleton AND state = 'active' AND writes_enabled
+	)
 	AND NOT EXISTS (
 	    SELECT 1 FROM (VALUES
 	        ('train_run_booking_snapshots_capture_mutation'),
@@ -107,7 +115,11 @@ SELECT current_setting('server_version_num')::integer >= 160000
 	        ('payment_command_receipts_capture_mutation'),
 	        ('ticket_issuance_receipts_capture_mutation'),
 	        ('payment_refund_receipts_capture_mutation'),
-	        ('payment_compensation_receipts_capture_mutation')
+	        ('payment_compensation_receipts_capture_mutation'),
+	        ('ticket_refund_prepare_receipts_capture_mutation'),
+	        ('ticket_refund_prepare_receipts_guard_transition'),
+	        ('ticket_refund_compensation_receipts_capture_mutation'),
+	        ('selected_ticket_refund_receipts_capture_mutation')
 	    ) AS required(trigger_name)
 	    WHERE NOT EXISTS (
 	        SELECT 1 FROM pg_catalog.pg_trigger
@@ -117,6 +129,7 @@ SELECT current_setting('server_version_num')::integer >= 160000
    AND EXISTS (
        SELECT 1 FROM public.train_run_booking_snapshots
        WHERE train_run_id = $1 AND assignment_generation = $2
+         AND isfinite(scheduled_departure_at)
    )
    AND EXISTS (
        SELECT 1 FROM public.train_run_write_fences
@@ -130,7 +143,7 @@ SELECT current_setting('server_version_num')::integer >= 160000
 SELECT current_setting('server_version_num')::integer >= 160000
 	AND EXISTS (
 	    SELECT 1 FROM public.schema_migrations
-	    WHERE version = 2 AND NOT dirty
+	    WHERE version = 3 AND NOT dirty
 	)
    AND to_regclass('public.train_run_booking_snapshots') IS NOT NULL
    AND to_regclass('public.migration_apply_receipts') IS NOT NULL
@@ -139,6 +152,14 @@ SELECT current_setting('server_version_num')::integer >= 160000
 	AND to_regclass('public.ticket_issuance_receipts') IS NOT NULL
 	AND to_regclass('public.payment_refund_receipts') IS NOT NULL
 	AND to_regclass('public.payment_compensation_receipts') IS NOT NULL
+	AND to_regclass('public.ticket_refund_prepare_receipts') IS NOT NULL
+	AND to_regclass('public.ticket_refund_compensation_receipts') IS NOT NULL
+	AND to_regclass('public.selected_ticket_refund_receipts') IS NOT NULL
+	AND to_regclass('public.migration_evidence_mutation_authorizations') IS NOT NULL
+	AND EXISTS (
+	    SELECT 1 FROM public.regional_write_authority
+	    WHERE singleton AND state = 'active' AND writes_enabled
+	)
 	AND NOT EXISTS (
 	    SELECT 1 FROM (VALUES
 	        ('train_run_booking_snapshots_capture_mutation'),
@@ -154,7 +175,11 @@ SELECT current_setting('server_version_num')::integer >= 160000
 	        ('payment_command_receipts_capture_mutation'),
 	        ('ticket_issuance_receipts_capture_mutation'),
 	        ('payment_refund_receipts_capture_mutation'),
-	        ('payment_compensation_receipts_capture_mutation')
+	        ('payment_compensation_receipts_capture_mutation'),
+	        ('ticket_refund_prepare_receipts_capture_mutation'),
+	        ('ticket_refund_prepare_receipts_guard_transition'),
+	        ('ticket_refund_compensation_receipts_capture_mutation'),
+	        ('selected_ticket_refund_receipts_capture_mutation')
 	    ) AS required(trigger_name)
 	    WHERE NOT EXISTS (
 	        SELECT 1 FROM pg_catalog.pg_trigger
@@ -164,6 +189,10 @@ SELECT current_setting('server_version_num')::integer >= 160000
    AND NOT EXISTS (
        SELECT 1 FROM public.train_run_write_fences
        WHERE train_run_id = $1 AND write_enabled
+   )
+   AND NOT EXISTS (
+       SELECT 1 FROM public.train_run_booking_snapshots
+       WHERE train_run_id = $1 AND NOT isfinite(scheduled_departure_at)
    )`, record.TrainRunID).Scan(&targetReady); err != nil || !targetReady {
 		return physicalmigration.ErrCheckpointConflict
 	}
@@ -335,7 +364,6 @@ LIMIT $6`, request.Migration.MigrationID, request.Migration.TrainRunID, request.
 			&entry.EntityID, &entry.PrimaryKey, &entry.Metadata); err != nil {
 			return physicalmigration.JournalBatch{}, fmt.Errorf("%w: scan journal", ErrShardOperation)
 		}
-		entry.ApplyFingerprint = journalFingerprint(entry)
 		batch.Entries = append(batch.Entries, entry)
 	}
 	if err := rows.Err(); err != nil {
@@ -352,6 +380,9 @@ LIMIT $6`, request.Migration.MigrationID, request.Migration.TrainRunID, request.
 			return physicalmigration.JournalBatch{}, err
 		}
 		batch.Entries[index].Payload = payload
+	}
+	for index := range batch.Entries {
+		batch.Entries[index].ApplyFingerprint = journalFingerprint(batch.Entries[index])
 	}
 	return batch, nil
 }
@@ -943,6 +974,10 @@ func journalFingerprint(entry physicalmigration.JournalEntry) [32]byte {
 	hash.Write(entry.EntityID[:])
 	hash.Write(entry.PrimaryKey)
 	hash.Write(entry.Metadata)
+	if payload, ok := entry.Payload.([]byte); ok {
+		hash.Write([]byte{0})
+		hash.Write(payload)
+	}
 	var result [32]byte
 	copy(result[:], hash.Sum(nil))
 	return result

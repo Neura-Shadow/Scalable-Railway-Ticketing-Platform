@@ -33,7 +33,7 @@ func TestReverseAdapterRejectsPhysicalV1RatherThanGuessingItsShape(t *testing.T)
 	}
 }
 
-func TestV2CopyAndReversePreservePaymentFieldsAndReceiptTables(t *testing.T) {
+func TestV3CopyAndReversePreservePaymentFieldsAndReceiptTables(t *testing.T) {
 	t.Parallel()
 
 	for _, fragment := range []string{
@@ -49,7 +49,9 @@ func TestV2CopyAndReversePreservePaymentFieldsAndReceiptTables(t *testing.T) {
 	for _, table := range []string{
 		"booking_command_receipts", "payment_command_receipts",
 		"ticket_issuance_receipts", "payment_refund_receipts",
-		"payment_compensation_receipts",
+		"payment_compensation_receipts", "ticket_refund_compensation_receipts",
+		"ticket_refund_prepare_receipts",
+		"selected_ticket_refund_receipts",
 	} {
 		if _, ok := sourceQuery(table); !ok {
 			t.Fatalf("sourceQuery(%q) is not supported", table)
@@ -59,7 +61,7 @@ func TestV2CopyAndReversePreservePaymentFieldsAndReceiptTables(t *testing.T) {
 		}
 		if !reverseSupportedTable(table) || reverseUpsertSQL(SourceLegacy, table) == "" ||
 			reverseDeleteSQL(SourceLegacy, table) == "" {
-			t.Fatalf("reverse v2 relation %q is incomplete", table)
+			t.Fatalf("reverse v3 relation %q is incomplete", table)
 		}
 	}
 	for _, fragment := range []string{
@@ -74,24 +76,85 @@ func TestV2CopyAndReversePreservePaymentFieldsAndReceiptTables(t *testing.T) {
 	}
 }
 
-func TestReverseV2PreflightRequiresSourceAndTargetReceiptCaptureReadiness(t *testing.T) {
+func TestForwardV3PreflightRequiresControlV11AndPartialRefundCaptureReadiness(t *testing.T) {
+	t.Parallel()
+
+	control := &fakeDB{rowResults: []pgx.Row{
+		fakeRow{values: []any{true}}, fakeRow{values: []any{true}},
+	}}
+	target := &fakeDB{rowResults: []pgx.Row{fakeRow{values: []any{true}}}}
+	adapter, err := New(control, target, SourceLegacy)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	record := physicalmigration.Record{
+		MigrationID: uuid.New(), TrainRunID: uuid.New(),
+		SourceShardID: SourceLegacy, TargetShardID: "physical-shard-0",
+		SourceGeneration: 7, TargetGeneration: 8,
+		SourceProtocolVersion: 1, SourceSchemaVersion: 8,
+		TargetProtocolVersion: 1, TargetSchemaVersion: 3,
+	}
+	if err := adapter.Preflight(context.Background(), record); err != nil {
+		t.Fatalf("Preflight() error = %v", err)
+	}
+	joinedControl := strings.Join(control.queryRowSQL, "\n")
+	for _, fragment := range []string{
+		"version=11 AND NOT dirty",
+		"regional_write_authority", "state='active'", "writes_enabled",
+		"physical_source_ticket_refund_compensation_receipt_rows",
+		"physical_source_selected_ticket_refund_receipt_rows",
+		"guard_control_ticket_refund_evidence_mutation",
+		"ticket_refund_prepare_receipts_guard_evidence",
+		"ticket_refund_compensation_receipts_guard_evidence",
+		"selected_ticket_refund_receipts_guard_evidence",
+		"ticket_refund_compensation_receipts",
+		"selected_ticket_refund_receipts",
+	} {
+		if !strings.Contains(joinedControl, fragment) {
+			t.Fatalf("control-source preflight omitted %q: %s", fragment, joinedControl)
+		}
+	}
+	joinedTarget := strings.Join(target.queryRowSQL, "\n")
+	for _, fragment := range []string{
+		"version = 3", "regional_write_authority", "state = 'active'", "writes_enabled",
+		"migration_evidence_mutation_authorizations",
+		"ticket_refund_compensation_receipts_capture_mutation",
+		"selected_ticket_refund_receipts_capture_mutation",
+	} {
+		if !strings.Contains(joinedTarget, fragment) {
+			t.Fatalf("physical-target preflight omitted %q: %s", fragment, joinedTarget)
+		}
+	}
+}
+
+func TestReverseV3PreflightRequiresSourceAndTargetReceiptCaptureReadiness(t *testing.T) {
 	t.Parallel()
 
 	for _, fragment := range []string{
-		"version=2 AND NOT dirty",
+		"version=3 AND NOT dirty",
+		"regional_write_authority", "state='active'", "writes_enabled",
+		"migration_evidence_mutation_authorizations",
 		"payment_command_receipts_capture_mutation",
 		"ticket_issuance_receipts_capture_mutation",
 		"payment_refund_receipts_capture_mutation",
 		"payment_compensation_receipts_capture_mutation",
+		"ticket_refund_prepare_receipts_capture_mutation",
+		"ticket_refund_compensation_receipts_capture_mutation",
+		"selected_ticket_refund_receipts_capture_mutation",
 	} {
 		if !strings.Contains(reverseSourcePreflightSQL, fragment) {
 			t.Fatalf("reverse source preflight omitted %q", fragment)
 		}
 	}
 	for _, fragment := range []string{
-		"version=10 AND NOT dirty",
+		"version=11 AND NOT dirty",
+		"regional_write_authority", "state='active'", "writes_enabled",
 		"public.guard_control_booking_receipt_write()",
 		"public.capture_physical_source_receipt_mutation()",
+		"public.guard_control_ticket_refund_evidence_mutation()",
+		"ticket_refund_prepare_receipts_guard_evidence",
+		"ticket_refund_compensation_receipts_guard_evidence",
+		"selected_ticket_refund_receipts_guard_evidence",
 		"physical_target_write_guard",
 		"physical_source_capture",
 		"reservations_guard_payment_snapshot",
@@ -105,7 +168,8 @@ func TestReverseV2PreflightRequiresSourceAndTargetReceiptCaptureReadiness(t *tes
 		for _, table := range []string{
 			"booking_command_receipts", "payment_command_receipts",
 			"ticket_issuance_receipts", "payment_refund_receipts",
-			"payment_compensation_receipts",
+			"payment_compensation_receipts", "ticket_refund_prepare_receipts", "ticket_refund_compensation_receipts",
+			"selected_ticket_refund_receipts",
 		} {
 			if !strings.Contains(reverseTargetPreflightSQL, schema+"."+table) {
 				t.Fatalf("reverse target preflight omitted %s.%s", schema, table)
@@ -114,11 +178,11 @@ func TestReverseV2PreflightRequiresSourceAndTargetReceiptCaptureReadiness(t *tes
 	}
 }
 
-func TestReverseV2ValidationAccountsForEveryPhysicalTable(t *testing.T) {
+func TestReverseV3ValidationAccountsForEveryPhysicalTable(t *testing.T) {
 	t.Parallel()
 
-	if len(tableOrder) != 15 {
-		t.Fatalf("physical table contract has %d tables, want 15", len(tableOrder))
+	if len(tableOrder) != 18 {
+		t.Fatalf("physical table contract has %d tables, want 18", len(tableOrder))
 	}
 	sourceRows := make([]pgx.Rows, len(tableOrder))
 	targetRows := make([]pgx.Rows, len(tableOrder))
@@ -144,7 +208,7 @@ func TestReverseV2ValidationAccountsForEveryPhysicalTable(t *testing.T) {
 		t.Fatalf("Validate() error = %v", err)
 	}
 	if !result.Passed || result.Truncated || result.Tables != len(tableOrder) {
-		t.Fatalf("Validate() = %+v, want all 15 tables passed", result)
+		t.Fatalf("Validate() = %+v, want all 17 tables passed", result)
 	}
 }
 
@@ -251,6 +315,62 @@ func TestReverseTargetStatementsUseOnlyFixedAllowlistedRelations(t *testing.T) {
 		}
 		if !strings.Contains(reverseUpsertSQL(targetID, "reservations"), relation) {
 			t.Fatalf("target %s did not select %s", targetID, relation)
+		}
+	}
+}
+
+func TestReverseV3CleanupRemovesSelectedTicketEvidenceInForeignKeyOrder(t *testing.T) {
+	t.Parallel()
+
+	for _, targetID := range []string{SourceLegacy, SourceZero, SourceOne} {
+		countSQL := reverseCleanupCountSQL(targetID)
+		statements := strings.Join(reverseCleanupStatements(targetID), "\n")
+		for _, table := range []string{
+			"selected_ticket_refund_receipts", "ticket_refund_compensation_receipts",
+		} {
+			if !strings.Contains(countSQL, table) {
+				t.Fatalf("target %s cleanup count omits %s", targetID, table)
+			}
+			if !strings.Contains(statements, "DELETE FROM ") || !strings.Contains(statements, table) {
+				t.Fatalf("target %s cleanup omits %s: %s", targetID, table, statements)
+			}
+		}
+		selected := strings.Index(statements, "selected_ticket_refund_receipts")
+		compensation := strings.Index(statements, "ticket_refund_compensation_receipts")
+		tickets := strings.Index(statements, ".tickets")
+		if selected < 0 || compensation <= selected || tickets <= compensation {
+			t.Fatalf("target %s unsafe v3 cleanup order: %s", targetID, statements)
+		}
+	}
+}
+
+func TestReverseV3RetriesImmutableEvidenceWithoutUpdatingIt(t *testing.T) {
+	t.Parallel()
+
+	for _, targetID := range []string{SourceLegacy, SourceZero, SourceOne} {
+		for _, table := range []string{
+			"ticket_refund_compensation_receipts", "selected_ticket_refund_receipts",
+		} {
+			sql := reverseUpsertSQL(targetID, table)
+			if !strings.Contains(sql, "ON CONFLICT (id) DO NOTHING") || strings.Contains(sql, "DO UPDATE") {
+				t.Fatalf("target %s immutable %s retry can mutate evidence: %s", targetID, table, sql)
+			}
+		}
+	}
+}
+
+func TestReverseV3ReplaysPrepareResolutionAfterBaseCopy(t *testing.T) {
+	t.Parallel()
+	for _, targetID := range []string{SourceLegacy, SourceZero, SourceOne} {
+		sql := reverseUpsertSQL(targetID, "ticket_refund_prepare_receipts")
+		for _, fragment := range []string{
+			"state=EXCLUDED.state", "resolved_at=EXCLUDED.resolved_at",
+			".state='prepared'", "EXCLUDED.state IN ('released','applied')",
+			"IS DISTINCT FROM", ".request_fingerprint",
+		} {
+			if !strings.Contains(sql, fragment) {
+				t.Fatalf("target %s prepare merge omits %q: %s", targetID, fragment, sql)
+			}
 		}
 	}
 }
@@ -477,10 +597,83 @@ func TestControlMigrationScopesReverseApplyAuthorizationToTheExactTransaction(t 
 	}
 }
 
+func TestV11ControlRefundReceiptEvidenceRequiresExactCleanupAuthorization(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join("..", "..", "..", "..", "migrations", "000011_payment_ops_dr.up.sql")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read migration: %v", err)
+	}
+	sql := string(raw)
+	for _, fragment := range []string{
+		"guard_control_ticket_refund_evidence_mutation",
+		"apply_auth.transaction_id = txid_current()",
+		"apply_auth.train_run_id = (source_row ->> 'train_run_id')::uuid",
+		"apply_auth.target_generation = migration.target_generation",
+		"migration.reverse_migration",
+		"ticket_refund_prepare_receipts_guard_evidence",
+		"ticket_refund_compensation_receipts_guard_evidence",
+		"selected_ticket_refund_receipts_guard_evidence",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("v11 refund evidence guard omitted %q", fragment)
+		}
+	}
+}
+
+func TestV11AllowsAReleasedFailedTicketToBeSelectedByANewRefundRequest(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join("..", "..", "..", "..", "migrations", "000011_payment_ops_dr.up.sql")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read migration: %v", err)
+	}
+	sql := string(raw)
+	start := strings.Index(sql, "CREATE TABLE public.ticket_refund_request_items")
+	end := strings.Index(sql[start:], "CREATE TABLE public.ticket_refund_sagas")
+	if start < 0 || end < 0 {
+		t.Fatal("v11 refund request-item schema is incomplete")
+	}
+	itemSQL := sql[start : start+end]
+	if strings.Contains(itemSQL, "UNIQUE (ticket_id)") ||
+		!strings.Contains(itemSQL, "ticket_refund_request_items_active_ticket_idx") ||
+		!strings.Contains(itemSQL, "WHERE state <> 'failed'") {
+		t.Fatalf("v11 request-item uniqueness does not release failed selections: %s", itemSQL)
+	}
+}
+
+func TestV3MarksPopulatedSnapshotsUnverifiedUntilExactDepartureRematerialization(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join("..", "..", "..", "..", "migrations", "booking-shard", "000003_payment_ops_dr.up.sql")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read migration: %v", err)
+	}
+	sql := string(raw)
+	for _, fragment := range []string{
+		"scheduled_departure_at timestamptz NOT NULL",
+		"DEFAULT '-infinity'::timestamptz",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("v3 populated-snapshot marker omitted %q", fragment)
+		}
+	}
+	for _, preflight := range []string{reverseSourcePreflightSQL} {
+		if !strings.Contains(preflight, "isfinite(scheduled_departure_at)") {
+			t.Fatal("physical source readiness does not require an exact rematerialized departure")
+		}
+	}
+}
+
 type fakeDB struct {
-	rows      []pgx.Rows
-	querySQL  []string
-	queryArgs [][]any
+	rows        []pgx.Rows
+	querySQL    []string
+	queryArgs   [][]any
+	rowResults  []pgx.Row
+	queryRowSQL []string
 }
 
 func (*fakeDB) BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error) {
@@ -496,8 +689,23 @@ func (db *fakeDB) Query(_ context.Context, sql string, args ...any) (pgx.Rows, e
 	db.rows = db.rows[1:]
 	return rows, nil
 }
-func (*fakeDB) QueryRow(context.Context, string, ...any) pgx.Row {
-	panic("unexpected QueryRow")
+func (db *fakeDB) QueryRow(_ context.Context, sql string, _ ...any) pgx.Row {
+	db.queryRowSQL = append(db.queryRowSQL, sql)
+	if len(db.rowResults) == 0 {
+		panic("unexpected QueryRow")
+	}
+	row := db.rowResults[0]
+	db.rowResults = db.rowResults[1:]
+	return row
+}
+
+type fakeRow struct{ values []any }
+
+func (row fakeRow) Scan(destinations ...any) error {
+	for index, value := range row.values {
+		reflect.ValueOf(destinations[index]).Elem().Set(reflect.ValueOf(value))
+	}
+	return nil
 }
 
 type fakeRows struct {

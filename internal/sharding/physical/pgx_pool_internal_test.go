@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -35,6 +36,29 @@ func TestOpenPGXPoolExposesMigrationQueryBoundary(t *testing.T) {
 	defer pool.Close()
 	if _, ok := pool.(migrationQueryPool); !ok {
 		t.Fatal("physical pgx pool does not expose the bounded migration query boundary")
+	}
+}
+
+func TestRegionalPGXPoolFactoryInstallsAuthorityParameters(t *testing.T) {
+	t.Parallel()
+	factory := RegionalPGXPoolFactory(postgresx.RegionalSession{
+		Region: "region-b", Role: "recovery", Epoch: 8, WritesEnabled: false,
+	})
+	pool, err := factory(context.Background(),
+		"postgres://unused:unused@127.0.0.1:1/unused?sslmode=disable",
+		PoolLimits{MaxOpenConns: 1, MaxIdleConns: 0, ConnectTimeout: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	adapter, ok := pool.(*pgxPoolAdapter)
+	if !ok {
+		t.Fatalf("regional pool type = %T", pool)
+	}
+	params := adapter.pool.Config().ConnConfig.RuntimeParams
+	if params["railway.deployment_region"] != "region-b" || params["railway.deployment_role"] != "recovery" ||
+		params["railway.region_epoch"] != "8" || params["railway.regional_writes_enabled"] != "false" {
+		t.Fatalf("regional runtime parameters = %#v", params)
 	}
 }
 

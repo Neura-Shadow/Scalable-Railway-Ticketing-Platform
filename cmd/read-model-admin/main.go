@@ -12,15 +12,16 @@ import (
 	"time"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/clock"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/redisx"
 	queryreadmodel "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/readmodel"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
 
 const (
 	defaultAdminTimeout = 2 * time.Minute
+	maxAdminConnections = 4
 	readModelStream     = "railway:outbox:v1"
 	readModelGroup      = "railway-read-model"
 	readModelDLQ        = "railway:outbox:v1:read-model:dlq"
@@ -77,17 +78,27 @@ func run(parent context.Context, args []string, lookup func(string) (string, boo
 		fmt.Fprintln(stderr, "configuration invalid: DATABASE_URL is required")
 		return 2
 	}
+	session, sessionErr := postgresx.ParseRegionalSession(
+		environmentValue(lookup, "DEPLOYMENT_REGION"),
+		environmentValue(lookup, "DEPLOYMENT_ROLE"),
+		environmentValue(lookup, "REGION_EPOCH"),
+		environmentValue(lookup, "REGIONAL_WRITES_ENABLED"),
+	)
+	if sessionErr != nil {
+		fmt.Fprintln(stderr, "configuration invalid: regional database session is required")
+		return 2
+	}
 	var result envelope
 	var err error
 	switch args[0] {
 	case "rebuild-train-run":
-		result, err = rebuildTrainRun(parent, databaseURL, args[1:])
+		result, err = rebuildTrainRun(parent, databaseURL, session, args[1:])
 	case "rebuild-all":
-		result, err = rebuildAll(parent, databaseURL, args[1:])
+		result, err = rebuildAll(parent, databaseURL, session, args[1:])
 	case "reconcile":
-		result, err = reconcile(parent, databaseURL, args[1:])
+		result, err = reconcile(parent, databaseURL, session, args[1:])
 	case "inspect-lag":
-		result, err = inspectLag(parent, databaseURL, args[1:])
+		result, err = inspectLag(parent, databaseURL, session, args[1:])
 	case "resume-event":
 		redisAddress, _ := lookup("REDIS_ADDRESS")
 		if strings.TrimSpace(redisAddress) == "" {
@@ -97,6 +108,7 @@ func run(parent context.Context, args []string, lookup func(string) (string, boo
 		result, err = resumeEvent(
 			parent,
 			databaseURL,
+			session,
 			strings.TrimSpace(redisAddress),
 			redisPassword,
 			args[1:],
@@ -110,6 +122,7 @@ func run(parent context.Context, args []string, lookup func(string) (string, boo
 		result, err = replayOutbox(
 			parent,
 			databaseURL,
+			session,
 			strings.TrimSpace(redisAddress),
 			redisPassword,
 			args[1:],
@@ -136,6 +149,7 @@ func run(parent context.Context, args []string, lookup func(string) (string, boo
 func replayOutbox(
 	parent context.Context,
 	databaseURL string,
+	session postgresx.RegionalSession,
 	redisAddress string,
 	redisPassword string,
 	args []string,
@@ -152,7 +166,7 @@ func replayOutbox(
 		return envelope{}, errors.New("usage: read-model-admin replay-outbox [--after CURSOR] [--batch-size 50] [--consumer-name railway-read-model] [--apply] [--timeout 2m]")
 	}
 	result := envelope{Command: "replay-outbox", Status: "dry-run", ReadOnly: !*apply}
-	ctx, store, closeStore, err := openStore(parent, databaseURL, *timeout)
+	ctx, store, closeStore, err := openStore(parent, databaseURL, session, *timeout)
 	if err != nil {
 		return result, err
 	}
@@ -197,6 +211,7 @@ func replayOutbox(
 func resumeEvent(
 	parent context.Context,
 	databaseURL string,
+	session postgresx.RegionalSession,
 	redisAddress string,
 	redisPassword string,
 	args []string,
@@ -220,7 +235,7 @@ func resumeEvent(
 		ReadOnly: !*apply,
 		Result:   map[string]any{"event_id": eventID.String()},
 	}
-	ctx, store, closeStore, err := openStore(parent, databaseURL, *timeout)
+	ctx, store, closeStore, err := openStore(parent, databaseURL, session, *timeout)
 	if err != nil {
 		return result, err
 	}
@@ -251,7 +266,7 @@ func resumeEvent(
 	return result, nil
 }
 
-func rebuildTrainRun(parent context.Context, databaseURL string, args []string) (envelope, error) {
+func rebuildTrainRun(parent context.Context, databaseURL string, session postgresx.RegionalSession, args []string) (envelope, error) {
 	flags := flag.NewFlagSet("rebuild-train-run", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	trainRunText := flags.String("train-run-id", "", "canonical train-run UUID")
@@ -268,7 +283,7 @@ func rebuildTrainRun(parent context.Context, databaseURL string, args []string) 
 	if !*apply {
 		return result, nil
 	}
-	ctx, store, closeStore, err := openStore(parent, databaseURL, *timeout)
+	ctx, store, closeStore, err := openStore(parent, databaseURL, session, *timeout)
 	if err != nil {
 		return result, err
 	}
@@ -279,7 +294,7 @@ func rebuildTrainRun(parent context.Context, databaseURL string, args []string) 
 	return result, err
 }
 
-func rebuildAll(parent context.Context, databaseURL string, args []string) (envelope, error) {
+func rebuildAll(parent context.Context, databaseURL string, session postgresx.RegionalSession, args []string) (envelope, error) {
 	flags := flag.NewFlagSet("rebuild-all", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	after := flags.String("after", "", "opaque resume cursor")
@@ -290,7 +305,7 @@ func rebuildAll(parent context.Context, databaseURL string, args []string) (enve
 		*batchSize < 1 || *batchSize > queryreadmodel.MaxRebuildAllBatchSize {
 		return envelope{}, errors.New("usage: read-model-admin rebuild-all [--after CURSOR] [--batch-size 50] [--apply] [--timeout 2m]")
 	}
-	ctx, store, closeStore, err := openStore(parent, databaseURL, *timeout)
+	ctx, store, closeStore, err := openStore(parent, databaseURL, session, *timeout)
 	if err != nil {
 		return envelope{}, err
 	}
@@ -306,7 +321,7 @@ func rebuildAll(parent context.Context, databaseURL string, args []string) (enve
 	return result, err
 }
 
-func reconcile(parent context.Context, databaseURL string, args []string) (envelope, error) {
+func reconcile(parent context.Context, databaseURL string, session postgresx.RegionalSession, args []string) (envelope, error) {
 	flags := flag.NewFlagSet("reconcile", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	trainRunText := flags.String("train-run-id", "", "canonical train-run UUID")
@@ -318,7 +333,7 @@ func reconcile(parent context.Context, databaseURL string, args []string) (envel
 		(strings.TrimSpace(*trainRunText) != "" && strings.TrimSpace(*after) != "") {
 		return envelope{}, errors.New("usage: read-model-admin reconcile [--train-run-id UUID | --after UUID --limit 100] [--timeout 2m]")
 	}
-	ctx, store, closeStore, err := openStore(parent, databaseURL, *timeout)
+	ctx, store, closeStore, err := openStore(parent, databaseURL, session, *timeout)
 	if err != nil {
 		return envelope{}, err
 	}
@@ -387,7 +402,7 @@ func reconcile(parent context.Context, databaseURL string, args []string) (envel
 	return result, nil
 }
 
-func inspectLag(parent context.Context, databaseURL string, args []string) (envelope, error) {
+func inspectLag(parent context.Context, databaseURL string, session postgresx.RegionalSession, args []string) (envelope, error) {
 	flags := flag.NewFlagSet("inspect-lag", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	timeout := flags.Duration("timeout", defaultAdminTimeout, "maximum command duration")
@@ -396,7 +411,7 @@ func inspectLag(parent context.Context, databaseURL string, args []string) (enve
 	}
 	ctx, cancel := context.WithTimeout(parent, *timeout)
 	defer cancel()
-	pool, err := pgxpool.New(ctx, databaseURL)
+	pool, err := postgresx.NewRegionalBoundedPool(ctx, databaseURL, maxAdminConnections, session)
 	if err != nil {
 		return envelope{}, errors.New("postgres configuration invalid")
 	}
@@ -436,9 +451,9 @@ func inspectLag(parent context.Context, databaseURL string, args []string) (enve
 	return envelope{Command: "inspect-lag", Status: "completed", ReadOnly: true, Result: result}, nil
 }
 
-func openStore(parent context.Context, databaseURL string, timeout time.Duration) (context.Context, *queryreadmodel.Store, func(), error) {
+func openStore(parent context.Context, databaseURL string, session postgresx.RegionalSession, timeout time.Duration) (context.Context, *queryreadmodel.Store, func(), error) {
 	ctx, cancel := context.WithTimeout(parent, timeout)
-	pool, err := pgxpool.New(ctx, databaseURL)
+	pool, err := postgresx.NewRegionalBoundedPool(ctx, databaseURL, maxAdminConnections, session)
 	if err != nil {
 		cancel()
 		return nil, nil, func() {}, errors.New("postgres configuration invalid")
@@ -450,6 +465,11 @@ func openStore(parent context.Context, databaseURL string, timeout time.Duration
 		return nil, nil, func() {}, errors.New("read-model store initialization failed")
 	}
 	return ctx, store, func() { pool.Close(); cancel() }, nil
+}
+
+func environmentValue(lookup func(string) (string, bool), name string) string {
+	value, _ := lookup(name)
+	return strings.TrimSpace(value)
 }
 
 func canonicalUUID(raw string) (string, error) {

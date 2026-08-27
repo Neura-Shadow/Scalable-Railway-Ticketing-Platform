@@ -26,7 +26,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const admissionSchemaVersion = 10
+const admissionSchemaVersion = 11
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -59,7 +59,7 @@ func run(logger *slog.Logger) error {
 
 	rootContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	pool, err := postgresx.NewBoundedPool(rootContext, cfg.DatabaseURL, cfg.ControlDatabaseMaxOpenConns)
+	pool, err := postgresx.NewRegionalBoundedPool(rootContext, cfg.DatabaseURL, cfg.ControlDatabaseMaxOpenConns, admissionRegionalSession(cfg))
 	if err != nil {
 		return errors.New("postgres configuration invalid")
 	}
@@ -80,7 +80,7 @@ func run(logger *slog.Logger) error {
 		return errors.New("admission control initialization failed")
 	}
 	registry := prometheus.NewRegistry()
-	metrics, err := platformmetrics.New(registry)
+	metrics, err := platformmetrics.NewEventMetrics(registry)
 	if err != nil {
 		return errors.New("metrics initialization failed")
 	}
@@ -106,6 +106,10 @@ func run(logger *slog.Logger) error {
 	runPass := func() {
 		passContext, cancel := context.WithTimeout(rootContext, cfg.WorkerPassTimeout)
 		defer cancel()
+		if !admissionPassEnabled(cfg) || postgresx.CheckRegionalReadiness(passContext, pool, admissionRegionalSession(cfg)) != nil {
+			logger.Info("admission worker retained without regional claim authority", "deployment_role", cfg.DeploymentRole)
+			return
+		}
 		passStartedAt := time.Now().UTC()
 		result, runErr := worker.RunOnce(passContext)
 		passCompletedAt := time.Now().UTC()
@@ -166,6 +170,9 @@ func admissionReadiness(pool *pgxpool.Pool, client redis.UniversalClient, cfg co
 		if err := pool.Ping(ctx); err != nil {
 			return errors.New("worker dependency unavailable")
 		}
+		if !admissionPassEnabled(cfg) || postgresx.CheckRegionalReadiness(ctx, pool, admissionRegionalSession(cfg)) != nil {
+			return errors.New("worker regional authority unavailable")
+		}
 		if err := client.Ping(ctx).Err(); err != nil {
 			return errors.New("worker dependency unavailable")
 		}
@@ -180,6 +187,14 @@ func admissionReadiness(pool *pgxpool.Pool, client redis.UniversalClient, cfg co
 		}
 		return nil
 	}
+}
+
+func admissionPassEnabled(cfg config.Config) bool {
+	return cfg.AdmissionWorkerEnabled && cfg.DeploymentRole == config.DeploymentRoleActive && cfg.RegionalWritesEnabled
+}
+
+func admissionRegionalSession(cfg config.Config) postgresx.RegionalSession {
+	return postgresx.RegionalSession{Region: string(cfg.DeploymentRegion), Role: string(cfg.DeploymentRole), Epoch: cfg.RegionEpoch, WritesEnabled: cfg.RegionalWritesEnabled}
 }
 
 func admissionReadinessTimeout(cfg config.Config) time.Duration {
