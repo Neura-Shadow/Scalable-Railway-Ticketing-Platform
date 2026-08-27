@@ -327,6 +327,11 @@ jobs:
       - name: Rehearse Milestone 7 down to v10, Milestone 6 down to v9, and replay
         shell: bash
         run: |
+          # Keep the version-10 source fixture, but remove its derived version-11
+          # evidence so the guarded downgrade exercises the intentionally empty
+          # downgrade lane. The replay below must reconstruct the same evidence.
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --command 'TRUNCATE TABLE public.payment_saga_actions, public.financial_ledger_transactions CASCADE'
           go run ./cmd/migrate \
             -path migrations \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
@@ -375,6 +380,8 @@ jobs:
             up
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone7_v11_schema.sql
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone7_v11_data.sql
       - name: Apply migrations to an empty database
         run: go run ./cmd/migrate -path migrations up
       - name: Verify migration-up is safe to repeat
