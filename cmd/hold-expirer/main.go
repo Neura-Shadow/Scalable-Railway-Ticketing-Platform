@@ -27,7 +27,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-const holdExpirerSchemaVersion = 10
+const holdExpirerSchemaVersion = 11
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))

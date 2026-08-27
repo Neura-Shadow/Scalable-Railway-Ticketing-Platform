@@ -526,6 +526,10 @@ services:
       context: .
       target: physical-shard-admin
     environment:
+      DEPLOYMENT_REGION: region-a
+      DEPLOYMENT_ROLE: ${REGION_A_DEPLOYMENT_ROLE:-active}
+      REGION_EPOCH: ${REGION_A_EPOCH:-1}
+      REGIONAL_WRITES_ENABLED: ${REGION_A_WRITES_ENABLED:-true}
       CONTROL_DATABASE_URL: ${CONTROL_DATABASE_URL:-postgresql://railway_control:control-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3}
       BOOKING_SHARD_0_DATABASE_URL: ${BOOKING_SHARD_0_DATABASE_URL:-postgresql://railway_booking:shard-0-local-only@booking-shard-0-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
       BOOKING_SHARD_1_DATABASE_URL: ${BOOKING_SHARD_1_DATABASE_URL:-postgresql://railway_booking:shard-1-local-only@booking-shard-1-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}

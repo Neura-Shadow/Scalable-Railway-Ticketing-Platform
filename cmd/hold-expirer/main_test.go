@@ -10,6 +10,13 @@ import (
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
 )
 
+func TestHoldExpirerSchemaVersionMatchesCurrentControlMigration(t *testing.T) {
+	t.Parallel()
+	if holdExpirerSchemaVersion != 11 {
+		t.Fatalf("holdExpirerSchemaVersion = %d, want 11", holdExpirerSchemaVersion)
+	}
+}
+
 func TestInitialExpirationPassHonorsDisabledConfiguration(t *testing.T) {
 	t.Parallel()
 
