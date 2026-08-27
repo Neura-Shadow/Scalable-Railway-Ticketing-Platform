@@ -38,6 +38,8 @@ Require-Token $primaryBootstrap 'DR_REPLICATION_SOURCE_CIDR' 'primary bootstrap 
 Require-Token $primaryBootstrap 'hostssl replication' 'physical replication HBA must require TLS'
 Require-Token $primaryBootstrap 'ALTER ROLE' 're-running the primary bootstrap must rotate the replication credential'
 Require-Token $primaryBootstrap 'pg_hba.replication.conf' 'replication HBA must use a replaceable managed include'
+Require-Token $primaryBootstrap 'include_if_exists "pg_hba.replication.conf"' 'the managed HBA include filename must use PostgreSQL HBA double-quote syntax'
+Reject-Pattern $primaryBootstrap "include_if_exists\s+'pg_hba\.replication\.conf'" 'single quotes become part of an HBA include filename and must not be used'
 Require-Token $primaryBootstrap 'chown postgres:postgres "$hba_include"' 'a live root bootstrap must leave the restricted HBA include readable by PostgreSQL'
 Require-Token $primaryBootstrap 'SHOW data_checksums' 'primary bootstrap must fail closed when initdb data checksums are disabled'
 Reject-Pattern $primaryBootstrap '(?m)^host\s+replication\s+\S+\s+all\s+' 'replication HBA must not admit every source address'

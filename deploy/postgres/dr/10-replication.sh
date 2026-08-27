@@ -48,8 +48,8 @@ mv -f "$hba_include_tmp" "$hba_include"
 if [ "$(id -u)" = '0' ]; then
   chown postgres:postgres "$hba_include"
 fi
-if ! grep -Fqx "include_if_exists 'pg_hba.replication.conf'" "$PGDATA/pg_hba.conf"; then
-  printf "\ninclude_if_exists 'pg_hba.replication.conf'\n" >> "$PGDATA/pg_hba.conf"
+if ! grep -Fqx 'include_if_exists "pg_hba.replication.conf"' "$PGDATA/pg_hba.conf"; then
+  printf '\ninclude_if_exists "pg_hba.replication.conf"\n' >> "$PGDATA/pg_hba.conf"
 fi
 psql --set=ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" --command='SELECT pg_reload_conf()' >/dev/null
 install -d -o postgres -g postgres -m 0700 /var/lib/postgresql/wal-archive
