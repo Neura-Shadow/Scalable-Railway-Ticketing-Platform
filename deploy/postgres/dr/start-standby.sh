@@ -11,17 +11,32 @@ set -eu
 : "${DR_REPLICATION_TLS_CERT_FILE:?DR_REPLICATION_TLS_CERT_FILE is required}"
 : "${DR_REPLICATION_TLS_KEY_FILE:?DR_REPLICATION_TLS_KEY_FILE is required}"
 
+tls_dir=/var/lib/postgresql/tls
+tls_cert="$tls_dir/replication-server.crt"
+tls_key="$tls_dir/replication-server.key"
+tls_root_cert="$tls_dir/replication-root.crt"
+
 if [ "$(id -u)" = '0' ]; then
   install -d -o postgres -g postgres -m 0700 "$PGDATA"
-  install -d -o postgres -g postgres -m 0700 /var/lib/postgresql/tls
+  install -d -o postgres -g postgres -m 0700 "$tls_dir"
   for source in "$DR_REPLICATION_TLS_ROOT_CERT_FILE" "$DR_REPLICATION_TLS_CERT_FILE" "$DR_REPLICATION_TLS_KEY_FILE"; do
     if [ ! -s "$source" ]; then
       echo 'replication TLS material is unavailable' >&2
       exit 1
     fi
   done
+  install -o postgres -g postgres -m 0600 "$DR_REPLICATION_TLS_CERT_FILE" "$tls_cert"
+  install -o postgres -g postgres -m 0600 "$DR_REPLICATION_TLS_KEY_FILE" "$tls_key"
+  install -o postgres -g postgres -m 0600 "$DR_REPLICATION_TLS_ROOT_CERT_FILE" "$tls_root_cert"
   exec gosu postgres sh "$0" "$@"
 fi
+
+for staged in "$tls_root_cert" "$tls_cert" "$tls_key"; do
+  if [ ! -s "$staged" ]; then
+    echo 'staged replication TLS material is unavailable after privilege drop' >&2
+    exit 1
+  fi
+done
 
 for identity in "$PRIMARY_HOST" "$POSTGRES_USER" "$POSTGRES_DB" "$REPLICATION_SLOT" "$PGBACKREST_STANZA"; do
   case "$identity" in
@@ -45,7 +60,7 @@ fi
 
 export PGPASSWORD="$POSTGRES_PASSWORD"
 export PGSSLMODE=verify-full
-export PGSSLROOTCERT="$DR_REPLICATION_TLS_ROOT_CERT_FILE"
+export PGSSLROOTCERT="$tls_root_cert"
 
 primary_psql() {
   psql --host "$PRIMARY_HOST" --port 5432 --username "$POSTGRES_USER" \
@@ -137,10 +152,6 @@ if [ "$checksum_version" != '1' ]; then
   exit 1
 fi
 
-install -m 0600 "$DR_REPLICATION_TLS_CERT_FILE" /var/lib/postgresql/tls/replication-server.crt
-install -m 0600 "$DR_REPLICATION_TLS_KEY_FILE" /var/lib/postgresql/tls/replication-server.key
-install -m 0600 "$DR_REPLICATION_TLS_ROOT_CERT_FILE" /var/lib/postgresql/tls/replication-root.crt
-
 umask 077
 printf '%s:5432:*:%s:%s\n' "$PRIMARY_HOST" "$POSTGRES_USER" "$POSTGRES_PASSWORD" > "$PGDATA/.pgpass"
 chmod 0600 "$PGDATA/.pgpass"
@@ -149,9 +160,9 @@ unset POSTGRES_PASSWORD PGPASSWORD
 
 exec docker-entrypoint.sh postgres \
   -c ssl=on \
-  -c ssl_cert_file=/var/lib/postgresql/tls/replication-server.crt \
-  -c ssl_key_file=/var/lib/postgresql/tls/replication-server.key \
-  -c ssl_ca_file=/var/lib/postgresql/tls/replication-root.crt \
+  -c ssl_cert_file="$tls_cert" \
+  -c ssl_key_file="$tls_key" \
+  -c ssl_ca_file="$tls_root_cert" \
   -c max_connections=160 \
   -c hot_standby=on \
   -c max_standby_streaming_delay=30s \
@@ -159,5 +170,5 @@ exec docker-entrypoint.sh postgres \
   -c archive_command="/etc/railway/pgbackrest-secret.sh --stanza=$PGBACKREST_STANZA archive-push %p" \
   -c restore_command="/etc/railway/pgbackrest-secret.sh --stanza=$PGBACKREST_STANZA archive-get %f %p" \
   -c recovery_target_timeline=latest \
-  -c primary_conninfo="host=$PRIMARY_HOST port=5432 user=$POSTGRES_USER passfile=$PGDATA/.pgpass sslmode=verify-full sslrootcert=$DR_REPLICATION_TLS_ROOT_CERT_FILE application_name=$REPLICATION_SLOT" \
+  -c primary_conninfo="host=$PRIMARY_HOST port=5432 user=$POSTGRES_USER passfile=$PGDATA/.pgpass sslmode=verify-full sslrootcert=$tls_root_cert application_name=$REPLICATION_SLOT" \
   -c primary_slot_name="$REPLICATION_SLOT"

@@ -46,6 +46,9 @@ Reject-Pattern $primaryBootstrap '(?m)^host\s+replication\s+\S+\s+all\s+' 'repli
 
 Require-Token $standbyBootstrap 'sslmode=verify-full' 'standby connections must authenticate the primary certificate and hostname'
 Require-Token $standbyBootstrap 'DR_REPLICATION_TLS_ROOT_CERT_FILE' 'standby bootstrap must require a trusted replication CA'
+Require-Token $standbyBootstrap 'install -o postgres -g postgres -m 0600 "$DR_REPLICATION_TLS_KEY_FILE" "$tls_key"' 'standby TLS private keys must be staged before dropping root privileges'
+Require-Token $standbyBootstrap 'staged replication TLS material is unavailable after privilege drop' 'standby startup must fail closed if staged TLS material is unreadable'
+Require-Token $standbyBootstrap 'sslrootcert=$tls_root_cert' 'streaming replication must use the staged PostgreSQL-readable CA path'
 Require-Token $standbyBootstrap 'archive-get %f %p' 'standby recovery must fall back to the WAL archive'
 Require-Token $standbyBootstrap 'pg_replication_slots' 'standby bootstrap must inspect an existing physical slot before reuse'
 Require-Token $standbyBootstrap 'wal_status' 'standby bootstrap must reject or rebuild a lost physical slot'
