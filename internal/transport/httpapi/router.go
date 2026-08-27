@@ -20,6 +20,7 @@ type Dependencies struct {
 	TokenParser                BearerTokenParser
 	Reservations               ReservationService
 	Payments                   PaymentService
+	TicketRefunds              TicketRefundService
 	PaymentWebhooks            PaymentWebhookService
 	PaymentWebhookMaxBodyBytes int64
 	PaymentWebhookTimeout      time.Duration

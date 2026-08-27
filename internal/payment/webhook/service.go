@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/regional/authority"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/transport/httpapi"
 	"github.com/google/uuid"
 )
@@ -40,6 +41,8 @@ type Record struct {
 	ID                  uuid.UUID
 	Provider            string
 	ProviderEventID     string
+	ProviderAccountID   string
+	ProviderEnvironment string
 	EventType           string
 	ProviderPaymentID   string
 	PayloadHash         [sha256.Size]byte
@@ -63,8 +66,14 @@ type Repository interface {
 	StoreVerified(context.Context, Record) (StoreResult, error)
 }
 
+type KeyringValidator interface {
+	ValidateVerifiedKey(context.Context, string, string, string, time.Time) error
+}
+
 type Metrics interface {
 	RecordPaymentWebhookInvalid(provider string)
+	RecordWebhookAck(provider, result, reason string, commitDuration time.Duration)
+	RecordRegionalWriteRejected(region, databaseRole, shardID, reason string)
 }
 
 type Config struct {
@@ -74,6 +83,8 @@ type Config struct {
 	Now          func() time.Time
 	NewID        func() uuid.UUID
 	Metrics      Metrics
+	Region       string
+	Keyring      KeyringValidator
 }
 
 type Service struct {
@@ -83,6 +94,8 @@ type Service struct {
 	now          func() time.Time
 	newID        func() uuid.UUID
 	metrics      Metrics
+	region       string
+	keyring      KeyringValidator
 }
 
 func NewService(config Config) (*Service, error) {
@@ -96,6 +109,9 @@ func NewService(config Config) (*Service, error) {
 		}
 		providers[name] = verifier
 	}
+	if _, stripe := providers["stripe"]; stripe && config.Keyring == nil {
+		return nil, ErrInvalidConfiguration
+	}
 	maxBodyBytes := config.MaxBodyBytes
 	if maxBodyBytes <= 0 {
 		maxBodyBytes = defaultMaxBodyBytes
@@ -106,6 +122,7 @@ func NewService(config Config) (*Service, error) {
 	return &Service{
 		providers: providers, repository: config.Repository,
 		maxBodyBytes: maxBodyBytes, now: config.Now, newID: config.NewID, metrics: config.Metrics,
+		region: config.Region, keyring: config.Keyring,
 	}, nil
 }
 
@@ -114,8 +131,8 @@ func (service *Service) IngestPaymentWebhook(ctx context.Context, request httpap
 		return "", ErrPersistence
 	}
 	verifier, ok := service.providers[request.Provider]
-	if !ok || verifier == nil || !validIdentifier(request.KeyID, 64, false) ||
-		!validVisibleHeader(request.Timestamp, maximumTimestampLen) ||
+	if !ok || verifier == nil || !validIdentifier(request.KeyID, 64, true) ||
+		!validOptionalVisibleHeader(request.Timestamp, maximumTimestampLen) ||
 		!validVisibleHeader(request.Signature, maximumSignatureLen) ||
 		len(request.Body) == 0 || len(request.Body) > service.maxBodyBytes {
 		return "", httpapi.ErrWebhookInvalid
@@ -142,6 +159,30 @@ func (service *Service) IngestPaymentWebhook(ctx context.Context, request httpap
 		!validIdentifier(event.ProviderPaymentID, 128, true) || event.OccurredAt.IsZero() {
 		return "", httpapi.ErrWebhookInvalid
 	}
+	if request.Provider == "stripe" && (!validIdentifier(event.ProviderAccountID, 128, false) ||
+		(event.Environment != provider.WebhookEnvironmentTest && event.Environment != provider.WebhookEnvironmentLive)) {
+		return "", httpapi.ErrWebhookInvalid
+	}
+	if request.Provider != "stripe" && (event.ProviderAccountID != "" || event.Environment != "") {
+		return "", httpapi.ErrWebhookInvalid
+	}
+	verifiedKeyID := event.VerifiedKeyID
+	if verifiedKeyID == "" {
+		verifiedKeyID = request.KeyID
+	}
+	if !validIdentifier(verifiedKeyID, 64, false) {
+		return "", httpapi.ErrWebhookInvalid
+	}
+	if request.Provider == "stripe" {
+		if err := service.keyring.ValidateVerifiedKey(ctx, request.Provider, event.ProviderAccountID, verifiedKeyID, now); err != nil {
+			if errors.Is(err, ErrPersistence) {
+				service.recordAck(request.Provider, "failure", "database", 0)
+				return "", ErrPersistence
+			}
+			service.recordInvalid(request.Provider)
+			return "", httpapi.ErrWebhookInvalid
+		}
+	}
 	id := service.newID()
 	if id == uuid.Nil {
 		return "", ErrPersistence
@@ -149,27 +190,61 @@ func (service *Service) IngestPaymentWebhook(ctx context.Context, request httpap
 	record := Record{
 		ID: id, Provider: request.Provider,
 		ProviderEventID: event.ProviderEventID, EventType: eventType,
+		ProviderAccountID: event.ProviderAccountID, ProviderEnvironment: string(event.Environment),
 		ProviderPaymentID: event.ProviderPaymentID, PayloadHash: sha256.Sum256(body),
-		VerifiedKeyID: request.KeyID, EventCreatedAt: event.OccurredAt.UTC(),
+		VerifiedKeyID: verifiedKeyID, EventCreatedAt: event.OccurredAt.UTC(),
 		SignatureVerifiedAt: now, ReceivedAt: now, BodySizeBytes: len(request.Body),
 		Ignored: ignored,
 	}
+	commitStarted := time.Now()
 	result, err := service.repository.StoreVerified(ctx, record)
 	if err != nil {
+		reason := webhookCommitReason(err)
+		service.recordAck(request.Provider, "failure", reason, time.Since(commitStarted))
+		if isRegionalWriteRejection(err) && service.metrics != nil {
+			service.metrics.RecordRegionalWriteRejected(service.region, "control", "none", reason)
+		}
 		return "", ErrPersistence
 	}
 	switch result {
 	case StoreAccepted:
+		service.recordAck(request.Provider, "accepted", "none", time.Since(commitStarted))
 		if ignored {
 			return httpapi.PaymentWebhookIgnored, nil
 		}
 		return httpapi.PaymentWebhookAccepted, nil
 	case StoreDuplicate:
+		service.recordAck(request.Provider, "duplicate", "duplicate", time.Since(commitStarted))
 		return httpapi.PaymentWebhookDuplicate, nil
 	case StoreConflict:
-		return "", httpapi.ErrWebhookConflict
+		service.recordAck(request.Provider, "conflict", "event_conflict", time.Since(commitStarted))
+		return httpapi.PaymentWebhookConflict, nil
 	default:
+		service.recordAck(request.Provider, "failure", "unexpected", time.Since(commitStarted))
 		return "", ErrPersistence
+	}
+}
+
+func isRegionalWriteRejection(err error) bool {
+	return errors.Is(err, authority.ErrRoleNotActive) || errors.Is(err, authority.ErrWritesDisabled) ||
+		errors.Is(err, authority.ErrRegionMismatch) || errors.Is(err, authority.ErrEpochMismatch) ||
+		errors.Is(err, authority.ErrAuthorityNotActive)
+}
+
+func webhookCommitReason(err error) string {
+	switch {
+	case errors.Is(err, authority.ErrRoleNotActive):
+		return "passive"
+	case errors.Is(err, authority.ErrWritesDisabled):
+		return "writes_disabled"
+	case errors.Is(err, authority.ErrRegionMismatch):
+		return "region_mismatch"
+	case errors.Is(err, authority.ErrEpochMismatch):
+		return "stale_epoch"
+	case errors.Is(err, authority.ErrAuthorityNotActive):
+		return "fenced"
+	default:
+		return "database"
 	}
 }
 
@@ -181,6 +256,12 @@ func webhookAuthenticationFailure(err error) bool {
 func (service *Service) recordInvalid(providerName string) {
 	if service != nil && service.metrics != nil {
 		service.metrics.RecordPaymentWebhookInvalid(providerName)
+	}
+}
+
+func (service *Service) recordAck(providerName, result, reason string, duration time.Duration) {
+	if service != nil && service.metrics != nil {
+		service.metrics.RecordWebhookAck(providerName, result, reason, duration)
 	}
 }
 
@@ -201,6 +282,10 @@ func validVisibleHeader(value string, maximum int) bool {
 		}
 	}
 	return true
+}
+
+func validOptionalVisibleHeader(value string, maximum int) bool {
+	return value == "" || validVisibleHeader(value, maximum)
 }
 
 var _ httpapi.PaymentWebhookService = (*Service)(nil)

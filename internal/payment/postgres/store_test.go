@@ -10,6 +10,7 @@ import (
 	"time"
 
 	paymentapp "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/application"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/regional/authority"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -185,15 +186,20 @@ func TestRequestCancellationCreatesVoidBeforeCaptureAndRefundAfterCapture(t *tes
 			finalized.State = test.wantState
 			request := cancellationRequest(intent)
 			providerHash := cancellationOperationHash(intent.OwnerID, request.IdempotencyKeyHash)
-			tx := &fakeTx{rows: []pgx.Row{
+			rows := []pgx.Row{
 				intentRow(intent), fakeRow{values: []any{test.captured}},
 				fakeRow{err: pgx.ErrNoRows}, fakeRow{err: pgx.ErrNoRows},
-				fakeRow{values: []any{
-					intent.ID, providerHash[:],
-					intent.AmountMinor, intent.Currency,
-				}},
+			}
+			if test.wantKind == "refund" {
+				rows = append(rows, fakeRow{values: []any{false}})
+			}
+			rows = append(rows, fakeRow{values: []any{
+				intent.ID, providerHash[:],
+				intent.AmountMinor, intent.Currency,
+			}},
 				intentRow(finalized),
-			}}
+			)
+			tx := &fakeTx{rows: rows}
 			store := mustStore(t, &fakeDB{transactions: []pgx.Tx{tx}})
 
 			got, err := store.RequestCancellation(context.Background(), request)
@@ -234,6 +240,22 @@ func TestRequestCancellationDefersWhileTicketIssuanceIsNotControlFinalized(t *te
 				t.Fatalf("state=%s error=%v committed=%v execs=%d", state, err, tx.committed, len(tx.execs))
 			}
 		})
+	}
+}
+
+func TestRequestCancellationRejectsFullRefundAfterPartialRefundEvidence(t *testing.T) {
+	intent := intentFixture()
+	intent.State = "completed"
+	tx := &fakeTx{rows: []pgx.Row{
+		intentRow(intent), fakeRow{values: []any{true}},
+		fakeRow{err: pgx.ErrNoRows}, fakeRow{err: pgx.ErrNoRows},
+		fakeRow{values: []any{true}},
+	}}
+	store := mustStore(t, &fakeDB{transactions: []pgx.Tx{tx}})
+
+	_, err := store.RequestCancellation(context.Background(), cancellationRequest(intent))
+	if !errors.Is(err, paymentapp.ErrPaymentConflict) || tx.committed || len(tx.execs) != 0 {
+		t.Fatalf("RequestCancellation() error=%v committed=%v execs=%d", err, tx.committed, len(tx.execs))
 	}
 }
 
@@ -293,7 +315,10 @@ func cancellationRequest(intent paymentapp.IntentRecord) paymentapp.CancelIntent
 
 func mustStore(t *testing.T, db DB) *Store {
 	t.Helper()
-	store, err := NewStore(db)
+	region, _ := authority.ParseRegion("region-a")
+	epoch, _ := authority.NewEpoch(7)
+	deployment, _ := authority.NewDeployment(region, authority.RoleActive, epoch, true)
+	store, err := NewStore(db, WithRegionalAuthority(deployment))
 	if err != nil {
 		t.Fatalf("NewStore() error = %v", err)
 	}
@@ -329,6 +354,9 @@ func (db *fakeDB) BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error) {
 	}
 	tx := db.transactions[0]
 	db.transactions = db.transactions[1:]
+	if regional, ok := tx.(*fakeTx); ok {
+		regional.rows = append([]pgx.Row{fakeRow{values: []any{"region-a", int64(7), "active", true}}}, regional.rows...)
+	}
 	return tx, nil
 }
 

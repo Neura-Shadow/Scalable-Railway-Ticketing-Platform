@@ -100,6 +100,33 @@ type PaymentService interface {
 	CancelPaymentIntent(context.Context, CancelPaymentIntentCommand) (PaymentIntentView, error)
 }
 
+type CreateTicketRefundCommand struct {
+	OwnerID        string
+	TicketOrderID  string
+	TicketIDs      []string
+	IdempotencyKey string
+}
+
+// TicketRefundView contains only customer-safe, server-derived financial
+// state. Provider identities, shard routes, leases, and internal evidence are
+// intentionally absent.
+type TicketRefundView struct {
+	ID            string     `json:"id"`
+	TicketOrderID string     `json:"ticket_order_id"`
+	TicketIDs     []string   `json:"ticket_ids"`
+	State         string     `json:"state"`
+	AmountMinor   int64      `json:"amount_minor"`
+	Currency      string     `json:"currency"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	CompletedAt   *time.Time `json:"completed_at,omitempty"`
+}
+
+type TicketRefundService interface {
+	CreateTicketRefund(context.Context, CreateTicketRefundCommand) (TicketRefundView, error)
+	GetTicketRefund(context.Context, string, string) (TicketRefundView, error)
+}
+
 type ReservationPaymentCancellationService interface {
 	CancelReservationPayment(context.Context, CancelReservationPaymentCommand) (PaymentIntentView, error)
 }
@@ -110,6 +137,7 @@ const (
 	PaymentWebhookAccepted  PaymentWebhookDisposition = "accepted"
 	PaymentWebhookDuplicate PaymentWebhookDisposition = "duplicate"
 	PaymentWebhookIgnored   PaymentWebhookDisposition = "ignored"
+	PaymentWebhookConflict  PaymentWebhookDisposition = "conflict"
 )
 
 type PaymentWebhookRequest struct {

@@ -11,6 +11,8 @@ import (
 	"regexp"
 
 	paymentapp "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/application"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/regional/authority"
+	authoritypostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/regional/authority/postgres"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -21,13 +23,48 @@ type DB interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-type Store struct{ db DB }
+type Store struct {
+	db     DB
+	writer *authoritypostgres.ControlWriter
+}
 
-func NewStore(db DB) (*Store, error) {
+type storeOptions struct {
+	deployment *authority.Deployment
+}
+
+type Option func(*storeOptions)
+
+func WithRegionalAuthority(deployment authority.Deployment) Option {
+	return func(options *storeOptions) {
+		options.deployment = &deployment
+	}
+}
+
+func NewStore(db DB, options ...Option) (*Store, error) {
 	if db == nil {
 		return nil, paymentapp.ErrPaymentUnavailable
 	}
-	return &Store{db: db}, nil
+	configured := storeOptions{}
+	for _, apply := range options {
+		if apply == nil {
+			return nil, paymentapp.ErrPaymentUnavailable
+		}
+		apply(&configured)
+	}
+	store := &Store{db: db}
+	if configured.deployment == nil {
+		return store, nil
+	}
+	writer, err := authoritypostgres.NewControlWriter(
+		db,
+		*configured.deployment,
+		pgx.TxOptions{IsoLevel: pgx.Serializable},
+	)
+	if err != nil {
+		return nil, paymentapp.ErrPaymentUnavailable
+	}
+	store.writer = writer
+	return store, nil
 }
 
 func (store *Store) LookupIntentByIdempotency(
@@ -54,24 +91,31 @@ WHERE intent.owner_user_id=$1 AND intent.idempotency_key_hash=$2`, ownerID, keyH
 }
 
 func (store *Store) ReserveIntent(ctx context.Context, request paymentapp.ReserveIntentRequest) (paymentapp.IntentRecord, bool, error) {
-	if store == nil || store.db == nil || ctx == nil || !validReserveRequest(request) {
+	if store == nil || store.db == nil || store.writer == nil || ctx == nil || !validReserveRequest(request) {
 		return paymentapp.IntentRecord{}, false, paymentapp.ErrPaymentUnavailable
 	}
-	tx, err := store.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
-	if err != nil {
-		return paymentapp.IntentRecord{}, false, err
+	var record paymentapp.IntentRecord
+	var replayed bool
+	err := store.writer.Write(ctx, func(tx pgx.Tx) error {
+		var err error
+		record, replayed, err = reserveIntent(ctx, tx, request)
+		return err
+	})
+	if errors.Is(err, errConcurrentIntentInsert) {
+		return store.LookupIntentByIdempotency(
+			ctx, request.OwnerID, request.IdempotencyKeyHash, request.RequestFingerprint,
+		)
 	}
-	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	return record, replayed, err
+}
 
+func reserveIntent(ctx context.Context, tx pgx.Tx, request paymentapp.ReserveIntentRequest) (paymentapp.IntentRecord, bool, error) {
 	existing, storedFingerprint, err := scanIntent(tx.QueryRow(ctx, selectIntent+`
 WHERE intent.owner_user_id=$1 AND intent.idempotency_key_hash=$2
 FOR UPDATE OF intent,saga`, request.OwnerID, request.IdempotencyKeyHash[:]))
 	if err == nil {
 		if storedFingerprint != request.RequestFingerprint {
 			return paymentapp.IntentRecord{}, false, paymentapp.ErrPaymentConflict
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return paymentapp.IntentRecord{}, false, err
 		}
 		return existing, true, nil
 	}
@@ -105,16 +149,7 @@ INSERT INTO public.payment_intents (
 		request.IdempotencyKeyHash[:], request.RequestFingerprint[:])
 	if err != nil {
 		if isUniqueViolation(err) {
-			_ = tx.Rollback(context.WithoutCancel(ctx))
-			record, found, lookupErr := store.LookupIntentByIdempotency(
-				ctx, request.OwnerID, request.IdempotencyKeyHash, request.RequestFingerprint,
-			)
-			if lookupErr != nil {
-				return paymentapp.IntentRecord{}, false, lookupErr
-			}
-			if found {
-				return record, true, nil
-			}
+			return paymentapp.IntentRecord{}, false, errConcurrentIntentInsert
 		}
 		return paymentapp.IntentRecord{}, false, normalizeConflict(err)
 	}
@@ -131,9 +166,6 @@ WHERE intent.payment_intent_id=$1`, request.PaymentIntentID))
 	if err != nil {
 		return paymentapp.IntentRecord{}, false, err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return paymentapp.IntentRecord{}, false, err
-	}
 	return record, false, nil
 }
 
@@ -147,15 +179,29 @@ func (store *Store) MarkReservationSecured(
 	commandID uuid.UUID,
 	fingerprint [sha256.Size]byte,
 ) (paymentapp.IntentRecord, error) {
-	if store == nil || store.db == nil || ctx == nil || intentID == uuid.Nil || commandID == uuid.Nil || zeroDigest(fingerprint) {
+	if store == nil || store.db == nil || store.writer == nil || ctx == nil || intentID == uuid.Nil || commandID == uuid.Nil || zeroDigest(fingerprint) {
 		return paymentapp.IntentRecord{}, paymentapp.ErrControlFinalizationDeferred
 	}
-	tx, err := store.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
-	if err != nil {
+	var record paymentapp.IntentRecord
+	err := store.writer.Write(ctx, func(tx pgx.Tx) error {
+		var err error
+		record, err = markReservationSecured(ctx, tx, intentID, commandID, fingerprint)
+		return err
+	})
+	if err != nil && !errors.Is(err, paymentapp.ErrPaymentNotFound) &&
+		!errors.Is(err, paymentapp.ErrPaymentConflict) && !isAuthorityRejection(err) {
 		return paymentapp.IntentRecord{}, paymentapp.ErrControlFinalizationDeferred
 	}
-	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	return record, err
+}
 
+func markReservationSecured(
+	ctx context.Context,
+	tx pgx.Tx,
+	intentID uuid.UUID,
+	commandID uuid.UUID,
+	fingerprint [sha256.Size]byte,
+) (paymentapp.IntentRecord, error) {
 	record, storedFingerprint, err := scanIntent(tx.QueryRow(ctx, selectIntent+`
 WHERE intent.payment_intent_id=$1
 FOR UPDATE OF intent,saga`, intentID))
@@ -217,9 +263,6 @@ WHERE intent.payment_intent_id=$1`, intentID))
 	if err != nil {
 		return paymentapp.IntentRecord{}, paymentapp.ErrControlFinalizationDeferred
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return paymentapp.IntentRecord{}, paymentapp.ErrControlFinalizationDeferred
-	}
 	return record, nil
 }
 
@@ -228,33 +271,30 @@ func (store *Store) FailReservationSecuring(
 	intentID uuid.UUID,
 	fingerprint [sha256.Size]byte,
 ) error {
-	if store == nil || store.db == nil || ctx == nil || intentID == uuid.Nil || zeroDigest(fingerprint) {
+	if store == nil || store.db == nil || store.writer == nil || ctx == nil || intentID == uuid.Nil || zeroDigest(fingerprint) {
 		return paymentapp.ErrControlFinalizationDeferred
 	}
-	tx, err := store.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
-	if err != nil {
-		return paymentapp.ErrControlFinalizationDeferred
-	}
-	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-
-	intentTag, err := tx.Exec(ctx, `UPDATE public.payment_intents
+	err := store.writer.Write(ctx, func(tx pgx.Tx) error {
+		intentTag, err := tx.Exec(ctx, `UPDATE public.payment_intents
 SET state='failed',completed_at=clock_timestamp()
 WHERE payment_intent_id=$1 AND state='reservation_securing'
   AND request_fingerprint=$2`, intentID, fingerprint[:])
-	if err != nil || intentTag.RowsAffected() != 1 {
-		return paymentapp.ErrControlFinalizationDeferred
-	}
-	sagaTag, err := tx.Exec(ctx, `UPDATE public.payment_sagas
+		if err != nil || intentTag.RowsAffected() != 1 {
+			return paymentapp.ErrControlFinalizationDeferred
+		}
+		sagaTag, err := tx.Exec(ctx, `UPDATE public.payment_sagas
 SET state='failed',current_step='complete',bounded_error_category='reservation_not_payable',
     completed_at=clock_timestamp(),lease_owner=NULL,lease_until=NULL
 WHERE payment_intent_id=$1 AND state='created' AND current_step='secure_reservation'`, intentID)
-	if err != nil || sagaTag.RowsAffected() != 1 {
+		if err != nil || sagaTag.RowsAffected() != 1 {
+			return paymentapp.ErrControlFinalizationDeferred
+		}
+		return nil
+	})
+	if err != nil && !isAuthorityRejection(err) {
 		return paymentapp.ErrControlFinalizationDeferred
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return paymentapp.ErrControlFinalizationDeferred
-	}
-	return nil
+	return err
 }
 
 func (store *Store) GetOwnedIntent(ctx context.Context, ownerID, intentID uuid.UUID) (paymentapp.IntentRecord, error) {
@@ -284,15 +324,19 @@ LIMIT 1`, reservationID, ownerID))
 }
 
 func (store *Store) RequestCancellation(ctx context.Context, request paymentapp.CancelIntentRequest) (paymentapp.IntentRecord, error) {
-	if store == nil || store.db == nil || ctx == nil || !validCancellationRequest(request) {
+	if store == nil || store.db == nil || store.writer == nil || ctx == nil || !validCancellationRequest(request) {
 		return paymentapp.IntentRecord{}, paymentapp.ErrPaymentConflict
 	}
-	tx, err := store.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
-	if err != nil {
-		return paymentapp.IntentRecord{}, err
-	}
-	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	var record paymentapp.IntentRecord
+	err := store.writer.Write(ctx, func(tx pgx.Tx) error {
+		var err error
+		record, err = requestCancellation(ctx, tx, request)
+		return err
+	})
+	return record, err
+}
 
+func requestCancellation(ctx context.Context, tx pgx.Tx, request paymentapp.CancelIntentRequest) (paymentapp.IntentRecord, error) {
 	record, _, err := scanIntent(tx.QueryRow(ctx, selectIntent+`
 WHERE intent.payment_intent_id=$1 AND intent.owner_user_id=$2
 FOR UPDATE OF intent,saga`, request.PaymentIntentID, request.OwnerID))
@@ -330,9 +374,6 @@ WHERE provider=$1 AND provider_idempotency_key_hash=$2`, record.Provider, provid
 		if existingIntentID != request.PaymentIntentID || existingKind != kind {
 			return paymentapp.IntentRecord{}, paymentapp.ErrPaymentConflict
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return paymentapp.IntentRecord{}, err
-		}
 		return record, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
@@ -345,9 +386,6 @@ SELECT provider_idempotency_key_hash
 FROM public.payment_operations
 WHERE payment_intent_id=$1 AND operation_type=$2`, request.PaymentIntentID, kind).Scan(&existingHash)
 	if err == nil {
-		if err := tx.Commit(ctx); err != nil {
-			return paymentapp.IntentRecord{}, err
-		}
 		return record, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
@@ -355,6 +393,18 @@ WHERE payment_intent_id=$1 AND operation_type=$2`, request.PaymentIntentID, kind
 	}
 	if !stateAllowsNewCancellation(record.State, kind) {
 		return paymentapp.IntentRecord{}, paymentapp.ErrPaymentConflict
+	}
+	if kind == "refund" {
+		var partialRefundExists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM public.ticket_refund_requests
+WHERE payment_intent_id=$1 AND state<>'failed'
+)`, request.PaymentIntentID).Scan(&partialRefundExists); err != nil {
+			return paymentapp.IntentRecord{}, err
+		}
+		if partialRefundExists {
+			return paymentapp.IntentRecord{}, paymentapp.ErrPaymentConflict
+		}
 	}
 
 	if _, err = tx.Exec(ctx, `
@@ -424,9 +474,6 @@ WHERE payment_intent_id=$1
 	record, _, err = scanIntent(tx.QueryRow(ctx, selectIntent+`
 WHERE intent.payment_intent_id=$1`, request.PaymentIntentID))
 	if err != nil {
-		return paymentapp.IntentRecord{}, err
-	}
-	if err := tx.Commit(ctx); err != nil {
 		return paymentapp.IntentRecord{}, err
 	}
 	return record, nil
@@ -550,6 +597,14 @@ func normalizeConflict(err error) error {
 		return paymentapp.ErrPaymentConflict
 	}
 	return err
+}
+
+var errConcurrentIntentInsert = errors.New("concurrent payment intent insert")
+
+func isAuthorityRejection(err error) bool {
+	return errors.Is(err, authority.ErrRoleNotActive) || errors.Is(err, authority.ErrWritesDisabled) ||
+		errors.Is(err, authority.ErrRegionMismatch) || errors.Is(err, authority.ErrEpochMismatch) ||
+		errors.Is(err, authority.ErrAuthorityNotActive)
 }
 
 func isUniqueViolation(err error) bool {

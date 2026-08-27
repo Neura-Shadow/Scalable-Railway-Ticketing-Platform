@@ -11,7 +11,11 @@ import (
 	"syscall"
 	"time"
 
+	paymentprovider "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider"
 	providerhttp "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider/httpclient"
+	providerstripe "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider/stripe"
+	paymentrefund "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/refund"
+	refundpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/refund/postgres"
 	paymentshard "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/shard"
 	paymentshardpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/shard/postgres"
 	paymentworker "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/worker"
@@ -20,6 +24,8 @@ import (
 	platformmetrics "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/metrics"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/workerhttp"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/regional/authority"
+	authoritypostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/regional/authority/postgres"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	shardphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physical"
 	"github.com/google/uuid"
@@ -28,7 +34,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-const paymentControlSchemaVersion = 10
+const paymentControlSchemaVersion = 11
 
 const databasePoolObservationInterval = time.Second
 
@@ -53,24 +59,28 @@ func run(logger *slog.Logger) error {
 	}
 	rootContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	pool, err := postgresx.NewBoundedPool(rootContext, cfg.DatabaseURL, cfg.ControlDatabaseMaxOpenConns)
+	pool, err := postgresx.NewRegionalBoundedPool(rootContext, cfg.DatabaseURL, cfg.ControlDatabaseMaxOpenConns, regionalSession(cfg))
 	if err != nil {
 		return errors.New("control database unavailable")
 	}
 	defer pool.Close()
 
-	controlStore, err := paymentworkerpostgres.New(pool)
+	deployment, err := regionalDeployment(cfg)
+	if err != nil {
+		return errors.New("regional deployment invalid")
+	}
+	controlStore, err := paymentworkerpostgres.NewWithRegionalAuthority(pool, deployment)
 	if err != nil {
 		return errors.New("payment store initialization failed")
 	}
-	providerClient, err := providerhttp.New(providerhttp.Config{
-		BaseURL: cfg.PaymentProviderBaseURL, APIKey: cfg.PaymentProviderAPIKey,
-		ConnectTimeout: cfg.PaymentProviderConnectTimeout, RequestTimeout: cfg.PaymentProviderRequestTimeout,
-		MaxResponseBytes: int64(cfg.PaymentProviderMaxResponseBytes), Now: time.Now,
-	})
+	providerClient, err := newPaymentProvider(cfg)
 	if err != nil {
 		return errors.New("payment provider initialization failed")
 	}
+	if err := providerClient.Descriptor().Require(paymentprovider.SagaCapabilities()); err != nil {
+		return errors.New("payment provider capability contract unsupported")
+	}
+	providerDescriptor := providerClient.Descriptor()
 	defer providerClient.CloseIdleConnections()
 
 	physicalRegistry, err := newPhysicalRegistry(rootContext, cfg)
@@ -86,7 +96,7 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return errors.New("payment directory initialization failed")
 	}
-	shardStore, err := paymentshardpostgres.NewStore(physicalRouter)
+	shardStore, err := paymentshardpostgres.NewStore(physicalRouter, paymentshardpostgres.WithRegionalAuthority(deployment))
 	if err != nil {
 		return errors.New("payment shard store initialization failed")
 	}
@@ -94,9 +104,13 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return errors.New("payment shard gateway initialization failed")
 	}
+	workerShardGateway := paymentworker.ShardGateway(shardGateway)
+	if testFault := newTestTicketIssueConflict(shardGateway, os.LookupEnv); testFault != nil {
+		workerShardGateway = testFault
+	}
 
 	registry := prometheus.NewRegistry()
-	metrics, err := platformmetrics.New(registry)
+	metrics, err := platformmetrics.NewEventMetrics(registry)
 	if err != nil {
 		return errors.New("metrics initialization failed")
 	}
@@ -105,10 +119,11 @@ func run(logger *slog.Logger) error {
 	)
 	defer stopDatabasePoolObserver()
 	workerID := "payment-" + uuid.NewString()
+	testCrash := newTestExternalEffectCrash(os.LookupEnv, os.Exit)
 	paymentWorker, err := paymentworker.New(
 		controlStore,
-		paymentworker.Providers{"sandbox": providerClient},
-		shardGateway,
+		paymentworker.Providers{string(cfg.PaymentProviderType): providerClient},
+		workerShardGateway,
 		paymentMetrics{metrics: metrics},
 		paymentworker.Config{
 			WorkerID: workerID, BatchSize: cfg.PaymentWorkerBatchSize,
@@ -116,10 +131,33 @@ func run(logger *slog.Logger) error {
 			RetryBase: cfg.PaymentWorkerRetryBase, RetryMax: retryMaximum(cfg.PaymentWorkerRetryBase),
 			MaxUncertain: cfg.PaymentMaxUncertain,
 			Interval:     cfg.PaymentWorkerInterval, Now: time.Now,
+			TestAfterExternalEffect: testCrash.payment,
 		},
 	)
 	if err != nil {
 		return errors.New("payment worker initialization failed")
+	}
+	refundStore, err := refundpostgres.NewStore(pool, shardGateway, refundpostgres.Config{
+		PartialRefundProviders: map[string]bool{providerDescriptor.Name: providerDescriptor.Capabilities.PartialRefund},
+		RegionalAuthority:      &deployment,
+	})
+	if err != nil {
+		return errors.New("ticket refund store initialization failed")
+	}
+	refundProcessor, err := paymentrefund.NewProcessor(
+		refundStore,
+		paymentrefund.Providers{string(cfg.PaymentProviderType): providerClient},
+		shardGateway,
+		paymentrefund.ProcessorConfig{
+			WorkerID: workerID, BatchSize: cfg.PaymentWorkerBatchSize,
+			MaxAttempts: cfg.PaymentWorkerMaxAttempts, LeaseTTL: cfg.PaymentWorkerLease,
+			RetryBase: cfg.PaymentWorkerRetryBase, RetryMax: retryMaximum(cfg.PaymentWorkerRetryBase),
+			Region: string(cfg.DeploymentRegion), RegionalEpoch: cfg.RegionEpoch, Now: time.Now,
+			TestAfterExternalEffect: testCrash.refund,
+		},
+	)
+	if err != nil {
+		return errors.New("ticket refund worker initialization failed")
 	}
 
 	readiness := paymentReadiness(pool, physicalRegistry, providerClient, cfg)
@@ -136,15 +174,30 @@ func run(logger *slog.Logger) error {
 	defer shutdownHealthServer(healthServer, cfg.ShutdownTimeout)
 
 	runPass := func() {
-		passContext, cancel := context.WithTimeout(rootContext, cfg.WorkerPassTimeout)
-		defer cancel()
-		result, runErr := paymentWorker.RunOnce(passContext)
+		paymentContext, cancelPayment := context.WithTimeout(rootContext, cfg.WorkerPassTimeout)
+		result, runErr := paymentWorker.RunOnce(paymentContext)
+		cancelPayment()
+		refundStarted := time.Now()
+		refundContext, cancelRefund := context.WithTimeout(rootContext, cfg.WorkerPassTimeout)
+		refundResult, refundErr := refundProcessor.RunOnce(refundContext)
+		cancelRefund()
+		for _, observation := range refundResult.Observations {
+			metrics.RecordPartialRefund(observation.Provider, observation.Result, observation.Reason, observation.Currency, 0, time.Since(refundStarted))
+		}
 		if runErr != nil {
 			logger.Error("payment pass completed with isolated failures",
 				"operations_claimed", result.OperationsClaimed,
 				"webhooks_claimed", result.WebhooksClaimed,
 				"actions_claimed", result.ActionsClaimed,
 				"failure_count", result.Failures)
+		}
+		if refundErr != nil {
+			logger.Error("ticket refund pass completed with isolated failures",
+				"claimed", refundResult.Claimed, "completed", refundResult.Completed,
+				"retried", refundResult.Retried, "manual_review", refundResult.ManualReview,
+				"failure_count", refundResult.Failures)
+		}
+		if runErr != nil || refundErr != nil {
 			return
 		}
 		logger.Info("payment pass complete",
@@ -156,9 +209,15 @@ func run(logger *slog.Logger) error {
 			"actions_done", result.ActionsDone,
 			"retried", result.Retried,
 			"compensating", result.Compensating,
-			"manual_review", result.ManualReview)
+			"manual_review", result.ManualReview,
+			"ticket_refunds_claimed", refundResult.Claimed,
+			"ticket_refunds_completed", refundResult.Completed)
 	}
-	runPass()
+	if paymentPassEnabled(cfg) && paymentAuthorityReady(rootContext, pool, physicalRegistry, cfg) == nil {
+		runPass()
+	} else {
+		logger.Info("payment worker retained without claim authority", "deployment_role", cfg.DeploymentRole)
+	}
 	ticker := time.NewTicker(cfg.PaymentWorkerInterval)
 	defer ticker.Stop()
 	for {
@@ -171,9 +230,122 @@ func run(logger *slog.Logger) error {
 			}
 			return nil
 		case <-ticker.C:
-			runPass()
+			if paymentPassEnabled(cfg) && paymentAuthorityReady(rootContext, pool, physicalRegistry, cfg) == nil {
+				runPass()
+			}
 		}
 	}
+}
+
+type testExternalEffectCrash struct {
+	point  string
+	target uuid.UUID
+	exit   func(int)
+}
+
+// testTicketIssueConflict is a deterministic, target-specific test hook used
+// to drive the real full-refund compensation state machine. It is impossible
+// to enable outside APP_ENV=test and delegates every non-target operation.
+type testTicketIssueConflict struct {
+	next   paymentworker.ShardGateway
+	target uuid.UUID
+}
+
+func newTestTicketIssueConflict(next paymentworker.ShardGateway, lookup func(string) (string, bool)) *testTicketIssueConflict {
+	if next == nil || lookup == nil {
+		return nil
+	}
+	environment, _ := lookup("APP_ENV")
+	enabled, _ := lookup("PAYMENT_WORKER_TEST_TICKET_ISSUE_CONFLICT_ENABLED")
+	targetText, _ := lookup("PAYMENT_WORKER_TEST_TICKET_ISSUE_CONFLICT_TARGET_ID")
+	target, err := uuid.Parse(targetText)
+	if environment != "test" || enabled != "true" || err != nil || target == uuid.Nil {
+		return nil
+	}
+	return &testTicketIssueConflict{next: next, target: target}
+}
+
+func (fault *testTicketIssueConflict) IssueTickets(ctx context.Context, command paymentshard.IssueTicketsCommand) (paymentshard.IssueTicketsReceipt, error) {
+	if fault != nil && command.PaymentIntentID == fault.target {
+		return paymentshard.IssueTicketsReceipt{}, paymentshard.ErrTicketClaimConflict
+	}
+	return fault.next.IssueTickets(ctx, command)
+}
+
+func (fault *testTicketIssueConflict) MarkRefundPending(ctx context.Context, command paymentshard.MarkRefundPendingCommand) (paymentshard.MarkRefundPendingReceipt, error) {
+	return fault.next.MarkRefundPending(ctx, command)
+}
+
+func (fault *testTicketIssueConflict) CancelVoidedReservation(ctx context.Context, command paymentshard.CancelVoidedReservationCommand) (paymentshard.CancelVoidedReservationReceipt, error) {
+	return fault.next.CancelVoidedReservation(ctx, command)
+}
+
+func (fault *testTicketIssueConflict) ApplyRefundCompensation(ctx context.Context, command paymentshard.ApplyRefundCompensationCommand) (paymentshard.ApplyRefundCompensationReceipt, error) {
+	return fault.next.ApplyRefundCompensation(ctx, command)
+}
+
+func newTestExternalEffectCrash(lookup func(string) (string, bool), exit func(int)) *testExternalEffectCrash {
+	disabled := &testExternalEffectCrash{}
+	if lookup == nil || exit == nil {
+		return disabled
+	}
+	appEnv, _ := lookup("APP_ENV")
+	enabled, _ := lookup("PAYMENT_WORKER_TEST_CRASH_AFTER_EFFECT_ENABLED")
+	point, _ := lookup("PAYMENT_WORKER_TEST_CRASH_AFTER_EFFECT_POINT")
+	targetText, _ := lookup("PAYMENT_WORKER_TEST_CRASH_TARGET_ID")
+	if appEnv != "test" || enabled != "true" {
+		return disabled
+	}
+	allowed := map[string]bool{
+		string(paymentworker.ExternalEffectCaptureCommitted):        true,
+		string(paymentworker.ExternalEffectTicketsCommitted):        true,
+		string(paymentworker.ExternalEffectRefundCommitted):         true,
+		string(paymentworker.ExternalEffectCompensationCommitted):   true,
+		string(paymentrefund.ExternalEffectProviderRefundCommitted): true,
+		string(paymentrefund.ExternalEffectShardRefundCommitted):    true,
+	}
+	target, err := uuid.Parse(targetText)
+	if !allowed[point] || err != nil || target == uuid.Nil {
+		return disabled
+	}
+	return &testExternalEffectCrash{point: point, target: target, exit: exit}
+}
+
+func (crash *testExternalEffectCrash) trigger(point string, target uuid.UUID) {
+	if crash != nil && crash.exit != nil && crash.point == point && crash.target == target {
+		crash.exit(86)
+	}
+}
+
+func (crash *testExternalEffectCrash) payment(point paymentworker.ExternalEffectPoint, target uuid.UUID) {
+	crash.trigger(string(point), target)
+}
+
+func (crash *testExternalEffectCrash) refund(point paymentrefund.ExternalEffectPoint, target uuid.UUID) {
+	crash.trigger(string(point), target)
+}
+
+func paymentPassEnabled(cfg config.Config) bool {
+	return cfg.DeploymentRole == config.DeploymentRoleActive && cfg.RegionalWritesEnabled
+}
+
+func regionalSession(cfg config.Config) postgresx.RegionalSession {
+	return postgresx.RegionalSession{
+		Region: string(cfg.DeploymentRegion), Role: string(cfg.DeploymentRole),
+		Epoch: cfg.RegionEpoch, WritesEnabled: cfg.RegionalWritesEnabled,
+	}
+}
+
+func regionalDeployment(cfg config.Config) (authority.Deployment, error) {
+	region, err := authority.ParseRegion(string(cfg.DeploymentRegion))
+	if err != nil || cfg.RegionEpoch <= 0 {
+		return authority.Deployment{}, authority.ErrInvalidDeployment
+	}
+	epoch, err := authority.NewEpoch(uint64(cfg.RegionEpoch))
+	if err != nil {
+		return authority.Deployment{}, err
+	}
+	return authority.NewDeployment(region, authority.Role(cfg.DeploymentRole), epoch, cfg.RegionalWritesEnabled)
 }
 
 func newPhysicalRegistry(ctx context.Context, cfg config.Config) (*shardphysical.Registry, error) {
@@ -194,16 +366,49 @@ func newPhysicalRegistry(ctx context.Context, cfg config.Config) (*shardphysical
 			ConnectTimeout:   cfg.PhysicalShardConnectTimeout,
 			StatementTimeout: cfg.PhysicalShardQueryTimeout, LockTimeout: cfg.PhysicalShardQueryTimeout,
 		},
-	}, shardphysical.OpenPGXPool)
+	}, shardphysical.RegionalPGXPoolFactory(regionalSession(cfg)))
 }
 
-func paymentReadiness(pool *pgxpool.Pool, registry *shardphysical.Registry, providerClient *providerhttp.Client, cfg config.Config) workerhttp.ReadinessCheck {
+type paymentProviderRuntime interface {
+	paymentprovider.Client
+	paymentprovider.Described
+	paymentprovider.RefundLookupReader
+	Ready(context.Context) error
+	CloseIdleConnections()
+}
+
+func newPaymentProvider(cfg config.Config) (paymentProviderRuntime, error) {
+	switch cfg.PaymentProviderType {
+	case config.PaymentProviderSandbox:
+		return providerhttp.New(providerhttp.Config{
+			BaseURL: cfg.PaymentProviderBaseURL, APIKey: cfg.PaymentProviderAPIKey,
+			ConnectTimeout: cfg.PaymentProviderConnectTimeout, RequestTimeout: cfg.PaymentProviderRequestTimeout,
+			MaxResponseBytes: int64(cfg.PaymentProviderMaxResponseBytes), Now: time.Now,
+		})
+	case config.PaymentProviderStripe:
+		return providerstripe.New(providerstripe.Config{
+			SecretKey: cfg.PaymentProviderAPIKey, AccountID: cfg.PaymentProviderAccountID,
+			APIOrigin: cfg.PaymentProviderBaseURL, SuccessURL: cfg.PaymentProviderSuccessURL,
+			CancelURL: cfg.PaymentProviderCancelURL, ConnectTimeout: cfg.PaymentProviderConnectTimeout,
+			RequestTimeout:       cfg.PaymentProviderRequestTimeout,
+			MaxResponseBodyBytes: int64(cfg.PaymentProviderMaxResponseBytes), Now: time.Now,
+			AllowInsecureForTest: cfg.Environment == config.EnvironmentTest,
+		})
+	default:
+		return nil, errors.New("payment provider type unsupported")
+	}
+}
+
+func paymentReadiness(pool *pgxpool.Pool, registry *shardphysical.Registry, providerClient paymentProviderRuntime, cfg config.Config) workerhttp.ReadinessCheck {
 	return func(ctx context.Context) error {
 		if pool == nil || registry == nil || providerClient == nil || cfg.ValidateFor(config.ProcessPaymentWorker) != nil {
 			return errors.New("worker dependency unavailable")
 		}
 		if err := pool.Ping(ctx); err != nil {
 			return errors.New("worker dependency unavailable")
+		}
+		if err := paymentAuthorityReady(ctx, pool, registry, cfg); err != nil {
+			return errors.New("worker regional authority unavailable")
 		}
 		var version int
 		var dirty bool
@@ -213,16 +418,31 @@ func paymentReadiness(pool *pgxpool.Pool, registry *shardphysical.Registry, prov
 		if err := providerClient.Ready(ctx); err != nil {
 			return errors.New("worker provider unavailable")
 		}
-		for _, rawShardID := range cfg.BookingShardIDs {
-			if err := physicalShardReady(ctx, pool, registry, rawShardID); err != nil {
-				return errors.New("worker physical shard unavailable")
-			}
-		}
 		return nil
 	}
 }
 
-func physicalShardReady(ctx context.Context, pool *pgxpool.Pool, registry *shardphysical.Registry, rawShardID string) error {
+func paymentAuthorityReady(ctx context.Context, pool *pgxpool.Pool, registry *shardphysical.Registry, cfg config.Config) error {
+	deployment, err := regionalDeployment(cfg)
+	if err != nil || !paymentPassEnabled(cfg) || pool == nil || registry == nil {
+		return errors.New("worker regional authority unavailable")
+	}
+	if err := authoritypostgres.CheckActiveReadiness(ctx, pool, deployment); err != nil {
+		return errors.New("worker regional authority unavailable")
+	}
+	shardIDs := cfg.BookingShardIDs
+	if cfg.DRRequiredDatabaseCount == 3 {
+		shardIDs = []string{"physical-shard-0", "physical-shard-1"}
+	}
+	for _, rawShardID := range shardIDs {
+		if err := physicalShardReady(ctx, pool, registry, rawShardID, deployment); err != nil {
+			return errors.New("worker regional authority unavailable")
+		}
+	}
+	return nil
+}
+
+func physicalShardReady(ctx context.Context, pool *pgxpool.Pool, registry *shardphysical.Registry, rawShardID string, deployment authority.Deployment) error {
 	var (
 		catalogShardID, storageKind, connectionRef, healthState, state string
 		protocolVersion, schemaVersion                                 int32
@@ -256,6 +476,9 @@ WHERE shard_id=$1`, rawShardID).Scan(&catalogShardID, &storageKind, &connectionR
 	var shardDirty bool
 	if err := tx.QueryRow(ctx, `SELECT version,dirty FROM public.schema_migrations LIMIT 1`).Scan(&schemaVersion, &shardDirty); err != nil || schemaVersion != shardphysical.SupportedSchemaVersion || shardDirty {
 		return errors.New("physical shard migration unavailable")
+	}
+	if err := authoritypostgres.CheckActiveReadiness(ctx, tx, deployment); err != nil {
+		return errors.New("physical shard authority unavailable")
 	}
 	return tx.Commit(ctx)
 }
@@ -303,7 +526,7 @@ func (metrics paymentMetrics) RecordPaymentWorker(observation paymentworker.Metr
 	}
 	switch observation.Lane {
 	case "operation":
-		metrics.metrics.RecordPaymentOperation(observation.Provider, observation.Operation, observation.Result, observation.Duration, observation.Uncertain)
+		metrics.metrics.RecordPaymentOperationWithReason(observation.Provider, observation.Operation, observation.Result, observation.Reason, observation.Duration, observation.Uncertain)
 		if observation.Result == "success" {
 			recordOperationTransitions(metrics.metrics, observation.Operation)
 		} else if observation.Result == "superseded" {

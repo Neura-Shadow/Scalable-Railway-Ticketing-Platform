@@ -25,7 +25,11 @@ import (
 	offeringpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/offering/postgres"
 	paymentapp "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/application"
 	paymentpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/postgres"
+	paymentprovider "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider"
 	providerhttp "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider/httpclient"
+	providerstripe "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider/stripe"
+	paymentrefund "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/refund"
+	refundpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/refund/postgres"
 	paymentshard "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/shard"
 	paymentshardpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/shard/postgres"
 	paymentwebhook "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/webhook"
@@ -38,6 +42,7 @@ import (
 	querycache "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/cache"
 	querypostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/postgres"
 	queryreadmodel "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/readmodel"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/regional/authority"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	shardphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physical"
 	shardingpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/postgres"
@@ -95,14 +100,14 @@ func run(logger *slog.Logger) error {
 	handlerContext, cancelHandlers := context.WithCancel(context.Background())
 	defer cancelHandlers()
 
-	pool, err := postgresx.NewBoundedPool(signalContext, cfg.DatabaseURL, cfg.ControlDatabaseMaxOpenConns)
+	pool, err := postgresx.NewRegionalBoundedPool(signalContext, cfg.DatabaseURL, cfg.ControlDatabaseMaxOpenConns, regionalSession(cfg))
 	if err != nil {
 		return errors.New("postgres configuration invalid")
 	}
 	defer pool.Close()
 
 	registry := prometheus.NewRegistry()
-	metrics, err := platformmetrics.New(registry)
+	metrics, err := platformmetrics.NewEventMetrics(registry)
 	if err != nil {
 		return errors.New("metrics initialization failed")
 	}
@@ -136,7 +141,7 @@ func run(logger *slog.Logger) error {
 				StatementTimeout: cfg.PhysicalShardQueryTimeout,
 				LockTimeout:      cfg.PhysicalShardQueryTimeout,
 			},
-		}, shardphysical.OpenPGXPool)
+		}, shardphysical.RegionalPGXPoolFactory(regionalSession(cfg)))
 		if err != nil {
 			return errors.New("physical shard registry initialization failed")
 		}
@@ -418,13 +423,18 @@ func run(logger *slog.Logger) error {
 	}
 	var (
 		paymentService  httpapi.PaymentService
+		ticketRefunds   httpapi.TicketRefundService
 		paymentWebhooks httpapi.PaymentWebhookService
 	)
 	if cfg.PaymentEnabled {
 		if physicalRouter == nil {
 			return errors.New("payment requires physical booking shards")
 		}
-		controlStore, paymentErr := paymentpostgres.NewStore(pool)
+		deployment, paymentErr := regionalDeployment(cfg)
+		if paymentErr != nil {
+			return errors.New("regional payment authority invalid")
+		}
+		controlStore, paymentErr := paymentpostgres.NewStore(pool, paymentpostgres.WithRegionalAuthority(deployment))
 		if paymentErr != nil {
 			return errors.New("payment control initialization failed")
 		}
@@ -432,7 +442,7 @@ func run(logger *slog.Logger) error {
 		if paymentErr != nil {
 			return errors.New("payment directory initialization failed")
 		}
-		shardStore, paymentErr := paymentshardpostgres.NewStore(physicalRouter)
+		shardStore, paymentErr := paymentshardpostgres.NewStore(physicalRouter, paymentshardpostgres.WithRegionalAuthority(deployment))
 		if paymentErr != nil {
 			return errors.New("payment shard store initialization failed")
 		}
@@ -441,31 +451,104 @@ func run(logger *slog.Logger) error {
 			return errors.New("payment shard gateway initialization failed")
 		}
 		useCases := paymentapp.NewService(controlStore, shardGateway, time.Now, uuid.New).
-			WithProcessingGrace(cfg.PaymentProcessingGrace)
+			WithProcessingGrace(cfg.PaymentProcessingGrace).
+			WithProvider(string(cfg.PaymentProviderType))
 		paymentService = app.NewPaymentService(useCases, metrics)
-
-		webhookKeys, paymentErr := cfg.ParsePaymentWebhookKeys()
-		if paymentErr != nil {
-			return errors.New("payment webhook keyring invalid")
-		}
-		providerClient, paymentErr := providerhttp.New(providerhttp.Config{
-			BaseURL: cfg.PaymentProviderBaseURL, ConnectTimeout: cfg.PaymentProviderConnectTimeout,
-			RequestTimeout:      cfg.PaymentProviderRequestTimeout,
-			MaxResponseBytes:    int64(cfg.PaymentProviderMaxResponseBytes),
-			MaxWebhookBodyBytes: int64(cfg.PaymentWebhookMaxBodyBytes), WebhookKeys: webhookKeys,
-			WebhookClockSkew: cfg.PaymentWebhookClockSkew,
-		})
-		if paymentErr != nil {
+		var providerDescriptor paymentprovider.Descriptor
+		switch cfg.PaymentProviderType {
+		case config.PaymentProviderSandbox:
+			providerDescriptor = providerhttp.Descriptor()
+		case config.PaymentProviderStripe:
+			providerDescriptor = providerstripe.Descriptor()
+		default:
 			return errors.New("payment provider initialization failed")
 		}
-		webhookRepository, paymentErr := webhookpostgres.NewRepository(pool)
+		if err := providerDescriptor.Require(paymentprovider.SagaCapabilities()); err != nil {
+			return errors.New("payment provider capability contract unsupported")
+		}
+		refundStore, paymentErr := refundpostgres.NewStore(pool, shardGateway, refundpostgres.Config{
+			PartialRefundProviders: map[string]bool{providerDescriptor.Name: providerDescriptor.Capabilities.PartialRefund},
+			RegionalAuthority:      &deployment,
+		})
+		if paymentErr != nil {
+			return errors.New("ticket refund store initialization failed")
+		}
+		refundUseCases, paymentErr := paymentrefund.NewService(refundStore, paymentrefund.Policy{
+			CutoffBeforeDeparture: cfg.TicketRefundCutoff, MaxTickets: cfg.MaxPassengersPerReservation,
+		})
+		if paymentErr != nil {
+			return errors.New("ticket refund initialization failed")
+		}
+		ticketRefunds = app.NewTicketRefundService(refundUseCases, metrics)
+
+		webhookRepository, paymentErr := webhookpostgres.NewRepository(pool, webhookpostgres.WithRegionalAuthority(deployment))
 		if paymentErr != nil {
 			return errors.New("payment webhook repository initialization failed")
 		}
+		var verifier paymentwebhook.Verifier
+		switch cfg.PaymentProviderType {
+		case config.PaymentProviderSandbox:
+			webhookKeys, keyErr := cfg.ParsePaymentWebhookKeys()
+			if keyErr != nil {
+				return errors.New("payment webhook keyring invalid")
+			}
+			providerClient, providerErr := providerhttp.New(providerhttp.Config{
+				BaseURL: cfg.PaymentProviderBaseURL, ConnectTimeout: cfg.PaymentProviderConnectTimeout,
+				RequestTimeout:      cfg.PaymentProviderRequestTimeout,
+				MaxResponseBytes:    int64(cfg.PaymentProviderMaxResponseBytes),
+				MaxWebhookBodyBytes: int64(cfg.PaymentWebhookMaxBodyBytes), WebhookKeys: webhookKeys,
+				WebhookClockSkew: cfg.PaymentWebhookClockSkew,
+			})
+			if providerErr != nil {
+				return errors.New("payment provider initialization failed")
+			}
+			defer providerClient.CloseIdleConnections()
+			verifier = providerClient
+		case config.PaymentProviderStripe:
+			keyIDs, secrets, keyErr := cfg.ParseStripeWebhookSecrets()
+			if keyErr != nil {
+				return errors.New("payment webhook keyring invalid")
+			}
+			rotationNow := time.Now().UTC()
+			secretProofs := make(map[string][32]byte, len(keyIDs))
+			for index, keyID := range keyIDs {
+				secretProofs[keyID] = paymentwebhook.KeyProof(string(config.PaymentProviderStripe), cfg.PaymentProviderAccountID, keyID, secrets[index])
+			}
+			plan, keyErr := webhookRepository.SynchronizeKeyring(signalContext, string(config.PaymentProviderStripe), cfg.PaymentProviderAccountID, paymentwebhook.DesiredKeyring{
+				PrimaryKeyID: cfg.PaymentWebhookPrimaryKeyID, AcceptedKeyIDs: keyIDs,
+				SecretProofs: secretProofs, Grace: cfg.PaymentWebhookKeyRetirementGrace, Now: rotationNow,
+			})
+			if keyErr != nil {
+				return errors.New("payment webhook keyring metadata synchronization failed")
+			}
+			secretNotAfter, keyErr := stripeWebhookSecretDeadlines(keyIDs, plan)
+			if keyErr != nil {
+				return errors.New("payment webhook keyring metadata invalid")
+			}
+			stripeVerifier, providerErr := providerstripe.NewWebhookVerifier(providerstripe.WebhookConfig{
+				MaxBodyBytes: int64(cfg.PaymentWebhookMaxBodyBytes), Tolerance: cfg.PaymentWebhookClockSkew,
+				Secrets: secrets, SecretIDs: keyIDs, SecretNotAfter: secretNotAfter, Now: time.Now,
+				AccountID: cfg.PaymentProviderAccountID,
+				LiveMode:  cfg.Environment == config.EnvironmentProduction,
+			})
+			if providerErr != nil {
+				return errors.New("payment provider initialization failed")
+			}
+			verifier = stripeVerifier
+			readiness.WithProbe("webhook_keyring", func(ctx context.Context) error {
+				readinessDesired := paymentwebhook.DesiredKeyring{
+					PrimaryKeyID: cfg.PaymentWebhookPrimaryKeyID, AcceptedKeyIDs: append([]string(nil), keyIDs...),
+					SecretProofs: secretProofs, Grace: cfg.PaymentWebhookKeyRetirementGrace, Now: time.Now().UTC(),
+				}
+				return webhookRepository.ValidateKeyring(ctx, string(config.PaymentProviderStripe), cfg.PaymentProviderAccountID, readinessDesired)
+			})
+		default:
+			return errors.New("payment provider initialization failed")
+		}
 		paymentWebhooks, paymentErr = paymentwebhook.NewService(paymentwebhook.Config{
-			Providers:  map[string]paymentwebhook.Verifier{"sandbox": providerClient},
+			Providers:  map[string]paymentwebhook.Verifier{string(cfg.PaymentProviderType): verifier},
 			Repository: webhookRepository, MaxBodyBytes: cfg.PaymentWebhookMaxBodyBytes,
-			Now: time.Now, NewID: uuid.New, Metrics: metrics,
+			Now: time.Now, NewID: uuid.New, Metrics: metrics, Region: string(cfg.DeploymentRegion), Keyring: webhookRepository,
 		})
 		if paymentErr != nil {
 			return errors.New("payment webhook initialization failed")
@@ -478,6 +561,7 @@ func run(logger *slog.Logger) error {
 		TokenParser:                tokenParser,
 		Reservations:               reservationService,
 		Payments:                   paymentService,
+		TicketRefunds:              ticketRefunds,
 		PaymentWebhooks:            paymentWebhooks,
 		PaymentWebhookMaxBodyBytes: int64(cfg.PaymentWebhookMaxBodyBytes),
 		PaymentWebhookTimeout:      cfg.DatabaseTimeout,
@@ -523,6 +607,39 @@ func run(logger *slog.Logger) error {
 	return serveUntilShutdown(server, listener, signalContext.Done(), cfg.ShutdownTimeout)
 }
 
+func stripeWebhookSecretDeadlines(keyIDs []string, plan paymentwebhook.KeyringPlan) ([]time.Time, error) {
+	deadlines := make([]time.Time, len(keyIDs))
+	for index, keyID := range keyIDs {
+		version, found := plan.ByID[keyID]
+		if !found {
+			return nil, paymentwebhook.ErrKeyringConflict
+		}
+		switch version.State {
+		case paymentwebhook.KeyPrimary:
+			if version.RetirementNotBefore != nil || version.RetiredAt != nil {
+				return nil, paymentwebhook.ErrKeyringConflict
+			}
+		case paymentwebhook.KeyAccepted:
+			if version.RetiredAt != nil {
+				return nil, paymentwebhook.ErrKeyringConflict
+			}
+			if version.RetirementNotBefore != nil {
+				deadlines[index] = version.RetirementNotBefore.UTC()
+			}
+		default:
+			return nil, paymentwebhook.ErrKeyringConflict
+		}
+	}
+	return deadlines, nil
+}
+
+func regionalSession(cfg config.Config) postgresx.RegionalSession {
+	return postgresx.RegionalSession{
+		Region: string(cfg.DeploymentRegion), Role: string(cfg.DeploymentRole),
+		Epoch: cfg.RegionEpoch, WritesEnabled: cfg.RegionalWritesEnabled,
+	}
+}
+
 func serveUntilShutdown(server *http.Server, listener net.Listener, shutdown <-chan struct{}, timeout time.Duration) error {
 	if server == nil || listener == nil || shutdown == nil || timeout <= 0 {
 		return errors.New("http lifecycle configuration invalid")
@@ -560,6 +677,19 @@ func readinessTimeout(cfg config.Config) time.Duration {
 		return 2 * time.Second
 	}
 	return timeout
+}
+
+func regionalDeployment(cfg config.Config) (authority.Deployment, error) {
+	region, err := authority.ParseRegion(string(cfg.DeploymentRegion))
+	if err != nil || cfg.RegionEpoch <= 0 {
+		return authority.Deployment{}, authority.ErrInvalidDeployment
+	}
+	epoch, err := authority.NewEpoch(uint64(cfg.RegionEpoch))
+	if err != nil {
+		return authority.Deployment{}, err
+	}
+	role := authority.Role(cfg.DeploymentRole)
+	return authority.NewDeployment(region, role, epoch, cfg.RegionalWritesEnabled)
 }
 
 func startReadModelObserver(

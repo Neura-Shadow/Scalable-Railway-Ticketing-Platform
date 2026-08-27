@@ -39,7 +39,6 @@ var (
 	ErrRefundFailed                  = errors.New("refund failed")
 	ErrTicketIssuanceProcessing      = errors.New("ticket issuance processing")
 	ErrWebhookInvalid                = errors.New("payment webhook invalid")
-	ErrWebhookConflict               = errors.New("payment webhook conflict")
 )
 
 type retryAfterError struct {
@@ -145,8 +144,6 @@ func classifyError(err error) (int, string, string) {
 		return http.StatusAccepted, "ticket_issuance_processing", "ticket issuance is processing"
 	case errors.Is(err, ErrWebhookInvalid):
 		return http.StatusUnauthorized, "payment_webhook_invalid", "payment webhook is invalid"
-	case errors.Is(err, ErrWebhookConflict):
-		return http.StatusConflict, "payment_webhook_conflict", "payment webhook conflicts with a prior event"
 	default:
 		return http.StatusInternalServerError, "internal_error", "internal server error"
 	}

@@ -20,7 +20,8 @@ func TestCreateIntentDerivesFinancialsAndSecuresReservationOnce(t *testing.T) {
 		AmountMinor: 12500, Currency: "TWD", ExpiresAt: now.Add(10 * time.Minute),
 	}}
 	service := application.NewService(store, reservations, func() time.Time { return now }, uuid.New).
-		WithProcessingGrace(2 * time.Minute)
+		WithProcessingGrace(2 * time.Minute).
+		WithProvider("stripe")
 
 	first, err := service.CreateIntent(context.Background(), application.CreateIntentCommand{
 		OwnerID: owner, ReservationID: reservationID, IdempotencyKey: "payment-key-123",
@@ -48,6 +49,9 @@ func TestCreateIntentDerivesFinancialsAndSecuresReservationOnce(t *testing.T) {
 	}
 	if store.lastReserve.IdempotencyKeyHash == [32]byte{} || store.lastReserve.RequestFingerprint == [32]byte{} {
 		t.Fatal("raw idempotency identity was not reduced to bounded hashes")
+	}
+	if store.lastReserve.Provider != "stripe" {
+		t.Fatalf("provider = %q, want configured stripe", store.lastReserve.Provider)
 	}
 }
 

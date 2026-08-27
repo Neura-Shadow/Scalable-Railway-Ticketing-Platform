@@ -11,6 +11,8 @@ import (
 
 	paymentapp "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/application"
 	paymentshard "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/shard"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/regional/authority"
+	authoritypostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/regional/authority/postgres"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	shardphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physical"
 	"github.com/google/uuid"
@@ -101,6 +103,9 @@ func (store *Store) IssueTickets(ctx context.Context, route sharding.ShardRoute,
 			return paymentshard.IssueTicketsReceipt{}, paymentshard.ErrShardPaymentUnavailable
 		}
 		return receipt, nil
+	}
+	if err := store.authorizeRegional(ctx, tx); err != nil {
+		return rollback(err)
 	}
 	if err := lockFence(ctx, tx, route); err != nil {
 		return rollback(err)
@@ -396,13 +401,31 @@ WHERE id=$1 AND reservation_id=$2 AND payment_intent_id=$3
 	}, true, nil
 }
 
-type Store struct{ router RouteResolver }
+type Store struct {
+	router     RouteResolver
+	deployment *authority.Deployment
+}
 
-func NewStore(router RouteResolver) (*Store, error) {
+type StoreOption func(*Store) error
+
+func WithRegionalAuthority(deployment authority.Deployment) StoreOption {
+	return func(store *Store) error {
+		store.deployment = &deployment
+		return nil
+	}
+}
+
+func NewStore(router RouteResolver, options ...StoreOption) (*Store, error) {
 	if router == nil {
 		return nil, paymentshard.ErrInvalidGateway
 	}
-	return &Store{router: router}, nil
+	store := &Store{router: router}
+	for _, option := range options {
+		if option == nil || option(store) != nil {
+			return nil, paymentshard.ErrInvalidGateway
+		}
+	}
+	return store, nil
 }
 
 func (store *Store) GetPayableReservation(ctx context.Context, route sharding.ShardRoute, reservationID uuid.UUID) (paymentapp.ReservationSnapshot, error) {
@@ -460,6 +483,9 @@ func (store *Store) BeginPayment(ctx context.Context, route sharding.ShardRoute,
 			return paymentapp.BeginPaymentReceipt{}, paymentshard.ErrShardPaymentUnavailable
 		}
 		return receipt, nil
+	}
+	if err := store.authorizeRegional(ctx, tx); err != nil {
+		return rollback(err)
 	}
 	if err := lockFence(ctx, tx, route); err != nil {
 		return rollback(err)
@@ -636,6 +662,16 @@ WHERE train_run_id=$1 FOR UPDATE`, route.TrainRunID()).Scan(&generation, &writeE
 		return sharding.ErrAssignmentStale
 	}
 	if !writeEnabled || state != "active" {
+		return sharding.ErrWriteFenced
+	}
+	return nil
+}
+
+func (store *Store) authorizeRegional(ctx context.Context, tx pgx.Tx) error {
+	if store == nil || store.deployment == nil {
+		return nil
+	}
+	if err := authoritypostgres.AuthorizeControlTransaction(ctx, tx, *store.deployment); err != nil {
 		return sharding.ErrWriteFenced
 	}
 	return nil

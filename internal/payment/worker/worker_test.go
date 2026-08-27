@@ -170,6 +170,51 @@ func TestRunOnceUnknownProviderOutcomeNeverBlindlyRetries(t *testing.T) {
 	}
 }
 
+func TestUncertainFullRefundRequiresExactCumulativeRefundTotal(t *testing.T) {
+	t.Parallel()
+	claim := validOperation(domain.OperationRefund)
+	claim.PreviousState = domain.OperationUncertain
+	store := &storeFake{operations: []OperationClaim{claim}}
+	client := &providerFake{payment: provider.Payment{
+		ProviderPaymentID: claim.ProviderPaymentID, Status: provider.StatusRefunded,
+		AmountMinor: claim.AmountMinor, Currency: claim.Currency,
+		CapturedMinor: claim.AmountMinor, RefundedMinor: claim.AmountMinor - 1,
+		ProviderUpdatedAt: fixedNow,
+	}}
+	value := newTestWorker(t, store, client, &shardFake{}, 4)
+
+	result, err := value.RunOnce(context.Background())
+	if err != nil || result.ManualReview != 1 || result.OperationsDone != 0 ||
+		store.completeOperationCalls != 0 || len(store.operationFailures) != 1 ||
+		!store.operationFailures[0].ManualReview {
+		t.Fatalf("result=%+v err=%v complete=%d failures=%+v", result, err,
+			store.completeOperationCalls, store.operationFailures)
+	}
+}
+
+func TestSynchronousCaptureContradictionHasNoDurableOrShardEffects(t *testing.T) {
+	t.Parallel()
+	claim := validOperation(domain.OperationCapture)
+	store := &storeFake{operations: []OperationClaim{claim}}
+	client := &providerFake{operation: provider.OperationResult{
+		ProviderPaymentID: claim.ProviderPaymentID, ProviderOperationID: "capture-1",
+		Status: provider.StatusAuthorized, AmountMinor: claim.AmountMinor, Currency: claim.Currency,
+	}}
+	shards := &shardFake{}
+	value := newTestWorker(t, store, client, shards, 4)
+
+	result, err := value.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if result.Retried != 1 || result.ManualReview != 0 || len(store.operationFailures) != 1 ||
+		!store.operationFailures[0].Uncertain || store.completeOperationCalls != 0 ||
+		shards.lastIssue.CommandID != uuid.Nil {
+		t.Fatalf("result=%+v failures=%+v complete=%d shard=%+v", result,
+			store.operationFailures, store.completeOperationCalls, shards.lastIssue)
+	}
+}
+
 func TestSandboxCommittedMutationLossQueriesBeforeDecision(t *testing.T) {
 	t.Parallel()
 	for _, kind := range []domain.OperationType{domain.OperationCapture, domain.OperationVoid, domain.OperationRefund} {
@@ -334,9 +379,12 @@ func TestWebhookOrderPermutationsAlwaysUseCurrentProviderState(t *testing.T) {
 				store := &storeFake{webhooks: []WebhookClaim{claim}}
 				client := &providerFake{payment: provider.Payment{
 					ProviderPaymentID: claim.ProviderPaymentID, Status: currentState,
-					AmountMinor: 2500, Currency: "TWD", CapturedMinor: 2500,
+					AmountMinor: 2500, Currency: "TWD",
 					ProviderUpdatedAt: fixedNow,
 				}}
+				if currentState == provider.StatusCaptured || currentState == provider.StatusRefunded {
+					client.payment.CapturedMinor = 2500
+				}
 				if currentState == provider.StatusRefunded {
 					client.payment.RefundedMinor = 2500
 				}
@@ -397,11 +445,34 @@ func TestRunOnceWebhookUsesCurrentProviderStateAndUnknownTypeNeverAdvances(t *te
 	}
 }
 
+func TestWebhookContradictoryFinancialObservationHasZeroEffects(t *testing.T) {
+	t.Parallel()
+	claim := validWebhook(provider.EventCaptured)
+	store := &storeFake{webhooks: []WebhookClaim{claim}}
+	client := &providerFake{payment: provider.Payment{
+		ProviderPaymentID: claim.ProviderPaymentID, Status: provider.StatusAuthorized,
+		AmountMinor: 2500, Currency: "TWD", CapturedMinor: 2500,
+		ProviderUpdatedAt: fixedNow,
+	}}
+	shards := &shardFake{}
+	value := newTestWorker(t, store, client, shards, 4)
+
+	result, err := value.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if result.ManualReview != 1 || store.completeWebhookCalls != 0 || len(store.webhookFailures) != 1 ||
+		!store.webhookFailures[0].ManualReview || shards.lastIssue.CommandID != uuid.Nil {
+		t.Fatalf("result=%+v webhook failures=%+v complete=%d shard=%+v", result,
+			store.webhookFailures, store.completeWebhookCalls, shards.lastIssue)
+	}
+}
+
 func TestRunOnceRetriesTicketIssuanceWithSameCommandIdentity(t *testing.T) {
 	t.Parallel()
 	commandID := uuid.New()
 	claim := ActionClaim{
-		SagaID: uuid.New(), Type: ActionIssueTickets, Provider: "sandbox", Attempts: 1,
+		ActionID: uuid.New(), SagaID: uuid.New(), Type: ActionIssueTickets, Provider: "sandbox", Attempts: 1,
 		LeaseOwner: "payment-test", LeaseUntil: fixedNow.Add(time.Minute),
 		Issue: shard.IssueTicketsCommand{CommandID: commandID, IssuanceID: uuid.New(), PaymentIntentID: uuid.New()},
 	}
@@ -428,6 +499,92 @@ func TestRunOnceRetriesTicketIssuanceWithSameCommandIdentity(t *testing.T) {
 	}
 }
 
+func TestFinalAttemptActionCrashReclaimsDurableShardReceipt(t *testing.T) {
+	t.Parallel()
+	claim := ActionClaim{
+		ActionID: uuid.New(), SagaID: uuid.New(), Type: ActionIssueTickets, Provider: "sandbox", Attempts: 1,
+		LeaseOwner: "payment-test", LeaseUntil: fixedNow.Add(time.Minute),
+		Issue: shard.IssueTicketsCommand{
+			CommandID: uuid.New(), IssuanceID: uuid.New(), PaymentIntentID: uuid.New(),
+			ReservationID: uuid.New(), AmountMinor: 2_500, Currency: "TWD",
+		},
+	}
+	receipt := shard.IssueTicketsReceipt{
+		CommandID: claim.Issue.CommandID, IssuanceID: claim.Issue.IssuanceID,
+		PaymentIntentID: claim.Issue.PaymentIntentID, ReservationID: claim.Issue.ReservationID,
+		AmountMinor: claim.Issue.AmountMinor, Currency: claim.Issue.Currency,
+		TicketOrderID: uuid.New(), TicketIDs: []uuid.UUID{uuid.New()}, TicketCodes: []string{"ticket_code_000001"},
+		OrderCreatedAt: fixedNow.Add(-time.Minute), IssuedAt: fixedNow,
+	}
+	store := &storeFake{actions: []ActionClaim{claim}, completeActionErr: errors.New("control commit lost after shard effect")}
+	shards := &shardFake{issueReceipt: receipt}
+	value := newTestWorker(t, store, &providerFake{}, shards, 1)
+
+	first, err := value.RunOnce(context.Background())
+	if err == nil || first.ActionsDone != 0 || shards.issueCalls != 1 || store.completeActionCalls != 1 {
+		t.Fatalf("crash pass result=%+v err=%v issue_calls=%d complete_calls=%d", first, err, shards.issueCalls, store.completeActionCalls)
+	}
+
+	recovery := claim
+	recovery.Attempts = 2 // the store's one bounded receipt-recovery claim
+	store.actions = []ActionClaim{recovery}
+	store.completeActionErr = nil
+	second, err := value.RunOnce(context.Background())
+	if err != nil || second.ActionsDone != 1 || shards.issueCalls != 2 || store.completeActionCalls != 2 ||
+		shards.lastIssue.CommandID != claim.Issue.CommandID {
+		t.Fatalf("recovery pass result=%+v err=%v issue_calls=%d complete_calls=%d command=%s",
+			second, err, shards.issueCalls, store.completeActionCalls, shards.lastIssue.CommandID)
+	}
+}
+
+func TestShardActionsHaveIndependentBackoffIdentity(t *testing.T) {
+	t.Parallel()
+	sagaID := uuid.MustParse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+	claims := []ActionClaim{
+		{
+			ActionID: uuid.MustParse("11111111-1111-4111-8111-111111111111"), SagaID: sagaID,
+			Type: ActionIssueTickets, Provider: "sandbox", Attempts: 1,
+			LeaseOwner: "payment-test", LeaseUntil: fixedNow.Add(time.Minute),
+			Issue: shard.IssueTicketsCommand{CommandID: uuid.New(), IssuanceID: uuid.New(), PaymentIntentID: uuid.New()},
+		},
+		{
+			ActionID: uuid.MustParse("22222222-2222-4222-8222-222222222222"), SagaID: sagaID,
+			Type: ActionIssueTickets, Provider: "sandbox", Attempts: 1,
+			LeaseOwner: "payment-test", LeaseUntil: fixedNow.Add(time.Minute),
+			Issue: shard.IssueTicketsCommand{CommandID: uuid.New(), IssuanceID: uuid.New(), PaymentIntentID: uuid.New()},
+		},
+	}
+	delays := make([]time.Time, 0, len(claims))
+	for _, claim := range claims {
+		store := &storeFake{actions: []ActionClaim{claim}}
+		value := newTestWorker(t, store, &providerFake{}, &shardFake{issueErr: errors.New("transient shard outage")}, 4)
+		if _, err := value.RunOnce(context.Background()); err != nil || len(store.actionFailures) != 1 {
+			t.Fatalf("RunOnce() error=%v failures=%+v", err, store.actionFailures)
+		}
+		delays = append(delays, store.actionFailures[0].NextAttemptAt)
+	}
+	if delays[0] == delays[1] {
+		t.Fatalf("independent actions inherited saga backoff identity: %v", delays)
+	}
+}
+
+func TestShardActionWithoutDurableIdentityNeverReachesShard(t *testing.T) {
+	t.Parallel()
+	claim := ActionClaim{
+		SagaID: uuid.New(), Type: ActionIssueTickets, Provider: "sandbox", Attempts: 1,
+		LeaseOwner: "payment-test", LeaseUntil: fixedNow.Add(time.Minute),
+		Issue: shard.IssueTicketsCommand{CommandID: uuid.New(), IssuanceID: uuid.New(), PaymentIntentID: uuid.New()},
+	}
+	store := &storeFake{actions: []ActionClaim{claim}}
+	shards := &shardFake{}
+	value := newTestWorker(t, store, &providerFake{}, shards, 4)
+
+	result, err := value.RunOnce(context.Background())
+	if err != nil || result.ManualReview != 1 || shards.lastIssue.CommandID != uuid.Nil || len(store.actionFailures) != 1 {
+		t.Fatalf("result=%+v err=%v shard=%+v failures=%+v", result, err, shards.lastIssue, store.actionFailures)
+	}
+}
+
 func TestVoidShardReceiptMustSucceedBeforeControlFinalization(t *testing.T) {
 	t.Parallel()
 	command := shard.CancelVoidedReservationCommand{
@@ -437,7 +594,7 @@ func TestVoidShardReceiptMustSucceedBeforeControlFinalization(t *testing.T) {
 	}
 	command.RequestFingerprint = shard.VoidCancellationFingerprint(command)
 	claim := ActionClaim{
-		SagaID: uuid.New(), Type: ActionCancelVoided, Provider: "sandbox", Attempts: 1,
+		ActionID: uuid.New(), SagaID: uuid.New(), Type: ActionCancelVoided, Provider: "sandbox", Attempts: 1,
 		LeaseOwner: "payment-test", LeaseUntil: fixedNow.Add(time.Minute), CancelVoided: command,
 	}
 	store := &storeFake{actions: []ActionClaim{claim}}
@@ -465,7 +622,7 @@ func TestVoidShardReceiptMustSucceedBeforeControlFinalization(t *testing.T) {
 func TestShardReceiptMismatchEscalatesWithoutControlFinalization(t *testing.T) {
 	t.Parallel()
 	claim := ActionClaim{
-		SagaID: uuid.New(), Type: ActionIssueTickets, Provider: "sandbox", Attempts: 1,
+		ActionID: uuid.New(), SagaID: uuid.New(), Type: ActionIssueTickets, Provider: "sandbox", Attempts: 1,
 		LeaseOwner: "payment-test", LeaseUntil: fixedNow.Add(time.Minute),
 		Issue: shard.IssueTicketsCommand{
 			CommandID: uuid.New(), IssuanceID: uuid.New(), PaymentIntentID: uuid.New(),
@@ -484,7 +641,7 @@ func TestShardReceiptMismatchEscalatesWithoutControlFinalization(t *testing.T) {
 func TestCommittedIssuanceControlFinalizeFailureNeverStartsRefund(t *testing.T) {
 	t.Parallel()
 	claim := ActionClaim{
-		SagaID: uuid.New(), Type: ActionIssueTickets, Provider: "sandbox", Attempts: 1,
+		ActionID: uuid.New(), SagaID: uuid.New(), Type: ActionIssueTickets, Provider: "sandbox", Attempts: 1,
 		LeaseOwner: "payment-test", LeaseUntil: fixedNow.Add(time.Minute),
 		Issue: shard.IssueTicketsCommand{
 			CommandID: uuid.New(), IssuanceID: uuid.New(), PaymentIntentID: uuid.New(),
@@ -912,12 +1069,14 @@ type shardFake struct {
 	issueErr      error
 	issueReceipt  shard.IssueTicketsReceipt
 	lastIssue     shard.IssueTicketsCommand
+	issueCalls    int
 	cancelErr     error
 	cancelReceipt shard.CancelVoidedReservationReceipt
 	lastCancel    shard.CancelVoidedReservationCommand
 }
 
 func (fake *shardFake) IssueTickets(_ context.Context, command shard.IssueTicketsCommand) (shard.IssueTicketsReceipt, error) {
+	fake.issueCalls++
 	fake.lastIssue = command
 	return fake.issueReceipt, fake.issueErr
 }
