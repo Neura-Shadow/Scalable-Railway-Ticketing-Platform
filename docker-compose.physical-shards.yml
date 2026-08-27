@@ -152,7 +152,8 @@ services:
       - sh
       - -ec
       - |
-        psql -h control-postgres -U railway_control -d railway_control -v ON_ERROR_STOP=1 <<'SQL'
+        for attempt in 1 2 3 4 5; do
+        if psql -h control-postgres -U railway_control -d railway_control -v ON_ERROR_STOP=1 <<'SQL'
         DO $$$$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='railway_runtime') THEN CREATE ROLE railway_runtime LOGIN PASSWORD 'runtime-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT; END IF; END $$$$;
         DO $$$$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='railway_backup_admin') THEN CREATE ROLE railway_backup_admin LOGIN PASSWORD 'backup-admin-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION; END IF; END $$$$;
         GRANT CONNECT ON DATABASE railway_control TO railway_runtime;
@@ -169,6 +170,10 @@ services:
         GRANT SELECT,INSERT,UPDATE ON public.backup_artifacts,public.backup_operations,public.backup_verifications,public.restore_validations,public.backup_expiration_operations TO railway_backup_admin;
         GRANT SELECT ON public.schema_migrations,public.regional_write_authority TO railway_backup_admin;
         SQL
+        then exit 0; fi
+        test "$$attempt" -lt 5
+        sleep 1
+        done
     depends_on: {migrate-control: {condition: service_completed_successfully}}
     networks: [backend]
     restart: "no"
@@ -180,7 +185,8 @@ services:
       - sh
       - -ec
       - |
-        psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 <<'SQL'
+        for attempt in 1 2 3 4 5; do
+        if psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 <<'SQL'
         DO $$$$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='railway_runtime') THEN CREATE ROLE railway_runtime LOGIN PASSWORD 'runtime-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT; END IF; END $$$$;
         GRANT CONNECT ON DATABASE railway_booking TO railway_runtime;
         GRANT USAGE ON SCHEMA public TO railway_runtime;
@@ -191,6 +197,10 @@ services:
         REVOKE ALL ON public.regional_write_authority FROM railway_runtime;
         GRANT SELECT ON public.schema_migrations,public.regional_write_authority TO railway_runtime;
         SQL
+        then exit 0; fi
+        test "$$attempt" -lt 5
+        sleep 1
+        done
     depends_on: {migrate-booking-shard-0: {condition: service_completed_successfully}}
     networks: [backend]
     restart: "no"
@@ -202,7 +212,8 @@ services:
       - sh
       - -ec
       - |
-        psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 <<'SQL'
+        for attempt in 1 2 3 4 5; do
+        if psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 <<'SQL'
         DO $$$$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='railway_runtime') THEN CREATE ROLE railway_runtime LOGIN PASSWORD 'runtime-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT; END IF; END $$$$;
         GRANT CONNECT ON DATABASE railway_booking TO railway_runtime;
         GRANT USAGE ON SCHEMA public TO railway_runtime;
@@ -213,6 +224,10 @@ services:
         REVOKE ALL ON public.regional_write_authority FROM railway_runtime;
         GRANT SELECT ON public.schema_migrations,public.regional_write_authority TO railway_runtime;
         SQL
+        then exit 0; fi
+        test "$$attempt" -lt 5
+        sleep 1
+        done
     depends_on: {migrate-booking-shard-1: {condition: service_completed_successfully}}
     networks: [backend]
     restart: "no"

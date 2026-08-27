@@ -121,10 +121,10 @@ jobs:
           --health-timeout 3s
           --health-retries 20
     env:
-      DATABASE_URL: postgres://railway:ci-local-password@localhost:5432/railway?sslmode=disable
-      MIGRATION_REHEARSAL_DATABASE_URL: postgres://railway:ci-local-password@localhost:5432/railway_migration_rehearsal?sslmode=disable
-      M7_LEDGER_DATABASE_URL: postgres://railway:ci-local-password@localhost:5432/railway_migration_rehearsal?sslmode=disable
-      SETTLEMENT_POSTGRES_TEST_DATABASE_URL: postgres://railway:ci-local-password@localhost:5432/railway?sslmode=disable
+      DATABASE_URL: postgres://railway:ci-local-password@localhost:5432/railway?sslmode=disable&options=-c%20railway.deployment_region=region-a%20-c%20railway.deployment_role=active%20-c%20railway.region_epoch=1%20-c%20railway.regional_writes_enabled=true
+      MIGRATION_REHEARSAL_DATABASE_URL: postgres://railway:ci-local-password@localhost:5432/railway_migration_rehearsal?sslmode=disable&options=-c%20railway.deployment_region=region-a%20-c%20railway.deployment_role=active%20-c%20railway.region_epoch=1%20-c%20railway.regional_writes_enabled=true
+      M7_LEDGER_DATABASE_URL: postgres://railway:ci-local-password@localhost:5432/railway_migration_rehearsal?sslmode=disable&options=-c%20railway.deployment_region=region-a%20-c%20railway.deployment_role=active%20-c%20railway.region_epoch=1%20-c%20railway.regional_writes_enabled=true
+      SETTLEMENT_POSTGRES_TEST_DATABASE_URL: postgres://railway:ci-local-password@localhost:5432/railway?sslmode=disable&options=-c%20railway.deployment_region=region-a%20-c%20railway.deployment_role=active%20-c%20railway.region_epoch=1%20-c%20railway.regional_writes_enabled=true
       REDIS_ADDR: localhost:6379
       TEST_REDIS_ADDR: localhost:6379
       APP_ENV: test

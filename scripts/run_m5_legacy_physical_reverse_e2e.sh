@@ -9,6 +9,10 @@ set -euo pipefail
 # the durable active authority. This acceptance fixture operates against the
 # migration's initial Region A, epoch 1 authority.
 export PGOPTIONS="${PGOPTIONS:-} -c railway.deployment_region=region-a -c railway.deployment_role=active -c railway.region_epoch=1 -c railway.regional_writes_enabled=true"
+export DEPLOYMENT_REGION=region-a
+export DEPLOYMENT_ROLE=active
+export REGION_EPOCH=1
+export REGIONAL_WRITES_ENABLED=true
 
 run_id=86000000-0000-4000-8000-000000000001
 forward_id=86000000-0000-4000-8000-000000000002

@@ -5,6 +5,8 @@ SELECT set_config('railway.deployment_region', 'region-a', true),
        set_config('railway.region_epoch', '1', true),
        set_config('railway.regional_writes_enabled', 'true', true);
 
+SAVEPOINT forward_capture_fixture;
+
 INSERT INTO public.physical_shard_migrations (
     migration_id, train_run_id, source_shard_id, target_shard_id,
     source_generation, target_generation, state
@@ -89,20 +91,11 @@ BEGIN
 END;
 $$;
 
-DELETE FROM public.selected_ticket_refund_receipts
- WHERE id = '79000000-0000-4000-8000-000000000015';
-DELETE FROM public.ticket_refund_compensation_receipts
- WHERE id = '79000000-0000-4000-8000-000000000010';
-DELETE FROM public.physical_source_migration_capture_state
- WHERE migration_id = '79000000-0000-4000-8000-000000000001';
-DELETE FROM public.physical_source_train_run_mutation_journal
- WHERE migration_id = '79000000-0000-4000-8000-000000000001';
-
-UPDATE public.train_run_shard_assignments
-   SET assignment_state = 'stable', active_physical_migration_id = NULL
- WHERE train_run_id = '66666666-6666-4666-8666-666666666666';
-DELETE FROM public.physical_shard_migrations
- WHERE migration_id = '79000000-0000-4000-8000-000000000001';
+-- Discard the forward-capture fixture transactionally. Runtime refund evidence
+-- is deliberately immutable, so test cleanup must not exercise a forbidden
+-- DELETE path or weaken the production guard.
+ROLLBACK TO SAVEPOINT forward_capture_fixture;
+RELEASE SAVEPOINT forward_capture_fixture;
 
 UPDATE public.train_run_write_fences
    SET write_enabled = false
