@@ -46,6 +46,10 @@ services:
       target: api
     environment:
       APP_ENV: development
+      DEPLOYMENT_REGION: region-a
+      DEPLOYMENT_ROLE: active
+      REGION_EPOCH: "1"
+      REGIONAL_WRITES_ENABLED: "true"
       HTTP_ADDR: :8080
       DATABASE_URL: postgres://railway:${POSTGRES_PASSWORD:-railway-local}@postgres:5432/railway?sslmode=disable
       REDIS_ADDR: redis:6379
