@@ -1376,6 +1376,27 @@ FROM pg_roles WHERE rolname='railway_runtime'
         Add-M7Phase 'runtime-database-roles-bounded'
         Add-M7Phase 'schemas-migrated'
 
+        $replicationHBAEvidence = [System.Collections.Generic.List[object]]::new()
+        foreach ($database in $databases) {
+            Invoke-M7Compose -Arguments @('exec','-T',$database.Primary,'sh','/etc/railway/configure-replication.sh') | Out-Null
+            $loadedRules = [int](Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL @"
+SELECT count(*)
+FROM pg_hba_file_rules
+WHERE type='hostssl'
+  AND database @> ARRAY['replication']::text[]
+  AND user_name @> ARRAY['$($database.ReplicationUser)']::text[]
+  AND auth_method='scram-sha-256'
+  AND error IS NULL
+"@)
+            if ($loadedRules -ne 1) { throw "managed replication HBA rule was not loaded for $($database.Name)" }
+            $replicationHBAEvidence.Add([ordered]@{
+                database=$database.Name; replication_identity=$database.ReplicationUser;
+                managed_rule_count=$loadedRules; tls_required=$true; auth_method='scram-sha-256'
+            })
+        }
+        Write-M7JSON -Name 'replication-hba-rules.json' -Value ([ordered]@{databases=$replicationHBAEvidence})
+        Add-M7Phase 'replication-hba-rules-loaded'
+
         foreach ($database in $databases) {
             Invoke-M7Compose -Arguments @('exec','-T',$database.Primary,'/etc/railway/pgbackrest-secret.sh',"--stanza=$($database.Stanza)",'stanza-create') | Out-Null
         }

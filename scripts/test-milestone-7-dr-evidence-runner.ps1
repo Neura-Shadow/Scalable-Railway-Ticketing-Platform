@@ -29,7 +29,6 @@ foreach ($required in @(
 )) {
     if (-not $workflow.Contains($required)) { throw "Milestone 7 DR workflow omits required token: $required" }
 }
-
 $tokens = $null
 $parseErrors = $null
 [System.Management.Automation.Language.Parser]::ParseFile(
@@ -38,6 +37,18 @@ $parseErrors = $null
 if ($parseErrors.Count -ne 0) { throw "Milestone 7 DR runner has $($parseErrors.Count) PowerShell parse errors" }
 
 $source = Get-Content -Raw -LiteralPath $runnerPath
+foreach ($replicationBootstrapGuard in @(
+    '/etc/railway/configure-replication.sh',
+    'pg_hba_file_rules',
+    "database @> ARRAY['replication']::text[]",
+    "auth_method='scram-sha-256'",
+    'replication-hba-rules.json',
+    "Add-M7Phase 'replication-hba-rules-loaded'"
+)) {
+    if (-not $source.Contains($replicationBootstrapGuard)) {
+        throw "DR runner omits live replication HBA proof: $replicationBootstrapGuard"
+    }
+}
 $requiredGuardrails = @(
     'ConfirmDestructiveDrill',
     'EvidenceDirectory must be outside the source repository',
