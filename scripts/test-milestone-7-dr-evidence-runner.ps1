@@ -64,6 +64,7 @@ foreach ($topologyPreflightGuard in @(
 foreach ($replayFreshnessGuard in @(
     'replayFreshnessMarkerEpoch',
     'replayFreshnessLSN',
+    'WITH updated AS (UPDATE public.dr_evidence_markers',
     'Wait-M7Replay -Service $database.Standby',
     'replay_freshness_marker_lsn',
     'replay_freshness_marker_epoch'

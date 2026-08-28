@@ -1532,7 +1532,7 @@ FROM pg_replication_slots WHERE slot_name='$($database.Slot)' AND slot_type='phy
             if ($archiveObservation.Count -ne 4 -or [int64]$archiveObservation[0] -lt 1 -or ([int64]$archiveObservation[3] -gt [int64]$archiveObservation[2])) {
                 throw "WAL archive freshness was not healthy for $($database.Name)"
             }
-            $replayFreshnessMarkerEpoch = [int64](Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL "UPDATE public.dr_evidence_markers SET created_at=clock_timestamp() WHERE marker=1 RETURNING extract(epoch FROM created_at)::bigint::text")
+            $replayFreshnessMarkerEpoch = [int64](Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL "WITH updated AS (UPDATE public.dr_evidence_markers SET created_at=clock_timestamp() WHERE marker=1 RETURNING created_at) SELECT extract(epoch FROM created_at)::bigint::text FROM updated")
             if ($replayFreshnessMarkerEpoch -le 0) { throw "replay freshness marker did not commit for $($database.Name)" }
             $replayFreshnessLSN = Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL 'SELECT pg_current_wal_lsn()::text'
             Wait-M7Replay -Service $database.Standby -User $database.ReplicationUser -Database $database.Database -LSN $replayFreshnessLSN
