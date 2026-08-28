@@ -63,9 +63,10 @@ Require-Token $primaryStartup '-c ssl=on' 'primary startup must enable PostgreSQ
 Require-Token $primaryStartup 'replication-server.key' 'primary startup must install a restricted external TLS key'
 Require-Token $primaryHealth "current_setting('data_checksums')" 'primary health must assert data checksums'
 Require-Token $primaryHealth 'pg_stat_archiver' 'primary health must assert current WAL archive health'
-Require-Token $standbyHealth 'pg_stat_wal_receiver' 'standby health must assert a streaming WAL receiver'
+Require-Token $standbyHealth 'pg_last_wal_receive_lsn' 'standby health must assert bounded WAL receipt without privileged statistics access'
 Require-Token $standbyHealth 'pg_last_xact_replay_timestamp' 'standby health must reject stale replay'
 Require-Token $standbyHealth 'timeline_id' 'standby health must observe a live timeline'
+Reject-Pattern $standbyHealth 'pg_stat_wal_receiver' 'least-privilege replication health must not depend on security-restricted session statistics'
 
 foreach ($token in @(
     'railway_control_replicator', 'railway_shard_0_replicator', 'railway_shard_1_replicator',

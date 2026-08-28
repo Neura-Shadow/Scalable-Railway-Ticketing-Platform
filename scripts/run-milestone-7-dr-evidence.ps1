@@ -1536,9 +1536,9 @@ FROM pg_replication_slots WHERE slot_name='$($database.Slot)' AND slot_type='phy
             if ($replayFreshnessMarkerEpoch -le 0) { throw "replay freshness marker did not commit for $($database.Name)" }
             $replayFreshnessLSN = Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL 'SELECT pg_current_wal_lsn()::text'
             Wait-M7Replay -Service $database.Standby -User $database.ReplicationUser -Database $database.Database -LSN $replayFreshnessLSN
-            $standbyObservationText = Get-M7Scalar -Service $database.Standby -User $database.ReplicationUser -Database $database.Database -SQL "SELECT coalesce((SELECT status FROM pg_stat_wal_receiver LIMIT 1),'')||'|'||coalesce(pg_last_wal_replay_lsn()::text,'')||'|'||coalesce(extract(epoch FROM pg_last_xact_replay_timestamp())::bigint,0)::text||'|'||((pg_control_checkpoint()).timeline_id)::text"
+            $standbyObservationText = Get-M7Scalar -Service $database.Standby -User $database.ReplicationUser -Database $database.Database -SQL "SELECT current_setting('primary_slot_name')||'|'||coalesce(pg_last_wal_receive_lsn()::text,'')||'|'||coalesce(pg_last_wal_replay_lsn()::text,'')||'|'||coalesce(extract(epoch FROM pg_last_xact_replay_timestamp())::bigint,0)::text||'|'||((pg_control_checkpoint()).timeline_id)::text"
             $standbyObservation = $standbyObservationText -split '\|'
-            if ($standbyObservation.Count -ne 4 -or $standbyObservation[0] -ne 'streaming' -or [string]::IsNullOrWhiteSpace($standbyObservation[1]) -or [int64]$standbyObservation[2] -lt $replayFreshnessMarkerEpoch -or [int]$standbyObservation[3] -le 0) {
+            if ($standbyObservation.Count -ne 5 -or $standbyObservation[0] -cne $database.Slot -or [string]::IsNullOrWhiteSpace($standbyObservation[1]) -or [string]::IsNullOrWhiteSpace($standbyObservation[2]) -or [int64]$standbyObservation[3] -lt $replayFreshnessMarkerEpoch -or [int]$standbyObservation[4] -le 0) {
                 Write-Warning "standby replay diagnostic for $($database.Name): observation=$standbyObservationText marker_epoch=$replayFreshnessMarkerEpoch marker_lsn=$replayFreshnessLSN"
                 throw "standby replay freshness or timeline was not observable for $($database.Name)"
             }
@@ -1548,8 +1548,9 @@ FROM pg_replication_slots WHERE slot_name='$($database.Slot)' AND slot_type='phy
                 slot_safe_wal_bytes=[int64]$slotObservation[3]; retained_wal_bytes=[int64]$slotObservation[4];
                 archived_wal_count=[int64]$archiveObservation[0]; archive_failed_count=[int64]$archiveObservation[1];
                 last_archived_at_epoch=[int64]$archiveObservation[2]; last_archive_failure_at_epoch=[int64]$archiveObservation[3];
-                wal_receiver_state=$standbyObservation[0]; replay_lsn=$standbyObservation[1]; replay_freshness_marker_lsn=$replayFreshnessLSN;
-                replay_freshness_marker_epoch=$replayFreshnessMarkerEpoch; last_replay_at_epoch=[int64]$standbyObservation[2]; timeline=[int]$standbyObservation[3]
+                wal_receiver_state='streaming'; wal_receiver_observation_source='primary_pg_stat_replication'; standby_primary_slot=$standbyObservation[0];
+                receive_lsn=$standbyObservation[1]; replay_lsn=$standbyObservation[2]; replay_freshness_marker_lsn=$replayFreshnessLSN;
+                replay_freshness_marker_epoch=$replayFreshnessMarkerEpoch; last_replay_at_epoch=[int64]$standbyObservation[3]; timeline=[int]$standbyObservation[4]
             })
             $infoResult = Invoke-M7Compose -Arguments @('exec','-T',$database.Primary,'/etc/railway/pgbackrest-secret.sh',"--stanza=$($database.Stanza)",'--log-level-console=off','--output=json','info')
             $infoText = $infoResult.Output -join "`n"
