@@ -423,7 +423,7 @@ function New-M7CustomerFixtures {
         $token = [string]$login.Body.access_token
         if ([string]::IsNullOrWhiteSpace($token)) { throw 'M7 synthetic login omitted its token' }
         $script:sensitiveValues += $token
-        if ($env:GITHUB_ACTIONS -eq 'true') { Write-Output "::add-mask::$token" }
+        if ($env:GITHUB_ACTIONS -eq 'true') { Write-Host "::add-mask::$token" }
         $groupEnd = [Math]::Min($Count-1, $groupStart+2)
         for ($index=$groupStart; $index -le $groupEnd; $index++) {
             $passengers = [System.Collections.Generic.List[string]]::new()

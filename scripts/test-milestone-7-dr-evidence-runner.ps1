@@ -139,6 +139,7 @@ $requiredGuardrails = @(
     'for ($groupStart=0; $groupStart -lt $Count; $groupStart+=3)',
     'Tokens=[string[]]$tokens',
     '$m7Customer.Tokens[$reservationIndex]',
+    'Write-Host "::add-mask::$token"',
     'source_marker=2', 'source_marker=3', 'target_marker_count=$targetMarkerCount',
     'maximum_missing_markers_per_database=1', 'maximum_missing_wal_bytes_per_database=536870912'
 )
@@ -148,6 +149,7 @@ foreach ($guardrail in $requiredGuardrails) {
 $randomWebhookKeyCount = [regex]::Matches($source, '\[System\.Security\.Cryptography\.RandomNumberGenerator\]::GetBytes\(32\)').Count
 if ($randomWebhookKeyCount -ne 2) { throw "Milestone 7 runner must generate exactly two independent 32-byte webhook keys; found $randomWebhookKeyCount" }
 if ($source.Contains('[System.Text.Encoding]::UTF8.GetBytes("m7-prev-')) { throw 'Milestone 7 runner must not derive webhook keys from variable-length prefixed text' }
+if ($source.Contains('Write-Output "::add-mask::$token"')) { throw 'M7 fixture creation must not pollute its object return pipeline with masking directives' }
 $settlementDisabledIndex = $source.IndexOf("`$env:REGION_A_SETTLEMENT_ENABLED = 'false'", [System.StringComparison]::Ordinal)
 $initialServicesIndex = $source.IndexOf("`$regionAInitialAppServices = @(`$regionAAppServices | Where-Object { `$_ -ne 'settlement-worker-region-a' })", [System.StringComparison]::Ordinal)
 $initialAppUpIndex = $source.IndexOf('$activeAppUp += $regionAInitialAppServices', [System.StringComparison]::Ordinal)
