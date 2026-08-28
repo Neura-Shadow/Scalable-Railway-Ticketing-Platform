@@ -697,6 +697,35 @@ function Complete-M7SandboxPayment {
     throw 'failover payment did not converge to completed'
 }
 
+function Wait-M7IssuedOrder {
+    param([string]$ShardService, [string]$ReservationID)
+    if ($ReservationID -notmatch '^[0-9a-f-]{36}$') { throw 'issued-order reservation identity is malformed' }
+    for ($attempt=1; $attempt -le 120; $attempt++) {
+        $value = Get-M7Scalar -Service $ShardService -User 'railway_booking' -Database 'railway_booking' -SQL @"
+SELECT coalesce((
+    SELECT orders.id::text||'|'||coalesce((
+        SELECT string_agg(ticket.id::text,',' ORDER BY ticket.id)
+        FROM public.tickets AS ticket
+        WHERE ticket.ticket_order_id=orders.id AND ticket.status='active'
+    ),'')
+    FROM public.ticket_orders AS orders
+    WHERE orders.reservation_id='$ReservationID'::uuid AND orders.status='issued'
+    ORDER BY orders.created_at DESC
+    LIMIT 1
+),'missing')
+"@
+        $parts = $value -split '\|',2
+        if ($parts.Count -eq 2 -and $parts[0] -match '^[0-9a-f-]{36}$') {
+            $ticketIDs = @($parts[1] -split ',' | Where-Object { $_ -match '^[0-9a-f-]{36}$' })
+            if ($ticketIDs.Count -eq 2) {
+                return [pscustomobject]@{ OrderID=$parts[0]; TicketIDs=($ticketIDs -join ',') }
+            }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    throw 'payment completed without converging to one issued order and two active tickets'
+}
+
 function Get-M7HostedPayment {
     param([string]$DatabaseService, [string]$ReservationID)
     for ($attempt=1; $attempt -le 120; $attempt++) {
@@ -1741,10 +1770,7 @@ COMMIT;
         $orderFixtures = [System.Collections.Generic.List[object]]::new()
         foreach ($reservationID in $m7Customer.Reservations[0..2]) {
             if ($reservationID -notmatch '^[0-9a-f-]{36}$') { throw 'M7 reservation fixture identity is malformed' }
-            $orderID = Get-M7Scalar -Service 'booking-shard-0-postgres' -User 'railway_booking' -Database 'railway_booking' -SQL "SELECT id::text FROM public.ticket_orders WHERE reservation_id='$reservationID'::uuid AND status='issued'"
-            $ticketIDs = Get-M7Scalar -Service 'booking-shard-0-postgres' -User 'railway_booking' -Database 'railway_booking' -SQL "SELECT string_agg(id::text,',' ORDER BY id) FROM public.tickets WHERE ticket_order_id='$orderID'::uuid AND status='active'"
-            if (($ticketIDs -split ',').Count -ne 2) { throw 'M7 issued order did not contain exactly two active tickets' }
-            $orderFixtures.Add([pscustomobject]@{ OrderID=$orderID; TicketIDs=$ticketIDs })
+            $orderFixtures.Add((Wait-M7IssuedOrder -ShardService 'booking-shard-0-postgres' -ReservationID $reservationID))
         }
         $m7Orders = [object[]]$orderFixtures
         $m7HealthyTrain = Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL @"
@@ -1761,24 +1787,24 @@ ORDER BY train_run_id LIMIT 1
             -IdempotencyKey "m7-healthy-shard-ticket-$suffix" -Body @{} -ExpectedStatus @(202)
         if ([string]$healthyIntent.Body.id -notmatch '^[0-9a-f-]{36}$') { throw 'healthy shard payment omitted its durable identity' }
         Complete-M7SandboxPayment -DatabaseService 'control-postgres' -ReservationID $m7HealthyCustomer.Reservations[0] -WebhookBaseURL (Get-M7PublishedURL)
-        $m7HealthyOrderID = Get-M7Scalar -Service 'booking-shard-1-postgres' -User 'railway_booking' -Database 'railway_booking' -SQL "SELECT id::text FROM public.ticket_orders WHERE reservation_id='$($m7HealthyCustomer.Reservations[0])'::uuid AND status='issued'"
-        if ($m7HealthyOrderID -notmatch '^[0-9a-f-]{36}$') { throw 'healthy shard ticket order was not durably issued' }
+        $m7HealthyOrder = Wait-M7IssuedOrder -ShardService 'booking-shard-1-postgres' -ReservationID $m7HealthyCustomer.Reservations[0]
+        $m7HealthyOrderID = $m7HealthyOrder.OrderID
         $refundCrashIntent = Invoke-Milestone5DriverAPI -BaseURL (Get-M7PublishedURL) -Method POST `
             -Path "/api/v1/reservations/$($m7Customer.Reservations[6])/payment-intents" -Token $m7Customer.Tokens[6] `
             -IdempotencyKey "m7-refund-crash-order-$suffix" -Body @{} -ExpectedStatus @(202)
         if ([string]$refundCrashIntent.Body.id -notmatch '^[0-9a-f-]{36}$') { throw 'refund crash fixture omitted its payment identity' }
         Complete-M7SandboxPayment -DatabaseService 'control-postgres' -ReservationID $m7Customer.Reservations[6] -WebhookBaseURL (Get-M7PublishedURL)
-        $refundCrashOrderID = Get-M7Scalar -Service 'booking-shard-0-postgres' -User 'railway_booking' -Database 'railway_booking' -SQL "SELECT id::text FROM public.ticket_orders WHERE reservation_id='$($m7Customer.Reservations[6])'::uuid AND status='issued'"
-        $refundCrashTicketIDs = Get-M7Scalar -Service 'booking-shard-0-postgres' -User 'railway_booking' -Database 'railway_booking' -SQL "SELECT string_agg(id::text,',' ORDER BY id) FROM public.tickets WHERE ticket_order_id='$refundCrashOrderID'::uuid AND status='active'"
-        if (($refundCrashTicketIDs -split ',').Count -ne 2) { throw 'refund crash fixture did not issue exactly two tickets' }
+        $refundCrashOrder = Wait-M7IssuedOrder -ShardService 'booking-shard-0-postgres' -ReservationID $m7Customer.Reservations[6]
+        $refundCrashOrderID = $refundCrashOrder.OrderID
+        $refundCrashTicketIDs = $refundCrashOrder.TicketIDs
         $refundShardCrashIntent = Invoke-Milestone5DriverAPI -BaseURL (Get-M7PublishedURL) -Method POST `
             -Path "/api/v1/reservations/$($m7Customer.Reservations[7])/payment-intents" -Token $m7Customer.Tokens[7] `
             -IdempotencyKey "m7-refund-shard-crash-order-$suffix" -Body @{} -ExpectedStatus @(202)
         if ([string]$refundShardCrashIntent.Body.id -notmatch '^[0-9a-f-]{36}$') { throw 'refund shard crash fixture omitted its payment identity' }
         Complete-M7SandboxPayment -DatabaseService 'control-postgres' -ReservationID $m7Customer.Reservations[7] -WebhookBaseURL (Get-M7PublishedURL)
-        $refundShardCrashOrderID = Get-M7Scalar -Service 'booking-shard-0-postgres' -User 'railway_booking' -Database 'railway_booking' -SQL "SELECT id::text FROM public.ticket_orders WHERE reservation_id='$($m7Customer.Reservations[7])'::uuid AND status='issued'"
-        $refundShardCrashTicketIDs = Get-M7Scalar -Service 'booking-shard-0-postgres' -User 'railway_booking' -Database 'railway_booking' -SQL "SELECT string_agg(id::text,',' ORDER BY id) FROM public.tickets WHERE ticket_order_id='$refundShardCrashOrderID'::uuid AND status='active'"
-        if (($refundShardCrashTicketIDs -split ',').Count -ne 2) { throw 'refund shard crash fixture did not issue exactly two tickets' }
+        $refundShardCrashOrder = Wait-M7IssuedOrder -ShardService 'booking-shard-0-postgres' -ReservationID $m7Customer.Reservations[7]
+        $refundShardCrashOrderID = $refundShardCrashOrder.OrderID
+        $refundShardCrashTicketIDs = $refundShardCrashOrder.TicketIDs
         $fullRefundProviderIntent = Invoke-Milestone5DriverAPI -BaseURL (Get-M7PublishedURL) -Method POST `
             -Path "/api/v1/reservations/$($m7Customer.Reservations[8])/payment-intents" -Token $m7Customer.Tokens[8] `
             -IdempotencyKey "m7-full-refund-provider-crash-$suffix" -Body @{} -ExpectedStatus @(202)
