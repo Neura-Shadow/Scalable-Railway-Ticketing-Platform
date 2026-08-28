@@ -390,7 +390,11 @@ function Wait-M7ServiceHTTP {
         if ($probe.ExitCode -eq 0) { return }
         Start-Sleep -Seconds 1
     }
-    throw "$Service did not expose its bounded HTTP evidence endpoint"
+    $state = Invoke-M7Compose -AllowFailure -Arguments @('ps','--all',$Service)
+    $response = Invoke-M7Compose -AllowFailure -Arguments @('exec','-T',$Service,'wget','-S','-T','2','-O','-',$URL)
+    $logs = Invoke-M7Compose -AllowFailure -Arguments @('logs','--no-color','--tail','80',$Service)
+    $diagnostic = Protect-M7Diagnostic -Lines (@($state.Output) + @($response.Output) + @($logs.Output))
+    throw "$Service did not expose its bounded HTTP evidence endpoint`n$diagnostic"
 }
 
 function Get-M7PublishedURL {
@@ -1357,6 +1361,17 @@ try {
         )) {
             Invoke-M7Compose -Arguments @('run','--rm','--no-deps',$roleService) | Out-Null
         }
+        foreach ($bootstrapService in @('bootstrap-booking-shard-0','bootstrap-booking-shard-1')) {
+            Invoke-M7Compose -Arguments @('run','--rm','--no-deps',$bootstrapService) | Out-Null
+        }
+        $physicalShardBootstrap = Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL @"
+SELECT count(*) FILTER (WHERE enabled AND write_enabled AND health_state='healthy' AND state='active')::text||'|'||
+       count(*)::text
+FROM public.booking_shards
+WHERE shard_id IN ('physical-shard-0','physical-shard-1')
+"@
+        if ($physicalShardBootstrap -ne '2|2') { throw "physical shard bootstrap did not activate the complete bounded set: $physicalShardBootstrap" }
+        Add-M7Phase 'physical-shards-bootstrapped'
         $runtimeRoleEvidence = [System.Collections.Generic.List[object]]::new()
         foreach ($database in $databases) {
             $roleProof = Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL @"
