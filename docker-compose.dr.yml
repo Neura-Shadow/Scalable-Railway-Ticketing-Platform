@@ -397,6 +397,7 @@ services:
       PGDATABASE: railway_control
       PGBACKREST_STANZA: railway-control
       PGBACKREST_CIPHER_FILE: /run/secrets/pgbackrest_control_cipher_pass
+      PGBACKREST_PITR_TARGET: ${PGBACKREST_PITR_TARGET:-unset}
       RESTORE_CONFIRM: restore-to-isolated-validation
     secrets: [pgbackrest_control_cipher_pass]
     volumes:
@@ -414,6 +415,7 @@ services:
       PGDATABASE: railway_booking
       PGBACKREST_STANZA: railway-shard-0
       PGBACKREST_CIPHER_FILE: /run/secrets/pgbackrest_shard_0_cipher_pass
+      PGBACKREST_PITR_TARGET: ${PGBACKREST_PITR_TARGET:-unset}
       RESTORE_CONFIRM: restore-to-isolated-validation
     secrets: [pgbackrest_shard_0_cipher_pass]
     volumes:
@@ -431,6 +433,7 @@ services:
       PGDATABASE: railway_booking
       PGBACKREST_STANZA: railway-shard-1
       PGBACKREST_CIPHER_FILE: /run/secrets/pgbackrest_shard_1_cipher_pass
+      PGBACKREST_PITR_TARGET: ${PGBACKREST_PITR_TARGET:-unset}
       RESTORE_CONFIRM: restore-to-isolated-validation
     secrets: [pgbackrest_shard_1_cipher_pass]
     volumes:

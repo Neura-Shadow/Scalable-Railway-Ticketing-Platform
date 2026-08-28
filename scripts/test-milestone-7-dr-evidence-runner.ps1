@@ -165,6 +165,8 @@ if ($source -match '(?im)^\s*(docker\s+(system\s+prune|volume\s+prune)|Remove-It
 }
 
 $compose = Get-Content -Raw -LiteralPath $composePath
+$restoreTargetBindingCount = [regex]::Matches($compose, '(?m)^\s+PGBACKREST_PITR_TARGET:\s+').Count
+if ($restoreTargetBindingCount -ne 4) { throw "Milestone 7 Compose must bind the PITR target in the restore anchor and all three overriding service environments; found $restoreTargetBindingCount" }
 foreach ($required in @(
     'control-postgres-region-b', 'booking-shard-0-postgres-region-b',
     'booking-shard-1-postgres-region-b', 'synchronous_commit=local',
