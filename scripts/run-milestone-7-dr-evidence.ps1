@@ -1716,10 +1716,7 @@ COMMIT;
         $m7Train = '21000000-0000-4000-8000-000000000401'
         $m7Migration = '67000000-0000-4000-8000-000000000701'
         New-Milestone5Migration -Context $driverContext -TrainRunID $m7Train -TargetShard 'physical-shard-0' -MigrationID $m7Migration -Prefix 'm7-dr-train'
-        Move-Milestone5Migration -Context $driverContext -MigrationID $m7Migration -Target validating_online -Prefix 'm7-dr-train'
-        if ((Get-Milestone5MigrationState -Context $driverContext -MigrationID $m7Migration -Artifact 'm7-refund-migration-barrier-open.log') -ne 'validating_online') {
-            throw 'refund/migration barrier did not open in validating_online'
-        }
+        Move-Milestone5Migration -Context $driverContext -MigrationID $m7Migration -Target rollback_window -Prefix 'm7-dr-train'
         $m7HealthyTrainSeed = '21000000-0000-4000-8000-000000000402'
         $m7HealthyMigration = '67000000-0000-4000-8000-000000000702'
         New-Milestone5Migration -Context $driverContext -TrainRunID $m7HealthyTrainSeed -TargetShard 'physical-shard-1' -MigrationID $m7HealthyMigration -Prefix 'm7-dr-healthy-train'
@@ -1816,6 +1813,16 @@ ORDER BY train_run_id LIMIT 1
             'financial_ledger_transaction_total','settlement_import_total','settlement_reconciliation_total','settlement_reconciliation_mismatch_total','regional_active_epoch',
             'backup_total','backup_restore_duration_seconds'
         )
+        $m7ReverseMigration = '67000000-0000-4000-8000-000000000703'
+        $m7ReturnMigration = '67000000-0000-4000-8000-000000000704'
+        Invoke-Milestone5DriverAdmin -Context $driverContext -Arguments @(
+            'plan-reverse-migration','--migration-id',$m7Migration,'--reverse-migration-id',$m7ReverseMigration,
+            '--generation','3','--confirm','--timeout','2m'
+        ) -Artifact 'm7-refund-reverse-plan.log' | Out-Null
+        Move-Milestone5Migration -Context $driverContext -MigrationID $m7ReverseMigration -Target validating_online -Prefix 'm7-refund-reverse' -ReverseStart
+        if ((Get-Milestone5MigrationState -Context $driverContext -MigrationID $m7ReverseMigration -Artifact 'm7-refund-migration-barrier-open.log') -ne 'validating_online') {
+            throw 'refund/reverse-migration barrier did not open in validating_online'
+        }
         Invoke-M7K6 -Script 'partial-ticket-refund.js' -Environment (@{} + $commonK6 + @{
             CUSTOMER_TOKEN=$m7Customer.Tokens[0]; TICKET_ORDER_ID=$m7Orders[0].OrderID; TICKET_IDS=($m7Orders[0].TicketIDs -split ',')[0]
         })
@@ -1826,10 +1833,9 @@ ORDER BY train_run_id LIMIT 1
         })
         Assert-M7PartialRefund -OrderID $m7Orders[0].OrderID -SelectedTicketID (($m7Orders[0].TicketIDs -split ',')[0]) -Scenario 'partial-ticket-refund'
         Assert-M7PartialRefund -OrderID $m7Orders[1].OrderID -SelectedTicketID (($m7Orders[1].TicketIDs -split ',')[0]) -Scenario 'partial-refund-idempotency'
-        if ((Get-Milestone5MigrationState -Context $driverContext -MigrationID $m7Migration -Artifact 'm7-refund-migration-barrier-held.log') -ne 'validating_online') {
-            throw 'physical migration advanced before both refund effects were durably applied'
+        if ((Get-Milestone5MigrationState -Context $driverContext -MigrationID $m7ReverseMigration -Artifact 'm7-refund-migration-barrier-held.log') -ne 'validating_online') {
+            throw 'reverse physical migration advanced before both refund effects were durably applied'
         }
-        Move-Milestone5Migration -Context $driverContext -MigrationID $m7Migration -Target rollback_window -Prefix 'm7-dr-train-after-refund'
         $postCutoverRefundRoute = Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL @"
 SELECT (SELECT shard_id FROM public.train_run_shard_assignments WHERE train_run_id='$m7Train'::uuid AND is_current)::text||'|'||
        (SELECT count(*) FROM public.reservation_shard_locators WHERE reservation_id IN ('$($m7Customer.Reservations[0])'::uuid,'$($m7Customer.Reservations[1])'::uuid) AND shard_id='physical-shard-0')::text
@@ -1837,13 +1843,7 @@ SELECT (SELECT shard_id FROM public.train_run_shard_assignments WHERE train_run_
         if ($postCutoverRefundRoute -ne 'physical-shard-0|2') { throw 'post-cutover refund locators did not follow the current physical route' }
         Add-M7Phase 'partial-refunds-applied-during-physical-migration'
 
-        $m7ReverseMigration = '67000000-0000-4000-8000-000000000703'
-        $m7ReturnMigration = '67000000-0000-4000-8000-000000000704'
-        Invoke-Milestone5DriverAdmin -Context $driverContext -Arguments @(
-            'plan-reverse-migration','--migration-id',$m7Migration,'--reverse-migration-id',$m7ReverseMigration,
-            '--generation','3','--confirm','--timeout','2m'
-        ) -Artifact 'm7-refund-reverse-plan.log' | Out-Null
-        Move-Milestone5Migration -Context $driverContext -MigrationID $m7ReverseMigration -Target rollback_window -Prefix 'm7-refund-reverse' -ReverseStart
+        Move-Milestone5Migration -Context $driverContext -MigrationID $m7ReverseMigration -Target rollback_window -Prefix 'm7-refund-reverse'
         $reverseRefundEvidence = Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL @"
 SELECT assignment.shard_id||'|'||assignment.assignment_generation::text||'|'||
        count(receipt.*)::text

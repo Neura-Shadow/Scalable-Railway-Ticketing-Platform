@@ -150,6 +150,16 @@ $randomWebhookKeyCount = [regex]::Matches($source, '\[System\.Security\.Cryptogr
 if ($randomWebhookKeyCount -ne 2) { throw "Milestone 7 runner must generate exactly two independent 32-byte webhook keys; found $randomWebhookKeyCount" }
 if ($source.Contains('[System.Text.Encoding]::UTF8.GetBytes("m7-prev-')) { throw 'Milestone 7 runner must not derive webhook keys from variable-length prefixed text' }
 if ($source.Contains('Write-Output "::add-mask::$token"')) { throw 'M7 fixture creation must not pollute its object return pipeline with masking directives' }
+$forwardCutoverIndex = $source.IndexOf('Move-Milestone5Migration -Context $driverContext -MigrationID $m7Migration -Target rollback_window', [System.StringComparison]::Ordinal)
+$fixtureCreateIndex = $source.IndexOf('$m7Customer = New-M7CustomerFixtures', [System.StringComparison]::Ordinal)
+$reverseBarrierIndex = $source.IndexOf('Move-Milestone5Migration -Context $driverContext -MigrationID $m7ReverseMigration -Target validating_online', [System.StringComparison]::Ordinal)
+$partialRefundIndex = $source.IndexOf("Invoke-M7K6 -Script 'partial-ticket-refund.js'", [System.StringComparison]::Ordinal)
+$reverseCutoverIndex = $source.IndexOf('Move-Milestone5Migration -Context $driverContext -MigrationID $m7ReverseMigration -Target rollback_window', [System.StringComparison]::Ordinal)
+if ($forwardCutoverIndex -lt 0 -or $fixtureCreateIndex -le $forwardCutoverIndex -or
+    $reverseBarrierIndex -le $fixtureCreateIndex -or $partialRefundIndex -le $reverseBarrierIndex -or
+    $reverseCutoverIndex -le $partialRefundIndex) {
+    throw 'partial refund evidence must use a physical assignment while reverse migration remains in validating_online'
+}
 $settlementDisabledIndex = $source.IndexOf("`$env:REGION_A_SETTLEMENT_ENABLED = 'false'", [System.StringComparison]::Ordinal)
 $initialServicesIndex = $source.IndexOf("`$regionAInitialAppServices = @(`$regionAAppServices | Where-Object { `$_ -ne 'settlement-worker-region-a' })", [System.StringComparison]::Ordinal)
 $initialAppUpIndex = $source.IndexOf('$activeAppUp += $regionAInitialAppServices', [System.StringComparison]::Ordinal)
