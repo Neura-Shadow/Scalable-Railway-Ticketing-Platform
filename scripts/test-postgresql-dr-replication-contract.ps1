@@ -7,6 +7,8 @@ $standbyBootstrap = Get-Content -Raw (Join-Path $root 'deploy/postgres/dr/start-
 $primaryStartup = Get-Content -Raw (Join-Path $root 'deploy/postgres/dr/start-primary.sh')
 $primaryHealth = Get-Content -Raw (Join-Path $root 'deploy/postgres/dr/primary-health.sh')
 $standbyHealth = Get-Content -Raw (Join-Path $root 'deploy/postgres/dr/standby-health.sh')
+$restoreValidation = Get-Content -Raw (Join-Path $root 'deploy/postgres/dr/restore-validation.sh')
+$pgBackRestConfig = Get-Content -Raw (Join-Path $root 'deploy/postgres/dr/pgbackrest.conf')
 $compose = Get-Content -Raw (Join-Path $root 'docker-compose.dr.yml')
 $evidenceRunner = Get-Content -Raw (Join-Path $root 'scripts/run-milestone-7-dr-evidence.ps1')
 
@@ -70,6 +72,10 @@ Require-Token $standbyHealth 'pg_stat_wal_receiver' 'standby health must require
 Require-Token $standbyHealth 'pg_last_wal_receive_lsn' 'standby health must assert bounded WAL receipt'
 Require-Token $standbyHealth 'pg_last_xact_replay_timestamp' 'standby health must reject stale replay'
 Require-Token $standbyHealth 'timeline_id' 'standby health must observe a live timeline'
+Require-Token $restoreValidation "sed -e 's/T/ /' -e 's/Z$/+00/'" 'restore validation must translate canonical UTC into the pgBackRest time-target grammar'
+Require-Token $restoreValidation 'unset PGBACKREST_PITR_TARGET' 'the runner-only PITR environment must not leak into pgBackRest option parsing'
+Require-Token $pgBackRestConfig 'expire-auto=n' 'automatic expiration must remain disabled for operator-controlled retention'
+Reject-Pattern $pgBackRestConfig 'repo[0-9]+-expire-auto' 'expire-auto is a global pgBackRest option and must not use a repository prefix'
 
 foreach ($token in @(
     'railway_control_replicator', 'railway_shard_0_replicator', 'railway_shard_1_replicator',

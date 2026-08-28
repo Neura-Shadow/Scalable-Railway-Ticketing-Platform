@@ -25,12 +25,14 @@ if ! printf '%s' "$PGBACKREST_PITR_TARGET" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{
   echo 'PITR target must be canonical UTC RFC3339 seconds' >&2
   exit 1
 fi
+pgbackrest_pitr_target=$(printf '%s' "$PGBACKREST_PITR_TARGET" | sed -e 's/T/ /' -e 's/Z$/+00/')
+unset PGBACKREST_PITR_TARGET
 if [ -e "$PGDATA/PG_VERSION" ]; then
   echo 'isolated restore target is not empty' >&2
   exit 1
 fi
 set -- --stanza="$PGBACKREST_STANZA" --pg1-path="$PGDATA" --delta \
-  --type=time --target="$PGBACKREST_PITR_TARGET" --target-action=promote
+  --type=time --target="$pgbackrest_pitr_target" --target-action=promote
 if [ -n "${PGBACKREST_SET:-}" ]; then
   case "$PGBACKREST_SET" in
     *[!A-Za-z0-9._:-]*) echo 'backup set is malformed' >&2; exit 1 ;;

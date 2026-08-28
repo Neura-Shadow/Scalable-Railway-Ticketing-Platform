@@ -1595,7 +1595,8 @@ FROM pg_replication_slots WHERE slot_name='$($database.Slot)' AND slot_type='phy
                 throw
             }
             $backups = @($info[0].backup)
-            if ($backups.Count -lt 1 -or [string]::IsNullOrWhiteSpace([string]$backups[-1].label) -or [string]$info[0].cipher -ne 'aes-256-cbc') {
+            if ($backups.Count -lt 1 -or [string]::IsNullOrWhiteSpace([string]$backups[-1].label) -or
+                [int64]$backups[-1].timestamp.stop -lt 1 -or [string]$info[0].cipher -ne 'aes-256-cbc') {
                 throw "encrypted pgBackRest backup metadata is invalid for $($database.Name)"
             }
             $backupSet = [string]$backups[-1].label
@@ -1606,14 +1607,19 @@ FROM pg_replication_slots WHERE slot_name='$($database.Slot)' AND slot_type='phy
                 database=$database.Name; stanza=$database.Stanza; backup_set=$backupSet;
                 metadata_sha256=(Get-M7SHA256 -Text ($infoText.Trim())); encrypted=$true;
                 repository_check='passed'; repository_verify='passed';
-                source_timeline=[int]$backupSource[0]; source_wal=[uint64]$backupSource[1]
+                source_timeline=[int]$backupSource[0]; source_wal=[uint64]$backupSource[1];
+                completed_at_epoch=[int64]$backups[-1].timestamp.stop
             })
         }
         Add-M7Phase 'encrypted-backups-verified'
 
-        $pitrTarget = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        $env:PGBACKREST_PITR_TARGET = $pitrTarget
         foreach ($database in $databases) {
+            $backup = @($backupEvidence | Where-Object { $_.database -eq $database.Name })
+            if ($backup.Count -ne 1 -or [int64]$backup[0].completed_at_epoch -lt 1) {
+                throw "verified backup completion time was unavailable for $($database.Name)"
+            }
+            $pitrTarget = [DateTimeOffset]::FromUnixTimeSeconds([int64]$backup[0].completed_at_epoch).UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
+            $env:PGBACKREST_PITR_TARGET = $pitrTarget
             $restoreService = "restore-validation-$($database.Name)"
             $restoreUp = @('--profile','dr-restore','up','-d','--no-deps')
             if ($SkipBuild) { $restoreUp += '--no-build' }

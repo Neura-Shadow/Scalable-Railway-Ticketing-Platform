@@ -17,7 +17,7 @@ time; encrypted full backups plus WAL provide independent restore history.
 Checksums and repository verification detect corruption, but they are not
 restore proof.
 
-Automatic pgBackRest expiration is disabled (`repo1-expire-auto=n`). Retention
+Automatic pgBackRest expiration is disabled (`expire-auto=n`). Retention
 inspection is read-only; a deletion is allowed only after a persisted dry run,
 an operator-bound confirmation, and a durable `confirmed` transition. The
 backup administration process invokes `/etc/railway/pgbackrest-secret.sh`, not
