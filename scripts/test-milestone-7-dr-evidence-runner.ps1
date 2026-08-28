@@ -134,12 +134,16 @@ $requiredGuardrails = @(
     "@('bootstrap-booking-shard-0','bootstrap-booking-shard-1')",
     'physical-shards-bootstrapped',
     "@('ps','--all',`$Service)",
+    '[System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32)',
     'source_marker=2', 'source_marker=3', 'target_marker_count=$targetMarkerCount',
     'maximum_missing_markers_per_database=1', 'maximum_missing_wal_bytes_per_database=536870912'
 )
 foreach ($guardrail in $requiredGuardrails) {
     if (-not $source.Contains($guardrail)) { throw "Milestone 7 DR runner omits guardrail: $guardrail" }
 }
+$randomWebhookKeyCount = [regex]::Matches($source, '\[System\.Security\.Cryptography\.RandomNumberGenerator\]::GetBytes\(32\)').Count
+if ($randomWebhookKeyCount -ne 2) { throw "Milestone 7 runner must generate exactly two independent 32-byte webhook keys; found $randomWebhookKeyCount" }
+if ($source.Contains('[System.Text.Encoding]::UTF8.GetBytes("m7-prev-')) { throw 'Milestone 7 runner must not derive webhook keys from variable-length prefixed text' }
 $failoverMarkerIndex = $source.IndexOf("INSERT INTO public.dr_evidence_markers(marker) VALUES (2)", [System.StringComparison]::Ordinal)
 $failoverStopIndex = $source.IndexOf("Ensure-M7ServicesStopped -Services @(`$databases.Primary)", $failoverMarkerIndex, [System.StringComparison]::Ordinal)
 $failbackMarkerIndex = $source.IndexOf("INSERT INTO public.dr_evidence_markers(marker) VALUES (3)", [System.StringComparison]::Ordinal)

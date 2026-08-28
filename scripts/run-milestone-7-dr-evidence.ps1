@@ -171,8 +171,8 @@ $env:DR_FENCE_ATTESTATION_ISSUER = 'railway-local-fence-authority'
 $env:DR_FENCE_ATTESTATION_KEY_ID = 'ephemeral-m7'
 $env:DR_FENCE_ATTESTATION_PUBLIC_KEY_B64 = [Convert]::ToBase64String($fencingPublicRaw)
 $env:REGION_A_SETTLEMENT_ENABLED = 'false'
-$webhookPreviousKey = [System.Text.Encoding]::UTF8.GetBytes("m7-prev-$([guid]::NewGuid().ToString('N'))")
-$webhookCurrentKey = [System.Text.Encoding]::UTF8.GetBytes("m7-curr-$([guid]::NewGuid().ToString('N'))")
+$webhookPreviousKey = [System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32)
+$webhookCurrentKey = [System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32)
 $webhookPreviousB64 = [Convert]::ToBase64String($webhookPreviousKey)
 $webhookCurrentB64 = [Convert]::ToBase64String($webhookCurrentKey)
 $env:M7_WEBHOOK_KEYRING = "previous=$webhookPreviousB64,current=$webhookCurrentB64"
