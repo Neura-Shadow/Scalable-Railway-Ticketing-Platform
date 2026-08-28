@@ -1618,7 +1618,25 @@ FROM pg_replication_slots WHERE slot_name='$($database.Slot)' AND slot_type='phy
             if ($backup.Count -ne 1 -or [int64]$backup[0].completed_at_epoch -lt 1) {
                 throw "verified backup completion time was unavailable for $($database.Name)"
             }
-            $pitrTarget = [DateTimeOffset]::FromUnixTimeSeconds([int64]$backup[0].completed_at_epoch).UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
+            Invoke-M7SQL -Service $database.Primary -User $database.User -Database $database.Database -SQL 'INSERT INTO public.dr_evidence_markers(marker) VALUES (4)'
+            $pitrLowerBound = [DateTimeOffset]::Parse((Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL 'SELECT clock_timestamp()::text'))
+            Start-Sleep -Seconds 2
+            $pitrSentinelAt = [DateTimeOffset]::Parse((Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL 'INSERT INTO public.dr_evidence_markers(marker) VALUES (5) RETURNING created_at::text'))
+            $pitrTargetAt = $pitrLowerBound.AddSeconds(1)
+            if ($pitrTargetAt -ge $pitrSentinelAt) { throw "PITR marker window was not ordered for $($database.Name)" }
+            $pitrTarget = $pitrTargetAt.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
+            $pitrArchiveWAL = Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL 'SELECT pg_walfile_name(pg_switch_wal())'
+            if ($pitrArchiveWAL -notmatch '^[0-9A-F]{24}$') { throw "PITR archive boundary was malformed for $($database.Name)" }
+            $pitrArchiveReady = $false
+            for ($archiveAttempt=1; $archiveAttempt -le 60; $archiveAttempt++) {
+                $lastArchivedWAL = Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL "SELECT coalesce(last_archived_wal,'') FROM pg_stat_archiver"
+                if (-not [string]::IsNullOrWhiteSpace($lastArchivedWAL) -and [string]::CompareOrdinal($lastArchivedWAL,$pitrArchiveWAL) -ge 0) {
+                    $pitrArchiveReady = $true
+                    break
+                }
+                Start-Sleep -Seconds 1
+            }
+            if (-not $pitrArchiveReady) { throw "PITR sentinel WAL was not archived for $($database.Name)" }
             $env:PGBACKREST_PITR_TARGET = $pitrTarget
             $restoreService = "restore-validation-$($database.Name)"
             $restoreUp = @('--profile','dr-restore','up','-d','--no-deps')
@@ -1627,15 +1645,19 @@ FROM pg_replication_slots WHERE slot_name='$($database.Slot)' AND slot_type='phy
             Invoke-M7Compose -Arguments $restoreUp | Out-Null
             Wait-M7Role -Service $restoreService -User $database.User -Database $database.Database -Recovery $false
             $schema = Get-M7Scalar -Service $restoreService -User $database.User -Database $database.Database -SQL "SELECT version::text||'|'||dirty::text FROM public.schema_migrations"
-            $markerCount = [int](Get-M7Scalar -Service $restoreService -User $database.User -Database $database.Database -SQL 'SELECT count(*) FROM public.dr_evidence_markers WHERE marker=1')
-            if ($schema -ne "$($database.ExpectedVersion)|false" -or $markerCount -ne 1) { throw "isolated restore validation failed for $($database.Name)" }
+            $markerObservation = (Get-M7Scalar -Service $restoreService -User $database.User -Database $database.Database -SQL 'SELECT count(*) FILTER (WHERE marker IN (1,4))::text||''|''||count(*) FILTER (WHERE marker=5)::text FROM public.dr_evidence_markers') -split '\|'
+            if ($schema -ne "$($database.ExpectedVersion)|false" -or $markerObservation.Count -ne 2 -or [int]$markerObservation[0] -ne 2 -or [int]$markerObservation[1] -ne 0) { throw "isolated PITR marker validation failed for $($database.Name)" }
             $timeline = [int](Get-M7Scalar -Service $restoreService -User $database.User -Database $database.Database -SQL 'SELECT ((pg_control_checkpoint()).timeline_id)::text')
             if ($database.Name -eq 'control') {
                 Invoke-M7SQLFile -Service $restoreService -User $database.User -Database $database.Database -Path 'migrations/testdata/assert_milestone7_v11_data.sql'
             } else {
                 Invoke-M7SQLFile -Service $restoreService -User $database.User -Database $database.Database -Path 'migrations/testdata/assert_booking_shard_v3_data.sql'
             }
-            $restoreEvidence.Add([ordered]@{ database=$database.Name; schema_version=$database.ExpectedVersion; timeline=$timeline; pitr_target=$pitrTarget; marker_count=$markerCount; financial_fixture_assertion='passed' })
+            $restoreEvidence.Add([ordered]@{
+                database=$database.Name; schema_version=$database.ExpectedVersion; timeline=$timeline; pitr_target=$pitrTarget;
+                baseline_and_recovered_marker_count=[int]$markerObservation[0]; excluded_sentinel_marker_count=[int]$markerObservation[1];
+                archived_through_wal=$pitrArchiveWAL; financial_fixture_assertion='passed'
+            })
         }
         foreach ($database in $databases) {
             $backup = @($backupEvidence | Where-Object { $_.database -eq $database.Name })
