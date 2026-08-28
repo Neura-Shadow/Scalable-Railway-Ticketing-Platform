@@ -144,6 +144,16 @@ foreach ($guardrail in $requiredGuardrails) {
 $randomWebhookKeyCount = [regex]::Matches($source, '\[System\.Security\.Cryptography\.RandomNumberGenerator\]::GetBytes\(32\)').Count
 if ($randomWebhookKeyCount -ne 2) { throw "Milestone 7 runner must generate exactly two independent 32-byte webhook keys; found $randomWebhookKeyCount" }
 if ($source.Contains('[System.Text.Encoding]::UTF8.GetBytes("m7-prev-')) { throw 'Milestone 7 runner must not derive webhook keys from variable-length prefixed text' }
+$settlementDisabledIndex = $source.IndexOf("`$env:REGION_A_SETTLEMENT_ENABLED = 'false'", [System.StringComparison]::Ordinal)
+$initialServicesIndex = $source.IndexOf("`$regionAInitialAppServices = @(`$regionAAppServices | Where-Object { `$_ -ne 'settlement-worker-region-a' })", [System.StringComparison]::Ordinal)
+$initialAppUpIndex = $source.IndexOf('$activeAppUp += $regionAInitialAppServices', [System.StringComparison]::Ordinal)
+$settlementEnabledIndex = $source.IndexOf("`$env:REGION_A_SETTLEMENT_ENABLED = 'true'", [System.StringComparison]::Ordinal)
+$settlementUpIndex = $source.IndexOf("`$settlementUp += 'settlement-worker-region-a'", [System.StringComparison]::Ordinal)
+if ($settlementDisabledIndex -lt 0 -or $initialServicesIndex -le $settlementDisabledIndex -or
+    $initialAppUpIndex -le $initialServicesIndex -or $settlementEnabledIndex -le $initialAppUpIndex -or
+    $settlementUpIndex -le $settlementEnabledIndex) {
+    throw 'region A settlement worker must remain stopped until settlement processing is explicitly enabled'
+}
 $failoverMarkerIndex = $source.IndexOf("INSERT INTO public.dr_evidence_markers(marker) VALUES (2)", [System.StringComparison]::Ordinal)
 $failoverStopIndex = $source.IndexOf("Ensure-M7ServicesStopped -Services @(`$databases.Primary)", $failoverMarkerIndex, [System.StringComparison]::Ordinal)
 $failbackMarkerIndex = $source.IndexOf("INSERT INTO public.dr_evidence_markers(marker) VALUES (3)", [System.StringComparison]::Ordinal)

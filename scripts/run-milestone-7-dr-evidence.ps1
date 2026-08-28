@@ -1269,6 +1269,7 @@ $regionAAppServices = @(
     'booking-command-reconciler','redis','payment-sandbox','payment-stripe-contract',
     'proxy-region-a','global-test-ingress'
 )
+$regionAInitialAppServices = @($regionAAppServices | Where-Object { $_ -ne 'settlement-worker-region-a' })
 $regionBWriterServices = @(
     'api-region-b-1','api-region-b-2','api-region-b-3','payment-worker-region-b-1',
     'payment-worker-region-b-2','payment-reconciler-region-b','settlement-worker-region-b',
@@ -1698,11 +1699,10 @@ COMMIT;
         $env:ACTIVE_REGION_UPSTREAM = 'proxy-region-a'
         $activeAppUp = @('--profile','dr-app','up','-d','--no-deps')
         if ($SkipBuild) { $activeAppUp += '--no-build' }
-        $activeAppUp += $regionAAppServices
+        $activeAppUp += $regionAInitialAppServices
         Invoke-M7Compose -Arguments $activeAppUp | Out-Null
         foreach ($api in @('api-1','api-2','api-3')) { Wait-M7ServiceHTTP -Service $api -URL 'http://127.0.0.1:8080/readyz' }
         Wait-M7ServiceHTTP -Service 'global-test-ingress' -URL 'http://127.0.0.1:8080/readyz'
-        Wait-M7ServiceHTTP -Service 'settlement-worker-region-a' -URL 'http://127.0.0.1:9090/metrics'
 
         Initialize-Milestone5DriverFixture -Context $driverContext
         $m7Train = '21000000-0000-4000-8000-000000000401'
