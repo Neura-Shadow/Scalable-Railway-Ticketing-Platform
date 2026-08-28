@@ -1651,7 +1651,7 @@ FROM pg_replication_slots WHERE slot_name='$($database.Slot)' AND slot_type='phy
             if ($database.Name -eq 'control') {
                 Invoke-M7SQLFile -Service $restoreService -User $database.User -Database $database.Database -Path 'migrations/testdata/assert_milestone7_v11_data.sql'
             } else {
-                Invoke-M7SQLFile -Service $restoreService -User $database.User -Database $database.Database -Path 'migrations/testdata/assert_booking_shard_v3_data.sql'
+                Invoke-M7SQLFile -Service $restoreService -User $database.User -Database $database.Database -Path 'migrations/testdata/assert_booking_shard_v3_financial_evidence.sql'
             }
             $restoreEvidence.Add([ordered]@{
                 database=$database.Name; schema_version=$database.ExpectedVersion; timeline=$timeline; pitr_target=$pitrTarget;
@@ -2303,8 +2303,8 @@ SELECT
             if (@($running.Output | Where-Object { $_.Trim() -ne '' }).Count -ne 0) { throw "region-b worker or proxy started before complete database activation: $service" }
         }
         Invoke-M7SQLFile -Service 'control-postgres-region-b' -User 'railway_control' -Database 'railway_control' -Path 'migrations/testdata/assert_milestone7_v11_data.sql'
-        Invoke-M7SQLFile -Service 'booking-shard-0-postgres-region-b' -User 'railway_booking' -Database 'railway_booking' -Path 'migrations/testdata/assert_booking_shard_v3_data.sql'
-        Invoke-M7SQLFile -Service 'booking-shard-1-postgres-region-b' -User 'railway_booking' -Database 'railway_booking' -Path 'migrations/testdata/assert_booking_shard_v3_data.sql'
+        Invoke-M7SQLFile -Service 'booking-shard-0-postgres-region-b' -User 'railway_booking' -Database 'railway_booking' -Path 'migrations/testdata/assert_booking_shard_v3_financial_evidence.sql'
+        Invoke-M7SQLFile -Service 'booking-shard-1-postgres-region-b' -User 'railway_booking' -Database 'railway_booking' -Path 'migrations/testdata/assert_booking_shard_v3_financial_evidence.sql'
         $reconciliationObservation = Get-M7ReconciliationObservation -ControlService 'control-postgres-region-b' `
             -Shard0Service 'booking-shard-0-postgres-region-b' -Shard1Service 'booking-shard-1-postgres-region-b'
         Write-M7JSON -Name 'region-b-reconciliation-observation.json' -Value $reconciliationObservation

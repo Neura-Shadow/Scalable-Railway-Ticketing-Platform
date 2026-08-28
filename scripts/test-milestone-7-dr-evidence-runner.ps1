@@ -130,6 +130,7 @@ $requiredGuardrails = @(
     'PITR sentinel WAL was not archived',
     'excluded_sentinel_marker_count',
     'WITH inserted AS (INSERT INTO public.dr_evidence_markers(marker) VALUES (5) RETURNING created_at) SELECT created_at::text FROM inserted',
+    'migrations/testdata/assert_booking_shard_v3_financial_evidence.sql',
     'source_marker=2', 'source_marker=3', 'target_marker_count=$targetMarkerCount',
     'maximum_missing_markers_per_database=1', 'maximum_missing_wal_bytes_per_database=536870912'
 )
