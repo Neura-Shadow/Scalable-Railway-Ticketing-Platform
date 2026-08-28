@@ -143,6 +143,9 @@ $requiredGuardrails = @(
     'function Wait-M7IssuedOrder',
     "'missing')",
     'payment completed without converging to one issued order and two active tickets',
+    "@('logs','--no-color','--tail','80','payment-worker-1','payment-worker-2')",
+    "@('payment-worker-1','payment-worker-2')",
+    "'saga='||saga.state||':'||saga.current_step",
     'source_marker=2', 'source_marker=3', 'target_marker_count=$targetMarkerCount',
     'maximum_missing_markers_per_database=1', 'maximum_missing_wal_bytes_per_database=536870912'
 )

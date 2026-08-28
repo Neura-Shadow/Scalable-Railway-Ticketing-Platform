@@ -694,7 +694,15 @@ function Complete-M7SandboxPayment {
         if ($state -eq 'completed') { return }
         Start-Sleep -Milliseconds 500
     }
-    throw 'failover payment did not converge to completed'
+    $stateDiagnostic = Get-M7Scalar -Service $DatabaseService -User 'railway_control' -Database 'railway_control' -SQL @"
+SELECT coalesce((SELECT 'intent='||intent.state FROM public.payment_intents AS intent WHERE intent.reservation_id='$ReservationID'::uuid ORDER BY intent.created_at DESC LIMIT 1),'intent=missing')||'|'||
+       coalesce((SELECT 'saga='||saga.state||':'||saga.current_step FROM public.payment_sagas AS saga JOIN public.payment_intents AS intent USING(payment_intent_id) WHERE intent.reservation_id='$ReservationID'::uuid ORDER BY saga.created_at DESC LIMIT 1),'saga=missing')||'|'||
+       coalesce((SELECT 'operations='||string_agg(operation.operation_type||':'||operation.state,',' ORDER BY operation.operation_type) FROM public.payment_operations AS operation JOIN public.payment_intents AS intent USING(payment_intent_id) WHERE intent.reservation_id='$ReservationID'::uuid),'operations=none')||'|'||
+       coalesce((SELECT 'actions='||string_agg(action.action_type||':'||action.state,',' ORDER BY action.action_type) FROM public.payment_saga_actions AS action JOIN public.payment_sagas AS saga USING(saga_id) JOIN public.payment_intents AS intent USING(payment_intent_id) WHERE intent.reservation_id='$ReservationID'::uuid),'actions=none')
+"@
+    $workerLogs = Invoke-M7Compose -AllowFailure -Arguments @('logs','--no-color','--tail','80','payment-worker-1','payment-worker-2')
+    $diagnostic = Protect-M7Diagnostic -Lines (@($stateDiagnostic) + @($workerLogs.Output))
+    throw "failover payment did not converge to completed`n$diagnostic"
 }
 
 function Wait-M7IssuedOrder {
@@ -1740,6 +1748,7 @@ COMMIT;
         Invoke-M7Compose -Arguments $activeAppUp | Out-Null
         foreach ($api in @('api-1','api-2','api-3')) { Wait-M7ServiceHTTP -Service $api -URL 'http://127.0.0.1:8080/readyz' }
         Wait-M7ServiceHTTP -Service 'global-test-ingress' -URL 'http://127.0.0.1:8080/readyz'
+        foreach ($worker in @('payment-worker-1','payment-worker-2')) { Wait-M7ServiceHTTP -Service $worker -URL 'http://127.0.0.1:9090/readyz' }
 
         Initialize-Milestone5DriverFixture -Context $driverContext
         $m7Train = '21000000-0000-4000-8000-000000000401'
