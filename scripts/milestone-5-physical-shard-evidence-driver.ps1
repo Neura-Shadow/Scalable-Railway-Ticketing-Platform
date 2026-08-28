@@ -198,11 +198,21 @@ function Invoke-Milestone5DriverAPI {
         $responseHeaders = $response.Headers
     } catch {
         if ($null -eq $_.Exception.Response) { throw }
-        $status = [int]$_.Exception.Response.StatusCode
-        $responseHeaders = $_.Exception.Response.Headers
-        $stream = $_.Exception.Response.GetResponseStream()
-        $reader = [System.IO.StreamReader]::new($stream)
-        try { $content = $reader.ReadToEnd() } finally { $reader.Dispose() }
+        $errorResponse = $_.Exception.Response
+        $status = [int]$errorResponse.StatusCode
+        $responseHeaders = $errorResponse.Headers
+        $contentProperty = $errorResponse.PSObject.Properties['Content']
+        if ($null -ne $_.ErrorDetails -and -not [string]::IsNullOrWhiteSpace([string]$_.ErrorDetails.Message)) {
+            $content = [string]$_.ErrorDetails.Message
+        } elseif ($null -ne $contentProperty -and $null -ne $contentProperty.Value) {
+            $content = $contentProperty.Value.ReadAsStringAsync().GetAwaiter().GetResult()
+        } elseif ($null -ne $errorResponse.PSObject.Methods['GetResponseStream']) {
+            $stream = $errorResponse.GetResponseStream()
+            $reader = [System.IO.StreamReader]::new($stream)
+            try { $content = $reader.ReadToEnd() } finally { $reader.Dispose() }
+        } else {
+            $content = ''
+        }
     }
     $decoded = $null
     if (-not [string]::IsNullOrWhiteSpace($content)) { $decoded = $content | ConvertFrom-Json }

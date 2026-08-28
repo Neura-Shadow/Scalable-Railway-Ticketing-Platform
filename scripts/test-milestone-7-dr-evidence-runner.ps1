@@ -135,6 +135,10 @@ $requiredGuardrails = @(
     'physical-shards-bootstrapped',
     "@('ps','--all',`$Service)",
     '[System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32)',
+    '$script:m7FixtureClientSequence = 0',
+    'for ($groupStart=0; $groupStart -lt $Count; $groupStart+=3)',
+    'Tokens=[string[]]$tokens',
+    '$m7Customer.Tokens[$reservationIndex]',
     'source_marker=2', 'source_marker=3', 'target_marker_count=$targetMarkerCount',
     'maximum_missing_markers_per_database=1', 'maximum_missing_wal_bytes_per_database=536870912'
 )

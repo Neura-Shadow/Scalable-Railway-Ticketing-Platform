@@ -92,6 +92,8 @@ Assert-True -Condition (-not $driver.Contains('--header=')) `
     -Message 'stale prewarm must pass BusyBox long-option values as separate arguments'
 Assert-True -Condition (-not $driver.Contains('--post-data=')) `
     -Message 'stale prewarm must pass BusyBox post data as a separate argument'
+Assert-True -Condition ($driver.Contains("PSObject.Properties['Content']") -and $driver.Contains('ReadAsStringAsync().GetAwaiter().GetResult()')) `
+    -Message 'API error handling must read PowerShell 7 HttpResponseMessage bodies without assuming GetResponseStream'
 Assert-True -Condition (-not $driver.Contains("'sh','-c',`$shell")) `
     -Message 'stale prewarm must preserve JSON and header argv boundaries without a shell command string'
 Assert-True -Condition $driver.Contains("'--post-data',`$nativeBody") `

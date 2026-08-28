@@ -189,6 +189,7 @@ $sensitiveValues = @(
     $webhookPreviousB64, $webhookCurrentB64, $env:M7_WEBHOOK_KEYRING,
     $stripeWebhookPrevious, $stripeWebhookCurrent, $env:M7_STRIPE_WEBHOOK_KEYRING
 )
+$script:m7FixtureClientSequence = 0
 if ($env:GITHUB_ACTIONS -eq 'true') {
     foreach ($value in $sensitiveValues) { Write-Output "::add-mask::$value" }
 }
@@ -408,33 +409,40 @@ function New-M7CustomerFixtures {
     param([string]$BaseURL, [string]$TrainRunID, [int]$Count, [string]$Label='primary')
     if ($Count -lt 1 -or $Count -gt 10) { throw 'M7 customer fixture count is outside the bound' }
     if ($Label -notmatch '^[a-z][a-z0-9-]{0,20}$') { throw 'M7 customer fixture label is invalid' }
-    $password = "M7-$([guid]::NewGuid().ToString('N').Substring(0, 14))-Aa1!"
-    $email = "m7-dr-$Label-$suffix@example.test"
-    Invoke-Milestone5DriverAPI -BaseURL $BaseURL -Method POST -Path '/api/v1/auth/register' -ForwardedFor '198.19.7.41' `
-        -Body @{ email=$email; password=$password; display_name='M7 DR Rider' } -ExpectedStatus @(202) | Out-Null
-    $login = Invoke-Milestone5DriverAPI -BaseURL $BaseURL -Method POST -Path '/api/v1/auth/login' -ForwardedFor '198.19.7.41' `
-        -Body @{ email=$email; password=$password } -ExpectedStatus @(200)
-    $token = [string]$login.Body.access_token
-    if ([string]::IsNullOrWhiteSpace($token)) { throw 'M7 synthetic login omitted its token' }
-    $script:sensitiveValues += $token
-    if ($env:GITHUB_ACTIONS -eq 'true') { Write-Output "::add-mask::$token" }
     $reservations = [System.Collections.Generic.List[string]]::new()
-    for ($index=0; $index -lt $Count; $index++) {
-        $passengers = [System.Collections.Generic.List[string]]::new()
-        foreach ($passengerIndex in 0,1) {
-            $passenger = Invoke-Milestone5DriverAPI -BaseURL $BaseURL -Method POST -Path '/api/v1/passengers' -Token $token `
-                -Body @{ display_name="M7 Passenger $index-$passengerIndex" } -ExpectedStatus @(201)
-            $passengers.Add([string]$passenger.Body.id)
+    $tokens = [System.Collections.Generic.List[string]]::new()
+    for ($groupStart=0; $groupStart -lt $Count; $groupStart+=3) {
+        $script:m7FixtureClientSequence++
+        $clientIP = "198.19.$($script:m7FixtureClientSequence).41"
+        $password = "M7-$([guid]::NewGuid().ToString('N').Substring(0, 14))-Aa1!"
+        $email = "m7-dr-$Label-$groupStart-$suffix@example.test"
+        Invoke-Milestone5DriverAPI -BaseURL $BaseURL -Method POST -Path '/api/v1/auth/register' -ForwardedFor $clientIP `
+            -Body @{ email=$email; password=$password; display_name='M7 DR Rider' } -ExpectedStatus @(202) | Out-Null
+        $login = Invoke-Milestone5DriverAPI -BaseURL $BaseURL -Method POST -Path '/api/v1/auth/login' -ForwardedFor $clientIP `
+            -Body @{ email=$email; password=$password } -ExpectedStatus @(200)
+        $token = [string]$login.Body.access_token
+        if ([string]::IsNullOrWhiteSpace($token)) { throw 'M7 synthetic login omitted its token' }
+        $script:sensitiveValues += $token
+        if ($env:GITHUB_ACTIONS -eq 'true') { Write-Output "::add-mask::$token" }
+        $groupEnd = [Math]::Min($Count-1, $groupStart+2)
+        for ($index=$groupStart; $index -le $groupEnd; $index++) {
+            $passengers = [System.Collections.Generic.List[string]]::new()
+            foreach ($passengerIndex in 0,1) {
+                $passenger = Invoke-Milestone5DriverAPI -BaseURL $BaseURL -Method POST -Path '/api/v1/passengers' -Token $token `
+                    -Body @{ display_name="M7 Passenger $index-$passengerIndex" } -ExpectedStatus @(201)
+                $passengers.Add([string]$passenger.Body.id)
+            }
+            $reservation = Invoke-Milestone5DriverAPI -BaseURL $BaseURL -Method POST -Path '/api/v1/reservations' -Token $token `
+                    -IdempotencyKey "m7-dr-reservation-$Label-$suffix-$index" -Body @{
+                    train_run_id=$TrainRunID; origin_station_code='M2A'; destination_station_code='M2B'
+                    seat_class='standard'; passenger_ids=[string[]]$passengers
+                } -ExpectedStatus @(201)
+            $reservations.Add([string]$reservation.Body.id)
+            $tokens.Add($token)
         }
-        $reservation = Invoke-Milestone5DriverAPI -BaseURL $BaseURL -Method POST -Path '/api/v1/reservations' -Token $token `
-                -IdempotencyKey "m7-dr-reservation-$Label-$suffix-$index" -Body @{
-                train_run_id=$TrainRunID; origin_station_code='M2A'; destination_station_code='M2B'
-                seat_class='standard'; passenger_ids=[string[]]$passengers
-            } -ExpectedStatus @(201)
-        $reservations.Add([string]$reservation.Body.id)
+        $password = $null
     }
-    $password = $null
-    return [pscustomobject]@{ Token=$token; Reservations=[string[]]$reservations }
+    return [pscustomobject]@{ Token=$tokens[0]; Tokens=[string[]]$tokens; Reservations=[string[]]$reservations }
 }
 
 function Assert-M7SettlementImport {
@@ -1725,9 +1733,10 @@ COMMIT;
         }
         $sensitiveValues += [string]$commonK6.SANDBOX_CONTROL_TOKEN
         if ($env:GITHUB_ACTIONS -eq 'true') { Write-Output "::add-mask::$($commonK6.SANDBOX_CONTROL_TOKEN)" }
-        foreach ($reservationID in $m7Customer.Reservations[0..2]) {
+        foreach ($reservationIndex in 0..2) {
+            $reservationID = $m7Customer.Reservations[$reservationIndex]
             $intent = Invoke-Milestone5DriverAPI -BaseURL (Get-M7PublishedURL) -Method POST `
-                -Path "/api/v1/reservations/$reservationID/payment-intents" -Token $m7Customer.Token `
+                -Path "/api/v1/reservations/$reservationID/payment-intents" -Token $m7Customer.Tokens[$reservationIndex] `
                 -IdempotencyKey "m7-initial-ticket-$reservationID" -Body @{} -ExpectedStatus @(202)
             if ([string]$intent.Body.id -notmatch '^[0-9a-f-]{36}$') { throw 'initial ticket payment omitted its durable identity' }
             Complete-M7SandboxPayment -DatabaseService 'control-postgres' -ReservationID $reservationID -WebhookBaseURL (Get-M7PublishedURL)
@@ -1758,7 +1767,7 @@ ORDER BY train_run_id LIMIT 1
         $m7HealthyOrderID = Get-M7Scalar -Service 'booking-shard-1-postgres' -User 'railway_booking' -Database 'railway_booking' -SQL "SELECT id::text FROM public.ticket_orders WHERE reservation_id='$($m7HealthyCustomer.Reservations[0])'::uuid AND status='issued'"
         if ($m7HealthyOrderID -notmatch '^[0-9a-f-]{36}$') { throw 'healthy shard ticket order was not durably issued' }
         $refundCrashIntent = Invoke-Milestone5DriverAPI -BaseURL (Get-M7PublishedURL) -Method POST `
-            -Path "/api/v1/reservations/$($m7Customer.Reservations[6])/payment-intents" -Token $m7Customer.Token `
+            -Path "/api/v1/reservations/$($m7Customer.Reservations[6])/payment-intents" -Token $m7Customer.Tokens[6] `
             -IdempotencyKey "m7-refund-crash-order-$suffix" -Body @{} -ExpectedStatus @(202)
         if ([string]$refundCrashIntent.Body.id -notmatch '^[0-9a-f-]{36}$') { throw 'refund crash fixture omitted its payment identity' }
         Complete-M7SandboxPayment -DatabaseService 'control-postgres' -ReservationID $m7Customer.Reservations[6] -WebhookBaseURL (Get-M7PublishedURL)
@@ -1766,7 +1775,7 @@ ORDER BY train_run_id LIMIT 1
         $refundCrashTicketIDs = Get-M7Scalar -Service 'booking-shard-0-postgres' -User 'railway_booking' -Database 'railway_booking' -SQL "SELECT string_agg(id::text,',' ORDER BY id) FROM public.tickets WHERE ticket_order_id='$refundCrashOrderID'::uuid AND status='active'"
         if (($refundCrashTicketIDs -split ',').Count -ne 2) { throw 'refund crash fixture did not issue exactly two tickets' }
         $refundShardCrashIntent = Invoke-Milestone5DriverAPI -BaseURL (Get-M7PublishedURL) -Method POST `
-            -Path "/api/v1/reservations/$($m7Customer.Reservations[7])/payment-intents" -Token $m7Customer.Token `
+            -Path "/api/v1/reservations/$($m7Customer.Reservations[7])/payment-intents" -Token $m7Customer.Tokens[7] `
             -IdempotencyKey "m7-refund-shard-crash-order-$suffix" -Body @{} -ExpectedStatus @(202)
         if ([string]$refundShardCrashIntent.Body.id -notmatch '^[0-9a-f-]{36}$') { throw 'refund shard crash fixture omitted its payment identity' }
         Complete-M7SandboxPayment -DatabaseService 'control-postgres' -ReservationID $m7Customer.Reservations[7] -WebhookBaseURL (Get-M7PublishedURL)
@@ -1774,12 +1783,12 @@ ORDER BY train_run_id LIMIT 1
         $refundShardCrashTicketIDs = Get-M7Scalar -Service 'booking-shard-0-postgres' -User 'railway_booking' -Database 'railway_booking' -SQL "SELECT string_agg(id::text,',' ORDER BY id) FROM public.tickets WHERE ticket_order_id='$refundShardCrashOrderID'::uuid AND status='active'"
         if (($refundShardCrashTicketIDs -split ',').Count -ne 2) { throw 'refund shard crash fixture did not issue exactly two tickets' }
         $fullRefundProviderIntent = Invoke-Milestone5DriverAPI -BaseURL (Get-M7PublishedURL) -Method POST `
-            -Path "/api/v1/reservations/$($m7Customer.Reservations[8])/payment-intents" -Token $m7Customer.Token `
+            -Path "/api/v1/reservations/$($m7Customer.Reservations[8])/payment-intents" -Token $m7Customer.Tokens[8] `
             -IdempotencyKey "m7-full-refund-provider-crash-$suffix" -Body @{} -ExpectedStatus @(202)
         $fullRefundProviderHosted = Get-M7HostedPayment -DatabaseService 'control-postgres' -ReservationID $m7Customer.Reservations[8]
         if ([string]$fullRefundProviderHosted.IntentID -cne [string]$fullRefundProviderIntent.Body.id) { throw 'full-refund provider crash fixture identity was inconsistent' }
         $fullRefundShardIntent = Invoke-Milestone5DriverAPI -BaseURL (Get-M7PublishedURL) -Method POST `
-            -Path "/api/v1/reservations/$($m7Customer.Reservations[9])/payment-intents" -Token $m7Customer.Token `
+            -Path "/api/v1/reservations/$($m7Customer.Reservations[9])/payment-intents" -Token $m7Customer.Tokens[9] `
             -IdempotencyKey "m7-full-refund-shard-crash-$suffix" -Body @{} -ExpectedStatus @(202)
         $fullRefundShardHosted = Get-M7HostedPayment -DatabaseService 'control-postgres' -ReservationID $m7Customer.Reservations[9]
         if ([string]$fullRefundShardHosted.IntentID -cne [string]$fullRefundShardIntent.Body.id) { throw 'full-refund shard crash fixture identity was inconsistent' }
@@ -1808,11 +1817,11 @@ ORDER BY train_run_id LIMIT 1
             'backup_total','backup_restore_duration_seconds'
         )
         Invoke-M7K6 -Script 'partial-ticket-refund.js' -Environment (@{} + $commonK6 + @{
-            CUSTOMER_TOKEN=$m7Customer.Token; TICKET_ORDER_ID=$m7Orders[0].OrderID; TICKET_IDS=($m7Orders[0].TicketIDs -split ',')[0]
+            CUSTOMER_TOKEN=$m7Customer.Tokens[0]; TICKET_ORDER_ID=$m7Orders[0].OrderID; TICKET_IDS=($m7Orders[0].TicketIDs -split ',')[0]
         })
         Invoke-M7K6 -Script 'partial-refund-idempotency.js' -Environment (@{} + $commonK6 + @{
             BASE_URLS='http://api-1:8080,http://api-2:8080,http://api-3:8080';
-            CUSTOMER_TOKEN=$m7Customer.Token; TICKET_ORDER_ID=$m7Orders[1].OrderID;
+            CUSTOMER_TOKEN=$m7Customer.Tokens[1]; TICKET_ORDER_ID=$m7Orders[1].OrderID;
             TICKET_IDS=($m7Orders[1].TicketIDs -split ',')[0]; CONFLICT_TICKET_ID=($m7Orders[1].TicketIDs -split ',')[1]
         })
         Assert-M7PartialRefund -OrderID $m7Orders[0].OrderID -SelectedTicketID (($m7Orders[0].TicketIDs -split ',')[0]) -Scenario 'partial-ticket-refund'
@@ -1866,7 +1875,7 @@ GROUP BY assignment.shard_id,assignment.assignment_generation
         if ([string]$ticketCrashHosted.IntentID -cne [string]$ticketCrashIntent.Body.id) { throw 'ticket crash fixture identity was inconsistent' }
 
         $paymentCrashIntent = Invoke-Milestone5DriverAPI -BaseURL (Get-M7PublishedURL) -Method POST `
-            -Path "/api/v1/reservations/$($m7Customer.Reservations[5])/payment-intents" -Token $m7Customer.Token `
+            -Path "/api/v1/reservations/$($m7Customer.Reservations[5])/payment-intents" -Token $m7Customer.Tokens[5] `
             -IdempotencyKey "m7-capture-crash-$suffix" -Body @{} -ExpectedStatus @(202)
         if ([string]$paymentCrashIntent.Body.id -notmatch '^[0-9a-f-]{36}$') { throw 'capture crash fixture omitted its payment identity' }
         $paymentCrashHosted = Get-M7HostedPayment -DatabaseService 'control-postgres' -ReservationID $m7Customer.Reservations[5]
@@ -1935,7 +1944,7 @@ SELECT (SELECT count(*) FROM public.ticket_issuance_receipts WHERE payment_inten
 
         $providerRefundSelectedTicket = ($refundCrashTicketIDs -split ',')[0]
         $providerRefundResponse = Invoke-Milestone5DriverAPI -BaseURL (Get-M7PublishedURL) -Method POST `
-            -Path "/api/v1/ticket-orders/$refundCrashOrderID/refunds" -Token $m7Customer.Token `
+            -Path "/api/v1/ticket-orders/$refundCrashOrderID/refunds" -Token $m7Customer.Tokens[6] `
             -IdempotencyKey "m7-refund-provider-crash-$suffix" -Body @{ticket_ids=@($providerRefundSelectedTicket)} -ExpectedStatus @(202)
         $providerRefundRequestID = [string]$providerRefundResponse.Body.id
         $providerRefundOperationID = Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL "SELECT refund_operation_id::text FROM public.ticket_refund_operations WHERE refund_request_id='$providerRefundRequestID'::uuid"
@@ -1953,7 +1962,7 @@ WHERE request.refund_request_id='$providerRefundRequestID'::uuid
 
         $shardRefundSelectedTicket = ($refundShardCrashTicketIDs -split ',')[0]
         $shardRefundResponse = Invoke-Milestone5DriverAPI -BaseURL (Get-M7PublishedURL) -Method POST `
-            -Path "/api/v1/ticket-orders/$refundShardCrashOrderID/refunds" -Token $m7Customer.Token `
+            -Path "/api/v1/ticket-orders/$refundShardCrashOrderID/refunds" -Token $m7Customer.Tokens[7] `
             -IdempotencyKey "m7-refund-shard-crash-$suffix" -Body @{ticket_ids=@($shardRefundSelectedTicket)} -ExpectedStatus @(202)
         $shardRefundRequestID = [string]$shardRefundResponse.Body.id
         $shardRefundOperationID = Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL "SELECT refund_operation_id::text FROM public.ticket_refund_operations WHERE refund_request_id='$shardRefundRequestID'::uuid"
@@ -2504,12 +2513,12 @@ WHERE ledger.event_id IN ('partial_refund:$providerRefundOperationID','partial_r
         $webhookOutageEndedAt = [DateTimeOffset]::UtcNow
         Add-M7Phase 'webhook-retried-on-region-b-after-switch'
 
-        $redisOutagePassenger = Invoke-Milestone5DriverAPI -BaseURL (Get-M7PublishedURL) -Method POST -Path '/api/v1/passengers' -Token $m7Customer.Token `
+        $redisOutagePassenger = Invoke-Milestone5DriverAPI -BaseURL (Get-M7PublishedURL) -Method POST -Path '/api/v1/passengers' -Token $m7Customer.Tokens[0] `
             -Body @{ display_name='M7 Redis outage passenger' } -ExpectedStatus @(201)
         $redisOutageBeforeControl = Get-M7Scalar -Service 'control-postgres-region-b' -User 'railway_control' -Database 'railway_control' -SQL "SELECT count(*) FROM public.reservation_shard_locators WHERE train_run_id='$m7HealthyTrain'::uuid"
         $redisOutageBeforeShard = Get-M7Scalar -Service 'booking-shard-1-postgres-region-b' -User 'railway_booking' -Database 'railway_booking' -SQL "SELECT count(*) FROM public.reservations WHERE train_run_id='$m7HealthyTrain'::uuid"
         Invoke-M7Compose -Arguments @('stop','-t','15','redis-region-b') | Out-Null
-        Invoke-Milestone5DriverAPI -BaseURL (Get-M7PublishedURL) -Method POST -Path '/api/v1/reservations' -Token $m7Customer.Token `
+        Invoke-Milestone5DriverAPI -BaseURL (Get-M7PublishedURL) -Method POST -Path '/api/v1/reservations' -Token $m7Customer.Tokens[0] `
             -IdempotencyKey "m7-redis-outage-$suffix" -Body @{
                 train_run_id=$m7HealthyTrain; origin_station_code='M2A'; destination_station_code='M2B';
                 seat_class='standard'; passenger_ids=@([string]$redisOutagePassenger.Body.id)
@@ -2527,7 +2536,7 @@ WHERE ledger.event_id IN ('partial_refund:$providerRefundOperationID','partial_r
         Add-M7Phase 'active-redis-outage-admission-failed-closed-without-booking-bypass'
 
         $oldDurableRead = Invoke-Milestone5DriverAPI -BaseURL (Get-M7PublishedURL) -Method GET -Path "/api/v1/ticket-orders/$($m7Orders[0].OrderID)" `
-            -Token $m7Customer.Token -ExpectedStatus @(200)
+            -Token $m7Customer.Tokens[0] -ExpectedStatus @(200)
         if ([string]$oldDurableRead.Body.id -ne [string]$m7Orders[0].OrderID) { throw 'region-b did not rebuild an old durable read after region-a Redis loss' }
         $redisAdmissionCustomer = New-M7CustomerFixtures -BaseURL (Get-M7PublishedURL) -TrainRunID $m7HealthyTrain -Count 1 -Label 'redis-rebuild'
         $redisAdmissionLocator = Get-M7Scalar -Service 'control-postgres-region-b' -User 'railway_control' -Database 'railway_control' -SQL "SELECT count(*) FROM public.reservation_shard_locators WHERE reservation_id='$($redisAdmissionCustomer.Reservations[0])'::uuid AND shard_id='physical-shard-1'"
@@ -2543,7 +2552,7 @@ WHERE ledger.event_id IN ('partial_refund:$providerRefundOperationID','partial_r
 
         Invoke-M7Compose -Arguments @('stop','-t','15','booking-shard-0-postgres-region-b') | Out-Null
         Invoke-Milestone5DriverAPI -BaseURL (Get-M7PublishedURL) -Method GET -Path "/api/v1/ticket-orders/$($m7Orders[0].OrderID)" `
-            -Token $m7Customer.Token -ExpectedStatus @(500,503,504) | Out-Null
+            -Token $m7Customer.Tokens[0] -ExpectedStatus @(500,503,504) | Out-Null
         $outageHealthyCustomer = New-M7CustomerFixtures -BaseURL (Get-M7PublishedURL) -TrainRunID $m7HealthyTrain -Count 1 -Label 'shard-outage'
         $outageHealthyControl = Get-M7Scalar -Service 'control-postgres-region-b' -User 'railway_control' -Database 'railway_control' -SQL "SELECT count(*) FROM public.reservation_shard_locators WHERE reservation_id='$($outageHealthyCustomer.Reservations[0])'::uuid AND shard_id='physical-shard-1'"
         $outageHealthyShard = Get-M7Scalar -Service 'booking-shard-1-postgres-region-b' -User 'railway_booking' -Database 'railway_booking' -SQL "SELECT count(*) FROM public.reservations WHERE id='$($outageHealthyCustomer.Reservations[0])'::uuid AND status='held'"
@@ -2551,7 +2560,7 @@ WHERE ledger.event_id IN ('partial_refund:$providerRefundOperationID','partial_r
         Invoke-M7Compose -Arguments @('start','booking-shard-0-postgres-region-b') | Out-Null
         Wait-M7Role -Service 'booking-shard-0-postgres-region-b' -User 'railway_shard_0_replicator' -Database 'railway_booking' -Recovery $false
         $restoredAffected = Invoke-Milestone5DriverAPI -BaseURL (Get-M7PublishedURL) -Method GET -Path "/api/v1/ticket-orders/$($m7Orders[0].OrderID)" `
-            -Token $m7Customer.Token -ExpectedStatus @(200)
+            -Token $m7Customer.Tokens[0] -ExpectedStatus @(200)
         if ([string]$restoredAffected.Body.id -ne [string]$m7Orders[0].OrderID) { throw 'restored shard did not recover its assigned ticket order' }
         $singleShardOutageEvidence = [ordered]@{ stopped_shard='physical-shard-0'; affected_route_rejected=$true; fallback_forbidden=$true; healthy_shard_completed=$true; healthy_shard_new_operation=$true; restored_and_reconciled=$true }
         Add-M7Phase 'promoted-single-shard-outage-contained-and-recovered'
@@ -2578,17 +2587,17 @@ WHERE ledger.event_id IN ('partial_refund:$providerRefundOperationID','partial_r
         )
         Invoke-M7K6 -Script 'regional-failover.js' -Environment @{
             VUS='1'; ITERATIONS_PER_VU='1'; DURATION='1m'; ACTIVE_REGION_URL='http://proxy-region-b:8080'; STALE_REGION_URL='http://proxy-region-a:8080';
-            CUSTOMER_TOKENS=$m7Customer.Token; RESERVATION_IDS=$m7Customer.Reservations[4]
+            CUSTOMER_TOKENS=$m7Customer.Tokens[4]; RESERVATION_IDS=$m7Customer.Reservations[4]
         }
         $commonB = @{
             VUS='1'; ITERATIONS_PER_VU='1'; DURATION='3m'; POLL_ATTEMPTS='100'; PAYMENT_POLL_ATTEMPTS='120'; REFUND_POLL_ATTEMPTS='120';
             BASE_URL='http://api-region-b-1:8080'; SANDBOX_URL='http://payment-sandbox:8099'; SANDBOX_CONTROL_TOKEN='synthetic-disposable-fault-token'
         }
         Invoke-M7K6 -Script 'payment-during-failover.js' -Environment (@{} + $commonB + @{
-            CUSTOMER_TOKENS=$m7Customer.Token; RESERVATION_IDS=$m7Customer.Reservations[3]
+            CUSTOMER_TOKENS=$m7Customer.Tokens[3]; RESERVATION_IDS=$m7Customer.Reservations[3]
         })
         Invoke-M7K6 -Script 'refund-during-failover.js' -Environment (@{} + $commonB + @{
-            CUSTOMER_TOKEN=$m7Customer.Token; TICKET_ORDER_ID=$m7Orders[2].OrderID; TICKET_IDS=($m7Orders[2].TicketIDs -split ',')[0]
+            CUSTOMER_TOKEN=$m7Customer.Tokens[2]; TICKET_ORDER_ID=$m7Orders[2].OrderID; TICKET_IDS=($m7Orders[2].TicketIDs -split ',')[0]
         })
         Complete-M7SandboxPayment -DatabaseService 'control-postgres-region-b' -ReservationID $m7Customer.Reservations[3] -WebhookBaseURL (Get-M7PublishedURL)
         Assert-M7PartialRefund -OrderID $m7Orders[2].OrderID -SelectedTicketID (($m7Orders[2].TicketIDs -split ',')[0]) -Scenario 'refund-during-failover' `
@@ -2846,7 +2855,7 @@ WHERE ledger.event_id IN ('partial_refund:$providerRefundOperationID','partial_r
             VUS='1'; ITERATIONS_PER_VU='1'; DURATION='1m'; FAILBACK_ACTIVE_URL='http://proxy-region-a:8080'; RETAINED_REGION_URL='http://proxy-region-b:8080'
         }
         $failbackIntent = Invoke-Milestone5DriverAPI -BaseURL (Get-M7PublishedURL) -Method POST `
-            -Path "/api/v1/reservations/$($m7Customer.Reservations[4])/payment-intents" -Token $m7Customer.Token `
+            -Path "/api/v1/reservations/$($m7Customer.Reservations[4])/payment-intents" -Token $m7Customer.Tokens[4] `
             -IdempotencyKey "m7-failback-payment-$suffix" -Body @{} -ExpectedStatus @(202)
         if ([string]::IsNullOrWhiteSpace([string]$failbackIntent.Body.id)) { throw 'failback payment omitted its durable identity' }
         Complete-M7SandboxPayment -DatabaseService 'control-postgres-region-a-reseed' -ReservationID $m7Customer.Reservations[4] -WebhookBaseURL (Get-M7PublishedURL)
