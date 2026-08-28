@@ -1621,7 +1621,7 @@ FROM pg_replication_slots WHERE slot_name='$($database.Slot)' AND slot_type='phy
             Invoke-M7SQL -Service $database.Primary -User $database.User -Database $database.Database -SQL 'INSERT INTO public.dr_evidence_markers(marker) VALUES (4)'
             $pitrLowerBound = [DateTimeOffset]::Parse((Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL 'SELECT clock_timestamp()::text'))
             Start-Sleep -Seconds 2
-            $pitrSentinelAt = [DateTimeOffset]::Parse((Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL 'INSERT INTO public.dr_evidence_markers(marker) VALUES (5) RETURNING created_at::text'))
+            $pitrSentinelAt = [DateTimeOffset]::Parse((Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL 'WITH inserted AS (INSERT INTO public.dr_evidence_markers(marker) VALUES (5) RETURNING created_at) SELECT created_at::text FROM inserted'))
             $pitrTargetAt = $pitrLowerBound.AddSeconds(1)
             if ($pitrTargetAt -ge $pitrSentinelAt) { throw "PITR marker window was not ordered for $($database.Name)" }
             $pitrTarget = $pitrTargetAt.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -2204,7 +2204,7 @@ SELECT
         }
         Add-M7Phase 'failover-journal-durable-before-final-rpo-marker'
         foreach ($database in $databases) {
-            $sourceObservedAt = [DateTimeOffset]::Parse((Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL 'INSERT INTO public.dr_evidence_markers(marker) VALUES (2) RETURNING created_at::text'))
+            $sourceObservedAt = [DateTimeOffset]::Parse((Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL 'WITH inserted AS (INSERT INTO public.dr_evidence_markers(marker) VALUES (2) RETURNING created_at) SELECT created_at::text FROM inserted'))
             $position = Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL "SELECT ((pg_control_checkpoint()).timeline_id)::text||'|'||pg_current_wal_lsn()::text||'|'||pg_wal_lsn_diff(pg_current_wal_lsn(),'0/0')::bigint::text"
             $parts = $position -split '\|'
             if ($parts.Count -ne 3) { throw "final source WAL position was malformed for $($database.Name)" }
@@ -2659,7 +2659,7 @@ WHERE ledger.event_id IN ('partial_refund:$providerRefundOperationID','partial_r
         Add-M7Phase 'failback-reseed-provenance-validated-before-promotion'
         Add-M7Phase 'failback-journal-and-reseed-provenance-durable-before-final-rpo-marker'
         foreach ($database in $databases) {
-            $sourceObservedAt = [DateTimeOffset]::Parse((Get-M7Scalar -Service $database.Standby -User $database.User -Database $database.Database -SQL 'INSERT INTO public.dr_evidence_markers(marker) VALUES (3) RETURNING created_at::text'))
+            $sourceObservedAt = [DateTimeOffset]::Parse((Get-M7Scalar -Service $database.Standby -User $database.User -Database $database.Database -SQL 'WITH inserted AS (INSERT INTO public.dr_evidence_markers(marker) VALUES (3) RETURNING created_at) SELECT created_at::text FROM inserted'))
             $position = Get-M7Scalar -Service $database.Standby -User $database.User -Database $database.Database -SQL "SELECT ((pg_control_checkpoint()).timeline_id)::text||'|'||pg_current_wal_lsn()::text||'|'||pg_wal_lsn_diff(pg_current_wal_lsn(),'0/0')::bigint::text"
             $parts = $position -split '\|'
             if ($parts.Count -ne 3) { throw "final failback source WAL was malformed for $($database.Name)" }
