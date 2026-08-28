@@ -66,6 +66,7 @@ foreach ($replayFreshnessGuard in @(
     'replayFreshnessLSN',
     'WITH updated AS (UPDATE public.dr_evidence_markers',
     'Wait-M7Replay -Service $database.Standby',
+    'standby replay diagnostic',
     'replay_freshness_marker_lsn',
     'replay_freshness_marker_epoch'
 )) {
