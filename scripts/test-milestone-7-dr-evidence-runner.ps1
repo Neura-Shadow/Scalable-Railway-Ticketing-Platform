@@ -252,6 +252,9 @@ foreach ($required in @(
         throw "DR app/failback contract omits required token: $required"
     }
 }
+if (-not ((Get-Content -Raw -LiteralPath (Join-Path $root 'deploy/compose/payment.override.yml')).Contains('PAYMENT_SANDBOX_WEBHOOK_KEYRING: ${M7_WEBHOOK_KEYRING:-current=${PAYMENT_WEBHOOK_KEY_B64:-'))) {
+    throw 'payment sandbox signer and API verifier must consume the same M7 webhook keyring'
+}
 if ($appCompose -match 'PAYMENT_CONTRACT_API_KEY:-') {
     throw 'DR app Compose must not contain a committed provider API key fallback'
 }
