@@ -7,12 +7,13 @@ case "$DR_MAX_REPLAY_STALENESS_SECONDS" in
   ''|*[!0-9]*) echo 'standby replay staleness bound is invalid' >&2; exit 1 ;;
 esac
 
-result=$(psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" --tuples-only --no-align \
+result=$(PGOPTIONS='-c role=pg_read_all_stats' psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" --tuples-only --no-align \
   --set=ON_ERROR_STOP=1 --set=slot_name="$REPLICATION_SLOT" --set=max_staleness="$DR_MAX_REPLAY_STALENESS_SECONDS" <<'SQL'
 SELECT concat_ws('|',
   pg_is_in_recovery()::text,
   current_setting('data_checksums'),
   current_setting('primary_slot_name'),
+  coalesce((SELECT status FROM pg_stat_wal_receiver LIMIT 1), ''),
   (pg_last_wal_receive_lsn() IS NOT NULL)::text,
   CASE
     WHEN pg_last_wal_receive_lsn() IS NOT NULL
@@ -25,7 +26,7 @@ SELECT concat_ws('|',
 SQL
 )
 
-if [ "$result" != "true|on|$REPLICATION_SLOT|true|true|true" ]; then
-  echo 'standby recovery, slot, WAL receipt, replay freshness, checksum, or timeline health check failed' >&2
+if [ "$result" != "true|on|$REPLICATION_SLOT|streaming|true|true|true" ]; then
+  echo 'standby recovery, slot, streaming receiver, WAL receipt, replay freshness, checksum, or timeline health check failed' >&2
   exit 1
 fi

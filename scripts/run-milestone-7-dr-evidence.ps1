@@ -307,8 +307,11 @@ function Write-M7JSON {
 }
 
 function Get-M7Scalar {
-    param([string]$Service, [string]$User, [string]$Database, [string]$SQL)
-    $result = Invoke-M7Compose -Arguments @('exec','-T',$Service,'psql','-X','-v','ON_ERROR_STOP=1','-U',$User,'-d',$Database,'-tAc',$SQL)
+    param([string]$Service, [string]$User, [string]$Database, [string]$SQL, [switch]$Monitoring)
+    $arguments = @('exec','-T')
+    if ($Monitoring) { $arguments += @('-e','PGOPTIONS=-c role=pg_read_all_stats') }
+    $arguments += @($Service,'psql','-X','-v','ON_ERROR_STOP=1','-U',$User,'-d',$Database,'-tAc',$SQL)
+    $result = Invoke-M7Compose -Arguments $arguments
     $values = @($result.Output | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
     if ($values.Count -ne 1) { throw "database scalar was not exactly one row for $Service" }
     return [string]$values[0]
@@ -1479,6 +1482,29 @@ LIMIT 1
         Write-M7JSON -Name 'topology-preflight.json' -Value ([ordered]@{databases=$topologyPreflight})
         Add-M7Phase 'topology-preflight-synchronized'
 
+        $initialStandbyHealth = Invoke-M7Compose -AllowFailure -Arguments @('exec','-T','control-postgres-region-b','sh','/etc/railway/standby-health.sh')
+        if ($initialStandbyHealth.ExitCode -ne 0) { throw 'standby health was not ready before the disconnect test' }
+        $disconnectObserved = $false
+        Invoke-M7Compose -Arguments @('stop','--timeout','10','control-postgres') | Out-Null
+        try {
+            for ($attempt=1; $attempt -le 45; $attempt++) {
+                $healthProbe = Invoke-M7Compose -AllowFailure -Arguments @('exec','-T','control-postgres-region-b','sh','/etc/railway/standby-health.sh')
+                if ($healthProbe.ExitCode -ne 0) { $disconnectObserved = $true; break }
+                Start-Sleep -Seconds 1
+            }
+        } finally {
+            Invoke-M7Compose -Arguments @('start','control-postgres') | Out-Null
+            Wait-M7Role -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -Recovery $false
+        }
+        if (-not $disconnectObserved) { throw 'caught-up standby health did not fail after the receiver disconnected' }
+        $healthRecoveryMarkerEpoch = [int64](Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL "WITH updated AS (UPDATE public.dr_evidence_markers SET created_at=clock_timestamp() WHERE marker=1 RETURNING created_at) SELECT extract(epoch FROM created_at)::bigint::text FROM updated")
+        if ($healthRecoveryMarkerEpoch -le 0) { throw 'standby health recovery marker did not commit' }
+        $healthRecoveryLSN = Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL 'SELECT pg_current_wal_lsn()::text'
+        Wait-M7Replay -Service 'control-postgres-region-b' -User 'railway_control_replicator' -Database 'railway_control' -LSN $healthRecoveryLSN
+        $healthRecovered = Invoke-M7Compose -AllowFailure -Arguments @('exec','-T','control-postgres-region-b','sh','/etc/railway/standby-health.sh')
+        if ($healthRecovered.ExitCode -ne 0) { throw 'standby health did not recover after streaming reconnected' }
+        Add-M7Phase 'standby-disconnect-health-recovered'
+
         $env:DR_RECOVERY_EPOCH = '1'
         $env:DR_JOURNAL_REGION = 'region-a'
         $env:DR_JOURNAL_DATABASE_URL = 'postgresql://railway_control:control-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3'
@@ -1536,9 +1562,11 @@ FROM pg_replication_slots WHERE slot_name='$($database.Slot)' AND slot_type='phy
             if ($replayFreshnessMarkerEpoch -le 0) { throw "replay freshness marker did not commit for $($database.Name)" }
             $replayFreshnessLSN = Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL 'SELECT pg_current_wal_lsn()::text'
             Wait-M7Replay -Service $database.Standby -User $database.ReplicationUser -Database $database.Database -LSN $replayFreshnessLSN
-            $standbyObservationText = Get-M7Scalar -Service $database.Standby -User $database.ReplicationUser -Database $database.Database -SQL "SELECT current_setting('primary_slot_name')||'|'||coalesce(pg_last_wal_receive_lsn()::text,'')||'|'||coalesce(pg_last_wal_replay_lsn()::text,'')||'|'||coalesce(extract(epoch FROM pg_last_xact_replay_timestamp())::bigint,0)::text||'|'||((pg_control_checkpoint()).timeline_id)::text"
+            $streamingRecheck = [int](Get-M7Scalar -Service $database.Primary -User $database.User -Database $database.Database -SQL "SELECT count(*) FROM pg_stat_replication AS replication JOIN pg_stat_ssl AS tls USING(pid) WHERE replication.application_name='$($database.Slot)' AND replication.state='streaming' AND tls.ssl")
+            if ($streamingRecheck -ne 1) { throw "TLS streaming was not current after the replay marker for $($database.Name)" }
+            $standbyObservationText = Get-M7Scalar -Monitoring -Service $database.Standby -User $database.ReplicationUser -Database $database.Database -SQL "SELECT coalesce((SELECT status FROM pg_stat_wal_receiver LIMIT 1),'')||'|'||current_setting('primary_slot_name')||'|'||coalesce(pg_last_wal_receive_lsn()::text,'')||'|'||coalesce(pg_last_wal_replay_lsn()::text,'')||'|'||(pg_last_wal_receive_lsn()>='$replayFreshnessLSN'::pg_lsn)::text||'|'||coalesce(extract(epoch FROM pg_last_xact_replay_timestamp())::bigint,0)::text||'|'||((pg_control_checkpoint()).timeline_id)::text"
             $standbyObservation = $standbyObservationText -split '\|'
-            if ($standbyObservation.Count -ne 5 -or $standbyObservation[0] -cne $database.Slot -or [string]::IsNullOrWhiteSpace($standbyObservation[1]) -or [string]::IsNullOrWhiteSpace($standbyObservation[2]) -or [int64]$standbyObservation[3] -lt $replayFreshnessMarkerEpoch -or [int]$standbyObservation[4] -le 0) {
+            if ($standbyObservation.Count -ne 7 -or $standbyObservation[0] -ne 'streaming' -or $standbyObservation[1] -cne $database.Slot -or [string]::IsNullOrWhiteSpace($standbyObservation[2]) -or [string]::IsNullOrWhiteSpace($standbyObservation[3]) -or $standbyObservation[4] -ne 'true' -or [int64]$standbyObservation[5] -lt $replayFreshnessMarkerEpoch -or [int]$standbyObservation[6] -le 0) {
                 Write-Warning "standby replay diagnostic for $($database.Name): observation=$standbyObservationText marker_epoch=$replayFreshnessMarkerEpoch marker_lsn=$replayFreshnessLSN"
                 throw "standby replay freshness or timeline was not observable for $($database.Name)"
             }
@@ -1548,13 +1576,24 @@ FROM pg_replication_slots WHERE slot_name='$($database.Slot)' AND slot_type='phy
                 slot_safe_wal_bytes=[int64]$slotObservation[3]; retained_wal_bytes=[int64]$slotObservation[4];
                 archived_wal_count=[int64]$archiveObservation[0]; archive_failed_count=[int64]$archiveObservation[1];
                 last_archived_at_epoch=[int64]$archiveObservation[2]; last_archive_failure_at_epoch=[int64]$archiveObservation[3];
-                wal_receiver_state='streaming'; wal_receiver_observation_source='primary_pg_stat_replication'; standby_primary_slot=$standbyObservation[0];
-                receive_lsn=$standbyObservation[1]; replay_lsn=$standbyObservation[2]; replay_freshness_marker_lsn=$replayFreshnessLSN;
-                replay_freshness_marker_epoch=$replayFreshnessMarkerEpoch; last_replay_at_epoch=[int64]$standbyObservation[3]; timeline=[int]$standbyObservation[4]
+                wal_receiver_state=$standbyObservation[0]; wal_receiver_observation_source='standby_pg_stat_wal_receiver'; standby_primary_slot=$standbyObservation[1];
+                primary_tls_streaming_rechecked=$true; receive_lsn=$standbyObservation[2]; replay_lsn=$standbyObservation[3]; receive_covers_marker=$true;
+                replay_freshness_marker_lsn=$replayFreshnessLSN; replay_freshness_marker_epoch=$replayFreshnessMarkerEpoch;
+                last_replay_at_epoch=[int64]$standbyObservation[5]; timeline=[int]$standbyObservation[6]
             })
             $infoResult = Invoke-M7Compose -Arguments @('exec','-T',$database.Primary,'/etc/railway/pgbackrest-secret.sh',"--stanza=$($database.Stanza)",'--log-level-console=off','--output=json','info')
             $infoText = $infoResult.Output -join "`n"
-            $info = $infoText | ConvertFrom-Json
+            $jsonStart = $infoText.IndexOf('[')
+            $jsonEnd = $infoText.LastIndexOf(']')
+            if ($jsonStart -lt 0 -or $jsonEnd -lt $jsonStart) {
+                Write-Warning "sanitized pgBackRest info diagnostics for $($database.Name): $(Protect-M7Diagnostic -Lines $infoResult.Output)"
+                throw "pgBackRest info omitted its JSON document for $($database.Name)"
+            }
+            try { $info = $infoText.Substring($jsonStart, $jsonEnd-$jsonStart+1) | ConvertFrom-Json }
+            catch {
+                Write-Warning "sanitized pgBackRest JSON diagnostics for $($database.Name): $(Protect-M7Diagnostic -Lines $infoResult.Output)"
+                throw
+            }
             $backups = @($info[0].backup)
             if ($backups.Count -lt 1 -or [string]::IsNullOrWhiteSpace([string]$backups[-1].label) -or [string]$info[0].cipher -ne 'aes-256-cbc') {
                 throw "encrypted pgBackRest backup metadata is invalid for $($database.Name)"

@@ -66,11 +66,23 @@ foreach ($replayFreshnessGuard in @(
     'replayFreshnessLSN',
     'WITH updated AS (UPDATE public.dr_evidence_markers',
     'Wait-M7Replay -Service $database.Standby',
+    'PGOPTIONS=-c role=pg_read_all_stats',
+    'primary_tls_streaming_rechecked',
+    'receive_covers_marker',
     'standby replay diagnostic',
     'replay_freshness_marker_lsn',
     'replay_freshness_marker_epoch'
 )) {
     if (-not $source.Contains($replayFreshnessGuard)) { throw "Milestone 7 runner is missing replay freshness proof: $replayFreshnessGuard" }
+}
+foreach ($disconnectHealthGuard in @(
+    "'stop','--timeout','10','control-postgres'",
+    'standby health was not ready before the disconnect test',
+    'caught-up standby health did not fail after the receiver disconnected',
+    'standby health did not recover after streaming reconnected',
+    "Add-M7Phase 'standby-disconnect-health-recovered'"
+)) {
+    if (-not $source.Contains($disconnectHealthGuard)) { throw "Milestone 7 runner is missing disconnect-sensitive standby health proof: $disconnectHealthGuard" }
 }
 $requiredGuardrails = @(
     'ConfirmDestructiveDrill',

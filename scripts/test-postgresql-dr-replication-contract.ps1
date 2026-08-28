@@ -37,6 +37,8 @@ function Reject-Pattern {
 Require-Token $primaryBootstrap 'DR_REPLICATION_SOURCE_CIDR' 'primary bootstrap must require an explicit source CIDR'
 Require-Token $primaryBootstrap 'hostssl replication' 'physical replication HBA must require TLS'
 Require-Token $primaryBootstrap 'ALTER ROLE' 're-running the primary bootstrap must rotate the replication credential'
+Require-Token $primaryBootstrap 'GRANT pg_read_all_stats' 'the no-inherit replication identity must be able to assume the bounded statistics role for health checks'
+Require-Token $primaryBootstrap 'NOINHERIT' 'the replication identity must not inherit monitoring privileges outside an explicit role switch'
 Require-Token $primaryBootstrap 'pg_hba.replication.conf' 'replication HBA must use a replaceable managed include'
 Require-Token $primaryBootstrap 'include_if_exists "pg_hba.replication.conf"' 'the managed HBA include filename must use PostgreSQL HBA double-quote syntax'
 Reject-Pattern $primaryBootstrap "include_if_exists\s+'pg_hba\.replication\.conf'" 'single quotes become part of an HBA include filename and must not be used'
@@ -63,10 +65,11 @@ Require-Token $primaryStartup '-c ssl=on' 'primary startup must enable PostgreSQ
 Require-Token $primaryStartup 'replication-server.key' 'primary startup must install a restricted external TLS key'
 Require-Token $primaryHealth "current_setting('data_checksums')" 'primary health must assert data checksums'
 Require-Token $primaryHealth 'pg_stat_archiver' 'primary health must assert current WAL archive health'
-Require-Token $standbyHealth 'pg_last_wal_receive_lsn' 'standby health must assert bounded WAL receipt without privileged statistics access'
+Require-Token $standbyHealth "PGOPTIONS='-c role=pg_read_all_stats'" 'standby health must explicitly assume only the bounded statistics role'
+Require-Token $standbyHealth 'pg_stat_wal_receiver' 'standby health must require a currently streaming receiver'
+Require-Token $standbyHealth 'pg_last_wal_receive_lsn' 'standby health must assert bounded WAL receipt'
 Require-Token $standbyHealth 'pg_last_xact_replay_timestamp' 'standby health must reject stale replay'
 Require-Token $standbyHealth 'timeline_id' 'standby health must observe a live timeline'
-Reject-Pattern $standbyHealth 'pg_stat_wal_receiver' 'least-privilege replication health must not depend on security-restricted session statistics'
 
 foreach ($token in @(
     'railway_control_replicator', 'railway_shard_0_replicator', 'railway_shard_1_replicator',

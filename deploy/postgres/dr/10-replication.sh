@@ -32,6 +32,7 @@ SELECT 1 / CASE WHEN NOT EXISTS (
 SELECT format('CREATE ROLE %I LOGIN REPLICATION PASSWORD %L', :'replication_user', :'replication_password')
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname=:'replication_user') \gexec
 SELECT format('ALTER ROLE %I WITH LOGIN REPLICATION NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT PASSWORD %L', :'replication_user', :'replication_password') \gexec
+SELECT format('GRANT pg_read_all_stats TO %I', :'replication_user') \gexec
 SQL
 
 if [ "$(psql --set=ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" --tuples-only --no-align --command='SHOW data_checksums')" != 'on' ]; then
