@@ -148,6 +148,27 @@ func TestShardActionsUsePurposeBuiltDurableAttemptAndLeaseBudget(t *testing.T) {
 	}
 }
 
+func TestClaimActionsSeedsNewActionAtRunClock(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 8, 1, 0, 0, 0, time.UTC)
+	tx := &recordingTx{}
+	store, err := New(&recordingDB{tx: tx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.ClaimActions(context.Background(), worker.ClaimOptions{
+		WorkerID: "payment-test", BatchSize: 1, MaxAttempts: 3,
+		LeaseTTL: time.Minute, Now: now,
+	})
+	if err != nil {
+		t.Fatalf("ClaimActions() error = %v", err)
+	}
+	if len(tx.execs) == 0 || !strings.Contains(tx.execs[0], "action_type,next_attempt_at") ||
+		!strings.Contains(tx.execs[0], "END,$1") || len(tx.execArgs[0]) != 1 || tx.execArgs[0][0] != now {
+		t.Fatalf("new action was not made eligible at the fixed run clock: sql=%q args=%v", tx.execs[0], tx.execArgs[0])
+	}
+}
+
 func TestShardActionFinalAttemptCrashGetsOneBoundedReceiptRecovery(t *testing.T) {
 	t.Parallel()
 	tx := &recordingTx{}

@@ -112,6 +112,40 @@ type Failure struct {
 	Compensate    bool
 }
 
+type FailureLane string
+
+const (
+	FailureLaneClaimOperations  FailureLane = "claim_operations"
+	FailureLaneProcessOperation FailureLane = "process_operation"
+	FailureLaneClaimWebhooks    FailureLane = "claim_webhooks"
+	FailureLaneProcessWebhook   FailureLane = "process_webhook"
+	FailureLaneClaimActions     FailureLane = "claim_actions"
+	FailureLaneProcessAction    FailureLane = "process_action"
+)
+
+type FailureReason string
+
+const (
+	FailureReasonStoreUnavailable             FailureReason = "store_unavailable"
+	FailureReasonLeaseLost                    FailureReason = "lease_lost"
+	FailureReasonInvalidClaim                 FailureReason = "invalid_claim"
+	FailureReasonProviderUnavailable          FailureReason = "provider_unavailable"
+	FailureReasonProviderOutcomeUnknown       FailureReason = "provider_outcome_unknown"
+	FailureReasonDatabaseFinalizeFailed       FailureReason = "database_finalize_failed"
+	FailureReasonShardUnavailable             FailureReason = "shard_unavailable"
+	FailureReasonRegionalAuthorityUnavailable FailureReason = "regional_authority_unavailable"
+	FailureReasonConstraintRejected           FailureReason = "constraint_rejected"
+	FailureReasonTimeout                      FailureReason = "timeout"
+	FailureReasonUnknown                      FailureReason = "unknown"
+)
+
+// FailureSummary is safe for production logs and metrics. It deliberately
+// retains no joined error, identifier, query, DSN, or provider payload.
+type FailureSummary struct {
+	Lane   FailureLane   `json:"lane"`
+	Reason FailureReason `json:"reason"`
+}
+
 type WebhookClaim struct {
 	InboxID           uuid.UUID
 	Provider          string
@@ -218,4 +252,5 @@ type Result struct {
 	Compensating      int
 	ManualReview      int
 	Failures          int
+	FailureSummaries  []FailureSummary
 }

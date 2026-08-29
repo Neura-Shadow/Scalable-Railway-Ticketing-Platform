@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +21,30 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
+
+func TestPaymentFailureLogExcludesRawDatabaseError(t *testing.T) {
+	t.Parallel()
+	var output bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&output, nil))
+	result := paymentworker.Result{
+		Failures: 1,
+		FailureSummaries: []paymentworker.FailureSummary{{
+			Lane: paymentworker.FailureLaneClaimActions, Reason: paymentworker.FailureReasonStoreUnavailable,
+		}},
+	}
+	raw := errors.New("postgres://user:secret@example synthetic-password-never-log")
+
+	logPaymentPassFailure(logger, result, raw)
+	got := output.String()
+	if strings.Contains(got, "postgres://") || strings.Contains(got, "synthetic-password") {
+		t.Fatalf("payment failure log leaked raw database error: %s", got)
+	}
+	for _, want := range []string{"claim_actions", "store_unavailable", "failure_lanes", "failure_reasons"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("payment failure log = %s, want bounded value %q", got, want)
+		}
+	}
+}
 
 func TestExternalEffectCrashIsExactAndTestOnly(t *testing.T) {
 	t.Parallel()

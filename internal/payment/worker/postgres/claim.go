@@ -304,7 +304,7 @@ func (store *Store) ClaimActions(ctx context.Context, options worker.ClaimOption
 	defer rollback(ctx, tx)
 	if _, err = tx.Exec(ctx, `
 INSERT INTO public.payment_saga_actions (
- action_id,saga_id,payment_intent_id,action_type
+ action_id,saga_id,payment_intent_id,action_type,next_attempt_at
 )
 SELECT gen_random_uuid(),saga.saga_id,saga.payment_intent_id,
  CASE
@@ -312,12 +312,12 @@ SELECT gen_random_uuid(),saga.saga_id,saga.payment_intent_id,
   WHEN saga.state='compensating' AND saga.current_step='refund' THEN 'mark_refund_pending'
   WHEN saga.state='compensating' AND saga.current_step='compensate' THEN 'cancel_voided_reservation'
   WHEN saga.state='refunding' THEN 'compensate'
- END
+ END,$1
 FROM public.payment_sagas AS saga
 WHERE (saga.state='issuing_tickets' AND saga.current_step='issue_tickets')
    OR (saga.state='compensating' AND saga.current_step IN ('refund','compensate'))
    OR (saga.state='refunding' AND saga.current_step='compensate')
-ON CONFLICT DO NOTHING`); err != nil {
+ON CONFLICT DO NOTHING`, options.Now); err != nil {
 		return nil, worker.ErrStoreUnavailable
 	}
 	// Expired action leases are safe to reclaim because all shard commands use

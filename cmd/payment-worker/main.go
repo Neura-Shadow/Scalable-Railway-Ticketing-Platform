@@ -185,11 +185,7 @@ func run(logger *slog.Logger) error {
 			metrics.RecordPartialRefund(observation.Provider, observation.Result, observation.Reason, observation.Currency, 0, time.Since(refundStarted))
 		}
 		if runErr != nil {
-			logger.Error("payment pass completed with isolated failures",
-				"operations_claimed", result.OperationsClaimed,
-				"webhooks_claimed", result.WebhooksClaimed,
-				"actions_claimed", result.ActionsClaimed,
-				"failure_count", result.Failures)
+			logPaymentPassFailure(logger, result, runErr)
 		}
 		if refundErr != nil {
 			logger.Error("ticket refund pass completed with isolated failures",
@@ -235,6 +231,22 @@ func run(logger *slog.Logger) error {
 			}
 		}
 	}
+}
+
+func logPaymentPassFailure(logger *slog.Logger, result paymentworker.Result, _ error) {
+	lanes := make([]string, 0, len(result.FailureSummaries))
+	reasons := make([]string, 0, len(result.FailureSummaries))
+	for _, failure := range result.FailureSummaries {
+		lanes = append(lanes, string(failure.Lane))
+		reasons = append(reasons, string(failure.Reason))
+	}
+	logger.Error("payment pass completed with isolated failures",
+		"operations_claimed", result.OperationsClaimed,
+		"webhooks_claimed", result.WebhooksClaimed,
+		"actions_claimed", result.ActionsClaimed,
+		"failure_count", result.Failures,
+		"failure_lanes", lanes,
+		"failure_reasons", reasons)
 }
 
 type testExternalEffectCrash struct {
@@ -525,6 +537,8 @@ func (metrics paymentMetrics) RecordPaymentWorker(observation paymentworker.Metr
 		return
 	}
 	switch observation.Lane {
+	case "failure":
+		metrics.metrics.RecordPaymentWorkerLaneFailure(observation.Operation, observation.Reason)
 	case "operation":
 		metrics.metrics.RecordPaymentOperationWithReason(observation.Provider, observation.Operation, observation.Result, observation.Reason, observation.Duration, observation.Uncertain)
 		if observation.Result == "success" {

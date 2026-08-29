@@ -71,11 +71,13 @@ func (worker *Worker) RunOnce(ctx context.Context) (Result, error) {
 
 	operations, err := worker.store.ClaimOperations(ctx, options)
 	if err != nil {
+		worker.appendFailure(&result, FailureLaneClaimOperations, err)
 		failures = append(failures, fmt.Errorf("claim payment operations: %w", err))
 	} else {
 		result.OperationsClaimed = len(operations)
 		for _, claim := range operations {
 			if err := worker.processOperation(ctx, now, claim, &result); err != nil {
+				worker.appendFailure(&result, FailureLaneProcessOperation, err)
 				failures = append(failures, err)
 			}
 		}
@@ -83,11 +85,13 @@ func (worker *Worker) RunOnce(ctx context.Context) (Result, error) {
 
 	webhooks, err := worker.store.ClaimWebhooks(ctx, options)
 	if err != nil {
+		worker.appendFailure(&result, FailureLaneClaimWebhooks, err)
 		failures = append(failures, fmt.Errorf("claim payment webhooks: %w", err))
 	} else {
 		result.WebhooksClaimed = len(webhooks)
 		for _, claim := range webhooks {
 			if err := worker.processWebhook(ctx, now, claim, &result); err != nil {
+				worker.appendFailure(&result, FailureLaneProcessWebhook, err)
 				failures = append(failures, err)
 			}
 		}
@@ -95,17 +99,40 @@ func (worker *Worker) RunOnce(ctx context.Context) (Result, error) {
 
 	actions, err := worker.store.ClaimActions(ctx, options)
 	if err != nil {
+		worker.appendFailure(&result, FailureLaneClaimActions, err)
 		failures = append(failures, fmt.Errorf("claim payment actions: %w", err))
 	} else {
 		result.ActionsClaimed = len(actions)
 		for _, claim := range actions {
 			if err := worker.processAction(ctx, now, claim, &result); err != nil {
+				worker.appendFailure(&result, FailureLaneProcessAction, err)
 				failures = append(failures, err)
 			}
 		}
 	}
 	result.Failures = len(failures)
 	return result, errors.Join(failures...)
+}
+
+func (worker *Worker) appendFailure(result *Result, lane FailureLane, err error) {
+	reason := boundedFailureReason(err)
+	result.FailureSummaries = append(result.FailureSummaries, FailureSummary{Lane: lane, Reason: reason})
+	worker.record(MetricObservation{Lane: "failure", Operation: string(lane), Result: "failure", Reason: string(reason)})
+}
+
+func boundedFailureReason(err error) FailureReason {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return FailureReasonTimeout
+	case errors.Is(err, ErrLeaseLost):
+		return FailureReasonLeaseLost
+	case errors.Is(err, ErrStoreUnavailable):
+		return FailureReasonStoreUnavailable
+	case errors.Is(err, ErrProviderUnavailable):
+		return FailureReasonProviderUnavailable
+	default:
+		return FailureReasonUnknown
+	}
 }
 
 func (worker *Worker) processOperation(ctx context.Context, now time.Time, claim OperationClaim, result *Result) error {

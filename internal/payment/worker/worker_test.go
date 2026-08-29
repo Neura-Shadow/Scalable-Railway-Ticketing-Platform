@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,6 +21,32 @@ import (
 )
 
 var fixedNow = time.Date(2026, 8, 8, 10, 0, 0, 0, time.UTC)
+
+func TestRunOnceReportsBoundedFailureSummaryWithoutRawStoreError(t *testing.T) {
+	t.Parallel()
+	const sensitive = "postgres://user:secret@example synthetic-password-never-log"
+	store := &storeFake{claimActionErr: errors.Join(ErrStoreUnavailable, errors.New(sensitive))}
+	value := newTestWorker(t, store, &providerFake{}, &shardFake{}, 4)
+
+	result, err := value.RunOnce(context.Background())
+	if err == nil {
+		t.Fatal("RunOnce() error = nil, want isolated store failure")
+	}
+	if result.Failures != 1 || len(result.FailureSummaries) != 1 {
+		t.Fatalf("result = %+v, want one bounded failure summary", result)
+	}
+	want := FailureSummary{Lane: FailureLaneClaimActions, Reason: FailureReasonStoreUnavailable}
+	if result.FailureSummaries[0] != want {
+		t.Fatalf("failure summary = %+v, want %+v", result.FailureSummaries[0], want)
+	}
+	encoded, marshalErr := json.Marshal(result.FailureSummaries)
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	if strings.Contains(string(encoded), "postgres://") || strings.Contains(string(encoded), "synthetic-password") {
+		t.Fatalf("bounded summaries leaked raw store error: %s", encoded)
+	}
+}
 
 func TestRunOnceQueriesBeforeRetryingUncertainCapture(t *testing.T) {
 	t.Parallel()
@@ -879,6 +906,7 @@ type storeFake struct {
 	actionFailures         []Failure
 	actionEvidence         ActionEvidence
 	completeActionErr      error
+	claimActionErr         error
 	onCompleteOperation    func()
 }
 
@@ -927,7 +955,7 @@ func (store *storeFake) FailWebhook(_ context.Context, _ WebhookClaim, failure F
 	return nil
 }
 func (store *storeFake) ClaimActions(context.Context, ClaimOptions) ([]ActionClaim, error) {
-	return append([]ActionClaim(nil), store.actions...), nil
+	return append([]ActionClaim(nil), store.actions...), store.claimActionErr
 }
 func (store *storeFake) CompleteAction(_ context.Context, _ ActionClaim, evidence ActionEvidence) error {
 	store.completeActionCalls++

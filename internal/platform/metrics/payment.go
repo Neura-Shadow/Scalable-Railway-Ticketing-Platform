@@ -34,6 +34,15 @@ var (
 		"payment.checkout_created", "payment.authorized", "payment.captured",
 		"payment.voided", "payment.refunded", "unknown",
 	)
+	allowedPaymentWorkerFailureLanes = set(
+		"claim_operations", "process_operation", "claim_webhooks",
+		"process_webhook", "claim_actions", "process_action",
+	)
+	allowedPaymentWorkerFailureReasons = set(
+		"store_unavailable", "lease_lost", "invalid_claim", "provider_unavailable",
+		"provider_outcome_unknown", "database_finalize_failed", "shard_unavailable",
+		"regional_authority_unavailable", "constraint_rejected", "timeout", "unknown",
+	)
 	allowedReconciliationTypes = set("payment_intents", "payment_operations", "payment_webhooks", "payment_tickets", "payment_provider", "payment_all")
 )
 
@@ -45,7 +54,7 @@ type paymentMetrics struct {
 	webhookConflict                                            *prometheus.CounterVec
 	ticketIssuanceTotal, ticketIssuanceFailure, ticketReplay   *prometheus.CounterVec
 	reconciliationTotal, reconciliationMismatch                *prometheus.CounterVec
-	reconciliationRepair                                       *prometheus.CounterVec
+	reconciliationRepair, workerLaneFailure                    *prometheus.CounterVec
 	intentDuration, operationDuration, webhookDuration         *prometheus.HistogramVec
 	webhookLag, ticketIssuanceDuration                         *prometheus.HistogramVec
 }
@@ -82,6 +91,7 @@ func newPaymentMetrics() *paymentMetrics {
 		reconciliationTotal:    counter("payment_reconciliation_total", "Payment reconciliation outcomes.", "reconciliation_type", "result"),
 		reconciliationMismatch: counter("payment_reconciliation_mismatch_total", "Payment reconciliation mismatches.", "reconciliation_type"),
 		reconciliationRepair:   counter("payment_reconciliation_repair_total", "Explicit payment reconciliation repairs.", "reconciliation_type", "result"),
+		workerLaneFailure:      counter("payment_worker_lane_failure_total", "Payment worker failures by bounded lane and reason.", "lane", "reason"),
 	}
 }
 
@@ -91,8 +101,15 @@ func (m *paymentMetrics) collectors() []prometheus.Collector {
 		m.operationTotal, m.operationDuration, m.operationUncertain, m.captureTotal, m.voidTotal, m.refundTotal,
 		m.webhookTotal, m.webhookDuplicate, m.webhookInvalid, m.webhookConflict, m.webhookDuration, m.webhookLag,
 		m.ticketIssuanceTotal, m.ticketIssuanceFailure, m.ticketIssuanceDuration, m.ticketReplay,
-		m.reconciliationTotal, m.reconciliationMismatch, m.reconciliationRepair,
+		m.reconciliationTotal, m.reconciliationMismatch, m.reconciliationRepair, m.workerLaneFailure,
 	}
+}
+
+func (m *Metrics) RecordPaymentWorkerLaneFailure(lane, reason string) {
+	m.payment.workerLaneFailure.WithLabelValues(
+		normalize(lane, allowedPaymentWorkerFailureLanes, "unknown"),
+		normalize(reason, allowedPaymentWorkerFailureReasons, "unknown"),
+	).Inc()
 }
 
 func (m *Metrics) RecordPaymentIntent(state, result string, duration time.Duration) {
