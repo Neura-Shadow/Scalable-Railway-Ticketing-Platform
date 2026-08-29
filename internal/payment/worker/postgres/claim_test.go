@@ -169,6 +169,36 @@ func TestClaimActionsSeedsNewActionAtRunClock(t *testing.T) {
 	}
 }
 
+func TestClaimActionsLeavesHistoricalActionsWithoutDurableProofPending(t *testing.T) {
+	t.Parallel()
+	tx := &recordingTx{}
+	store, err := New(&recordingDB{tx: tx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.ClaimActions(context.Background(), worker.ClaimOptions{
+		WorkerID: "payment-test", BatchSize: 4, MaxAttempts: 8,
+		LeaseTTL: time.Minute, Now: time.Date(2026, 8, 8, 1, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("ClaimActions() error = %v", err)
+	}
+	joined := strings.Join(tx.queries, "\n")
+	for _, required := range []string{
+		"action.action_type IN ('issue_tickets','mark_refund_pending')",
+		"operation.operation_type='capture'",
+		"action.action_type='cancel_voided_reservation'",
+		"operation.operation_type='void'",
+		"action.action_type='compensate'",
+		"operation.operation_type='refund'",
+		"octet_length(operation.response_fingerprint)=32",
+	} {
+		if !strings.Contains(joined, required) {
+			t.Fatalf("action candidate can claim a historical row without durable proof %q:\n%s", required, joined)
+		}
+	}
+}
+
 func TestShardActionFinalAttemptCrashGetsOneBoundedReceiptRecovery(t *testing.T) {
 	t.Parallel()
 	tx := &recordingTx{}

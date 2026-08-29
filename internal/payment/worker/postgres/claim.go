@@ -390,6 +390,37 @@ WITH candidates AS (
      OR (action.action_type='cancel_voided_reservation' AND saga.state='compensating' AND saga.current_step='compensate')
      OR (action.action_type='compensate' AND saga.state='refunding' AND saga.current_step='compensate')
    )
+   AND (
+     (
+       action.action_type IN ('issue_tickets','mark_refund_pending')
+       AND EXISTS (
+         SELECT 1 FROM public.payment_operations AS operation
+         WHERE operation.payment_intent_id=action.payment_intent_id
+           AND operation.operation_type='capture' AND operation.state='succeeded'
+           AND octet_length(operation.response_fingerprint)=32
+       )
+     )
+     OR (
+       action.action_type='cancel_voided_reservation'
+       AND EXISTS (
+         SELECT 1 FROM public.payment_operations AS operation
+         WHERE operation.payment_intent_id=action.payment_intent_id
+           AND operation.operation_type='void' AND operation.state='succeeded'
+           AND operation.completed_at IS NOT NULL
+           AND octet_length(operation.response_fingerprint)=32
+       )
+     )
+     OR (
+       action.action_type='compensate'
+       AND EXISTS (
+         SELECT 1 FROM public.payment_operations AS operation
+         WHERE operation.payment_intent_id=action.payment_intent_id
+           AND operation.operation_type='refund' AND operation.state='succeeded'
+           AND operation.completed_at IS NOT NULL
+           AND octet_length(operation.response_fingerprint)=32
+       )
+     )
+   )
  ORDER BY action.next_attempt_at,action.updated_at,action.action_id
  FOR UPDATE OF action,saga SKIP LOCKED LIMIT $2
 ), claimed AS (

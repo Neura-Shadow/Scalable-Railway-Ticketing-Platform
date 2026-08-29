@@ -23,6 +23,51 @@ import (
 )
 
 const integrationDatabaseEnv = "M7_PAYMENT_INTEGRATION_DATABASE_URL"
+const requireHistoricalFixtureEnv = "M7_PAYMENT_REQUIRE_HISTORICAL_FIXTURE"
+
+func TestM7HistoricalActionsWithoutProofDoNotPoisonClaimLane(t *testing.T) {
+	dsn := os.Getenv(integrationDatabaseEnv)
+	if dsn == "" {
+		t.Skip("focused Milestone 7 PostgreSQL fixture is not enabled")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := openRegionalPool(t, ctx, dsn)
+	defer pool.Close()
+	historicalActionID := uuid.MustParse("73000000-0000-4000-8000-000000000001")
+	var exists bool
+	if err := pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM public.payment_saga_actions WHERE saga_id=$1)", historicalActionID).Scan(&exists); err != nil {
+		t.Fatal(boundedDatabaseDiagnostic("detect_historical_action", "claim_actions", err))
+	}
+	if !exists {
+		if os.Getenv(requireHistoricalFixtureEnv) == "true" {
+			t.Fatal("required populated v10 to v11 historical fixture is absent")
+		}
+		t.Skip("populated v10 to v11 historical fixture is not present")
+	}
+	diagnostics := &boundedPostgresRecorder{}
+	store, err := workerpostgres.NewWithRegionalAuthority(diagnosticDB{DB: pool, recorder: diagnostics}, integrationDeployment(t))
+	if err != nil {
+		t.Fatal("bounded setup failure: operation=new_store lane=claim_actions sqlstate=unknown constraint=unknown")
+	}
+	diagnostics.reset()
+	_, err = store.ClaimActions(ctx, worker.ClaimOptions{
+		WorkerID: "m7-historical-proof-probe", BatchSize: 25, MaxAttempts: 8,
+		LeaseTTL: 30 * time.Second, Now: time.Now().UTC(),
+	})
+	if err != nil {
+		code, constraint := diagnostics.snapshot()
+		t.Fatalf("historical action poisoned claim lane: lane=claim_actions reason=invalid_claim sqlstate=%s constraint=%s", code, constraint)
+	}
+	var state string
+	var leaseOwner *string
+	if err := pool.QueryRow(ctx, "SELECT state,lease_owner FROM public.payment_saga_actions WHERE saga_id=$1 AND action_type='issue_tickets'", historicalActionID).Scan(&state, &leaseOwner); err != nil {
+		t.Fatal(boundedDatabaseDiagnostic("read_historical_action", "claim_actions", err))
+	}
+	if state != "pending" || leaseOwner != nil {
+		t.Fatalf("historical action changed without durable proof: state=%s leased=%t", state, leaseOwner != nil)
+	}
+}
 
 func TestM7PaymentWorkerRunOnceV11Lanes(t *testing.T) {
 	dsn := os.Getenv(integrationDatabaseEnv)
