@@ -8,13 +8,333 @@ $ErrorActionPreference = 'Stop'
 
 $root = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $runnerPath = Join-Path $PSScriptRoot 'run-milestone-7-dr-evidence.ps1'
+$k6DiagnosticPath = Join-Path $PSScriptRoot 'milestone-7/k6-diagnostics.ps1'
+$focusedRunnerPath = Join-Path $PSScriptRoot 'run-m7-provider-contract-focused.ps1'
 $composePath = Join-Path $root 'docker-compose.dr.yml'
 $replicationPath = Join-Path $root 'deploy/postgres/dr/10-replication.sh'
 $standbyPath = Join-Path $root 'deploy/postgres/dr/start-standby.sh'
 $workflowPath = Join-Path $root '.github/workflows/milestone-7-dr.yml'
 $dockerfilePath = Join-Path $root 'Dockerfile'
-foreach ($required in @($runnerPath, $composePath, $replicationPath, $standbyPath, $workflowPath)) {
+foreach ($required in @($runnerPath, $k6DiagnosticPath, $focusedRunnerPath, $composePath, $replicationPath, $standbyPath, $workflowPath)) {
     if (-not (Test-Path -LiteralPath $required)) { throw "Milestone 7 DR artifact is missing: $(Split-Path -Leaf $required)" }
+}
+
+. $k6DiagnosticPath
+$k6DiagnosticSource = Get-Content -Raw -LiteralPath $k6DiagnosticPath
+foreach ($required in @(
+    'New-M7K6TraversalState', 'Use-M7K6TraversalBudget', 'Get-M7K6TraversalProperty',
+    "'object_node'", "'property'", "'check'", "'threshold'", "'array'", "'array_element'",
+    '-TraversalState $traversalState', 'diagnostic_truncated', 'summary_inspection_complete'
+)) {
+    if (-not $k6DiagnosticSource.Contains($required)) { throw "k6 diagnostics omit shared traversal contract: $required" }
+}
+
+function Invoke-M7DiagnosticDocker {
+    param(
+        [Parameter(Mandatory=$true)][string[]]$Arguments,
+        [ValidateRange(1,300)][int]$TimeoutSeconds = 90
+    )
+    $process = [System.Diagnostics.Process]::new()
+    try {
+        $dockerCommand = @(Get-Command docker -CommandType Application -ErrorAction Stop)[0]
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $dockerCommand.Source
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        foreach ($argument in $Arguments) { [void]$startInfo.ArgumentList.Add([string]$argument) }
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) { throw 'diagnostic docker process did not start' }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            $process.Kill($true)
+            [void]$process.WaitForExit(5000)
+            return [pscustomobject]@{ ExitCode=124; Output=[string[]]@('diagnostic docker process timed out') }
+        }
+        $output = [string[]]@(
+            [regex]::Split("$($stdoutTask.GetAwaiter().GetResult())`n$($stderrTask.GetAwaiter().GetResult())", '\r?\n') |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                Select-Object -Last 80
+        )
+        return [pscustomobject]@{ ExitCode=[int]$process.ExitCode; Output=$output }
+    } finally {
+        $process.Dispose()
+    }
+}
+
+$containerFixtureDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "railway-m7-k6-container-test-$([guid]::NewGuid().ToString('N'))"
+[System.IO.Directory]::CreateDirectory($containerFixtureDirectory) | Out-Null
+$containerFixtureToken = "railway-m7-k6-proof-$([guid]::NewGuid().ToString('N').Substring(0,12))"
+$capabilityContainerName = "$containerFixtureToken-capability"
+$negativeContainerName = "$containerFixtureToken-negative"
+$containerSummaryPath = Join-Path $containerFixtureDirectory 'synthetic-negative-summary.json'
+$containerSecrets = [string[]]@(
+    'rk_test_should_never_leak', 'Bearer synthetic-wide-token',
+    'postgresql://wide-user:wide-password@example.invalid/database',
+    'synthetic-wide-webhook-secret', 'user@example.invalid', '+15555550123'
+)
+$containerCapabilityProof = $false
+$negativeContainerSummaryCopied = $false
+$negativeContainerRemoved = $false
+try {
+    $negativeScriptPath = Join-Path $containerFixtureDirectory 'synthetic-negative.js'
+    [System.IO.File]::WriteAllText($negativeScriptPath, @'
+import { check } from 'k6';
+export const options = { vus: 1, iterations: 1, thresholds: { checks: ['rate==1'] } };
+const neverLog = ['rk_test_should_never_leak', 'Bearer synthetic-wide-token', 'postgresql://wide-user:wide-password@example.invalid/database', 'synthetic-wide-webhook-secret', 'user@example.invalid', '+15555550123'];
+export default function () {
+  check(false, { 'stripe_adapter_payouts returned 200': (value) => value === true });
+  if (neverLog.length !== 6) { throw new Error('invalid fixture'); }
+}
+'@, [System.Text.UTF8Encoding]::new($false))
+
+    $repoScriptMount = "type=bind,src=$(Join-Path $root 'loadtest/k6'),dst=/scripts,readonly"
+    $capability = Invoke-M7DiagnosticDocker -Arguments @(
+        'run','--rm','--name',$capabilityContainerName,'--label',"m7.focused.project=$containerFixtureToken",
+        '--network','none','--user','12345:12345','--read-only','--tmpfs','/tmp:rw,noexec,nosuid,size=16m',
+        '--security-opt','no-new-privileges','--cap-drop','ALL','--mount',$repoScriptMount,
+        '--entrypoint','sh','grafana/k6:0.57.0','-c',
+        'set -eu; test "$(id -u)" = 12345; test "$(awk ''/^CapEff:/ {print $2}'' /proc/self/status)" = 0000000000000000; test -w /tmp; awk ''$5 == "/scripts" && $6 ~ /(^|,)ro(,|$)/ { found=1 } END { exit !found }'' /proc/self/mountinfo; : > /tmp/identity-proof; printf "uid=12345 cap_eff=0 tmp_writable=true scripts_read_only=true\n"'
+    )
+    if ($capability.ExitCode -ne 0 -or ([string]($capability.Output -join "`n")) -notmatch 'uid=12345 cap_eff=0 tmp_writable=true scripts_read_only=true') {
+        throw 'pinned k6 image did not prove the unprivileged zero-capability writable-/tmp contract'
+    }
+    $containerCapabilityProof = $true
+
+    $fixtureMount = "type=bind,src=$containerFixtureDirectory,dst=/scripts,readonly"
+    $negative = Invoke-M7DiagnosticDocker -Arguments @(
+        'run','--name',$negativeContainerName,'--label',"m7.focused.project=$containerFixtureToken",
+        '--network','none','--user','12345:12345',
+        '--security-opt','no-new-privileges','--cap-drop','ALL','--mount',$fixtureMount,
+        '--entrypoint','sh','grafana/k6:0.57.0','-c',
+        'umask 022; k6 "$@"; code=$?; test "$(stat -c %a /tmp/synthetic-negative-summary.json)" = 644; printf "summary_mode=644\n"; exit "$code"',
+        'sh','run','--quiet','--summary-export','/tmp/synthetic-negative-summary.json','/scripts/synthetic-negative.js'
+    )
+    if ($negative.ExitCode -ne 99 -or ([string]($negative.Output -join "`n")) -notmatch 'summary_mode=644') {
+        throw "synthetic stopped-container k6 exit/mode proof was invalid; exit=$($negative.ExitCode)"
+    }
+    $copy = Invoke-M7DiagnosticDocker -Arguments @('cp',"${negativeContainerName}:/tmp/synthetic-negative-summary.json",$containerSummaryPath)
+    if ($copy.ExitCode -ne 0 -or -not [System.IO.File]::Exists($containerSummaryPath)) {
+        throw 'synthetic stopped-container k6 summary was not copied to host evidence'
+    }
+    $negativeContainerSummaryCopied = $true
+    $containerDiagnostic = Get-M7K6Diagnostic -Script 'production-provider-contract.js' -ExitCode $negative.ExitCode -SummaryPath $containerSummaryPath -LogLines ([string[]]$negative.Output) -SensitiveValues $containerSecrets
+    $containerDiagnosticJSON = $containerDiagnostic | ConvertTo-Json -Depth 10 -Compress
+    if ([int]$containerDiagnostic.exit_code -ne 99 -or @($containerDiagnostic.failed_checks).Count -ne 1 -or
+        [string]$containerDiagnostic.failed_checks[0] -cne 'stripe_adapter_payouts returned 200') {
+        throw 'synthetic stopped-container k6 diagnostic did not preserve its non-zero failed check'
+    }
+    foreach ($secret in $containerSecrets) {
+        if ($containerDiagnosticJSON.Contains($secret)) { throw 'synthetic stopped-container diagnostic leaked a fixture secret' }
+    }
+} finally {
+    [void](Invoke-M7DiagnosticDocker -Arguments @('rm','-f',$negativeContainerName))
+    [void](Invoke-M7DiagnosticDocker -Arguments @('rm','-f',$capabilityContainerName))
+    $remainingFixtureContainers = Invoke-M7DiagnosticDocker -Arguments @('ps','-aq','--filter',"label=m7.focused.project=$containerFixtureToken")
+    $negativeContainerRemoved = ($remainingFixtureContainers.ExitCode -eq 0 -and @($remainingFixtureContainers.Output).Count -eq 0)
+    if ([System.IO.Directory]::Exists($containerFixtureDirectory)) { [System.IO.Directory]::Delete($containerFixtureDirectory, $true) }
+}
+if (-not $containerCapabilityProof -or -not $negativeContainerSummaryCopied -or -not $negativeContainerRemoved) {
+    throw 'unprivileged k6 stopped-container evidence regression did not complete or clean up'
+}
+
+$diagnosticFixtureDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "railway-m7-k6-diagnostic-test-$([guid]::NewGuid().ToString('N'))"
+[System.IO.Directory]::CreateDirectory($diagnosticFixtureDirectory) | Out-Null
+try {
+    $summaryPath = Join-Path $diagnosticFixtureDirectory 'failed-check-summary.json'
+    [System.IO.File]::WriteAllText($summaryPath, (@{
+        metrics = @{ checks = @{ passes = 12; fails = 1; value = 0.923; thresholds = @{ 'rate==1' = $true } }; iterations = @{ count = 1 } }
+        root_group = @{ name = ''; groups = @{}; checks = @{ 'stripe_adapter_payouts returned 200' = @{ name = 'stripe_adapter_payouts returned 200'; passes = 0; fails = 1 } } }
+    } | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
+    $diagnostic = Get-M7K6Diagnostic -Script 'production-provider-contract.js' -ExitCode 99 -SummaryPath $summaryPath -LogLines @()
+    if (-not [bool]$diagnostic.summary_present -or [int]$diagnostic.check_passes -ne 12 -or [int]$diagnostic.check_failures -ne 1 -or
+        @($diagnostic.failed_checks).Count -ne 1 -or [string]$diagnostic.failed_checks[0] -cne 'stripe_adapter_payouts returned 200') {
+        throw 'bounded k6 diagnostic did not extract a failed check from a valid non-zero summary'
+    }
+
+    $thresholdSummaryPath = Join-Path $diagnosticFixtureDirectory 'failed-threshold-summary.json'
+    [System.IO.File]::WriteAllText($thresholdSummaryPath, (@{
+        metrics = @{
+            checks = @{ passes = 19; fails = 0; value = 1; thresholds = @{ 'rate==1' = $false } }
+            iterations = @{ count = 1 }
+            payment_http_request_duration = @{ count = 0; 'p(99)' = 0; thresholds = @{ 'p(99)<10000' = $true } }
+        }
+        root_group = @{ name = ''; groups = @{}; checks = @{} }
+    } | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
+    $thresholdDiagnostic = Get-M7K6Diagnostic -Script 'production-provider-contract.js' -ExitCode 99 -SummaryPath $thresholdSummaryPath -LogLines @()
+    if (@($thresholdDiagnostic.failed_thresholds).Count -ne 1 -or [string]$thresholdDiagnostic.failed_thresholds[0] -cne 'payment_http_request_duration' -or
+        [string]$thresholdDiagnostic.classification -cne 'k6_inherited_threshold_without_samples') {
+        throw 'bounded k6 diagnostic did not extract and classify a crossed zero-sample threshold'
+    }
+
+    $missingDiagnostic = Get-M7K6Diagnostic -Script 'production-provider-contract.js' -ExitCode 1 `
+        -SummaryPath (Join-Path $diagnosticFixtureDirectory 'missing-summary.json') `
+        -LogLines @('level=error msg="failed to handle the end-of-test summary" error="could not open summary: permission denied"')
+    if ([bool]$missingDiagnostic.summary_present -or [bool]$missingDiagnostic.summary_valid -or
+        [string]$missingDiagnostic.classification -cne 'k6_summary_write_failure') {
+        throw 'bounded k6 diagnostic did not classify a missing summary write failure'
+    }
+    $emptySummaryPath = Join-Path $diagnosticFixtureDirectory 'empty-summary.json'
+    [System.IO.File]::WriteAllText($emptySummaryPath, '', [System.Text.UTF8Encoding]::new($false))
+    $emptyDiagnostic = Get-M7K6Diagnostic -Script 'production-provider-contract.js' -ExitCode 107 `
+        -SummaryPath $emptySummaryPath -LogLines @('level=error msg="ReferenceError: synthetic runtime failure"')
+    if ([bool]$emptyDiagnostic.summary_present -or [bool]$emptyDiagnostic.summary_valid -or
+        [string]$emptyDiagnostic.classification -cne 'k6_runtime_exception') {
+        throw 'bounded k6 diagnostic treated a prepared but unwritten summary as malformed JSON'
+    }
+
+    $malformedSummaryPath = Join-Path $diagnosticFixtureDirectory 'malformed-summary.json'
+    [System.IO.File]::WriteAllText($malformedSummaryPath, '{not-json', [System.Text.UTF8Encoding]::new($false))
+    $malformedDiagnostic = Get-M7K6Diagnostic -Script 'production-provider-contract.js' -ExitCode 1 -SummaryPath $malformedSummaryPath -LogLines @()
+    if (-not [bool]$malformedDiagnostic.summary_present -or [bool]$malformedDiagnostic.summary_valid -or
+        [string]$malformedDiagnostic.classification -cne 'evidence_runner_diagnostic_failure') {
+        throw 'bounded k6 diagnostic did not classify a malformed summary'
+    }
+
+    $syntheticSecrets = [string[]]@(
+        'rk_test_must_never_appear',
+        'synthetic-provider-secret-never-log',
+        'postgresql://user:password@example.invalid/database',
+        'Bearer synthetic-token-never-log'
+    )
+    $boundedLogLines = [System.Collections.Generic.List[string]]::new()
+    foreach ($index in 1..55) { $boundedLogLines.Add(('time=synthetic level=error msg="bounded runtime line {0}"' -f $index)) }
+    $boundedLogLines.Add(('time=synthetic level=error msg="ReferenceError {0}"' -f ($syntheticSecrets -join ' ')))
+    $boundedLogLines.Add('time=synthetic level=error host=control-postgres.internal passenger_name=NeverExpose')
+    $boundedLogLines.Add('{"passenger_name":"NeverExpose","response":"arbitrary body"}')
+    $boundedLogLines.Add('time=synthetic level=error url=http://payment-stripe-contract:8100/private passenger@example.test +886-912-345-678')
+    $boundedDiagnostic = Get-M7K6Diagnostic -Script 'production-provider-contract.js' -ExitCode 107 -SummaryPath (Join-Path $diagnosticFixtureDirectory 'runtime-missing-summary.json') -LogLines ([string[]]$boundedLogLines) -SensitiveValues $syntheticSecrets
+    $boundedJSON = $boundedDiagnostic | ConvertTo-Json -Depth 10 -Compress
+    if (@($boundedDiagnostic.log_tail).Count -gt 40 -or $boundedJSON.Length -gt 4096 -or
+        [string]$boundedDiagnostic.runtime_error -cne 'javascript_exception') {
+        throw 'bounded k6 diagnostic did not enforce log/character limits or detect a JavaScript runtime error'
+    }
+    foreach ($secret in $syntheticSecrets) {
+        if ($boundedJSON.Contains($secret)) { throw 'bounded k6 diagnostic leaked a synthetic secret' }
+    }
+    foreach ($forbidden in @('control-postgres.internal','NeverExpose','arbitrary body','payment-stripe-contract','passenger@example.test','+886-912-345-678')) {
+        if ($boundedJSON.Contains($forbidden)) { throw 'bounded k6 diagnostic leaked a host, passenger value, or arbitrary response body' }
+    }
+
+    $boundedChecks = @{}
+    $boundedMetrics = @{ checks = @{ passes = 0; fails = 25; value = 0; thresholds = @{ 'rate==1' = $true } }; iterations = @{ count = 1 } }
+    foreach ($index in 1..25) {
+        $checkName = "failed check $index $($syntheticSecrets[$index % $syntheticSecrets.Count])"
+        $boundedChecks[$checkName] = @{ name = $checkName; passes = 0; fails = 1 }
+        $metricName = "synthetic_threshold_$index"
+        $boundedMetrics[$metricName] = @{ count = 1; thresholds = @{ 'count==0' = $true } }
+    }
+    $boundedSummaryPath = Join-Path $diagnosticFixtureDirectory 'bounded-items-summary.json'
+    [System.IO.File]::WriteAllText($boundedSummaryPath, (@{
+        metrics = $boundedMetrics
+        root_group = @{ name = ''; groups = @{}; checks = $boundedChecks }
+    } | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
+    $boundedItemsDiagnostic = Get-M7K6Diagnostic -Script 'production-provider-contract.js' -ExitCode 99 -SummaryPath $boundedSummaryPath -LogLines @() -SensitiveValues $syntheticSecrets
+    $boundedItemsJSON = $boundedItemsDiagnostic | ConvertTo-Json -Depth 10 -Compress
+    if (@($boundedItemsDiagnostic.failed_checks).Count -gt 20 -or @($boundedItemsDiagnostic.failed_thresholds).Count -gt 20 -or
+        $boundedItemsJSON.Length -gt 4096) {
+        throw 'bounded k6 diagnostic exceeded failed-item or character limits'
+    }
+    foreach ($secret in $syntheticSecrets) {
+        if ($boundedItemsJSON.Contains($secret)) { throw 'bounded k6 item extraction leaked a synthetic secret' }
+    }
+
+    $wideSecrets = [string[]]@(
+        'rk_test_should_never_leak', 'Bearer synthetic-wide-token',
+        'postgresql://wide-user:wide-password@example.invalid/database',
+        'synthetic-wide-webhook-secret', 'user@example.invalid', '+15555550123'
+    )
+    $wideChecks = [ordered]@{}
+    foreach ($index in 1..5000) {
+        $checkName = 'check_{0:D4}' -f $index
+        if ($index -eq 1000) { $checkName = "failed_around_boundary_$($wideSecrets[0])" }
+        if ($index -eq 4500) { $checkName = "failed_after_boundary_$($wideSecrets[1])" }
+        $failed = ($index -in @(1000,4500))
+        $wideChecks[$checkName] = [ordered]@{ name=$checkName; passes=$(if($failed){0}else{1}); fails=$(if($failed){1}else{0}) }
+    }
+    $wideSummaryPath = Join-Path $diagnosticFixtureDirectory 'wide-5000-check-summary.json'
+    [System.IO.File]::WriteAllText($wideSummaryPath, ([ordered]@{
+        metrics=[ordered]@{ checks=[ordered]@{ passes=4998; fails=2; value=0.9996; thresholds=[ordered]@{'rate==1'=$true} }; iterations=[ordered]@{count=1} }
+        root_group=[ordered]@{ name=''; groups=[ordered]@{}; checks=$wideChecks }
+    } | ConvertTo-Json -Depth 12), [System.Text.UTF8Encoding]::new($false))
+    $wideDiagnostic = Get-M7K6Diagnostic -Script 'production-provider-contract.js' -ExitCode 99 -SummaryPath $wideSummaryPath -LogLines @($wideSecrets) -SensitiveValues $wideSecrets
+    $wideDiagnosticJSON = $wideDiagnostic | ConvertTo-Json -Depth 10 -Compress
+    if (-not [bool]$wideDiagnostic.diagnostic_truncated -or [bool]$wideDiagnostic.summary_inspection_complete -or
+        [string]$wideDiagnostic.classification -cne 'evidence_runner_diagnostic_failure' -or
+        @($wideDiagnostic.failed_checks).Count -gt 20 -or @($wideDiagnostic.failed_thresholds).Count -gt 20 -or
+        $wideDiagnosticJSON.Length -gt 4096) {
+        throw 'public k6 diagnostic did not fail closed within the shared traversal budget for 5000 checks'
+    }
+    foreach ($secret in $wideSecrets) {
+        if ($wideDiagnosticJSON.Contains($secret)) { throw 'wide truncated k6 diagnostic leaked a synthetic secret' }
+    }
+    $wideThrownException = "production-provider-contract.js failed: $wideDiagnosticJSON"
+    $wideFocusedStdout = [ordered]@{
+        status='failed'
+        classification=[string]$wideDiagnostic.classification
+        diagnostic_truncated=[bool]$wideDiagnostic.diagnostic_truncated
+        failed_checks=[string[]]$wideDiagnostic.failed_checks
+        failed_thresholds=[string[]]$wideDiagnostic.failed_thresholds
+        runtime_error=[string]$wideDiagnostic.runtime_error
+    } | ConvertTo-Json -Depth 10 -Compress
+    $wideEvidenceLogPath = Join-Path $diagnosticFixtureDirectory 'wide-sanitized-evidence.log'
+    [System.IO.File]::WriteAllLines($wideEvidenceLogPath, [string[]]$wideDiagnostic.log_tail, [System.Text.UTF8Encoding]::new($false))
+    $wideSavedLog = Get-Content -Raw -LiteralPath $wideEvidenceLogPath
+    foreach ($secret in $wideSecrets) {
+        foreach ($sink in @($wideDiagnosticJSON,$wideThrownException,$wideFocusedStdout,$wideSavedLog)) {
+            if (([string]$sink).Contains($secret)) { throw 'wide truncated k6 diagnostic leaked a synthetic secret through an output sink' }
+        }
+    }
+
+    $wideChecks["failed_around_boundary_$($wideSecrets[0])"].passes = 1
+    $wideChecks["failed_around_boundary_$($wideSecrets[0])"].fails = 0
+    $wideChecks["failed_after_boundary_$($wideSecrets[1])"].passes = 1
+    $wideChecks["failed_after_boundary_$($wideSecrets[1])"].fails = 0
+    $wideExitZeroSummaryPath = Join-Path $diagnosticFixtureDirectory 'wide-5000-check-exit-zero-summary.json'
+    [System.IO.File]::WriteAllText($wideExitZeroSummaryPath, ([ordered]@{
+        metrics=[ordered]@{ checks=[ordered]@{ passes=5000; fails=0; value=1; thresholds=[ordered]@{'rate==1'=$false} }; iterations=[ordered]@{count=1} }
+        root_group=[ordered]@{ name=''; groups=[ordered]@{}; checks=$wideChecks }
+    } | ConvertTo-Json -Depth 12), [System.Text.UTF8Encoding]::new($false))
+    $wideExitZeroDiagnostic = Get-M7K6Diagnostic -Script 'production-provider-contract.js' -ExitCode 0 -SummaryPath $wideExitZeroSummaryPath -LogLines @() -SensitiveValues $wideSecrets
+    if (-not [bool]$wideExitZeroDiagnostic.diagnostic_truncated -or [bool]$wideExitZeroDiagnostic.summary_inspection_complete -or
+        [string]$wideExitZeroDiagnostic.classification -cne 'evidence_runner_diagnostic_failure') {
+        throw 'public k6 diagnostic did not fail closed for a misleading exit-zero wide summary'
+    }
+
+    $deepNode = [ordered]@{ thresholds=[ordered]@{} }
+    foreach ($index in 1..14) { $deepNode = [ordered]@{ ("layer_{0:D2}" -f $index)=$deepNode } }
+    $deepSummaryPath = Join-Path $diagnosticFixtureDirectory 'deep-exit-zero-summary.json'
+    [System.IO.File]::WriteAllText($deepSummaryPath, ([ordered]@{
+        metrics=[ordered]@{ checks=[ordered]@{ passes=1; fails=0; thresholds=[ordered]@{'rate==1'=$false} }; iterations=[ordered]@{count=1}; deep_metric=$deepNode }
+        root_group=[ordered]@{ name=''; groups=[ordered]@{}; checks=[ordered]@{} }
+    } | ConvertTo-Json -Depth 30), [System.Text.UTF8Encoding]::new($false))
+    $deepDiagnostic = Get-M7K6Diagnostic -Script 'production-provider-contract.js' -ExitCode 0 -SummaryPath $deepSummaryPath -LogLines @()
+    if (-not [bool]$deepDiagnostic.diagnostic_truncated -or [bool]$deepDiagnostic.summary_inspection_complete -or
+        [string]$deepDiagnostic.classification -cne 'evidence_runner_diagnostic_failure') {
+        throw 'public k6 diagnostic did not fail closed when its depth bound prevented complete inspection'
+    }
+
+    $successSummaryPath = Join-Path $diagnosticFixtureDirectory 'success-summary.json'
+    [System.IO.File]::WriteAllText($successSummaryPath, (@{
+        metrics = @{
+            checks = @{ passes = 19; fails = 0; value = 1; thresholds = @{ 'rate==1' = $false } }
+            iterations = @{ count = 1 }
+            provider_contract_operation_duration = @{ count = 5; 'p(99)' = 10; thresholds = @{ 'p(99)<10000' = $false } }
+        }
+        root_group = @{ name = ''; groups = @{}; checks = @{} }
+    } | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
+    $successDiagnostic = Get-M7K6Diagnostic -Script 'production-provider-contract.js' -ExitCode 0 -SummaryPath $successSummaryPath -LogLines @()
+    if ([int]$successDiagnostic.check_passes -ne 19 -or [int]$successDiagnostic.check_failures -ne 0 -or
+        @($successDiagnostic.failed_checks).Count -ne 0 -or @($successDiagnostic.failed_thresholds).Count -ne 0 -or
+        [int]$successDiagnostic.iterations -ne 1 -or [bool]$successDiagnostic.diagnostic_truncated -or
+        -not [bool]$successDiagnostic.summary_inspection_complete) {
+        throw 'bounded k6 diagnostic did not preserve an all-green strict summary'
+    }
+} finally {
+    foreach ($file in @(Get-ChildItem -LiteralPath $diagnosticFixtureDirectory -File)) { Remove-Item -LiteralPath $file.FullName -Force }
+    Remove-Item -LiteralPath $diagnosticFixtureDirectory -Force
 }
 
 $workflow = Get-Content -Raw -LiteralPath $workflowPath
@@ -35,8 +355,125 @@ $parseErrors = $null
     $runnerPath, [ref]$tokens, [ref]$parseErrors
 ) | Out-Null
 if ($parseErrors.Count -ne 0) { throw "Milestone 7 DR runner has $($parseErrors.Count) PowerShell parse errors" }
+$tokens = $null
+$parseErrors = $null
+[System.Management.Automation.Language.Parser]::ParseFile(
+    $focusedRunnerPath, [ref]$tokens, [ref]$parseErrors
+) | Out-Null
+if ($parseErrors.Count -ne 0) { throw "focused provider-contract runner has $($parseErrors.Count) PowerShell parse errors" }
 
 $source = Get-Content -Raw -LiteralPath $runnerPath
+$focusedSource = Get-Content -Raw -LiteralPath $focusedRunnerPath
+$diagnosticBuildIndex = $source.IndexOf('$diagnostic = Get-M7K6Diagnostic', [System.StringComparison]::Ordinal)
+$diagnosticThrowIndex = $source.IndexOf('if ($result.ExitCode -ne 0 -or', [System.StringComparison]::Ordinal)
+if ($diagnosticBuildIndex -lt 0 -or $diagnosticThrowIndex -le $diagnosticBuildIndex -or
+    -not $source.Contains('-SensitiveValues ([string[]]$sensitiveValues)') -or
+    -not $source.Contains('[string[]]$diagnostic.log_tail')) {
+    throw 'Milestone 7 runner must build and persist a bounded sanitized k6 diagnostic before throwing'
+}
+if ($source.Contains('chown 12345:12345') -or $focusedSource.Contains('chown 12345:12345') -or
+    $source -match '(?i)(?:--cap-add|cap_add|CAP_CHOWN)' -or $focusedSource -match '(?i)(?:--cap-add|cap_add|CAP_CHOWN)' -or
+    -not $source.Contains("'--user','12345:12345'") -or -not $source.Contains('& docker cp') -or
+    -not $source.Contains('/tmp/$name-summary.json')) {
+    throw 'Milestone 7 k6 summary extraction must use unprivileged container-local storage plus docker cp without ownership capabilities'
+}
+if (-not $source.Contains('umask 022; exec k6 "$@"') -or -not $focusedSource.Contains('umask 022; exec k6 "$@"')) {
+    throw 'Milestone 7 k6 one-off containers must establish a bounded 0644 summary mode without chown'
+}
+if (-not $source.Contains('[bool]$diagnostic.diagnostic_truncated') -or
+    -not $focusedSource.Contains('[bool]$diagnostic.diagnostic_truncated') -or
+    -not $focusedSource.Contains('diagnostic_truncated = $false')) {
+    throw 'Milestone 7 runners must fail closed when shared diagnostic traversal is truncated'
+}
+if (-not $source.Contains('@($diagnostic.failed_thresholds).Count -ne 0') -or
+    -not $source.Contains('[int64]$diagnostic.iterations -lt 1')) {
+    throw 'authoritative Milestone 7 runner must reject crossed thresholds and missing iterations before publishing evidence'
+}
+$summaryReadIndex = $source.IndexOf('$summary = Get-Content -Raw -LiteralPath $summaryPath | ConvertFrom-Json', $diagnosticThrowIndex, [System.StringComparison]::Ordinal)
+if ($summaryReadIndex -le $diagnosticThrowIndex -or
+    -not $source.Substring($diagnosticThrowIndex, $summaryReadIndex - $diagnosticThrowIndex).Contains('$null -eq $copyResult -or $copyResult.ExitCode -ne 0')) {
+    throw 'authoritative Milestone 7 runner must directly reject a missing or failed docker cp result'
+}
+foreach ($required in @(
+    'grafana/k6:0.57.0',
+    "build','--target','payment-stripe-contract'",
+    '[System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32)',
+    'PAYMENT_STRIPE_CONTRACT_TEST_ONLY=true',
+    'PAYMENT_PROVIDER_ACCOUNT_ID=acct_m7_contract',
+    'PAYMENT_PROVIDER_API_VERSION=2026-07-29.dahlia',
+    'PAYMENT_STRIPE_CONTRACT_PAGE_BARRIER_DELAY=8s',
+    'PAYMENT_STRIPE_CONTRACT_ADAPTER_ORIGIN=http://$($contractAlias):8100',
+    "'--user','12345:12345'", '/tmp/production-provider-contract-summary.json',
+    "'VUS=1'", "'ITERATIONS_PER_VU=1'", "'DURATION=1m'",
+    '/readyz','/adapter/balance-transactions','/adapter/payouts','/adapter/error-classification',
+    '--summary-export','production-provider-contract.js',
+    "'--read-only'", "'--security-opt','no-new-privileges'", "'--cap-drop','ALL'",
+    'm7.focused.project=', '[System.IO.Directory]::Delete($evidenceDirectory, $true)',
+    '[System.Diagnostics.ProcessStartInfo]::new()', '@(Get-Command docker -CommandType Application -ErrorAction Stop)[0]',
+    'WaitForExit($TimeoutSeconds * 1000)', 'Kill($true)',
+    "'image','ls','--quiet','--no-trunc','--filter'", 'reference=$imageName', 'image_cleanup_passed',
+    '$builtImageID', '{{.Id}}|{{index .Config.Labels "m7.focused.project"}}',
+    'field_assertions', 'k6_summary_copied', 'k6_container_removed',
+    'try { [System.IO.Directory]::Delete($evidenceDirectory, $true) }', '$k6ContainerName'
+)) {
+    if (-not $focusedSource.Contains($required)) { throw "focused provider-contract runner omits bounded topology token: $required" }
+}
+if ($focusedSource -match '(?s)\$finalResult\.status\s*=\s*''passed''\s*\r?\n\s*\$finalResult\.classification\s*=\s*''evidence_runner_diagnostic_failure''') {
+    throw 'focused provider-contract runner cannot report a diagnostic failure classification on success'
+}
+if ($focusedSource.Contains('run-milestone-7-dr-evidence.ps1') -or
+    $focusedSource -match "(?m)'(?:-p|--publish)'" -or
+    $focusedSource -match "(?m)'volume','create'" -or
+    $focusedSource -match '(?i)\b(control-postgres|booking-shard-[01]-postgres|redis|payment-worker|payment-reconciler|settlement-worker|pgbackrest|failover|failback)\b') {
+    throw 'focused provider-contract runner includes a forbidden full-DR service or resource shortcut'
+}
+$lastProbeIndex = $focusedSource.IndexOf('$finalResult.direct_probes_passed = $true', [System.StringComparison]::Ordinal)
+$k6Index = $focusedSource.IndexOf('$k6 = Invoke-M7FocusedNative', [System.StringComparison]::Ordinal)
+if ($lastProbeIndex -lt 0 -or $k6Index -le $lastProbeIndex) {
+    throw 'focused provider-contract runner must complete direct probes before k6'
+}
+if (-not $focusedSource.Contains("-not `$diagnostic.Contains('summary_inspection_complete')") -or
+    -not $focusedSource.Contains('$finalResult.summary_inspection_complete = [bool]$diagnostic.summary_inspection_complete') -or
+    $focusedSource.Contains('$finalResult.summary_inspection_complete = $true')) {
+    throw 'focused provider-contract runner must directly wire a guarded Boolean summary inspection result'
+}
+$missingInspectionDiagnostic = [ordered]@{ diagnostic_truncated=$false }
+$missingInspectionResult = [ordered]@{ status='failed'; summary_inspection_complete=$false }
+$missingInspectionRejected = $false
+try {
+    if (-not $missingInspectionDiagnostic.Contains('summary_inspection_complete') -or
+        $missingInspectionDiagnostic.summary_inspection_complete -isnot [bool]) {
+        throw [System.InvalidOperationException]::new('missing Boolean summary inspection contract')
+    }
+    $missingInspectionResult.summary_inspection_complete = [bool]$missingInspectionDiagnostic.summary_inspection_complete
+} catch [System.InvalidOperationException] {
+    $missingInspectionRejected = $true
+}
+if (-not $missingInspectionRejected -or [bool]$missingInspectionResult.summary_inspection_complete -or
+    [string]$missingInspectionResult.status -ceq 'passed') {
+    throw 'focused provider-contract result assembly did not fail closed for a missing completeness property'
+}
+$pwshCommand = @(Get-Command pwsh -CommandType Application -ErrorAction Stop)[0]
+$focusedInvocationOutput = [string[]]@(
+    & $pwshCommand.Source -NoLogo -NoProfile -File $focusedRunnerPath 2>&1 |
+        ForEach-Object { [string]$_ }
+)
+$focusedInvocationExitCode = $LASTEXITCODE
+$focusedJSONLine = [string]@(
+    $focusedInvocationOutput |
+        Where-Object { $_.TrimStart().StartsWith('{') -and $_.TrimEnd().EndsWith('}') } |
+        Select-Object -Last 1
+)
+if ($focusedInvocationExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($focusedJSONLine)) {
+    throw 'focused provider-contract runner did not emit a successful strict JSON result'
+}
+try { $focusedJSONResult = $focusedJSONLine | ConvertFrom-Json } catch { throw 'focused provider-contract runner emitted malformed final JSON' }
+$inspectionProperty = $focusedJSONResult.PSObject.Properties['summary_inspection_complete']
+if ($null -eq $inspectionProperty) { throw 'focused provider-contract final JSON omits summary_inspection_complete' }
+if ($inspectionProperty.Value -isnot [bool]) { throw 'focused provider-contract final JSON summary_inspection_complete is not Boolean' }
+if (-not [bool]$inspectionProperty.Value -or [bool]$focusedJSONResult.diagnostic_truncated) {
+    throw 'focused provider-contract final JSON does not prove complete non-truncated summary inspection'
+}
 $assignmentQueryContracts = @(
     @{
         Name = 'healthy physical-shard assignment selection'
@@ -564,5 +1001,11 @@ if (-not [string]::IsNullOrWhiteSpace($EvidenceDirectory)) {
     status = 'passed'
     scoped_teardown = $true
     secret_scan = $true
+    pinned_k6_capability_proof = $containerCapabilityProof
+    stopped_container_summary_copied = $negativeContainerSummaryCopied
+    stopped_container_removed = $negativeContainerRemoved
+    wide_traversal_fail_closed = ([bool]$wideDiagnostic.diagnostic_truncated -and [bool]$wideExitZeroDiagnostic.diagnostic_truncated)
+    negative_fixture_exit_code = 99
+    negative_fixture_failed_checks = [string[]]@('stripe_adapter_payouts returned 200')
     publication_evidence_verified = (-not [string]::IsNullOrWhiteSpace($EvidenceDirectory))
 } | ConvertTo-Json -Compress

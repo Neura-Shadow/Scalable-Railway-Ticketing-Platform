@@ -24,6 +24,8 @@ $composeFiles = @(
 )
 $driverPath = Join-Path $PSScriptRoot 'milestone-5-physical-shard-evidence-driver.ps1'
 . $driverPath
+$k6DiagnosticPath = Join-Path $PSScriptRoot 'milestone-7/k6-diagnostics.ps1'
+. $k6DiagnosticPath
 $suffix = [guid]::NewGuid().ToString('N').Substring(0, 10)
 if ([string]::IsNullOrWhiteSpace($ProjectName)) { $ProjectName = "railway-m7-dr-$suffix" }
 if ($ProjectName -notmatch '^[a-z0-9][a-z0-9_-]{2,62}$') { throw 'ProjectName is invalid' }
@@ -515,24 +517,90 @@ function Invoke-M7K6 {
     )
     if ($Script -notin $allowed) { throw "k6 module is not allowlisted: $Script" }
     $name = [System.IO.Path]::GetFileNameWithoutExtension($Script)
-    $arguments = @('--profile','dr-tests','run','--rm','--no-deps')
+    $summaryPath = Join-Path $EvidenceDirectory "$name-summary.json"
+    $containerName = "$ProjectName-k6-$name-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+    if ($containerName.Length -gt 120 -or $containerName -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,119}$') {
+        throw 'k6 one-off container name is invalid'
+    }
+    $existingContainer = Invoke-M7Native -AllowFailure -Command { & docker ps -aq --filter "name=^/$containerName$" }
+    if ($existingContainer.ExitCode -ne 0 -or @($existingContainer.Output | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -ne 0) {
+        throw 'k6 one-off container name is not available'
+    }
+    $networkIDs = [System.Collections.Generic.List[string]]::new()
+    foreach ($networkKey in @('region-a-app','region-b-app','dr-test-provider','dr-test-ingress')) {
+        $networkLookup = Invoke-M7Native -AllowFailure -Command {
+            & docker network ls -q --filter "label=com.docker.compose.project=$ProjectName" --filter "label=com.docker.compose.network=$networkKey"
+        }
+        $matches = @($networkLookup.Output | Where-Object { $_ -match '^[0-9a-f]{12,64}$' })
+        if ($networkLookup.ExitCode -ne 0 -or $matches.Count -ne 1) { throw "k6 project network ownership is invalid for $networkKey" }
+        $networkIDs.Add([string]$matches[0])
+    }
+    $scriptMount = "type=bind,src=$(Join-Path $root 'loadtest/k6'),dst=/scripts,readonly"
+    $arguments = @(
+        'create','--name',$containerName,'--label',"m7.k6.project=$ProjectName",
+        '--user','12345:12345','--security-opt','no-new-privileges','--cap-drop','ALL',
+        '--mount',$scriptMount,'--network',$networkIDs[0],'--entrypoint','sh'
+    )
     foreach ($key in @($Environment.Keys | Sort-Object)) {
         if ($key -notmatch '^[A-Z][A-Z0-9_]{0,63}$') { throw 'k6 environment name is invalid' }
         $arguments += @('-e',"$key=$($Environment[$key])")
     }
-    $arguments += @('k6-milestone-7','run','--quiet','--summary-export',"/evidence/$name-summary.json","/scripts/$Script")
-    $result = Invoke-M7Compose -AllowFailure -Arguments $arguments
-    [System.IO.File]::WriteAllLines((Join-Path $EvidenceDirectory "$name.log"), [string[]]$result.Output, [System.Text.UTF8Encoding]::new($false))
-    if ($result.ExitCode -ne 0) { throw "$Script failed" }
-    $summaryPath = Join-Path $EvidenceDirectory "$name-summary.json"
-    if (-not [System.IO.File]::Exists($summaryPath)) { throw "$Script omitted its strict summary" }
+    $arguments += @('grafana/k6:0.57.0','-c','umask 022; exec k6 "$@"','sh','run','--quiet','--summary-export',"/tmp/$name-summary.json","/scripts/$Script")
+    $result = $null
+    $copyResult = $null
+    $containerCreated = $false
+    $containerCleanupPassed = $false
+    try {
+        $createResult = Invoke-M7Native -AllowFailure -Command { & docker @arguments }
+        $result = $createResult
+        if ($createResult.ExitCode -eq 0) {
+            $containerCreated = $true
+            $networkConnected = $true
+            foreach ($networkID in @($networkIDs | Select-Object -Skip 1)) {
+                $connectResult = Invoke-M7Native -AllowFailure -Command { & docker network connect $networkID $containerName }
+                if ($connectResult.ExitCode -ne 0) {
+                    $networkConnected = $false
+                    $result = $connectResult
+                    break
+                }
+            }
+            if ($networkConnected) {
+                $result = Invoke-M7Native -AllowFailure -Command { & docker start -a $containerName }
+            }
+            $copyResult = Invoke-M7Native -AllowFailure -Command { & docker cp "${containerName}:/tmp/$name-summary.json" $summaryPath }
+        }
+    } finally {
+        if ($containerCreated) { [void](Invoke-M7Native -AllowFailure -Command { & docker rm -f $containerName }) }
+        $remainingContainer = Invoke-M7Native -AllowFailure -Command { & docker ps -aq --filter "name=^/$containerName$" }
+        $containerCleanupPassed = ($remainingContainer.ExitCode -eq 0 -and @($remainingContainer.Output | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -eq 0)
+    }
+    if ($null -eq $result) { throw 'k6 one-off container did not return an execution result' }
+    $diagnostic = Get-M7K6Diagnostic -Script $Script -ExitCode $result.ExitCode -SummaryPath $summaryPath -LogLines ([string[]]$result.Output) -SensitiveValues ([string[]]$sensitiveValues)
+    if (($null -eq $copyResult -or $copyResult.ExitCode -ne 0) -and $result.ExitCode -eq 0) {
+        $diagnostic.classification = 'evidence_runner_diagnostic_failure'
+    }
+    if (-not $containerCleanupPassed) {
+        $diagnostic.runtime_error = 'container_cleanup_failure'
+        $diagnostic.classification = 'evidence_runner_diagnostic_failure'
+    }
+    [System.IO.File]::WriteAllLines(
+        (Join-Path $EvidenceDirectory "$name.log"),
+        [string[]]$diagnostic.log_tail,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $diagnosticJSON = $diagnostic | ConvertTo-Json -Depth 10 -Compress
+    if ($result.ExitCode -ne 0 -or -not [bool]$diagnostic.summary_present -or -not [bool]$diagnostic.summary_valid -or
+        [bool]$diagnostic.diagnostic_truncated -or -not [bool]$diagnostic.summary_inspection_complete -or
+        $null -eq $copyResult -or $copyResult.ExitCode -ne 0 -or @($diagnostic.failed_thresholds).Count -ne 0 -or
+        [int64]$diagnostic.iterations -lt 1 -or -not $containerCleanupPassed) {
+        throw "$Script failed: $diagnosticJSON"
+    }
     $summary = Get-Content -Raw -LiteralPath $summaryPath | ConvertFrom-Json
-    $checks = $summary.metrics.PSObject.Properties['checks'].Value.values
-    if ([int64]$checks.fails -ne 0 -or [int64]$checks.passes -lt 1) { throw "$Script did not pass every check" }
+    if ([int64]$diagnostic.check_failures -ne 0 -or [int64]$diagnostic.check_passes -lt 1) { throw "$Script failed: $diagnosticJSON" }
     if ($Script -ceq 'settlement-import.js') {
-        $records = $summary.metrics.PSObject.Properties['settlement_import_records_observed'].Value.values
-        $rate = $summary.metrics.PSObject.Properties['settlement_import_rate_records_per_second'].Value.values
-        $lag = $summary.metrics.PSObject.Properties['settlement_import_lag_seconds_observed'].Value.values
+        $records = Get-M7K6MetricValues -Summary $summary -MetricName 'settlement_import_records_observed'
+        $rate = Get-M7K6MetricValues -Summary $summary -MetricName 'settlement_import_rate_records_per_second'
+        $lag = Get-M7K6MetricValues -Summary $summary -MetricName 'settlement_import_lag_seconds_observed'
         if ([int64]$records.count -lt 1 -or [double]$records.rate -le 0 -or
             [int64]$rate.count -lt 1 -or [double]$rate.avg -le 0 -or
             [int64]$lag.count -lt 1 -or [double]$lag.min -lt 0) {
