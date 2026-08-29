@@ -4,6 +4,7 @@ param(
     [ValidateSet(1, 2)][int]$WorkerReplicas = 1,
     [switch]$SkipBuild,
     [switch]$IntegrationProbe,
+    [switch]$PostRestoreScalarFixture,
     [switch]$NativeSelfTest
 )
 
@@ -15,7 +16,10 @@ $root = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $composeFile = Join-Path $root 'docker-compose.payment.yml'
 $focusedOverride = Join-Path $root 'deploy/compose/m7-payment-convergence.override.yml'
 $driverPath = Join-Path $PSScriptRoot 'milestone-5-physical-shard-evidence-driver.ps1'
+$authoritativeRunnerPath = Join-Path $PSScriptRoot 'run-milestone-7-dr-evidence.ps1'
 . $driverPath
+
+if ($IntegrationProbe -and $PostRestoreScalarFixture) { throw 'focused modes are mutually exclusive' }
 
 $suffix = [guid]::NewGuid().ToString('N').Substring(0, 10)
 if ([string]::IsNullOrWhiteSpace($ProjectName)) { $ProjectName = "railway-m7-payment-$suffix" }
@@ -79,10 +83,44 @@ function Invoke-M7FocusedDocker {
         }
         $stdout = $stdoutTask.GetAwaiter().GetResult()
         $stderr = $stderrTask.GetAwaiter().GetResult()
-        $lines = @($stdout, $stderr) | ForEach-Object { [string]$_ -split "`r?`n" } | Where-Object { $_ -ne '' }
+        $lines = [string[]]@(
+            @($stdout, $stderr) |
+                ForEach-Object { [string]$_ -split "`r?`n" } |
+                Where-Object { -not [string]::IsNullOrEmpty([string]$_) }
+        )
         if ($process.ExitCode -ne 0 -and -not $AllowFailure) { throw "$Label failed with exit code $($process.ExitCode)" }
         return [pscustomobject]@{Output=[string[]]$lines;ExitCode=$process.ExitCode}
     } finally { $process.Dispose() }
+}
+
+function Invoke-M7Compose {
+    param([Parameter(Mandatory=$true)][string[]]$Arguments, [switch]$AllowFailure)
+    return Invoke-M7FocusedDocker -AllowFailure:$AllowFailure -Label 'authoritative-scalar-compose' -Arguments (@($composeArguments) + $Arguments)
+}
+
+function Import-M7AuthoritativeScalarFunctions {
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+        $authoritativeRunnerPath, [ref]$tokens, [ref]$errors
+    )
+    if ($errors.Count -ne 0) { throw 'authoritative scalar source has PowerShell parse errors' }
+    foreach ($name in @('Get-M7Scalar','Complete-M7SandboxPayment','Wait-M7IssuedOrder','Get-M7HostedPayment')) {
+        $definitions = @($ast.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
+        }, $true))
+        if ($definitions.Count -ne 1) { throw "authoritative scalar source must define exactly one $name function" }
+        $bodyText = $definitions[0].Body.Extent.Text
+        Set-Item -Path "Function:script:$name" -Value ([scriptblock]::Create($bodyText.Substring(1, $bodyText.Length - 2)))
+    }
+    $optionalDefinitions = @($ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-M7OptionalScalar'
+    }, $true))
+    if ($optionalDefinitions.Count -ne 1) { throw 'authoritative scalar source must define exactly one optional scalar function' }
+    $bodyText = $optionalDefinitions[0].Body.Extent.Text
+    Set-Item -Path 'Function:script:Get-M7OptionalScalar' -Value ([scriptblock]::Create($bodyText.Substring(1, $bodyText.Length - 2)))
 }
 
 function Get-M7FocusedPortURL {
@@ -134,6 +172,13 @@ function Protect-M7FocusedDiagnostic {
     })
 }
 
+function Protect-M7Diagnostic {
+    param([string[]]$Lines)
+    $value = [string](@(Protect-M7FocusedDiagnostic -Lines $Lines | Select-Object -Last 12) -join "`n")
+    if ($value.Length -gt 2048) { $value = $value.Substring($value.Length - 2048) }
+    return $value
+}
+
 function Get-M7FocusedWorkerLogs {
     param([string[]]$Services)
     $lines = [System.Collections.Generic.List[string]]::new()
@@ -180,9 +225,10 @@ SELECT current_setting('railway.deployment_region')||'|'||current_setting('railw
 }
 
 function New-M7FocusedCustomerReservation {
-    param([string]$BaseURL, [string]$TrainRunID)
+    param([string]$BaseURL, [string]$TrainRunID, [string]$Label='initial')
+    if ($Label -notmatch '^[a-z][a-z0-9-]{0,31}$') { throw 'focused fixture label is invalid' }
     $password = "M7-$([guid]::NewGuid().ToString('N').Substring(0, 14))-Aa1!"
-    $email = "m7-focused-$suffix@example.test"
+    $email = "m7-focused-$Label-$suffix@example.test"
     $ip = '198.19.77.41'
     Invoke-Milestone5DriverAPI -BaseURL $BaseURL -Method POST -Path '/api/v1/auth/register' -ForwardedFor $ip `
         -Body @{email=$email;password=$password;display_name='M7 Focused Rider'} -ExpectedStatus @(202) | Out-Null
@@ -197,7 +243,7 @@ function New-M7FocusedCustomerReservation {
         $passengers.Add([string]$passenger.Body.id)
     }
     $reservation = Invoke-Milestone5DriverAPI -BaseURL $BaseURL -Method POST -Path '/api/v1/reservations' -Token $token `
-        -IdempotencyKey "m7-focused-reservation-$suffix" -Body @{
+        -IdempotencyKey "m7-focused-$Label-reservation-$suffix" -Body @{
             train_run_id=$TrainRunID;origin_station_code='M2A';destination_station_code='M2B';
             seat_class='standard';passenger_ids=[string[]]$passengers
         } -ExpectedStatus @(201)
@@ -234,20 +280,138 @@ function Complete-M7FocusedSandboxPayment {
 }
 
 function Assert-M7FocusedConvergence {
-    param([string]$ReservationID)
+    param(
+        [string]$ReservationID,
+        [ValidateSet('booking-shard-0-postgres','booking-shard-1-postgres')][string]$ShardService='booking-shard-0-postgres'
+    )
     Wait-M7FocusedScalar -SQL "SELECT intent.state||'|'||saga.state||'|'||saga.current_step FROM public.payment_intents AS intent JOIN public.payment_sagas AS saga USING(payment_intent_id) WHERE intent.reservation_id='$ReservationID'::uuid" -Accept { param($v) $v -eq 'completed|completed|complete' } | Out-Null
     $control = Get-M7FocusedScalar -Service control-postgres -User railway_control -Database railway_control -SQL @"
 SELECT (SELECT count(*) FROM public.payment_operations AS operation JOIN public.payment_intents AS intent USING(payment_intent_id) WHERE intent.reservation_id='$ReservationID'::uuid AND operation.operation_type='capture' AND operation.state='succeeded')::text||'|'||
        (SELECT count(*) FROM public.payment_saga_actions AS action JOIN public.payment_sagas AS saga ON saga.saga_id=action.saga_id JOIN public.payment_intents AS intent ON intent.payment_intent_id=saga.payment_intent_id WHERE intent.reservation_id='$ReservationID'::uuid AND action.action_type='issue_tickets' AND action.state='succeeded')::text;
 "@
     if ($control -ne '1|1') { throw "control convergence invariant failed: $control" }
-    $shard = Get-M7FocusedScalar -Service booking-shard-0-postgres -User railway_booking -Database railway_booking -SQL @"
+    $shard = Get-M7FocusedScalar -Service $ShardService -User railway_booking -Database railway_booking -SQL @"
 SELECT (SELECT count(*) FROM public.ticket_issuance_receipts WHERE reservation_id='$ReservationID'::uuid)::text||'|'||
        (SELECT count(*) FROM public.ticket_orders WHERE reservation_id='$ReservationID'::uuid AND status='issued')::text||'|'||
        (SELECT count(*) FROM public.tickets AS ticket JOIN public.ticket_orders AS orders ON orders.id=ticket.ticket_order_id WHERE orders.reservation_id='$ReservationID'::uuid AND ticket.status='active')::text||'|'||
        (SELECT count(*)-count(DISTINCT ticket.ticket_code) FROM public.tickets AS ticket JOIN public.ticket_orders AS orders ON orders.id=ticket.ticket_order_id WHERE orders.reservation_id='$ReservationID'::uuid)::text;
 "@
     if ($shard -ne '1|1|2|0') { throw "shard convergence invariant failed: $shard" }
+}
+
+function Invoke-M7PostRestoreScalarFixture {
+    param(
+        [Parameter(Mandatory=$true)][string]$BaseURL,
+        [Parameter(Mandatory=$true)][pscustomobject]$InitialFixture
+    )
+    Import-M7AuthoritativeScalarFunctions
+    $observations = [System.Collections.Generic.List[object]]::new()
+    $schemaObservation = Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -Operation 'schema.control_version_exact' -SQL 'SELECT version::text||''|''||dirty::text FROM public.schema_migrations'
+    if ($schemaObservation -cne '11|false') { throw 'post-restore focused control schema is not clean v11' }
+    $observations.Add([ordered]@{operation='schema.control_version_exact';row_count=1;contract='exact_one';result='exact'})
+    $hostedSQL = "SELECT coalesce(hosted_session_ref,'') FROM public.payment_intents WHERE reservation_id='$($InitialFixture.ReservationID)'::uuid ORDER BY created_at DESC LIMIT 1"
+    $strictFailure = ''
+    $strictFailureKind = ''
+    $strictFailureID = ''
+    try {
+        Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL $hostedSQL -Operation 'payment.hosted_session_wait' | Out-Null
+    } catch {
+        $strictFailure = [string]$_.Exception.Message
+        $strictFailureKind = [string]$_.Exception.GetType().Name
+        $strictFailureID = [string]$_.FullyQualifiedErrorId
+    }
+    $expectedStrictFailure = 'database scalar cardinality violation: operation=payment.hosted_session_wait;service=control-postgres;row_count=0;contract=exact_one'
+    if ($strictFailure -cne $expectedStrictFailure) {
+        $boundedObserved = if ($strictFailure -match '^database scalar cardinality violation: operation=[a-z][a-z0-9_.-]{0,63};service=[a-z][a-z0-9-]{0,63};row_count=(?:[0-9]{1,4}|9999\+);contract=(?:exact_one|zero_or_one)$') {
+            $strictFailure
+        } else {
+            $safeKind = if ($strictFailureKind -match '^[A-Za-z][A-Za-z0-9]{0,63}$') { $strictFailureKind } else { 'UnknownException' }
+            $safeID = if ($strictFailureID -match '^[A-Za-z][A-Za-z0-9.,_-]{0,127}$') { $strictFailureID } else { 'UnknownErrorId' }
+            "non-cardinality-failure:$safeKind`:$safeID"
+        }
+        throw "strict scalar zero-row reproduction did not match its bounded contract: observed=$boundedObserved"
+    }
+    $observations.Add([ordered]@{operation='payment.hosted_session_wait';row_count=0;contract='exact_one';result='premature_failure'})
+
+    $initialIntent = Invoke-Milestone5DriverAPI -BaseURL $BaseURL -Method POST -Path "/api/v1/reservations/$($InitialFixture.ReservationID)/payment-intents" `
+        -Token $InitialFixture.Token -IdempotencyKey "m7-post-restore-initial-$suffix" -Body @{} -ExpectedStatus @(202)
+    if ([string]$initialIntent.Body.id -notmatch '^[0-9a-f-]{36}$') { throw 'post-restore initial payment omitted durable identity' }
+
+    $notReady = Get-M7OptionalScalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL $hostedSQL -Operation 'payment.hosted_session_wait'
+    if ($null -ne $notReady) { throw 'worker-free hosted-session fixture unexpectedly became ready' }
+    $observations.Add([ordered]@{operation='payment.hosted_session_wait';row_count=0;contract='zero_or_one';result='not_ready'})
+
+    $workerUp = @('up','-d','--wait')
+    if (-not $SkipBuild) { $workerUp += '--build' }
+    $workerUp += 'payment-worker-1'
+    Invoke-M7FocusedDocker -Label 'post-restore-worker-up' -TimeoutSeconds 900 -Arguments (@($composeArguments) + $workerUp) | Out-Null
+
+    Complete-M7SandboxPayment -DatabaseService 'control-postgres' -ReservationID $InitialFixture.ReservationID -WebhookBaseURL $BaseURL
+    $initialOrder = Wait-M7IssuedOrder -ShardService 'booking-shard-0-postgres' -ReservationID $InitialFixture.ReservationID
+    if ($initialOrder.TicketIDs -notmatch '^[0-9a-f,-]+$') { throw 'post-restore initial tickets did not converge' }
+    Assert-M7FocusedConvergence -ReservationID $InitialFixture.ReservationID -ShardService 'booking-shard-0-postgres'
+    $observations.Add([ordered]@{operation='payment.hosted_session_wait';row_count=1;contract='zero_or_one';result='converged'})
+    $observations.Add([ordered]@{operation='payment.intent_state_wait';row_count=1;contract='exact_one';result='converged'})
+    $observations.Add([ordered]@{operation='ticket.issued_order_wait';row_count=1;contract='exact_one';result='converged'})
+
+    $healthyTrain = Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -Operation 'assignment.healthy_train_select' -SQL @"
+SELECT train_run_id::text FROM public.train_run_shard_assignments
+WHERE shard_id='physical-shard-1' AND train_run_id IN (
+ '21000000-0000-4000-8000-000000000402'::uuid,'21000000-0000-4000-8000-000000000403'::uuid,
+ '21000000-0000-4000-8000-000000000404'::uuid,'21000000-0000-4000-8000-000000000405'::uuid)
+ORDER BY train_run_id LIMIT 1
+"@
+    if ($healthyTrain -notmatch '^[0-9a-f-]{36}$') { throw 'post-restore healthy assignment was not exact' }
+    $observations.Add([ordered]@{operation='assignment.healthy_train_select';row_count=1;contract='exact_one';result='exact'})
+
+    $healthyFixture = New-M7FocusedCustomerReservation -BaseURL $BaseURL -TrainRunID $healthyTrain -Label 'healthy'
+    $healthyIntent = Invoke-Milestone5DriverAPI -BaseURL $BaseURL -Method POST -Path "/api/v1/reservations/$($healthyFixture.ReservationID)/payment-intents" `
+        -Token $healthyFixture.Token -IdempotencyKey "m7-post-restore-healthy-$suffix" -Body @{} -ExpectedStatus @(202)
+    if ([string]$healthyIntent.Body.id -notmatch '^[0-9a-f-]{36}$') { throw 'post-restore healthy payment omitted durable identity' }
+    Complete-M7SandboxPayment -DatabaseService 'control-postgres' -ReservationID $healthyFixture.ReservationID -WebhookBaseURL $BaseURL
+    Wait-M7IssuedOrder -ShardService 'booking-shard-1-postgres' -ReservationID $healthyFixture.ReservationID | Out-Null
+    Assert-M7FocusedConvergence -ReservationID $healthyFixture.ReservationID -ShardService 'booking-shard-1-postgres'
+
+    $refundFixture = New-M7FocusedCustomerReservation -BaseURL $BaseURL -TrainRunID '21000000-0000-4000-8000-000000000401' -Label 'refund-crash'
+    $refundIntent = Invoke-Milestone5DriverAPI -BaseURL $BaseURL -Method POST -Path "/api/v1/reservations/$($refundFixture.ReservationID)/payment-intents" `
+        -Token $refundFixture.Token -IdempotencyKey "m7-post-restore-refund-$suffix" -Body @{} -ExpectedStatus @(202)
+    if ([string]$refundIntent.Body.id -notmatch '^[0-9a-f-]{36}$') { throw 'post-restore refund fixture omitted durable identity' }
+    Complete-M7SandboxPayment -DatabaseService 'control-postgres' -ReservationID $refundFixture.ReservationID -WebhookBaseURL $BaseURL
+    Wait-M7IssuedOrder -ShardService 'booking-shard-0-postgres' -ReservationID $refundFixture.ReservationID | Out-Null
+    Assert-M7FocusedConvergence -ReservationID $refundFixture.ReservationID -ShardService 'booking-shard-0-postgres'
+
+    $fullRefundFixture = New-M7FocusedCustomerReservation -BaseURL $BaseURL -TrainRunID '21000000-0000-4000-8000-000000000401' -Label 'full-refund'
+    $fullRefundIntent = Invoke-Milestone5DriverAPI -BaseURL $BaseURL -Method POST -Path "/api/v1/reservations/$($fullRefundFixture.ReservationID)/payment-intents" `
+        -Token $fullRefundFixture.Token -IdempotencyKey "m7-post-restore-full-refund-$suffix" -Body @{} -ExpectedStatus @(202)
+    if ([string]$fullRefundIntent.Body.id -notmatch '^[0-9a-f-]{36}$') { throw 'post-restore full-refund fixture omitted durable identity' }
+    $fullRefundHosted = Get-M7HostedPayment -DatabaseService 'control-postgres' -ReservationID $fullRefundFixture.ReservationID
+    if ([string]$fullRefundHosted.IntentID -cne [string]$fullRefundIntent.Body.id) { throw 'post-restore full-refund hosted identity was inconsistent' }
+    $observations.Add([ordered]@{operation='payment.hosted_identity_wait';row_count=1;contract='zero_or_one';result='converged'})
+
+    $workerLogs = Get-M7FocusedWorkerLogs -Services @('payment-worker-1')
+    if (@($workerLogs | Select-String 'payment pass completed with isolated failures').Count -ne 0) {
+        throw 'post-restore scalar fixture worker retained an isolated failure'
+    }
+
+    return [ordered]@{
+        status='passed'
+        evidence_scope='scalar_contract_only'
+        restore_exercised=$false
+        crash_exercised=$false
+        refund_exercised=$false
+        financial_reconciliation_exercised=$false
+        strict_polling_reproduction=$true
+        schema_version=[int](($schemaObservation -split '\|',2)[0])
+        migrations=2
+        initial_payments=1
+        healthy_shard_payments=1
+        refund_crash_fixture_payments_created=1
+        full_refund_hosted_identities=1
+        issued_orders=3
+        active_tickets=6
+        provider_contract_k6=$false
+        operations=[object[]]$observations
+    }
 }
 
 if ($NativeSelfTest) {
@@ -284,7 +448,7 @@ try {
         $probeImageBuilt = $true
     }
     $services = @('api-1')
-    if (-not $IntegrationProbe) {
+    if (-not $IntegrationProbe -and -not $PostRestoreScalarFixture) {
         $services += 'payment-worker-1'
         if ($WorkerReplicas -eq 2) { $services += 'payment-worker-2' }
     }
@@ -302,8 +466,18 @@ try {
     $migrationID = '68000000-0000-4000-8000-000000000701'
     New-Milestone5Migration -Context $context -TrainRunID $trainRunID -TargetShard 'physical-shard-0' -MigrationID $migrationID -Prefix 'm7-focused-train'
     Move-Milestone5Migration -Context $context -MigrationID $migrationID -Target rollback_window -Prefix 'm7-focused-train'
+    if ($PostRestoreScalarFixture) {
+        $healthyMigrationID = '68000000-0000-4000-8000-000000000702'
+        New-Milestone5Migration -Context $context -TrainRunID '21000000-0000-4000-8000-000000000402' -TargetShard 'physical-shard-1' -MigrationID $healthyMigrationID -Prefix 'm7-focused-healthy-train'
+        Move-Milestone5Migration -Context $context -MigrationID $healthyMigrationID -Target rollback_window -Prefix 'm7-focused-healthy-train'
+    }
     $baseURL = Get-M7FocusedPortURL
     $fixture = New-M7FocusedCustomerReservation -BaseURL $baseURL -TrainRunID $trainRunID
+    if ($PostRestoreScalarFixture) {
+        $postRestoreResult = Invoke-M7PostRestoreScalarFixture -BaseURL $baseURL -InitialFixture $fixture
+        $postRestoreResult | ConvertTo-Json -Depth 8 -Compress
+        return
+    }
     $intent = Invoke-Milestone5DriverAPI -BaseURL $baseURL -Method POST -Path "/api/v1/reservations/$($fixture.ReservationID)/payment-intents" `
         -Token $fixture.Token -IdempotencyKey "m7-focused-payment-$suffix" -Body @{} -ExpectedStatus @(202)
     if ([string]$intent.Body.id -notmatch '^[0-9a-f-]{36}$') { throw 'payment intent omitted durable identity' }

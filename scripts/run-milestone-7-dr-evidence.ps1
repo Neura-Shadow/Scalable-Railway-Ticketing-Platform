@@ -310,13 +310,55 @@ function Write-M7JSON {
 }
 
 function Get-M7Scalar {
-    param([string]$Service, [string]$User, [string]$Database, [string]$SQL, [switch]$Monitoring)
+    param(
+        [string]$Service,
+        [string]$User,
+        [string]$Database,
+        [string]$SQL,
+        [switch]$Monitoring,
+        [string]$Operation = ''
+    )
+    if ($Operation -ne '' -and ($Operation -cnotmatch '^[a-z][a-z0-9_.-]{0,63}$' -or $Operation -match '[\r\n]')) {
+        throw 'database scalar operation label is invalid'
+    }
     $arguments = @('exec','-T')
     if ($Monitoring) { $arguments += @('-e','PGOPTIONS=-c role=pg_read_all_stats') }
     $arguments += @($Service,'psql','-X','-v','ON_ERROR_STOP=1','-U',$User,'-d',$Database,'-tAc',$SQL)
     $result = Invoke-M7Compose -Arguments $arguments
-    $values = @($result.Output | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
-    if ($values.Count -ne 1) { throw "database scalar was not exactly one row for $Service" }
+    $values = @($result.Output | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -ne '' })
+    if ($values.Count -ne 1) {
+        $boundedOperation = if ($Operation -eq '') { 'unlabeled' } else { $Operation }
+        $boundedService = if ($Service -cmatch '^[a-z][a-z0-9-]{0,63}$' -and $Service -notmatch '[\r\n]') { $Service } else { 'invalid-service' }
+        $boundedRowCount = if ($values.Count -gt 9999) { '9999+' } else { [string]$values.Count }
+        throw "database scalar cardinality violation: operation=$boundedOperation;service=$boundedService;row_count=$boundedRowCount;contract=exact_one"
+    }
+    return [string]$values[0]
+}
+
+function Get-M7OptionalScalar {
+    param(
+        [string]$Service,
+        [string]$User,
+        [string]$Database,
+        [string]$SQL,
+        [switch]$Monitoring,
+        [string]$Operation = ''
+    )
+    if ($Operation -ne '' -and ($Operation -cnotmatch '^[a-z][a-z0-9_.-]{0,63}$' -or $Operation -match '[\r\n]')) {
+        throw 'database scalar operation label is invalid'
+    }
+    $arguments = @('exec','-T')
+    if ($Monitoring) { $arguments += @('-e','PGOPTIONS=-c role=pg_read_all_stats') }
+    $arguments += @($Service,'psql','-X','-v','ON_ERROR_STOP=1','-U',$User,'-d',$Database,'-tAc',$SQL)
+    $result = Invoke-M7Compose -Arguments $arguments
+    $values = @($result.Output | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -ne '' })
+    if ($values.Count -eq 0) { return $null }
+    if ($values.Count -gt 1) {
+        $boundedOperation = if ($Operation -eq '') { 'unlabeled' } else { $Operation }
+        $boundedService = if ($Service -cmatch '^[a-z][a-z0-9-]{0,63}$' -and $Service -notmatch '[\r\n]') { $Service } else { 'invalid-service' }
+        $boundedRowCount = if ($values.Count -gt 9999) { '9999+' } else { [string]$values.Count }
+        throw "database scalar cardinality violation: operation=$boundedOperation;service=$boundedService;row_count=$boundedRowCount;contract=zero_or_one"
+    }
     return [string]$values[0]
 }
 
@@ -740,7 +782,8 @@ function Complete-M7SandboxPayment {
     if ($ReservationID -notmatch '^[0-9a-f-]{36}$') { throw 'payment failover reservation identity is malformed' }
     $hosted = ''
     for ($attempt=1; $attempt -le 120; $attempt++) {
-        $hosted = Get-M7Scalar -Service $DatabaseService -User 'railway_control' -Database 'railway_control' -SQL "SELECT coalesce(hosted_session_ref,'') FROM public.payment_intents WHERE reservation_id='$ReservationID'::uuid ORDER BY created_at DESC LIMIT 1"
+        $hosted = Get-M7OptionalScalar -Service $DatabaseService -User 'railway_control' -Database 'railway_control' -Operation 'payment.hosted_session_wait' -SQL "SELECT coalesce(hosted_session_ref,'') FROM public.payment_intents WHERE reservation_id='$ReservationID'::uuid ORDER BY created_at DESC LIMIT 1"
+        if ($null -eq $hosted) { $hosted = '' }
         if ($hosted -match '^sandbox-checkout:([A-Za-z0-9._:-]+)$') { break }
         Start-Sleep -Milliseconds 500
     }
@@ -758,11 +801,11 @@ function Complete-M7SandboxPayment {
         if ([int]$response.StatusCode -notin @(200,202)) { throw 'failover payment webhook was not durably acknowledged' }
     }
     for ($attempt=1; $attempt -le 120; $attempt++) {
-        $state = Get-M7Scalar -Service $DatabaseService -User 'railway_control' -Database 'railway_control' -SQL "SELECT state FROM public.payment_intents WHERE reservation_id='$ReservationID'::uuid ORDER BY created_at DESC LIMIT 1"
+        $state = Get-M7Scalar -Service $DatabaseService -User 'railway_control' -Database 'railway_control' -Operation 'payment.intent_state_wait' -SQL "SELECT state FROM public.payment_intents WHERE reservation_id='$ReservationID'::uuid ORDER BY created_at DESC LIMIT 1"
         if ($state -eq 'completed') { return }
         Start-Sleep -Milliseconds 500
     }
-    $stateDiagnostic = Get-M7Scalar -Service $DatabaseService -User 'railway_control' -Database 'railway_control' -SQL @"
+    $stateDiagnostic = Get-M7Scalar -Service $DatabaseService -User 'railway_control' -Database 'railway_control' -Operation 'payment.state_timeout_snapshot' -SQL @"
 SELECT coalesce((SELECT 'intent='||intent.state FROM public.payment_intents AS intent WHERE intent.reservation_id='$ReservationID'::uuid ORDER BY intent.created_at DESC LIMIT 1),'intent=missing')||'|'||
        coalesce((SELECT 'saga='||saga.state||':'||saga.current_step FROM public.payment_sagas AS saga JOIN public.payment_intents AS intent USING(payment_intent_id) WHERE intent.reservation_id='$ReservationID'::uuid ORDER BY saga.created_at DESC LIMIT 1),'saga=missing')||'|'||
        coalesce((SELECT 'operations='||string_agg(operation.operation_type||':'||operation.state,',' ORDER BY operation.operation_type) FROM public.payment_operations AS operation JOIN public.payment_intents AS intent USING(payment_intent_id) WHERE intent.reservation_id='$ReservationID'::uuid),'operations=none')||'|'||
@@ -777,7 +820,7 @@ function Wait-M7IssuedOrder {
     param([string]$ShardService, [string]$ReservationID)
     if ($ReservationID -notmatch '^[0-9a-f-]{36}$') { throw 'issued-order reservation identity is malformed' }
     for ($attempt=1; $attempt -le 120; $attempt++) {
-        $value = Get-M7Scalar -Service $ShardService -User 'railway_booking' -Database 'railway_booking' -SQL @"
+        $value = Get-M7Scalar -Service $ShardService -User 'railway_booking' -Database 'railway_booking' -Operation 'ticket.issued_order_wait' -SQL @"
 SELECT coalesce((
     SELECT orders.id::text||'|'||coalesce((
         SELECT string_agg(ticket.id::text,',' ORDER BY ticket.id)
@@ -805,7 +848,8 @@ SELECT coalesce((
 function Get-M7HostedPayment {
     param([string]$DatabaseService, [string]$ReservationID)
     for ($attempt=1; $attempt -le 120; $attempt++) {
-        $value = Get-M7Scalar -Service $DatabaseService -User 'railway_control' -Database 'railway_control' -SQL "SELECT payment_intent_id::text||'|'||coalesce(hosted_session_ref,'') FROM public.payment_intents WHERE reservation_id='$ReservationID'::uuid ORDER BY created_at DESC LIMIT 1"
+        $value = Get-M7OptionalScalar -Service $DatabaseService -User 'railway_control' -Database 'railway_control' -Operation 'payment.hosted_identity_wait' -SQL "SELECT payment_intent_id::text||'|'||coalesce(hosted_session_ref,'') FROM public.payment_intents WHERE reservation_id='$ReservationID'::uuid ORDER BY created_at DESC LIMIT 1"
+        if ($null -eq $value) { $value = '' }
         $parts = $value -split '\|',2
         if ($parts.Count -eq 2 -and $parts[0] -match '^[0-9a-f-]{36}$' -and $parts[1] -match '^sandbox-checkout:([A-Za-z0-9._:-]+)$') {
             return [pscustomobject]@{ IntentID=$parts[0]; ProviderPaymentID=$Matches[1] }
@@ -1850,7 +1894,7 @@ COMMIT;
             $orderFixtures.Add((Wait-M7IssuedOrder -ShardService 'booking-shard-0-postgres' -ReservationID $reservationID))
         }
         $m7Orders = [object[]]$orderFixtures
-        $m7HealthyTrain = Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL @"
+        $m7HealthyTrain = Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -Operation 'assignment.healthy_train_select' -SQL @"
 SELECT train_run_id::text FROM public.train_run_shard_assignments
 WHERE shard_id='physical-shard-1' AND train_run_id IN (
  '21000000-0000-4000-8000-000000000402'::uuid,'21000000-0000-4000-8000-000000000403'::uuid,

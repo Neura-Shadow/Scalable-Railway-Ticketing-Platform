@@ -10,12 +10,13 @@ $root = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $runnerPath = Join-Path $PSScriptRoot 'run-milestone-7-dr-evidence.ps1'
 $k6DiagnosticPath = Join-Path $PSScriptRoot 'milestone-7/k6-diagnostics.ps1'
 $focusedRunnerPath = Join-Path $PSScriptRoot 'run-m7-provider-contract-focused.ps1'
+$paymentFocusedRunnerPath = Join-Path $PSScriptRoot 'run-m7-payment-convergence.ps1'
 $composePath = Join-Path $root 'docker-compose.dr.yml'
 $replicationPath = Join-Path $root 'deploy/postgres/dr/10-replication.sh'
 $standbyPath = Join-Path $root 'deploy/postgres/dr/start-standby.sh'
 $workflowPath = Join-Path $root '.github/workflows/milestone-7-dr.yml'
 $dockerfilePath = Join-Path $root 'Dockerfile'
-foreach ($required in @($runnerPath, $k6DiagnosticPath, $focusedRunnerPath, $composePath, $replicationPath, $standbyPath, $workflowPath)) {
+foreach ($required in @($runnerPath, $k6DiagnosticPath, $focusedRunnerPath, $paymentFocusedRunnerPath, $composePath, $replicationPath, $standbyPath, $workflowPath)) {
     if (-not (Test-Path -LiteralPath $required)) { throw "Milestone 7 DR artifact is missing: $(Split-Path -Leaf $required)" }
 }
 
@@ -351,9 +352,9 @@ foreach ($required in @(
 }
 $tokens = $null
 $parseErrors = $null
-[System.Management.Automation.Language.Parser]::ParseFile(
+$runnerAst = [System.Management.Automation.Language.Parser]::ParseFile(
     $runnerPath, [ref]$tokens, [ref]$parseErrors
-) | Out-Null
+)
 if ($parseErrors.Count -ne 0) { throw "Milestone 7 DR runner has $($parseErrors.Count) PowerShell parse errors" }
 $tokens = $null
 $parseErrors = $null
@@ -361,9 +362,246 @@ $parseErrors = $null
     $focusedRunnerPath, [ref]$tokens, [ref]$parseErrors
 ) | Out-Null
 if ($parseErrors.Count -ne 0) { throw "focused provider-contract runner has $($parseErrors.Count) PowerShell parse errors" }
+$tokens = $null
+$parseErrors = $null
+$paymentFocusedAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    $paymentFocusedRunnerPath, [ref]$tokens, [ref]$parseErrors
+)
+if ($parseErrors.Count -ne 0) { throw "focused payment runner has $($parseErrors.Count) PowerShell parse errors" }
 
 $source = Get-Content -Raw -LiteralPath $runnerPath
 $focusedSource = Get-Content -Raw -LiteralPath $focusedRunnerPath
+$paymentFocusedSource = Get-Content -Raw -LiteralPath $paymentFocusedRunnerPath
+$postRestoreFocusedFunction = [regex]::Match($paymentFocusedSource, '(?ms)function Invoke-M7PostRestoreScalarFixture\b.*?^}').Value
+if (-not $paymentFocusedSource.Contains('function Protect-M7Diagnostic') -or
+    -not $paymentFocusedSource.Contains('Protect-M7FocusedDiagnostic -Lines $Lines | Select-Object -Last 12') -or
+    -not $paymentFocusedSource.Contains('if ($value.Length -gt 2048)') -or
+    -not $paymentFocusedSource.Contains("'Get-M7Scalar','Complete-M7SandboxPayment','Wait-M7IssuedOrder','Get-M7HostedPayment'") -or
+    -not $paymentFocusedSource.Contains("must define exactly one optional scalar function") -or
+    -not $paymentFocusedSource.Contains('[switch]$PostRestoreScalarFixture') -or
+    -not $paymentFocusedSource.Contains("-Operation 'schema.control_version_exact'") -or
+    -not $paymentFocusedSource.Contains("if (`$schemaObservation -cne '11|false')") -or
+    -not $paymentFocusedSource.Contains("evidence_scope='scalar_contract_only'") -or
+    -not $paymentFocusedSource.Contains('restore_exercised=$false') -or
+    -not $paymentFocusedSource.Contains('crash_exercised=$false') -or
+    -not $paymentFocusedSource.Contains('refund_exercised=$false') -or
+    -not $paymentFocusedSource.Contains('financial_reconciliation_exercised=$false') -or
+    -not $paymentFocusedSource.Contains('refund_crash_fixture_payments_created=1') -or
+    $paymentFocusedSource.Contains('refund_crash_payments=1') -or
+    [regex]::Matches($postRestoreFocusedFunction, '(?m)^\s*Assert-M7FocusedConvergence\s+-ReservationID').Count -ne 3 -or
+    -not $postRestoreFocusedFunction.Contains("Assert-M7FocusedConvergence -ReservationID `$InitialFixture.ReservationID -ShardService 'booking-shard-0-postgres'") -or
+    -not $postRestoreFocusedFunction.Contains("Assert-M7FocusedConvergence -ReservationID `$healthyFixture.ReservationID -ShardService 'booking-shard-1-postgres'") -or
+    -not $postRestoreFocusedFunction.Contains("Assert-M7FocusedConvergence -ReservationID `$refundFixture.ReservationID -ShardService 'booking-shard-0-postgres'") -or
+    -not $postRestoreFocusedFunction.Contains("Select-String 'payment pass completed with isolated failures'") -or
+    $paymentFocusedSource.Contains('schema_version=11') -or
+    $paymentFocusedSource.Contains("production-provider-contract.js")) {
+    throw 'focused payment runner does not preserve its bounded imported-helper diagnostic contract'
+}
+foreach ($functionName in @('Protect-M7FocusedDiagnostic','Protect-M7Diagnostic')) {
+    $definitions = @($paymentFocusedAst.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $functionName
+    }, $true))
+    if ($definitions.Count -ne 1) { throw "focused payment runner must define exactly one $functionName function" }
+    . ([scriptblock]::Create($definitions[0].Extent.Text))
+}
+$wrappedTimeoutDiagnostic = [string](Protect-M7Diagnostic -Lines @(
+    'postgresql://audit-user:audit-pass@db.example/railway',
+    'reservation=123e4567-e89b-12d3-a456-426614174000',
+    'token=synthetic-sensitive-value'
+))
+if ($wrappedTimeoutDiagnostic.Length -gt 2048 -or
+    $wrappedTimeoutDiagnostic.Contains('audit-pass') -or
+    $wrappedTimeoutDiagnostic.Contains('123e4567-e89b-12d3-a456-426614174000') -or
+    $wrappedTimeoutDiagnostic.Contains('synthetic-sensitive-value') -or
+    -not $wrappedTimeoutDiagnostic.Contains('[REDACTED_DSN]') -or
+    -not $wrappedTimeoutDiagnostic.Contains('[REDACTED_UUID]') -or
+    -not $wrappedTimeoutDiagnostic.Contains('token=[REDACTED]')) {
+    throw 'focused payment timeout diagnostic wrapper did not preserve bounded redaction'
+}
+$wideTimeoutDiagnostic = [string](Protect-M7Diagnostic -Lines ([string[]]@(1..40 | ForEach-Object { 'x' * 4096 })))
+if ($wideTimeoutDiagnostic.Length -ne 2048) { throw 'focused payment timeout diagnostic wrapper did not cap a wide diagnostic at 2048 characters' }
+
+function Set-M7ScalarTestResponses {
+    param([Parameter(Mandatory=$true)][object[]]$Responses)
+    $script:m7ScalarTestResponses = [System.Collections.Generic.Queue[object]]::new()
+    foreach ($response in $Responses) { $script:m7ScalarTestResponses.Enqueue($response) }
+    $script:m7ScalarTestCalls = 0
+}
+
+function Invoke-M7Compose {
+    param([Parameter(Mandatory=$true)][string[]]$Arguments, [switch]$AllowFailure)
+    $script:m7ScalarTestCalls++
+    if ($null -eq $script:m7ScalarTestResponses -or $script:m7ScalarTestResponses.Count -eq 0) {
+        throw 'scalar test response queue was exhausted'
+    }
+    $response = $script:m7ScalarTestResponses.Dequeue()
+    if ($response.PSObject.Properties['Error']) { throw [string]$response.Error }
+    return [pscustomobject]@{ Output=[string[]]@($response.Output); ExitCode=0 }
+}
+
+$scalarFunctionNames = @('Get-M7Scalar','Get-M7OptionalScalar')
+foreach ($functionName in $scalarFunctionNames) {
+    $definitions = @($runnerAst.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $functionName
+    }, $true))
+    if ($definitions.Count -ne 1) {
+        throw "Milestone 7 runner must define exactly one $functionName function; found $($definitions.Count)"
+    }
+    . ([scriptblock]::Create($definitions[0].Extent.Text))
+}
+
+function Get-M7ScalarTestFailure {
+    param([Parameter(Mandatory=$true)][scriptblock]$Command)
+    try {
+        & $Command | Out-Null
+    } catch {
+        return [string]$_.Exception.Message
+    }
+    throw 'expected scalar operation to fail'
+}
+
+function Assert-M7BoundedCardinalityFailure {
+    param(
+        [Parameter(Mandatory=$true)][string]$Message,
+        [Parameter(Mandatory=$true)][string]$Operation,
+        [Parameter(Mandatory=$true)][string]$RowCount,
+        [Parameter(Mandatory=$true)][ValidateSet('exact_one','zero_or_one')][string]$Contract
+    )
+    $expected = "database scalar cardinality violation: operation=$Operation;service=control-postgres;row_count=$RowCount;contract=$Contract"
+    if ($Message -cne $expected) { throw "scalar cardinality diagnostic contract mismatch: $Message" }
+    if ($Message.Length -gt 512) { throw 'scalar cardinality diagnostic exceeded 512 characters' }
+}
+
+$emptyResponse = [pscustomobject]@{ Output=[string[]]@() }
+$readyResponse = [pscustomobject]@{ Output=[string[]]@('ready') }
+$twoRowResponse = [pscustomobject]@{ Output=[string[]]@('first','secret-row-value') }
+$sqlErrorResponse = [pscustomobject]@{ Error='synthetic SQL execution failure' }
+
+# Strict exact-one remains fail closed for each invariant family in this window.
+foreach ($operation in @('assignment.healthy_train_select','payment.intent_state_wait','ticket.issued_order_wait')) {
+    Set-M7ScalarTestResponses -Responses @($emptyResponse)
+    $failure = Get-M7ScalarTestFailure {
+        Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL 'SELECT synthetic' -Operation $operation
+    }
+    Assert-M7BoundedCardinalityFailure -Message $failure -Operation $operation -RowCount '0' -Contract 'exact_one'
+}
+Set-M7ScalarTestResponses -Responses @($readyResponse)
+if ((Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL 'SELECT synthetic' -Operation 'payment.intent_state_wait') -cne 'ready') {
+    throw 'strict scalar did not preserve the exact one-row value'
+}
+Set-M7ScalarTestResponses -Responses @($twoRowResponse)
+$strictManyFailure = Get-M7ScalarTestFailure {
+    Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL 'SELECT synthetic' -Operation 'assignment.healthy_train_select'
+}
+Assert-M7BoundedCardinalityFailure -Message $strictManyFailure -Operation 'assignment.healthy_train_select' -RowCount '2' -Contract 'exact_one'
+if ($strictManyFailure.Contains('secret-row-value')) { throw 'strict scalar cardinality diagnostic leaked a row value' }
+
+# Strict scalar terminates a zero-row polling query before a deterministic later result.
+Set-M7ScalarTestResponses -Responses @($emptyResponse,$readyResponse)
+$prematureFailure = Get-M7ScalarTestFailure {
+    Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL 'SELECT synthetic' -Operation 'payment.hosted_session_wait'
+}
+Assert-M7BoundedCardinalityFailure -Message $prematureFailure -Operation 'payment.hosted_session_wait' -RowCount '0' -Contract 'exact_one'
+if ($script:m7ScalarTestCalls -ne 1 -or $script:m7ScalarTestResponses.Count -ne 1) {
+    throw 'strict scalar polling reproduction did not stop before the deterministic second result'
+}
+
+# Optional scalar is the only contract allowed to treat zero rows as not ready.
+Set-M7ScalarTestResponses -Responses @($emptyResponse)
+$optionalEmpty = Get-M7OptionalScalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL 'SELECT synthetic' -Operation 'payment.hosted_session_wait'
+if ($null -ne $optionalEmpty) { throw 'optional scalar did not return null for zero rows' }
+Set-M7ScalarTestResponses -Responses @($readyResponse)
+if ((Get-M7OptionalScalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL 'SELECT synthetic' -Operation 'payment.hosted_session_wait') -cne 'ready') {
+    throw 'optional scalar did not preserve the one-row value'
+}
+Set-M7ScalarTestResponses -Responses @($twoRowResponse)
+$optionalManyFailure = Get-M7ScalarTestFailure {
+    Get-M7OptionalScalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL 'SELECT synthetic' -Operation 'payment.hosted_identity_wait'
+}
+Assert-M7BoundedCardinalityFailure -Message $optionalManyFailure -Operation 'payment.hosted_identity_wait' -RowCount '2' -Contract 'zero_or_one'
+if ($optionalManyFailure.Contains('secret-row-value')) { throw 'optional scalar cardinality diagnostic leaked a row value' }
+Set-M7ScalarTestResponses -Responses @($sqlErrorResponse)
+$optionalSQLFailure = Get-M7ScalarTestFailure {
+    Get-M7OptionalScalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL 'SELECT synthetic' -Operation 'payment.hosted_identity_wait'
+}
+if ($optionalSQLFailure -cne 'synthetic SQL execution failure') { throw 'optional scalar did not preserve SQL execution failure semantics' }
+
+Set-M7ScalarTestResponses -Responses @($readyResponse)
+$invalidOperationFailure = Get-M7ScalarTestFailure {
+    Get-M7OptionalScalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL 'SELECT synthetic' -Operation 'Invalid.operation'
+}
+if ($invalidOperationFailure -cne 'database scalar operation label is invalid' -or $script:m7ScalarTestCalls -ne 0) {
+    throw 'optional scalar did not reject a malformed operation label before SQL execution'
+}
+Set-M7ScalarTestResponses -Responses @($readyResponse)
+$overlongOperationFailure = Get-M7ScalarTestFailure {
+    Get-M7OptionalScalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL 'SELECT synthetic' -Operation ('a' * 65)
+}
+if ($overlongOperationFailure -cne 'database scalar operation label is invalid' -or $script:m7ScalarTestCalls -ne 0) {
+    throw 'optional scalar did not reject a 65-character operation label before SQL execution'
+}
+Set-M7ScalarTestResponses -Responses @($readyResponse)
+$newlineOperationFailure = Get-M7ScalarTestFailure {
+    Get-M7OptionalScalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL 'SELECT synthetic' -Operation "valid.operation`n"
+}
+if ($newlineOperationFailure -cne 'database scalar operation label is invalid' -or $script:m7ScalarTestCalls -ne 0) {
+    throw 'optional scalar did not reject an operation label with a trailing newline before SQL execution'
+}
+Set-M7ScalarTestResponses -Responses @($readyResponse)
+if ((Get-M7OptionalScalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL 'SELECT synthetic' -Operation ('a' * 64)) -cne 'ready') {
+    throw 'optional scalar rejected a valid 64-character operation label'
+}
+Set-M7ScalarTestResponses -Responses @($emptyResponse)
+$newlineServiceFailure = Get-M7ScalarTestFailure {
+    Get-M7Scalar -Service "control-postgres`n" -User 'railway_control' -Database 'railway_control' -SQL 'SELECT synthetic' -Operation 'assignment.healthy_train_select'
+}
+$expectedNewlineServiceFailure = 'database scalar cardinality violation: operation=assignment.healthy_train_select;service=invalid-service;row_count=0;contract=exact_one'
+if ($newlineServiceFailure -cne $expectedNewlineServiceFailure) {
+    throw 'strict scalar did not suppress a newline-bearing service from its diagnostic'
+}
+Set-M7ScalarTestResponses -Responses @($readyResponse)
+if ((Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL 'SELECT synthetic') -cne 'ready') {
+    throw 'strict scalar compatibility without an operation label was not preserved'
+}
+
+Set-M7ScalarTestResponses -Responses @($emptyResponse,$readyResponse)
+$eventuallyReady = $null
+for ($attempt=1; $attempt -le 2; $attempt++) {
+    $eventuallyReady = Get-M7OptionalScalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL 'SELECT synthetic' -Operation 'payment.hosted_session_wait'
+    if ($null -eq $eventuallyReady) { continue }
+    break
+}
+if ($eventuallyReady -cne 'ready' -or $script:m7ScalarTestCalls -ne 2) {
+    throw 'optional scalar polling did not continue to the deterministic second result'
+}
+
+$scalarCallSiteContracts = @(
+    @{ Pattern='(?m)^\s*\$hosted\s*=\s*Get-M7OptionalScalar\b[^\r\n]*-Operation\s+''payment\.hosted_session_wait'''; Name='hosted-session wait' },
+    @{ Pattern='(?m)^\s*\$value\s*=\s*Get-M7OptionalScalar\b[^\r\n]*-Operation\s+''payment\.hosted_identity_wait'''; Name='hosted-identity wait' },
+    @{ Pattern='(?m)^\s*\$state\s*=\s*Get-M7Scalar\b[^\r\n]*-Operation\s+''payment\.intent_state_wait'''; Name='payment intent state wait' },
+    @{ Pattern='(?m)^\s*\$value\s*=\s*Get-M7Scalar\b[^\r\n]*-Operation\s+''ticket\.issued_order_wait'''; Name='issued-order wait' },
+    @{ Pattern='(?ms)^\s*\$m7HealthyTrain\s*=\s*Get-M7Scalar\b.*?-Operation\s+''assignment\.healthy_train_select''.*?-SQL\s+@"'; Name='healthy assignment exact lookup' }
+)
+foreach ($contract in $scalarCallSiteContracts) {
+    if ([regex]::Matches($source, [string]$contract.Pattern).Count -ne 1) {
+        throw "Milestone 7 runner omits exactly one bounded $($contract.Name) scalar contract"
+    }
+}
+if (-not $source.Contains("-Operation 'payment.state_timeout_snapshot'") -or
+    $source -notmatch 'Get-M7Scalar\b[^\r\n]*-Operation\s+''payment\.state_timeout_snapshot''' -or
+    -not $source.Contains("-Operation 'ticket.issued_order_wait'")) {
+    throw 'Milestone 7 polling window omits bounded exact-one diagnostic labels'
+}
+$hostedWait = [regex]::Match($source, '(?ms)function Complete-M7SandboxPayment\b.*?^}').Value
+$hostedIdentityWait = [regex]::Match($source, '(?ms)function Get-M7HostedPayment\b.*?^}').Value
+if (-not $hostedWait.Contains("if (`$null -eq `$hosted) { `$hosted = '' }") -or
+    -not $hostedIdentityWait.Contains("if (`$null -eq `$value) { `$value = '' }") -or
+    $hostedWait -notmatch 'attempt\s*-le\s*120' -or $hostedWait -notmatch 'Start-Sleep -Milliseconds 500' -or
+    $hostedIdentityWait -notmatch 'attempt\s*-le\s*120' -or $hostedIdentityWait -notmatch 'Start-Sleep -Milliseconds 500') {
+    throw 'optional scalar call sites must preserve explicit not-ready continuation and existing polling bounds'
+}
 $diagnosticBuildIndex = $source.IndexOf('$diagnostic = Get-M7K6Diagnostic', [System.StringComparison]::Ordinal)
 $diagnosticThrowIndex = $source.IndexOf('if ($result.ExitCode -ne 0 -or', [System.StringComparison]::Ordinal)
 if ($diagnosticBuildIndex -lt 0 -or $diagnosticThrowIndex -le $diagnosticBuildIndex -or
