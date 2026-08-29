@@ -37,6 +37,48 @@ $parseErrors = $null
 if ($parseErrors.Count -ne 0) { throw "Milestone 7 DR runner has $($parseErrors.Count) PowerShell parse errors" }
 
 $source = Get-Content -Raw -LiteralPath $runnerPath
+$assignmentQueryContracts = @(
+    @{
+        Name = 'healthy physical-shard assignment selection'
+        Pattern = '(?ms)^\s*\$m7HealthyTrain\s*=\s*Get-M7Scalar\b.*?-SQL\s+@"\r?\n(?<sql>SELECT\b.*?)\r?\n"@'
+        Required = @(
+            'FROM public.train_run_shard_assignments',
+            "WHERE shard_id='physical-shard-1'",
+            'train_run_id IN (',
+            'ORDER BY train_run_id LIMIT 1'
+        )
+    },
+    @{
+        Name = 'post-cutover refund route'
+        Pattern = '(?ms)^\s*\$postCutoverRefundRoute\s*=\s*Get-M7Scalar\b.*?-SQL\s+@"\r?\n(?<sql>SELECT\b.*?)\r?\n"@'
+        Required = @('FROM public.train_run_shard_assignments', "train_run_id='`$m7Train'::uuid")
+    },
+    @{
+        Name = 'reverse refund assignment evidence'
+        Pattern = '(?ms)^\s*\$reverseRefundEvidence\s*=\s*Get-M7Scalar\b.*?-SQL\s+@"\r?\n(?<sql>SELECT\b.*?)\r?\n"@'
+        Required = @('FROM public.train_run_shard_assignments AS assignment', "assignment.train_run_id='`$m7Train'::uuid")
+    },
+    @{
+        Name = 'return refund assignment evidence'
+        Pattern = '(?m)^\s*\$returnRefundEvidence\s*=\s*Get-M7Scalar\b.*?-SQL\s+"(?<sql>SELECT\b[^"\r\n]+)"\s*$'
+        Required = @('FROM public.train_run_shard_assignments', "train_run_id='`$m7Train'::uuid")
+    }
+)
+foreach ($contract in $assignmentQueryContracts) {
+    $queryMatches = [regex]::Matches($source, [string]$contract.Pattern)
+    if ($queryMatches.Count -ne 1) {
+        throw "Milestone 7 runner must contain exactly one $($contract.Name) query; found $($queryMatches.Count)"
+    }
+    $assignmentSQL = $queryMatches[0].Groups['sql'].Value
+    foreach ($requiredToken in $contract.Required) {
+        if (-not $assignmentSQL.Contains($requiredToken)) {
+            throw "$($contract.Name) query omits required token: $requiredToken"
+        }
+    }
+    if ($assignmentSQL -match '(?i)\bis_current\b') {
+        throw "$($contract.Name) query assumes nonexistent train_run_shard_assignments.is_current"
+    }
+}
 foreach ($replicationBootstrapGuard in @(
     '/etc/railway/configure-replication.sh',
     'pg_hba_file_rules',

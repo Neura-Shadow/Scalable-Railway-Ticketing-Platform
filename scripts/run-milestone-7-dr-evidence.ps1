@@ -1784,7 +1784,7 @@ COMMIT;
         $m7Orders = [object[]]$orderFixtures
         $m7HealthyTrain = Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL @"
 SELECT train_run_id::text FROM public.train_run_shard_assignments
-WHERE is_current AND shard_id='physical-shard-1' AND train_run_id IN (
+WHERE shard_id='physical-shard-1' AND train_run_id IN (
  '21000000-0000-4000-8000-000000000402'::uuid,'21000000-0000-4000-8000-000000000403'::uuid,
  '21000000-0000-4000-8000-000000000404'::uuid,'21000000-0000-4000-8000-000000000405'::uuid)
 ORDER BY train_run_id LIMIT 1
@@ -1872,7 +1872,7 @@ ORDER BY train_run_id LIMIT 1
             throw 'reverse physical migration advanced before both refund effects were durably applied'
         }
         $postCutoverRefundRoute = Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL @"
-SELECT (SELECT shard_id FROM public.train_run_shard_assignments WHERE train_run_id='$m7Train'::uuid AND is_current)::text||'|'||
+SELECT (SELECT shard_id FROM public.train_run_shard_assignments WHERE train_run_id='$m7Train'::uuid)::text||'|'||
        (SELECT count(*) FROM public.reservation_shard_locators WHERE reservation_id IN ('$($m7Customer.Reservations[0])'::uuid,'$($m7Customer.Reservations[1])'::uuid) AND shard_id='physical-shard-0')::text
 "@
         if ($postCutoverRefundRoute -ne 'physical-shard-0|2') { throw 'post-cutover refund locators did not follow the current physical route' }
@@ -1886,13 +1886,13 @@ FROM public.train_run_shard_assignments AS assignment
 LEFT JOIN public.physical_source_selected_ticket_refund_receipt_rows AS receipt
   ON receipt.source_shard_id=assignment.shard_id
  AND receipt.ticket_id IN ('$((($m7Orders[0].TicketIDs -split ',')[0]))'::uuid,'$((($m7Orders[1].TicketIDs -split ',')[0]))'::uuid)
-WHERE assignment.train_run_id='$m7Train'::uuid AND assignment.is_current
+WHERE assignment.train_run_id='$m7Train'::uuid
 GROUP BY assignment.shard_id,assignment.assignment_generation
 "@
         if ($reverseRefundEvidence -notmatch '^(legacy|shard-0|shard-1)\|3\|2$') { throw "reverse migration did not preserve both applied partial refunds: $reverseRefundEvidence" }
         New-Milestone5Migration -Context $driverContext -TrainRunID $m7Train -TargetShard 'physical-shard-0' -MigrationID $m7ReturnMigration -Prefix 'm7-refund-return'
         Move-Milestone5Migration -Context $driverContext -MigrationID $m7ReturnMigration -Target rollback_window -Prefix 'm7-refund-return'
-        $returnRefundEvidence = Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL "SELECT shard_id||'|'||assignment_generation::text FROM public.train_run_shard_assignments WHERE train_run_id='$m7Train'::uuid AND is_current"
+        $returnRefundEvidence = Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL "SELECT shard_id||'|'||assignment_generation::text FROM public.train_run_shard_assignments WHERE train_run_id='$m7Train'::uuid"
         $returnRefundReceipts = Get-M7Scalar -Service 'booking-shard-0-postgres' -User 'railway_booking' -Database 'railway_booking' -SQL "SELECT count(*) FROM public.selected_ticket_refund_receipts WHERE ticket_id IN ('$((($m7Orders[0].TicketIDs -split ',')[0]))'::uuid,'$((($m7Orders[1].TicketIDs -split ',')[0]))'::uuid)"
         if ($returnRefundEvidence -ne 'physical-shard-0|4' -or $returnRefundReceipts -ne '2') { throw 'post-reverse return migration did not preserve both applied partial refunds on the active physical shard' }
         $physicalMigrationInteractionEvidence = [ordered]@{
