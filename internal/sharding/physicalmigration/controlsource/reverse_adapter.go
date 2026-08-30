@@ -763,6 +763,9 @@ func normalizeReversePayload(data []byte, table string, record physicalmigration
 		delete(value, "updated_at")
 	case "ticket_orders", "tickets":
 		delete(value, "train_run_id")
+	case "ticket_refund_prepare_receipts":
+		// Control v11 keeps this fence column on each logical target.
+		value["assignment_generation"] = record.TargetGeneration
 	case "outbox_events":
 		delete(value, "lease_token")
 		delete(value, "updated_at")

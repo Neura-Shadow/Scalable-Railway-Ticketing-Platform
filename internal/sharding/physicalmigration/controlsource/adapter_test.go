@@ -2,6 +2,7 @@ package controlsource
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -400,6 +401,31 @@ func TestReversePayloadDropsPhysicalOnlyColumnsAndRebindsOutbox(t *testing.T) {
 		if !strings.Contains(text, required) {
 			t.Fatalf("normalized payload omitted %s: %s", required, text)
 		}
+	}
+}
+
+func TestReversePrepareReceiptRebindsTargetGeneration(t *testing.T) {
+	t.Parallel()
+
+	record := physicalmigration.Record{
+		TrainRunID: uuid.New(), SourceGeneration: 8,
+		TargetGeneration: 9, TargetShardID: SourceLegacy,
+	}
+	id := uuid.New()
+	raw := []byte(`{"id":"` + id.String() + `","train_run_id":"` + record.TrainRunID.String() +
+		`","assignment_generation":8}`)
+	normalized, err := normalizeReversePayload(raw, "ticket_refund_prepare_receipts", record)
+	if err != nil {
+		t.Fatalf("normalizeReversePayload() error = %v", err)
+	}
+	var payload struct {
+		AssignmentGeneration int64 `json:"assignment_generation"`
+	}
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatalf("decode normalized payload: %v", err)
+	}
+	if payload.AssignmentGeneration != record.TargetGeneration {
+		t.Fatalf("assignment_generation = %d, want target generation %d", payload.AssignmentGeneration, record.TargetGeneration)
 	}
 }
 
