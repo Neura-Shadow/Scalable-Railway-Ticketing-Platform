@@ -119,11 +119,11 @@ func RestoreFailover(checkpoint Checkpoint) (Failover, error) {
 	return operation, nil
 }
 
-// WriteReady becomes true only after the final step has re-proven that the old
-// source remains externally fenced. Target authority installation alone never
-// advertises readiness early.
+// WriteReady becomes true at the atomic target-activation checkpoint. The
+// initial external fence remains a prerequisite for every preceding phase;
+// the terminal source-retention phase re-observes that fence after activation.
 func (operation Failover) WriteReady() bool {
-	return operation.stage == StageSourceRetainedFenced
+	return operation.stage >= StageTargetActive && operation.stage <= StageSourceRetainedFenced
 }
 
 func (operation Failover) validateCheckpoint() error {
@@ -197,12 +197,6 @@ func (operation Failover) validateCheckpoint() error {
 			return ErrInvalidFailover
 		}
 	}
-	if operation.stage >= StageRTORecorded && operation.rto <= 0 {
-		return ErrInvalidFailover
-	}
-	if operation.stage >= StageRPORecorded && !lossesValid(operation.rpo) {
-		return ErrInvalidFailover
-	}
 	if operation.stage >= StageTargetActive {
 		if operation.activatedAt.IsZero() || operation.activatedAt.Before(operation.binding.declaredAt) {
 			return ErrInvalidFailover
@@ -216,6 +210,12 @@ func (operation Failover) validateCheckpoint() error {
 				return ErrInvalidFailover
 			}
 		}
+	}
+	if operation.stage >= StageRTORecorded && operation.rto <= 0 {
+		return ErrInvalidFailover
+	}
+	if operation.stage >= StageRPORecorded && !lossesValid(operation.rpo) {
+		return ErrInvalidFailover
 	}
 	if operation.stage >= StageSourceRetainedFenced {
 		if err := operation.retainedFence.ValidateForPurpose(operation.binding, FencingPurposeRetainedSource); err != nil ||
@@ -362,16 +362,6 @@ func (operation *Failover) apply(evidence Evidence) error {
 			return ErrInvalidEvidence
 		}
 		operation.actions.CustomerWrites = value.Observation
-	case RTORecorded:
-		if value.Duration <= 0 {
-			return ErrInvalidEvidence
-		}
-		operation.rto = value.Duration
-	case RPORecorded:
-		if !lossesValid(value.Loss) {
-			return ErrInvalidEvidence
-		}
-		operation.rpo = value.Loss
 	case TargetActivated:
 		if value.ObservedAt.IsZero() || value.ObservedAt.Before(operation.binding.declaredAt) {
 			return ErrInvalidEvidence
@@ -383,6 +373,16 @@ func (operation *Failover) apply(evidence Evidence) error {
 		}
 		operation.targetAuthorities = value.Authorities
 		operation.activatedAt = value.ObservedAt.UTC()
+	case RTORecorded:
+		if value.Duration <= 0 {
+			return ErrInvalidEvidence
+		}
+		operation.rto = value.Duration
+	case RPORecorded:
+		if !lossesValid(value.Loss) {
+			return ErrInvalidEvidence
+		}
+		operation.rpo = value.Loss
 	case SourceRetainedFenced:
 		if err := value.Attestation.ValidateForPurpose(operation.binding, FencingPurposeRetainedSource); err != nil || !value.Attestation.ObservedAt().After(operation.fencing.ObservedAt()) || !value.Attestation.ObservedAt().After(operation.activatedAt) || value.Attestation.Nonce() == operation.fencing.Nonce() {
 			return ErrInvalidEvidence
@@ -425,16 +425,16 @@ func (operation Failover) validateReplay(evidence Evidence) error {
 		if operation.shardAuthorities != value.Authorities {
 			return ErrEvidenceConflict
 		}
+	case TargetActivated:
+		if operation.targetAuthorities != value.Authorities || !operation.activatedAt.Equal(value.ObservedAt) {
+			return ErrEvidenceConflict
+		}
 	case RTORecorded:
 		if operation.rto != value.Duration {
 			return ErrEvidenceConflict
 		}
 	case RPORecorded:
 		if operation.rpo != value.Loss {
-			return ErrEvidenceConflict
-		}
-	case TargetActivated:
-		if operation.targetAuthorities != value.Authorities || !operation.activatedAt.Equal(value.ObservedAt) {
 			return ErrEvidenceConflict
 		}
 	case SourceRetainedFenced:

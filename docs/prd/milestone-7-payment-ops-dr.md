@@ -787,8 +787,10 @@ idempotent effect, durable completion marker, and safe resume behavior.
 Failover order is: prove external fencing; record positions and expected RPO;
 promote control and required shards; verify roles and timelines; install one
 new epoch; start applications in recovery; reconcile; enable workers; switch
-webhook ingress; enable customer writes; record RPO/RTO; mark the target active;
-and keep the source fenced. Customer writes cannot precede reconciliation.
+webhook ingress; configure customer writes while readiness remains gated;
+atomically mark the target active; verify customer-write readiness and record
+RTO; record RPO; and keep the source fenced. Customer writes cannot precede
+reconciliation or the target-activation commit.
 
 Failback never reuses stale primary data. It keeps the old region fenced,
 re-seeds every database from the current active region, catches up and
@@ -1058,9 +1060,9 @@ The operator-controlled failover protocol is fixed in this order:
 15. switch durable webhook and global ingress;
 16. enable the customer-write process configuration while readiness remains
     gated;
-17. record observed RTO;
-18. record observed RPO;
-19. atomically mark the target `active`, making customer writes ready; and
+17. atomically mark the target `active` with the durable phase CAS;
+18. verify customer-write readiness and record observed RTO;
+19. record observed RPO; and
 20. retain the source as externally fenced.
 
 Every phase is idempotent and resumable. Crash tests cover after source

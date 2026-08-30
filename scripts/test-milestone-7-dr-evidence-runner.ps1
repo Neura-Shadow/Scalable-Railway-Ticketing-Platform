@@ -951,7 +951,7 @@ $requiredGuardrails = @(
     'passive-webhook-keys-verified-and-writes-rejected',
     'Ensure-M7PromotedPrimary', 'Ensure-M7ServicesStopped', 'controller_reobservation_probe', 'resumed_by_reobservation',
     'runtime-database-roles-bounded', 'region-b-complete-authority-set.json',
-    'region-a-complete-authority-set.json', 'control_last=$true', 'external_action_reobserved=$true',
+    'region-a-complete-authority-set.json', 'control_last=$true',
     'prematureRegionBServices', 'prematureRegionAServices',
     'worker or proxy started before complete database activation',
     'worker or proxy started before complete failback database activation',
@@ -1019,6 +1019,41 @@ if ($failoverMarkerIndex -lt 0 -or $failoverStopIndex -le $failoverMarkerIndex -
 if ($failbackMarkerIndex -lt 0 -or $failbackStopIndex -le $failbackMarkerIndex -or
     $source.Substring($failbackMarkerIndex, $failbackStopIndex-$failbackMarkerIndex).Contains('Wait-M7Replay')) {
     throw 'failback RPO marker is awaited before the source fence'
+}
+$directControlActivations = @(
+    "Invoke-M7AuthorityTransition -Service 'control-postgres-region-b' -User 'railway_control' -Database 'railway_control' -Region 'region-b' -Epoch 2 -State 'active' -Writes `$true",
+    "Invoke-M7AuthorityTransition -Service 'control-postgres-region-a-reseed' -User 'railway_control' -Database 'railway_control' -Region 'region-a' -Epoch 3 -State 'active' -Writes `$true"
+)
+foreach ($directControlActivation in $directControlActivations) {
+    if ($source.Contains($directControlActivation)) {
+        throw 'control authority activation must be atomic with the target_active journal CAS'
+    }
+}
+$writeGateFunctionIndex = $source.IndexOf('function Assert-M7PreActivationWriteGate', [System.StringComparison]::Ordinal)
+$failoverWritesConfiguredIndex = $source.IndexOf("Advance-M7DRPhase -Stage 'customer_writes_configured'", [System.StringComparison]::Ordinal)
+$failoverWriteGateIndex = $source.IndexOf("Assert-M7PreActivationWriteGate -Phase 'failover'", [System.StringComparison]::Ordinal)
+$failoverTargetActiveIndex = $source.IndexOf("Advance-M7DRPhase -Stage 'target_active'", [System.StringComparison]::Ordinal)
+$failoverAtomicActivationIndex = $source.IndexOf("Add-M7Phase 'region-b-control-authority-and-journal-activated-atomically'", [System.StringComparison]::Ordinal)
+$failoverRTOIndex = $source.IndexOf("Advance-M7DRPhase -Stage 'rto_recorded'", $failoverTargetActiveIndex, [System.StringComparison]::Ordinal)
+$failoverRPOIndex = $source.IndexOf("Advance-M7DRPhase -Stage 'rpo_recorded'", $failoverRTOIndex, [System.StringComparison]::Ordinal)
+$failoverLeaseReleaseIndex = $source.IndexOf("Set-M7CrashLeaseBarrier -Kind 'payment-operation'", $failoverTargetActiveIndex, [System.StringComparison]::Ordinal)
+$failbackWritesConfiguredIndex = $source.IndexOf("Advance-M7DRPhase -OperationID `$failbackOperationID -Prefix 'dr-failback-phase' -Stage 'customer_writes_configured'", [System.StringComparison]::Ordinal)
+$failbackWriteGateIndex = $source.IndexOf("Assert-M7PreActivationWriteGate -Phase 'failback'", [System.StringComparison]::Ordinal)
+$failbackTargetActiveIndex = $source.IndexOf("Advance-M7DRPhase -OperationID `$failbackOperationID -Prefix 'dr-failback-phase' -Stage 'target_active'", [System.StringComparison]::Ordinal)
+$failbackAtomicActivationIndex = $source.IndexOf("Add-M7Phase 'region-a-control-authority-and-journal-activated-atomically'", [System.StringComparison]::Ordinal)
+$failbackRTOIndex = $source.IndexOf("Advance-M7DRPhase -OperationID `$failbackOperationID -Prefix 'dr-failback-phase' -Stage 'rto_recorded'", $failbackTargetActiveIndex, [System.StringComparison]::Ordinal)
+$failbackRPOIndex = $source.IndexOf("Advance-M7DRPhase -OperationID `$failbackOperationID -Prefix 'dr-failback-phase' -Stage 'rpo_recorded'", $failbackRTOIndex, [System.StringComparison]::Ordinal)
+$failbackSettlementIndex = $source.IndexOf("Assert-M7SettlementImport -DatabaseService 'control-postgres-region-a-reseed'", $failbackTargetActiveIndex, [System.StringComparison]::Ordinal)
+if ($writeGateFunctionIndex -lt 0 -or
+    $failoverWritesConfiguredIndex -lt 0 -or $failoverWriteGateIndex -le $failoverWritesConfiguredIndex -or
+    $failoverTargetActiveIndex -le $failoverWriteGateIndex -or $failoverAtomicActivationIndex -le $failoverTargetActiveIndex -or
+    $failoverRTOIndex -le $failoverAtomicActivationIndex -or $failoverRPOIndex -le $failoverRTOIndex -or
+    $failoverLeaseReleaseIndex -le $failoverRPOIndex -or
+    $failbackWritesConfiguredIndex -lt 0 -or $failbackWriteGateIndex -le $failbackWritesConfiguredIndex -or
+    $failbackTargetActiveIndex -le $failbackWriteGateIndex -or $failbackAtomicActivationIndex -le $failbackTargetActiveIndex -or
+    $failbackRTOIndex -le $failbackAtomicActivationIndex -or $failbackRPOIndex -le $failbackRTOIndex -or
+    $failbackSettlementIndex -le $failbackRPOIndex) {
+    throw 'failover/failback write readiness must remain mutation-tested and gated until atomic target activation commits'
 }
 if ($source.Contains('passive-webhook-overlap-generation-verified') -or
     $source -match "api-region-b-[12].*ExpectedStatus @\(200\)") {
@@ -1284,8 +1319,10 @@ if (-not [string]::IsNullOrWhiteSpace($EvidenceDirectory)) {
     )
     $actualApplicationCrashPoints = @($summary.application_transaction_crashes | ForEach-Object { [string]$_.point } | Sort-Object -Unique)
     $requiredSwitchPhases = @(
-        'global-ingress-switched-to-region-b-after-complete-authority',
-        'global-ingress-switched-to-region-a-after-complete-authority',
+        'global-ingress-configured-to-region-b-before-atomic-control-activation',
+        'global-ingress-configured-to-region-a-before-atomic-control-activation',
+        'region-b-control-authority-and-journal-activated-atomically',
+        'region-a-control-authority-and-journal-activated-atomically',
         'stripe-webhook-durable-grace-lifecycle-proven'
     )
     $actualPhases = @($summary.phases | Where-Object { $_.status -ceq 'passed' } | ForEach-Object { [string]$_.name })

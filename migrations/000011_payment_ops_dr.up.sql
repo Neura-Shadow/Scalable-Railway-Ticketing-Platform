@@ -2609,7 +2609,7 @@ CREATE TABLE public.regional_failover_operations (
             'recovery_apis_started', 'reconciled',
             'payment_workers_enabled', 'settlement_workers_enabled',
             'ingress_switched', 'customer_writes_configured',
-            'rto_recorded', 'rpo_recorded', 'target_active',
+            'target_active', 'rto_recorded', 'rpo_recorded',
             'source_retained_fenced'
         )
     ),
@@ -2654,7 +2654,7 @@ DECLARE
         'recovery_apis_started', 'reconciled',
         'payment_workers_enabled', 'settlement_workers_enabled',
         'ingress_switched', 'customer_writes_configured',
-        'rto_recorded', 'rpo_recorded', 'target_active',
+        'target_active', 'rto_recorded', 'rpo_recorded',
         'source_retained_fenced'
     ];
     old_index integer;

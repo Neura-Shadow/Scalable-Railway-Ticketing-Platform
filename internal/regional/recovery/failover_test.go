@@ -76,19 +76,19 @@ func TestFailoverAdvanceUsesTheFixedTwentyStepOrderAndActivatesWritesLast(t *tes
 		{recovery.StageSettlementWorkersEnabled, recovery.SettlementWorkersEnabled{Observation: actionHash("settlement-workers")}},
 		{recovery.StageIngressSwitched, recovery.IngressSwitched{Webhook: true, Global: true, Observation: actionHash("ingress")}},
 		{recovery.StageCustomerWritesConfigured, recovery.CustomerWritesConfigured{Enabled: true, ReadinessGated: true, Observation: actionHash("customer-writes")}},
-		{recovery.StageRTORecorded, recovery.RTORecorded{Duration: 4 * time.Minute}},
-		{recovery.StageRPORecorded, recovery.RPORecorded{Loss: recovery.NewDatabaseSet(recovery.Loss{}, recovery.Loss{}, recovery.Loss{})}},
 		{recovery.StageTargetActive, recovery.TargetActivated{Authorities: recovery.NewAuthoritySet(
 			mustRecoverySnapshot(t, target, targetEpoch, authority.StateActive, true),
 			mustRecoverySnapshot(t, target, targetEpoch, authority.StateActive, true),
 			mustRecoverySnapshot(t, target, targetEpoch, authority.StateActive, true),
 		), ObservedAt: declaredAt.Add(90 * time.Second)}},
+		{recovery.StageRTORecorded, recovery.RTORecorded{Duration: 4 * time.Minute}},
+		{recovery.StageRPORecorded, recovery.RPORecorded{Loss: recovery.NewDatabaseSet(recovery.Loss{}, recovery.Loss{}, recovery.Loss{})}},
 		{recovery.StageSourceRetainedFenced, recovery.SourceRetainedFenced{Attestation: retainedAttestation}},
 	}
 
 	for index, step := range steps {
-		if operation.WriteReady() {
-			t.Fatalf("WriteReady() before step %d (%s) = true", index+1, step.want)
+		if got, want := operation.WriteReady(), operation.Stage() >= recovery.StageTargetActive; got != want {
+			t.Fatalf("WriteReady() before step %d (%s) = %v, want %v", index+1, step.want, got, want)
 		}
 		operation, err = recovery.Advance(operation, step.evidence)
 		if err != nil {
@@ -97,12 +97,23 @@ func TestFailoverAdvanceUsesTheFixedTwentyStepOrderAndActivatesWritesLast(t *tes
 		if got := operation.Stage(); got != step.want {
 			t.Fatalf("stage after step %d = %s, want %s", index+1, got, step.want)
 		}
-		if index < 18 && operation.WriteReady() {
-			t.Fatalf("WriteReady() after early step %d (%s) = true", index+1, step.want)
+		if got, want := operation.WriteReady(), step.want >= recovery.StageTargetActive; got != want {
+			t.Fatalf("WriteReady() after step %d (%s) = %v, want %v", index+1, step.want, got, want)
 		}
 	}
 	if !operation.WriteReady() {
 		t.Fatal("WriteReady() after target activation and source retention = false")
+	}
+}
+
+func TestTargetActivationPrecedesObservedRTOAndRPO(t *testing.T) {
+	t.Parallel()
+	if recovery.StageTargetActive+1 != recovery.StageRTORecorded ||
+		recovery.StageRTORecorded+1 != recovery.StageRPORecorded ||
+		recovery.StageRPORecorded+1 != recovery.StageSourceRetainedFenced {
+		t.Fatalf("terminal stage order = target:%d rto:%d rpo:%d retained:%d",
+			recovery.StageTargetActive, recovery.StageRTORecorded,
+			recovery.StageRPORecorded, recovery.StageSourceRetainedFenced)
 	}
 }
 

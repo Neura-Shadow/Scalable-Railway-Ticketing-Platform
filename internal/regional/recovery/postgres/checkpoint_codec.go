@@ -518,9 +518,9 @@ func parseStage(raw string) (recovery.Stage, error) {
 		recovery.StageSettlementWorkersEnabled,
 		recovery.StageIngressSwitched,
 		recovery.StageCustomerWritesConfigured,
+		recovery.StageTargetActive,
 		recovery.StageRTORecorded,
 		recovery.StageRPORecorded,
-		recovery.StageTargetActive,
 		recovery.StageSourceRetainedFenced,
 	} {
 		if stage.String() == raw {

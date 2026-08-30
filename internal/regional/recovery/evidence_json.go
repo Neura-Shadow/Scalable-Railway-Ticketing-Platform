@@ -148,10 +148,13 @@ func DecodeEvidenceDocument(operation Failover, document []byte, verifier Fencin
 	if err := json.Unmarshal(document, &header); err != nil || header.Stage == "" {
 		return nil, ErrInvalidEvidenceDocument
 	}
-	if operation.Stage() == StageSourceRetainedFenced || header.Stage != Stage(operation.Stage()+1).String() {
+	documentStage := Stage(operation.Stage() + 1)
+	if operation.Stage() != StagePlanned && header.Stage == operation.Stage().String() {
+		documentStage = operation.Stage()
+	} else if operation.Stage() == StageSourceRetainedFenced || header.Stage != documentStage.String() {
 		return nil, ErrFailoverOutOfOrder
 	}
-	switch Stage(operation.Stage() + 1) {
+	switch documentStage {
 	case StageExternalFencingVerified, StageSourceRetainedFenced:
 		var value fenceEvidenceDocument
 		if strictEvidenceJSON(document, &value) != nil {
@@ -159,7 +162,7 @@ func DecodeEvidenceDocument(operation Failover, document []byte, verifier Fencin
 		}
 		signature, signatureErr := base64.StdEncoding.Strict().DecodeString(value.SignatureBase64)
 		expectedPurpose := FencingPurposeInitial
-		if Stage(operation.Stage()+1) == StageSourceRetainedFenced {
+		if documentStage == StageSourceRetainedFenced {
 			expectedPurpose = FencingPurposeRetainedSource
 		}
 		if value.Purpose != string(expectedPurpose) {
@@ -172,7 +175,7 @@ func DecodeEvidenceDocument(operation Failover, document []byte, verifier Fencin
 		if err != nil || signatureErr != nil || verifier.Verify(attestation) != nil {
 			return nil, ErrInvalidEvidenceDocument
 		}
-		if Stage(operation.Stage()+1) == StageExternalFencingVerified {
+		if documentStage == StageExternalFencingVerified {
 			return ExternalFencingVerified{Attestation: attestation}, nil
 		}
 		return SourceRetainedFenced{Attestation: attestation}, nil
@@ -192,7 +195,7 @@ func DecodeEvidenceDocument(operation Failover, document []byte, verifier Fencin
 		if hash == (ObservationHash{}) {
 			return nil, ErrInvalidEvidenceDocument
 		}
-		switch Stage(operation.Stage() + 1) {
+		switch documentStage {
 		case StagePassiveReadinessRemoved:
 			return PassiveReadinessRemoved{Observation: hash}, nil
 		case StageRecoveryAPIsStarted:
@@ -242,10 +245,10 @@ func DecodeEvidenceDocument(operation Failover, document []byte, verifier Fencin
 		if err != nil {
 			return nil, ErrInvalidEvidenceDocument
 		}
-		if Stage(operation.Stage()+1) == StageControlRecoveryInstalled {
+		if documentStage == StageControlRecoveryInstalled {
 			return ControlRecoveryInstalled{Authority: snapshot}, nil
 		}
-		if Stage(operation.Stage()+1) == StageShardAuthoritiesInstalled {
+		if documentStage == StageShardAuthoritiesInstalled {
 			return ShardAuthoritiesInstalled{Authorities: NewShardAuthoritySet(snapshot, snapshot)}, nil
 		}
 		return nil, ErrInvalidEvidenceDocument

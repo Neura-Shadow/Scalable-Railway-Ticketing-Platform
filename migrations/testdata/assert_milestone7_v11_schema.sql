@@ -324,6 +324,15 @@ BEGIN
         RAISE EXCEPTION 'regional write guards must acquire authority through the privileged lock function';
     END IF;
 
+    IF pg_catalog.strpos(
+        pg_catalog.pg_get_functiondef(
+            'public.guard_regional_failover_operation()'::regprocedure
+        ),
+        '''target_active'', ''rto_recorded'', ''rpo_recorded'''
+    ) = 0 THEN
+        RAISE EXCEPTION 'regional failover stage order must activate before customer-ready RTO and RPO evidence';
+    END IF;
+
     IF NOT EXISTS (
         SELECT 1
           FROM pg_catalog.pg_trigger

@@ -31,7 +31,7 @@ var (
 		"control_promoted", "shard_0_promoted", "shard_1_promoted", "roles_and_timelines_verified",
 		"epoch_allocated", "control_recovery_installed", "shard_authorities_installed", "recovery_apis_started",
 		"reconciled", "payment_workers_enabled", "settlement_workers_enabled", "ingress_switched",
-		"customer_writes_configured", "rto_recorded", "rpo_recorded", "target_active", "source_retained_fenced",
+		"customer_writes_configured", "target_active", "rto_recorded", "rpo_recorded", "source_retained_fenced",
 	)
 )
 

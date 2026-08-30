@@ -35,8 +35,9 @@ authority rows, resets pools, starts recovery-mode APIs, runs control/shard/
 payment/ticket/ledger/settlement reconciliation, activates both shard
 authorities and then control as the final complete-set marker, enables workers,
 starts the regional proxy, switches the
-single webhook/global ingress, enables customer writes, records RTO and RPO,
-marks the target active, and retains the source fence.
+single webhook/global ingress, configures customer writes behind the readiness
+gate, atomically marks the target active with the durable phase CAS, verifies
+customer-write readiness, records RTO and RPO, and retains the source fence.
 
 Recovery mode never starts mutating workers or the regional proxy. Before the
 activation commit, the evidence runner explicitly verifies those services are

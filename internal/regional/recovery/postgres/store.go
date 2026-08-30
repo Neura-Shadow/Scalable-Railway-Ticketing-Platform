@@ -282,6 +282,7 @@ func (store *Store) Save(
 		payload,
 		now.UTC(),
 		completed,
+		checkpoint.Target.String(),
 	)
 	if err != nil {
 		return 0, err
@@ -351,7 +352,31 @@ FROM public.regional_failover_operations
 WHERE operation_id=$1`
 
 const saveCheckpointSQL = `
-UPDATE public.regional_failover_operations
+WITH eligible_operation AS MATERIALIZED (
+    SELECT operation_id
+    FROM public.regional_failover_operations
+    WHERE operation_id=$1
+      AND checkpoint_version=$2
+    FOR UPDATE
+), activated_authority AS (
+    UPDATE public.regional_write_authority AS authority
+    SET region=$8,
+        epoch=$4,
+        state='active',
+        writes_enabled=true,
+        updated_at=$6
+    FROM eligible_operation
+    WHERE $3='target_active'
+      AND authority.singleton
+      AND authority.region=$8
+      AND authority.epoch=$4
+      AND (
+          (authority.state='recovery' AND NOT authority.writes_enabled)
+          OR (authority.state='active' AND authority.writes_enabled)
+      )
+    RETURNING authority.singleton
+)
+UPDATE public.regional_failover_operations AS operation
 SET stage=$3,
     target_epoch=$4,
     checkpoint=$5,
@@ -359,8 +384,12 @@ SET stage=$3,
     phase_timestamps=phase_timestamps || jsonb_build_object($3::text,$6::timestamptz),
     updated_at=$6,
     completed_at=CASE WHEN $7 THEN $6 ELSE completed_at END
-WHERE operation_id=$1
-  AND checkpoint_version=$2`
+FROM eligible_operation
+WHERE operation.operation_id=eligible_operation.operation_id
+  AND (
+      $3<>'target_active'
+      OR EXISTS (SELECT 1 FROM activated_authority)
+  )`
 
 const refreshFenceSQL = `
 UPDATE public.regional_failover_operations

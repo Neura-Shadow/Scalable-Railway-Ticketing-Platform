@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -26,6 +27,59 @@ func TestDecodeEvidenceDocumentVerifiesSignedFenceForLoadedOperation(t *testing.
 	advanced, err := recovery.Advance(operation, evidence)
 	if err != nil || advanced.Stage() != recovery.StageExternalFencingVerified {
 		t.Fatalf("Advance() stage=%s error=%v", advanced.Stage(), err)
+	}
+}
+
+func TestDecodeEvidenceDocumentAcceptsAnIdenticalCurrentStageReplay(t *testing.T) {
+	t.Parallel()
+	operation, declared := evidenceOperation(t)
+	document, verifier := signedFenceDocument(t, operation, declared.Add(time.Minute), false)
+	evidence, err := recovery.DecodeEvidenceDocument(operation, document, verifier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err = recovery.Advance(operation, evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := recovery.DecodeEvidenceDocument(operation, document, verifier)
+	if err != nil {
+		t.Fatalf("current-stage DecodeEvidenceDocument() error = %v", err)
+	}
+	afterReplay, err := recovery.Advance(operation, replayed)
+	if err != nil || afterReplay.Stage() != operation.Stage() {
+		t.Fatalf("current-stage replay stage=%s error=%v", afterReplay.Stage(), err)
+	}
+}
+
+func TestDecodeEvidenceDocumentAcceptsLostResponseReplayAtTargetActivation(t *testing.T) {
+	t.Parallel()
+	operation, declared := evidenceOperation(t)
+	initialDocument, verifier := signedFenceDocument(t, operation, declared.Add(time.Minute), false)
+	initialEvidence, err := recovery.DecodeEvidenceDocument(operation, initialDocument, verifier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err = recovery.Advance(operation, initialEvidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activatedAt := declared.Add(2 * time.Minute)
+	operation = advanceEvidenceThrough(t, operation, activatedAt, recovery.StageTargetActive)
+	document := []byte(fmt.Sprintf(`{
+        "stage":"target_active",
+        "observed_at":%q,
+        "control":{"region":"region-b","epoch":2,"state":"active","writes_enabled":true},
+        "shard_0":{"region":"region-b","epoch":2,"state":"active","writes_enabled":true},
+        "shard_1":{"region":"region-b","epoch":2,"state":"active","writes_enabled":true}
+    }`, activatedAt.UTC().Format(time.RFC3339Nano)))
+	replayed, err := recovery.DecodeEvidenceDocument(operation, document, verifier)
+	if err != nil {
+		t.Fatalf("target-active replay DecodeEvidenceDocument() error = %v", err)
+	}
+	afterReplay, err := recovery.Advance(operation, replayed)
+	if err != nil || afterReplay.Checkpoint() != operation.Checkpoint() {
+		t.Fatalf("target-active replay changed checkpoint or failed: %v", err)
 	}
 }
 
@@ -63,7 +117,7 @@ func TestDecodeEvidenceDocumentRejectsInitialFenceRelabeledAsRetainedFence(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	operation = advanceEvidenceToTargetActive(t, operation, declared.Add(2*time.Minute))
+	operation = advanceEvidenceThrough(t, operation, declared.Add(2*time.Minute), recovery.StageRPORecorded)
 	var relabeled map[string]any
 	if err := json.Unmarshal(document, &relabeled); err != nil {
 		t.Fatal(err)
@@ -75,7 +129,7 @@ func TestDecodeEvidenceDocumentRejectsInitialFenceRelabeledAsRetainedFence(t *te
 	}
 }
 
-func advanceEvidenceToTargetActive(t *testing.T, operation recovery.Failover, activatedAt time.Time) recovery.Failover {
+func advanceEvidenceThrough(t *testing.T, operation recovery.Failover, activatedAt time.Time, stop recovery.Stage) recovery.Failover {
 	t.Helper()
 	target := operation.Target()
 	epoch := mustRecoveryEpoch(t, operation.Binding().SourceEpoch().Uint64()+1)
@@ -101,8 +155,8 @@ func advanceEvidenceToTargetActive(t *testing.T, operation recovery.Failover, ac
 		recovery.PaymentWorkersEnabled{Observation: actionHash("payments")}, recovery.SettlementWorkersEnabled{Observation: actionHash("settlement")},
 		recovery.IngressSwitched{Webhook: true, Global: true, Observation: actionHash("ingress")},
 		recovery.CustomerWritesConfigured{Enabled: true, ReadinessGated: true, Observation: actionHash("writes")},
-		recovery.RTORecorded{Duration: time.Minute}, recovery.RPORecorded{Loss: recovery.NewDatabaseSet(recovery.Loss{}, recovery.Loss{}, recovery.Loss{})},
 		recovery.TargetActivated{Authorities: recovery.NewAuthoritySet(activeSnapshot, activeSnapshot, activeSnapshot), ObservedAt: activatedAt},
+		recovery.RTORecorded{Duration: time.Minute}, recovery.RPORecorded{Loss: recovery.NewDatabaseSet(recovery.Loss{}, recovery.Loss{}, recovery.Loss{})},
 	}
 	for _, step := range steps {
 		var err error
@@ -110,8 +164,12 @@ func advanceEvidenceToTargetActive(t *testing.T, operation recovery.Failover, ac
 		if err != nil {
 			t.Fatal(err)
 		}
+		if operation.Stage() == stop {
+			return operation
+		}
 	}
-	return operation
+	t.Fatalf("requested stop stage %s was not reached", stop)
+	return recovery.Failover{}
 }
 
 func evidenceOperation(t *testing.T) (recovery.Failover, time.Time) {

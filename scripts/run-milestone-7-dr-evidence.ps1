@@ -449,6 +449,40 @@ function Get-M7PublishedURL {
     return "http://127.0.0.1:$($Matches[1])"
 }
 
+function Assert-M7PreActivationWriteGate {
+    param(
+        [ValidateSet('failover','failback')][string]$Phase,
+        [string]$ControlService,
+        [string]$Shard0Service,
+        [string]$Shard1Service,
+        [string]$ReservationID,
+        [string]$Token
+    )
+    if ($ReservationID -notmatch '^[0-9a-f-]{36}$' -or [string]::IsNullOrWhiteSpace($Token)) {
+        throw 'pre-activation write-gate fixture is invalid'
+    }
+    $controlBefore = Get-M7Scalar -Service $ControlService -User 'railway_control' -Database 'railway_control' -SQL "SELECT count(*) FROM public.payment_intents WHERE reservation_id='$ReservationID'::uuid"
+    $shard0Before = Get-M7Scalar -Service $Shard0Service -User 'railway_booking' -Database 'railway_booking' -SQL "SELECT count(*) FROM public.reservations WHERE id='$ReservationID'::uuid"
+    $shard1Before = Get-M7Scalar -Service $Shard1Service -User 'railway_booking' -Database 'railway_booking' -SQL "SELECT count(*) FROM public.reservations WHERE id='$ReservationID'::uuid"
+    if ($controlBefore -ne '0' -or ([int]$shard0Before + [int]$shard1Before) -ne 1) {
+        throw 'pre-activation write-gate fixture is not unique and mutation-free'
+    }
+    Invoke-Milestone5DriverAPI -BaseURL (Get-M7PublishedURL) -Method POST `
+        -Path "/api/v1/reservations/$ReservationID/payment-intents" -Token $Token `
+        -IdempotencyKey "m7-$Phase-pre-activation-$suffix" -Body @{} -ExpectedStatus @(500,503) | Out-Null
+    $controlAfter = Get-M7Scalar -Service $ControlService -User 'railway_control' -Database 'railway_control' -SQL "SELECT count(*) FROM public.payment_intents WHERE reservation_id='$ReservationID'::uuid"
+    $shard0After = Get-M7Scalar -Service $Shard0Service -User 'railway_booking' -Database 'railway_booking' -SQL "SELECT count(*) FROM public.reservations WHERE id='$ReservationID'::uuid"
+    $shard1After = Get-M7Scalar -Service $Shard1Service -User 'railway_booking' -Database 'railway_booking' -SQL "SELECT count(*) FROM public.reservations WHERE id='$ReservationID'::uuid"
+    if ($controlAfter -ne $controlBefore -or $shard0After -ne $shard0Before -or $shard1After -ne $shard1Before) {
+        throw 'pre-activation authority gate allowed a durable mutation'
+    }
+    Write-M7JSON -Name "$Phase-pre-activation-write-gate.json" -Value ([ordered]@{
+        phase=$Phase; authenticated_mutation_rejected=$true; control_rows_before=[int]$controlBefore; control_rows_after=[int]$controlAfter;
+        shard_0_rows_before=[int]$shard0Before; shard_0_rows_after=[int]$shard0After;
+        shard_1_rows_before=[int]$shard1Before; shard_1_rows_after=[int]$shard1After; durable_delta=0
+    })
+}
+
 function New-M7CustomerFixtures {
     param([string]$BaseURL, [string]$TrainRunID, [int]$Count, [string]$Label='primary')
     if ($Count -lt 1 -or $Count -gt 10) { throw 'M7 customer fixture count is outside the bound' }
@@ -2502,19 +2536,23 @@ SELECT
         $preSwitchIngress = Invoke-M7Compose -AllowFailure -Arguments @('ps','--status','running','-q','global-test-ingress')
         if (@($preSwitchIngress.Output | Where-Object { $_.Trim() -ne '' }).Count -ne 0) { throw 'global ingress was running before complete database activation' }
 
-        # Activate both shard authorities first. Control is the final durable
-        # commit that declares the three-database authority set complete.
+        # Activate both shard authorities first. The control authority remains
+        # in recovery until the target_active checkpoint CAS changes both rows
+        # in one PostgreSQL statement.
         foreach ($database in @($databases | Where-Object { $_.Name -ne 'control' })) {
             $updated = Invoke-M7AuthorityTransition -Service $database.Standby -User $database.User -Database $database.Database -Region 'region-b' -Epoch 2 -State 'active' -Writes $true
             if ($updated -ne '1') { throw "region-b activation failed for $($database.Name)" }
         }
-        $updated = Invoke-M7AuthorityTransition -Service 'control-postgres-region-b' -User 'railway_control' -Database 'railway_control' -Region 'region-b' -Epoch 2 -State 'active' -Writes $true
-        if ($updated -ne '1') { throw 'region-b final control activation failed' }
-        $completeAuthority = foreach ($database in $databases) {
+        $preActivationAuthority = foreach ($database in $databases) {
             Get-M7Scalar -Service $database.Standby -User $database.User -Database $database.Database -SQL "SELECT region||'|'||epoch::text||'|'||state||'|'||writes_enabled::text||'|'||pg_is_in_recovery()::text FROM public.regional_write_authority WHERE singleton"
         }
-        if (@($completeAuthority | Where-Object { $_ -cne 'region-b|2|active|true|false' }).Count -ne 0) { throw 'region-b authority set was not completely active' }
-        Write-M7JSON -Name 'region-b-complete-authority-set.json' -Value ([ordered]@{control_last=$true; databases=@($completeAuthority); complete=$true})
+        if ($preActivationAuthority.Count -ne 3 -or $preActivationAuthority[0] -cne 'region-b|2|recovery|false|false' -or
+            @($preActivationAuthority[1..2] | Where-Object { $_ -cne 'region-b|2|active|true|false' }).Count -ne 0) {
+            throw 'region-b pre-activation authority gate was not control-last'
+        }
+        Write-M7JSON -Name 'region-b-pre-activation-authority-set.json' -Value ([ordered]@{
+            control_activation_pending=$true; control_last=$true; databases=@($preActivationAuthority); complete=$false
+        })
 
         $env:REGION_B_DEPLOYMENT_ROLE = 'active'
         $env:REGION_B_WRITES_ENABLED = 'true'
@@ -2529,11 +2567,18 @@ SELECT
             'settlement-worker-region-b','proxy-region-b'
         )
         Invoke-M7Compose -Arguments $activeAppUp | Out-Null
-        foreach ($api in @('api-region-b-1','api-region-b-2','api-region-b-3')) { Wait-M7ServiceHTTP -Service $api -URL 'http://127.0.0.1:8080/readyz' }
-        foreach ($worker in @('payment-worker-region-b-1','payment-worker-region-b-2')) { Wait-M7ServiceHTTP -Service $worker -URL 'http://127.0.0.1:9090/readyz' }
-        Wait-M7ServiceHTTP -Service 'settlement-worker-region-b' -URL 'http://127.0.0.1:9090/readyz'
-        Advance-M7DRPhase -Stage 'payment_workers_enabled' -Evidence @{ authority_set_complete=$true; artifact_sha256=(Get-M7RunningServiceHash -Services @('payment-worker-region-b-1','payment-worker-region-b-2')) }
-        Advance-M7DRPhase -Stage 'settlement_workers_enabled' -Evidence @{ authority_set_complete=$true; artifact_sha256=(Get-M7RunningServiceHash -Services @('settlement-worker-region-b')) }
+        foreach ($service in @('api-region-b-1','api-region-b-2','api-region-b-3')) { Wait-M7ServiceHTTP -Service $service -URL 'http://127.0.0.1:8080/livez' }
+        foreach ($service in @('payment-worker-region-b-1','payment-worker-region-b-2','settlement-worker-region-b')) { Wait-M7ServiceHTTP -Service $service -URL 'http://127.0.0.1:9090/livez' }
+        foreach ($probe in @(
+            @('api-region-b-1','http://127.0.0.1:8080/readyz'),
+            @('payment-worker-region-b-1','http://127.0.0.1:9090/readyz'),
+            @('settlement-worker-region-b','http://127.0.0.1:9090/readyz')
+        )) {
+            $prematureReadiness = Invoke-M7Compose -AllowFailure -Arguments @('exec','-T',$probe[0],'wget','-q','-T','2','-O','/dev/null',$probe[1])
+            if ($prematureReadiness.ExitCode -eq 0) { throw "region-b service became write-ready before target_active CAS: $($probe[0])" }
+        }
+        Advance-M7DRPhase -Stage 'payment_workers_enabled' -Evidence @{ artifact_sha256=(Get-M7RunningServiceHash -Services @('payment-worker-region-b-1','payment-worker-region-b-2')) }
+        Advance-M7DRPhase -Stage 'settlement_workers_enabled' -Evidence @{ artifact_sha256=(Get-M7RunningServiceHash -Services @('settlement-worker-region-b')) }
 
         $globalIngressUp = @('--profile','dr-app','up','-d','--no-deps','--force-recreate')
         if ($SkipBuild) { $globalIngressUp += '--no-build' }
@@ -2541,11 +2586,15 @@ SELECT
         Invoke-M7Compose -Arguments $globalIngressUp | Out-Null
         Wait-M7ServiceHTTP -Service 'global-test-ingress' -URL 'http://127.0.0.1:8080/readyz'
         Advance-M7DRPhase -Stage 'ingress_switched' -CrashOnce -Evidence @{
-            webhook=$true; global=$true; external_action_reobserved=$true;
+            webhook=$true; global=$true;
             artifact_sha256=(Get-M7RunningServiceHash -Services @('proxy-region-b','global-test-ingress'))
         }
-        Add-M7Phase 'global-ingress-switched-to-region-b-after-complete-authority'
-        Advance-M7DRPhase -Stage 'customer_writes_configured' -CrashOnce -Evidence @{ enabled=$true; readiness_gated=$true; all_database_authorities_active=$true; artifact_sha256=(Get-M7RunningServiceHash -Services @('api-region-b-1','api-region-b-2','api-region-b-3')) }
+        Add-M7Phase 'global-ingress-configured-to-region-b-before-atomic-control-activation'
+        Advance-M7DRPhase -Stage 'customer_writes_configured' -CrashOnce -Evidence @{ enabled=$true; readiness_gated=$true; artifact_sha256=(Get-M7RunningServiceHash -Services @('api-region-b-1','api-region-b-2','api-region-b-3')) }
+        Assert-M7PreActivationWriteGate -Phase 'failover' -ControlService 'control-postgres-region-b' `
+            -Shard0Service 'booking-shard-0-postgres-region-b' -Shard1Service 'booking-shard-1-postgres-region-b' `
+            -ReservationID $m7Customer.Reservations[4] -Token $m7Customer.Tokens[4]
+        Add-M7Phase 'pre-target-active-customer-write-rejected-on-region-b'
         $rpoWindows = @{}
         $rpoMissingRecords = @{}
         foreach ($database in $databases) {
@@ -2571,17 +2620,26 @@ SELECT
             })
         }
         $missingMarkers = [int](($rpoEvidence | Measure-Object -Property missing_records -Sum).Sum)
-        $rtoMS = [Math]::Max(1,[int64]([DateTimeOffset]::UtcNow.Subtract($failoverStart).TotalMilliseconds))
-        $failoverRTOEvidence = [ordered]@{ duration_ms=$rtoMS; authority_active=$true; customer_readiness=$true; ingress_switched_after_resume=$true }
-        Advance-M7DRPhase -Stage 'rto_recorded' -Evidence @{ duration_ms=$rtoMS }
-        Advance-M7DRPhase -Stage 'rpo_recorded' -Evidence @{
-            control=@{missing_records=$rpoMissingRecords['control'];window_ms=$rpoWindows['control']}; shard_0=@{missing_records=$rpoMissingRecords['shard-0'];window_ms=$rpoWindows['shard-0']}; shard_1=@{missing_records=$rpoMissingRecords['shard-1'];window_ms=$rpoWindows['shard-1']}
-        }
         Advance-M7DRPhase -Stage 'target_active' -Evidence @{
             observed_at=[DateTimeOffset]::UtcNow.ToString('o')
             control=@{region='region-b';epoch=2;state='active';writes_enabled=$true}
             shard_0=@{region='region-b';epoch=2;state='active';writes_enabled=$true}
             shard_1=@{region='region-b';epoch=2;state='active';writes_enabled=$true}
+        }
+        $completeAuthority = foreach ($database in $databases) {
+            Get-M7Scalar -Service $database.Standby -User $database.User -Database $database.Database -SQL "SELECT region||'|'||epoch::text||'|'||state||'|'||writes_enabled::text||'|'||pg_is_in_recovery()::text FROM public.regional_write_authority WHERE singleton"
+        }
+        if (@($completeAuthority | Where-Object { $_ -cne 'region-b|2|active|true|false' }).Count -ne 0) { throw 'region-b target_active CAS did not complete all three authorities' }
+        Write-M7JSON -Name 'region-b-complete-authority-set.json' -Value ([ordered]@{control_last=$true; journal_cas_atomic=$true; databases=@($completeAuthority); complete=$true})
+        foreach ($api in @('api-region-b-1','api-region-b-2','api-region-b-3')) { Wait-M7ServiceHTTP -Service $api -URL 'http://127.0.0.1:8080/readyz' }
+        foreach ($worker in @('payment-worker-region-b-1','payment-worker-region-b-2')) { Wait-M7ServiceHTTP -Service $worker -URL 'http://127.0.0.1:9090/readyz' }
+        Wait-M7ServiceHTTP -Service 'settlement-worker-region-b' -URL 'http://127.0.0.1:9090/readyz'
+        Add-M7Phase 'region-b-control-authority-and-journal-activated-atomically'
+        $rtoMS = [Math]::Max(1,[int64]([DateTimeOffset]::UtcNow.Subtract($failoverStart).TotalMilliseconds))
+        $failoverRTOEvidence = [ordered]@{ duration_ms=$rtoMS; authority_active=$true; customer_readiness=$true; ingress_switched_after_resume=$true }
+        Advance-M7DRPhase -Stage 'rto_recorded' -Evidence @{ duration_ms=$rtoMS }
+        Advance-M7DRPhase -Stage 'rpo_recorded' -Evidence @{
+            control=@{missing_records=$rpoMissingRecords['control'];window_ms=$rpoWindows['control']}; shard_0=@{missing_records=$rpoMissingRecords['shard-0'];window_ms=$rpoWindows['shard-0']}; shard_1=@{missing_records=$rpoMissingRecords['shard-1'];window_ms=$rpoWindows['shard-1']}
         }
         Set-M7CrashLeaseBarrier -Kind 'payment-operation' -Service 'control-postgres-region-b' -TargetID $paymentCrashHosted.IntentID -ExpectedState 'in_flight' -Region 'region-b' -Epoch 2 -Release
         Set-M7CrashLeaseBarrier -Kind 'payment-action' -Service 'control-postgres-region-b' -TargetID $ticketCrashHosted.IntentID -ExpectedState 'processing' -Region 'region-b' -Epoch 2 -Release
@@ -2946,13 +3004,16 @@ WHERE ledger.event_id IN ('partial_refund:$providerRefundOperationID','partial_r
             $updated = Invoke-M7AuthorityTransition -Service $database.Reseed -User $database.User -Database $database.Database -Region 'region-a' -Epoch 3 -State 'active' -Writes $true
             if ($updated -ne '1') { throw "region-a failback activation failed for $($database.Name)" }
         }
-        $updated = Invoke-M7AuthorityTransition -Service 'control-postgres-region-a-reseed' -User 'railway_control' -Database 'railway_control' -Region 'region-a' -Epoch 3 -State 'active' -Writes $true
-        if ($updated -ne '1') { throw 'region-a final control failback activation failed' }
-        $completeFailbackAuthority = foreach ($database in $databases) {
+        $preFailbackActivationAuthority = foreach ($database in $databases) {
             Get-M7Scalar -Service $database.Reseed -User $database.User -Database $database.Database -SQL "SELECT region||'|'||epoch::text||'|'||state||'|'||writes_enabled::text||'|'||pg_is_in_recovery()::text FROM public.regional_write_authority WHERE singleton"
         }
-        if (@($completeFailbackAuthority | Where-Object { $_ -cne 'region-a|3|active|true|false' }).Count -ne 0) { throw 'region-a failback authority set was not completely active' }
-        Write-M7JSON -Name 'region-a-complete-authority-set.json' -Value ([ordered]@{control_last=$true; databases=@($completeFailbackAuthority); complete=$true})
+        if ($preFailbackActivationAuthority.Count -ne 3 -or $preFailbackActivationAuthority[0] -cne 'region-a|3|recovery|false|false' -or
+            @($preFailbackActivationAuthority[1..2] | Where-Object { $_ -cne 'region-a|3|active|true|false' }).Count -ne 0) {
+            throw 'region-a failback pre-activation authority gate was not control-last'
+        }
+        Write-M7JSON -Name 'region-a-pre-activation-authority-set.json' -Value ([ordered]@{
+            control_activation_pending=$true; control_last=$true; databases=@($preFailbackActivationAuthority); complete=$false
+        })
 
         $env:REGION_A_DEPLOYMENT_ROLE = 'active'
         $env:REGION_A_WRITES_ENABLED = 'true'
@@ -2964,19 +3025,30 @@ WHERE ledger.event_id IN ('partial_refund:$providerRefundOperationID','partial_r
             'hold-expirer','outbox-worker','booking-command-reconciler','settlement-worker-region-a','proxy-region-a'
         )
         Invoke-M7Compose -Arguments $regionAIngressUp | Out-Null
-        foreach ($api in @('api-1','api-2','api-3')) { Wait-M7ServiceHTTP -Service $api -URL 'http://127.0.0.1:8080/readyz' }
-        foreach ($worker in @('payment-worker-1','payment-worker-2')) { Wait-M7ServiceHTTP -Service $worker -URL 'http://127.0.0.1:9090/readyz' }
-        Wait-M7ServiceHTTP -Service 'settlement-worker-region-a' -URL 'http://127.0.0.1:9090/readyz'
-        Advance-M7DRPhase -OperationID $failbackOperationID -Prefix 'dr-failback-phase' -Stage 'payment_workers_enabled' -Evidence @{ authority_set_complete=$true; artifact_sha256=(Get-M7RunningServiceHash -Services @('payment-worker-1','payment-worker-2')) }
-        Advance-M7DRPhase -OperationID $failbackOperationID -Prefix 'dr-failback-phase' -Stage 'settlement_workers_enabled' -Evidence @{ authority_set_complete=$true; artifact_sha256=(Get-M7RunningServiceHash -Services @('settlement-worker-region-a')) }
+        foreach ($service in @('api-1','api-2','api-3')) { Wait-M7ServiceHTTP -Service $service -URL 'http://127.0.0.1:8080/livez' }
+        foreach ($service in @('payment-worker-1','payment-worker-2','settlement-worker-region-a')) { Wait-M7ServiceHTTP -Service $service -URL 'http://127.0.0.1:9090/livez' }
+        foreach ($probe in @(
+            @('api-1','http://127.0.0.1:8080/readyz'),
+            @('payment-worker-1','http://127.0.0.1:9090/readyz'),
+            @('settlement-worker-region-a','http://127.0.0.1:9090/readyz')
+        )) {
+            $prematureReadiness = Invoke-M7Compose -AllowFailure -Arguments @('exec','-T',$probe[0],'wget','-q','-T','2','-O','/dev/null',$probe[1])
+            if ($prematureReadiness.ExitCode -eq 0) { throw "region-a service became write-ready before target_active CAS: $($probe[0])" }
+        }
+        Advance-M7DRPhase -OperationID $failbackOperationID -Prefix 'dr-failback-phase' -Stage 'payment_workers_enabled' -Evidence @{ artifact_sha256=(Get-M7RunningServiceHash -Services @('payment-worker-1','payment-worker-2')) }
+        Advance-M7DRPhase -OperationID $failbackOperationID -Prefix 'dr-failback-phase' -Stage 'settlement_workers_enabled' -Evidence @{ artifact_sha256=(Get-M7RunningServiceHash -Services @('settlement-worker-region-a')) }
         Invoke-M7Compose -Arguments $globalIngressUp | Out-Null
         Wait-M7ServiceHTTP -Service 'global-test-ingress' -URL 'http://127.0.0.1:8080/readyz'
         Advance-M7DRPhase -OperationID $failbackOperationID -Prefix 'dr-failback-phase' -Stage 'ingress_switched' -CrashOnce -Evidence @{
-            webhook=$true; global=$true; external_action_reobserved=$true;
+            webhook=$true; global=$true;
             artifact_sha256=(Get-M7RunningServiceHash -Services @('proxy-region-a','global-test-ingress'))
         }
-        Add-M7Phase 'global-ingress-switched-to-region-a-after-complete-authority'
-        Advance-M7DRPhase -OperationID $failbackOperationID -Prefix 'dr-failback-phase' -Stage 'customer_writes_configured' -CrashOnce -Evidence @{ enabled=$true; readiness_gated=$true; all_database_authorities_active=$true; artifact_sha256=(Get-M7RunningServiceHash -Services @('api-1','api-2','api-3')) }
+        Add-M7Phase 'global-ingress-configured-to-region-a-before-atomic-control-activation'
+        Advance-M7DRPhase -OperationID $failbackOperationID -Prefix 'dr-failback-phase' -Stage 'customer_writes_configured' -CrashOnce -Evidence @{ enabled=$true; readiness_gated=$true; artifact_sha256=(Get-M7RunningServiceHash -Services @('api-1','api-2','api-3')) }
+        Assert-M7PreActivationWriteGate -Phase 'failback' -ControlService 'control-postgres-region-a-reseed' `
+            -Shard0Service 'booking-shard-0-postgres-region-a-reseed' -Shard1Service 'booking-shard-1-postgres-region-a-reseed' `
+            -ReservationID $m7Customer.Reservations[4] -Token $m7Customer.Tokens[4]
+        Add-M7Phase 'pre-target-active-customer-write-rejected-on-region-a'
         $failbackRPOWindows = @{}
         $failbackMissingRecords = @{}
         foreach ($database in $databases) {
@@ -3001,17 +3073,26 @@ WHERE ledger.event_id IN ('partial_refund:$providerRefundOperationID','partial_r
                 window_definition='acknowledged source marker observation to promoted target replay observation'
             })
         }
-        $failbackRTOMS = [Math]::Max(1,[int64]([DateTimeOffset]::UtcNow.Subtract($failbackStart).TotalMilliseconds))
-        $failbackRTOEvidence = [ordered]@{ duration_ms=$failbackRTOMS; authority_active=$true; customer_readiness=$true; ingress_switched_after_resume=$true }
-        Advance-M7DRPhase -OperationID $failbackOperationID -Prefix 'dr-failback-phase' -Stage 'rto_recorded' -Evidence @{ duration_ms=$failbackRTOMS }
-        Advance-M7DRPhase -OperationID $failbackOperationID -Prefix 'dr-failback-phase' -Stage 'rpo_recorded' -Evidence @{
-            control=@{missing_records=$failbackMissingRecords['control'];window_ms=$failbackRPOWindows['control']}; shard_0=@{missing_records=$failbackMissingRecords['shard-0'];window_ms=$failbackRPOWindows['shard-0']}; shard_1=@{missing_records=$failbackMissingRecords['shard-1'];window_ms=$failbackRPOWindows['shard-1']}
-        }
         Advance-M7DRPhase -OperationID $failbackOperationID -Prefix 'dr-failback-phase' -Stage 'target_active' -Evidence @{
             observed_at=[DateTimeOffset]::UtcNow.ToString('o')
             control=@{region='region-a';epoch=3;state='active';writes_enabled=$true}
             shard_0=@{region='region-a';epoch=3;state='active';writes_enabled=$true}
             shard_1=@{region='region-a';epoch=3;state='active';writes_enabled=$true}
+        }
+        $completeFailbackAuthority = foreach ($database in $databases) {
+            Get-M7Scalar -Service $database.Reseed -User $database.User -Database $database.Database -SQL "SELECT region||'|'||epoch::text||'|'||state||'|'||writes_enabled::text||'|'||pg_is_in_recovery()::text FROM public.regional_write_authority WHERE singleton"
+        }
+        if (@($completeFailbackAuthority | Where-Object { $_ -cne 'region-a|3|active|true|false' }).Count -ne 0) { throw 'region-a target_active CAS did not complete all three authorities' }
+        Write-M7JSON -Name 'region-a-complete-authority-set.json' -Value ([ordered]@{control_last=$true; journal_cas_atomic=$true; databases=@($completeFailbackAuthority); complete=$true})
+        foreach ($api in @('api-1','api-2','api-3')) { Wait-M7ServiceHTTP -Service $api -URL 'http://127.0.0.1:8080/readyz' }
+        foreach ($worker in @('payment-worker-1','payment-worker-2')) { Wait-M7ServiceHTTP -Service $worker -URL 'http://127.0.0.1:9090/readyz' }
+        Wait-M7ServiceHTTP -Service 'settlement-worker-region-a' -URL 'http://127.0.0.1:9090/readyz'
+        Add-M7Phase 'region-a-control-authority-and-journal-activated-atomically'
+        $failbackRTOMS = [Math]::Max(1,[int64]([DateTimeOffset]::UtcNow.Subtract($failbackStart).TotalMilliseconds))
+        $failbackRTOEvidence = [ordered]@{ duration_ms=$failbackRTOMS; authority_active=$true; customer_readiness=$true; ingress_switched_after_resume=$true }
+        Advance-M7DRPhase -OperationID $failbackOperationID -Prefix 'dr-failback-phase' -Stage 'rto_recorded' -Evidence @{ duration_ms=$failbackRTOMS }
+        Advance-M7DRPhase -OperationID $failbackOperationID -Prefix 'dr-failback-phase' -Stage 'rpo_recorded' -Evidence @{
+            control=@{missing_records=$failbackMissingRecords['control'];window_ms=$failbackRPOWindows['control']}; shard_0=@{missing_records=$failbackMissingRecords['shard-0'];window_ms=$failbackRPOWindows['shard-0']}; shard_1=@{missing_records=$failbackMissingRecords['shard-1'];window_ms=$failbackRPOWindows['shard-1']}
         }
         $null = Assert-M7SettlementImport -DatabaseService 'control-postgres-region-a-reseed' -WorkerService 'settlement-worker-region-a' -Phase 'region-a-failback-epoch-3'
         Invoke-M7K6 -Script 'regional-failback.js' -Environment @{

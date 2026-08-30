@@ -134,9 +134,9 @@ const (
 	StageSettlementWorkersEnabled
 	StageIngressSwitched
 	StageCustomerWritesConfigured
+	StageTargetActive
 	StageRTORecorded
 	StageRPORecorded
-	StageTargetActive
 	StageSourceRetainedFenced
 )
 
@@ -176,12 +176,12 @@ func (stage Stage) String() string {
 		return "ingress_switched"
 	case StageCustomerWritesConfigured:
 		return "customer_writes_configured"
+	case StageTargetActive:
+		return "target_active"
 	case StageRTORecorded:
 		return "rto_recorded"
 	case StageRPORecorded:
 		return "rpo_recorded"
-	case StageTargetActive:
-		return "target_active"
 	case StageSourceRetainedFenced:
 		return "source_retained_fenced"
 	default:

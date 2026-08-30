@@ -62,8 +62,14 @@ func TestCheckpointStoreCreatesLoadsAndCASUpdatesTypedFailover(t *testing.T) {
 	}
 	if nextVersion != 2 || !containsSQL(db.execSQL[1], "checkpoint_version=$2") ||
 		!containsSQL(db.execSQL[1], "phase_timestamps") ||
-		!containsSQL(db.execSQL[1], "jsonb_build_object($3::text,$6::timestamptz)") {
+		!containsSQL(db.execSQL[1], "jsonb_build_object($3::text,$6::timestamptz)") ||
+		!containsSQL(db.execSQL[1], "eligible_operation") ||
+		!containsSQL(db.execSQL[1], "UPDATE public.regional_write_authority") ||
+		!containsSQL(db.execSQL[1], "$3='target_active'") {
 		t.Fatalf("save version/SQL = %d/%s", nextVersion, db.execSQL[1])
+	}
+	if got := db.execArgs[1][7]; got != "region-b" {
+		t.Fatalf("Save() target region argument = %v, want region-b", got)
 	}
 }
 

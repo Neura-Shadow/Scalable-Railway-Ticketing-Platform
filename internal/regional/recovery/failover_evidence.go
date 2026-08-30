@@ -114,12 +114,12 @@ func evidenceStage(evidence Evidence) (Stage, error) {
 		return StageIngressSwitched, nil
 	case CustomerWritesConfigured:
 		return StageCustomerWritesConfigured, nil
+	case TargetActivated:
+		return StageTargetActive, nil
 	case RTORecorded:
 		return StageRTORecorded, nil
 	case RPORecorded:
 		return StageRPORecorded, nil
-	case TargetActivated:
-		return StageTargetActive, nil
 	case SourceRetainedFenced:
 		return StageSourceRetainedFenced, nil
 	default:
