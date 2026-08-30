@@ -13,6 +13,7 @@ import (
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/migration"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const (
@@ -266,7 +267,31 @@ func errorCode(err error) string {
 	case errors.Is(err, errUnsupportedMigrationSource):
 		return "unsupported_migration_source"
 	default:
+		if code := boundedPostgresErrorCode(err); code != "" {
+			return code
+		}
 		return "operation_failed"
+	}
+}
+
+func boundedPostgresErrorCode(err error) string {
+	var databaseError *pgconn.PgError
+	if !errors.As(err, &databaseError) {
+		return ""
+	}
+	switch databaseError.Code {
+	case "23503":
+		return "operation_failed_database_foreign_key"
+	case "23505":
+		return "operation_failed_database_unique"
+	case "23514":
+		return "operation_failed_database_check"
+	case "55000":
+		return "operation_failed_database_prerequisite"
+	case "22P02":
+		return "operation_failed_database_value"
+	default:
+		return ""
 	}
 }
 

@@ -54,6 +54,10 @@ Assert-True -Condition (Test-Path -LiteralPath $driverPath -PathType Leaf) `
 
 function docker {
     Write-Output 'database postgresql://demo:supersecret@db:5432/app'
+    Write-Output 'Authorization: Bearer live-bearer-token'
+    Write-Output 'X-Admission-Token: live-admission-token'
+    Write-Output 'API_TOKEN=live-api-token'
+    Write-Output 'PAYMENT_PROVIDER_API_KEY=live-provider-key'
     Write-Output 'reverse planning failed because target evidence was missing'
     $global:LASTEXITCODE = 17
 }
@@ -72,7 +76,13 @@ try {
     } -Contains @(
         'exit code 17',
         'reverse planning failed because target evidence was missing'
-    ) -Excludes @('supersecret')
+    ) -Excludes @(
+        'supersecret',
+        'live-bearer-token',
+        'live-admission-token',
+        'live-api-token',
+        'live-provider-key'
+    )
 } finally {
     [System.IO.Directory]::Delete($diagnosticDirectory, $true)
 }

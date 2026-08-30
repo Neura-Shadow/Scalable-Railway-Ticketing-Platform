@@ -70,6 +70,8 @@ function Protect-Milestone5DriverDiagnostic {
     param([AllowNull()][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines)
     $value = [string](@($Lines | Select-Object -Last 12) -join "`n")
     $value = $value -replace '(?i)(postgres(?:ql)?://)[^\s/@:]+:[^\s/@]+@', '$1[redacted]@'
+    $value = $value -replace '(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+', '$1[redacted]'
+    $value = $value -replace '(?i)((?:[a-z0-9]+[_-])*(?:api[_-]?key|token)\s*[:=]\s*)[^\s,;]+', '$1[redacted]'
     $value = $value -replace '(?i)(password|cipher[_-]?pass|secret)(\s*[:=]\s*)[^\s,;]+', '$1$2[redacted]'
     if ($value.Length -gt 2048) { $value = $value.Substring($value.Length - 2048) }
     return $value

@@ -330,7 +330,7 @@ func (adapter *ReverseAdapter) ApplyBaseBatch(ctx context.Context, record physic
 			return rollback(physicalmigration.ErrInvalidBatch)
 		}
 		if _, err := tx.Exec(ctx, statement, normalized); err != nil {
-			return rollback(fmt.Errorf("%w: apply reverse base row", physicalpostgres.ErrShardOperation))
+			return rollback(fmt.Errorf("%w: apply reverse base row: %w", physicalpostgres.ErrShardOperation, err))
 		}
 	}
 	if err := adapter.releaseTargetApply(ctx, tx, record); err != nil {
