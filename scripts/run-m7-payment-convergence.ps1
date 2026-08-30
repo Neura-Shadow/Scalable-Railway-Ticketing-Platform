@@ -446,6 +446,11 @@ try {
             'build','--pull=false','-f',(Join-Path $root 'deploy/docker/m7-payment-integration.Dockerfile'),'-t',$probeImage,$root
         ) | Out-Null
         $probeImageBuilt = $true
+        $probeInspection = Invoke-M7FocusedDocker -Label 'integration-probe-runtime-user' -Arguments @(
+            'image','inspect','--format','{{.Config.User}}',$probeImage
+        )
+        $probeRuntimeUser = [string](@($probeInspection.Output | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }) | Select-Object -Last 1)
+        if ($probeRuntimeUser -cne 'probe') { throw 'focused integration image runtime user is not probe' }
     }
     $services = @('api-1')
     if (-not $IntegrationProbe -and -not $PostRestoreScalarFixture) {
@@ -487,7 +492,7 @@ try {
         $network = "${ProjectName}_backend"
         if ($network -notmatch '^[a-z0-9][a-z0-9_-]{2,127}$') { throw 'focused integration network name is invalid' }
         $mount = "type=bind,source=$root,target=/src,readonly"
-        $probeCommand = 'go test ./internal/payment/worker/postgres -run ^TestM7PaymentWorkerRunOnceV11Lanes$ -count=10 -timeout 300s && go test -race ./internal/payment/worker/postgres -run ^TestM7PaymentWorkerRunOnceV11Lanes$ -count=3 -timeout 420s'
+        $probeCommand = 'test "$(id -u)" -ne 0 && test "$(id -un)" = probe && test -w "$(go env GOPATH)" && test -w "$(go env GOMODCACHE)" && test -w "$(go env GOCACHE)" && go test ./internal/payment/worker/postgres -run ^TestM7PaymentWorkerRunOnceV11Lanes$ -count=10 -timeout 300s && go test -race ./internal/payment/worker/postgres -run ^TestM7PaymentWorkerRunOnceV11Lanes$ -count=3 -timeout 420s'
         $probe = Invoke-M7FocusedDocker -AllowFailure -Label 'm7-payment-integration-probe' -TimeoutSeconds 900 -Arguments @(
             'run','--rm','--pull=never','--network',$network,'--mount',$mount,'-w','/src',
             '-e','M7_PAYMENT_INTEGRATION_DATABASE_URL','-e','M7_PAYMENT_INTEGRATION_RESERVATION_ID',

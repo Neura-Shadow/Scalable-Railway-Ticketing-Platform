@@ -11,6 +11,12 @@ foreach ($required in @(
     'TestM7PaymentWorkerRunOnceV11Lanes',
     'm7-payment-integration.Dockerfile',
     'integration-probe-image-remove',
+    'integration-probe-runtime-user',
+    '{{.Config.User}}',
+    'test "$(id -u)" -ne 0',
+    'go env GOPATH',
+    'go env GOMODCACHE',
+    'go env GOCACHE',
     "'railway_runtime'",
     'ticket.ticket_code',
     'timeout_enforced',
@@ -36,6 +42,17 @@ if ($source.Contains('payment_reconciliation_mismatches')) { throw 'focused runn
 if ($source.Contains("@('logs','--tail','40'") -or $source.Contains("@('logs','--since'")) { throw 'focused runner retained a lossy worker log window' }
 if ($source.Contains("'run','--rm','--no-deps','-e','PAYMENT_PROCESSING_GRACE_SECONDS=1','payment-reconciler'")) {
     throw 'focused runner bypassed the reconciler least-privilege role initializers'
+}
+
+$probeDockerfile = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\deploy\docker\m7-payment-integration.Dockerfile') -Raw
+$probeUsers = [regex]::Matches($probeDockerfile, '(?im)^\s*USER\s+([^\s#]+)\s*(?:#.*)?$')
+$probeCacheIndex = $probeDockerfile.IndexOf('ENV GOCACHE=/home/probe/.cache/go-build', [System.StringComparison]::Ordinal)
+$probeUserIndex = $probeDockerfile.LastIndexOf('USER probe', [System.StringComparison]::Ordinal)
+$probeDownloadIndex = $probeDockerfile.IndexOf('RUN go mod download', [System.StringComparison]::Ordinal)
+if ($probeUsers.Count -eq 0 -or $probeUsers[$probeUsers.Count-1].Groups[1].Value -cne 'probe' -or
+    $probeCacheIndex -lt 0 -or $probeCacheIndex -ge $probeUserIndex -or
+    $probeUserIndex -lt 0 -or $probeDownloadIndex -le $probeUserIndex) {
+    throw 'focused integration probe image must provision its private cache and keep probe as the final user before module download'
 }
 
 'm7-payment-convergence-runner-contract:passed'
