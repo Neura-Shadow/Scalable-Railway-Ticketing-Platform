@@ -9,6 +9,13 @@ import (
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
 )
 
+func TestOutboxSchemaVersionMatchesCurrentControlMigration(t *testing.T) {
+	t.Parallel()
+	if outboxSchemaVersion != 11 {
+		t.Fatalf("outboxSchemaVersion = %d, want 11", outboxSchemaVersion)
+	}
+}
+
 func TestAllReadyChecksEverySelectedPublisherDependency(t *testing.T) {
 	t.Parallel()
 

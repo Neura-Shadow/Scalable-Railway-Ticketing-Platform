@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/ledger"
 	paymentreconcile "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/reconcile"
 	paymentshard "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/shard"
 	"github.com/google/uuid"
@@ -104,7 +105,7 @@ func TestRepairReceiptValidationFailsClosed(t *testing.T) {
 
 func TestDatabaseFinalizeManualReviewCanReclaimExactReceiptPath(t *testing.T) {
 	t.Parallel()
-	tx := &beginRepairTx{}
+	tx := &beginRepairTx{rows: []pgx.Row{beginRow(func(dest []any) { *(dest[0].(*bool)) = false })}}
 	repairer := &Repairer{control: &beginControl{tx: tx}}
 	evidence := repairEvidence{
 		SagaID: uuid.New(), IntentID: uuid.New(), IntentState: "manual_review",
@@ -119,7 +120,7 @@ func TestDatabaseFinalizeManualReviewCanReclaimExactReceiptPath(t *testing.T) {
 	if _, err := repairer.claimRepairSaga(context.Background(), unsafe, "issue_tickets"); !errors.Is(err, paymentreconcile.ErrRepairUnavailable) {
 		t.Fatalf("unsafe category error=%v", err)
 	}
-	markTx := &beginRepairTx{}
+	markTx := &beginRepairTx{rows: []pgx.Row{beginRow(func(dest []any) { *(dest[0].(*bool)) = false })}}
 	markRepairer := &Repairer{control: &beginControl{tx: markTx}}
 	markEvidence := repairEvidence{
 		SagaID: uuid.New(), IntentID: uuid.New(), IntentState: "manual_review",
@@ -130,6 +131,31 @@ func TestDatabaseFinalizeManualReviewCanReclaimExactReceiptPath(t *testing.T) {
 	}
 }
 
+func TestRepairAndManualReviewFailClosedOnActiveActionLease(t *testing.T) {
+	t.Parallel()
+	evidence := repairEvidence{
+		SagaID: uuid.New(), IntentID: uuid.New(), IntentState: "ticket_issue_pending",
+		SagaState: "issuing_tickets", Step: "issue_tickets",
+	}
+	repairTx := &beginRepairTx{rows: []pgx.Row{beginRow(func(dest []any) { *(dest[0].(*bool)) = true })}}
+	repairer := &Repairer{control: &beginControl{tx: repairTx}}
+	if _, err := repairer.claimRepairSaga(context.Background(), evidence, "issue_tickets"); !errors.Is(err, paymentreconcile.ErrRepairUnavailable) {
+		t.Fatalf("active action repair error=%v", err)
+	}
+	if repairTx.committed || len(repairTx.execs) != 0 {
+		t.Fatalf("active action repair mutated control: committed=%v execs=%v", repairTx.committed, repairTx.execs)
+	}
+
+	manualTx := &beginRepairTx{rows: []pgx.Row{beginRow(func(dest []any) { *(dest[0].(*bool)) = true })}}
+	manual := &Repairer{control: &beginControl{tx: manualTx}}
+	if err := manual.MarkManualReview(context.Background(), evidence.IntentID); !errors.Is(err, paymentreconcile.ErrRepairUnavailable) {
+		t.Fatalf("active action manual-review error=%v", err)
+	}
+	if manualTx.committed || len(manualTx.execs) != 0 {
+		t.Fatalf("active action manual review mutated control: committed=%v execs=%v", manualTx.committed, manualTx.execs)
+	}
+}
+
 func TestRepairSourceKeepsLeaseAndLocatorConflictGuards(t *testing.T) {
 	// This assertion is deliberately narrow: these SQL predicates are the
 	// fail-closed boundary between an idempotent shard replay and control-plane
@@ -137,6 +163,8 @@ func TestRepairSourceKeepsLeaseAndLocatorConflictGuards(t *testing.T) {
 	source := repairSourceForAssertion(t)
 	for _, fragment := range []string{
 		"lease_owner=$3 AND lease_until>=clock_timestamp()",
+		"lockSagaActionBoundary(ctx, tx",
+		"active_action.state='processing'",
 		"ON CONFLICT(ticket_order_id) DO UPDATE SET status=EXCLUDED.status",
 		"ticket_order_shard_locators.reservation_id=EXCLUDED.reservation_id",
 		"ON CONFLICT(ticket_id) DO UPDATE SET ticket_order_id=EXCLUDED.ticket_order_id",
@@ -222,6 +250,112 @@ func TestBeginReceiptReplayFailsClosedWhenShardEvidenceChanges(t *testing.T) {
 	}
 }
 
+func TestRepairIssuanceCommitsLedgerWithControlFinalization(t *testing.T) {
+	t.Parallel()
+	evidence := repairEvidence{
+		SagaID:        uuid.MustParse("79000000-0000-4000-8000-000000000001"),
+		IntentID:      uuid.MustParse("75000000-0000-4000-8000-000000000001"),
+		ReservationID: uuid.New(), TrainRunID: uuid.New(), OwnerID: uuid.New(),
+		AmountMinor: 12500, Currency: "TWD",
+	}
+	command := issueCommand(evidence)
+	receipt := paymentshard.IssueTicketsReceipt{
+		CommandID: command.CommandID, IssuanceID: command.IssuanceID, PaymentIntentID: evidence.IntentID,
+		ReservationID: evidence.ReservationID, TicketOrderID: uuid.New(), TicketIDs: []uuid.UUID{uuid.New()},
+		TicketCodes: []string{"ticket_code_000001"}, AmountMinor: evidence.AmountMinor, Currency: evidence.Currency,
+		OrderCreatedAt: time.Now().Add(-time.Minute), IssuedAt: time.Now(),
+	}
+	tx := &beginRepairTx{rows: []pgx.Row{beginRow(func(dest []any) {
+		*(dest[0].(*string)) = "ticket_issue_pending"
+		*(dest[1].(*string)) = "issuing_tickets"
+		*(dest[2].(*string)) = "issue_tickets"
+		*(dest[3].(*uuid.UUID)) = evidence.TrainRunID
+		*(dest[4].(*string)) = "booking-shard-1"
+		*(dest[5].(*int64)) = 4
+		*(dest[6].(*uuid.UUID)) = evidence.OwnerID
+		*(dest[7].(*bool)) = true
+	})}}
+	repairer := &Repairer{control: &beginControl{tx: tx}}
+	if err := repairer.finalizeIssue(context.Background(), evidence, command, receipt, "repair-owner"); err != nil {
+		t.Fatalf("finalizeIssue() error = %v", err)
+	}
+	if !tx.committed {
+		t.Fatal("issuance control fact and ledger did not commit together")
+	}
+	joined := strings.Join(tx.execs, "\n")
+	for _, fragment := range []string{
+		"INSERT INTO public.ticket_order_shard_locators", "INSERT INTO public.ticket_shard_locators",
+		"INSERT INTO public.financial_ledger_transactions", "state='completed'",
+	} {
+		if !strings.Contains(joined, fragment) {
+			t.Fatalf("atomic issuance finalization missing %q:\n%s", fragment, joined)
+		}
+	}
+	assertRepairPostings(t, tx.execArgs, ledger.AccountCustomerFundsPending, ledger.AccountTicketSales)
+	for index, query := range tx.execs {
+		if !strings.Contains(query, "INSERT INTO public.financial_ledger_transactions") {
+			continue
+		}
+		args := tx.execArgs[index]
+		if args[0] != uuid.MustParse("f020d39d-d1cb-5f81-955e-e84dc3fa6244") ||
+			args[1] != "ticket_issuance:ddb62b09-9c50-526a-adb4-e32a16aa7c66" ||
+			args[2] != "payment:75000000-0000-4000-8000-000000000001" {
+			t.Fatalf("repair issuance ledger identity args = %+v", args)
+		}
+		if got := repairHex(args[5].([]byte)); got != "d9e0ae58551a9829103246f613d371b754af2a68fec8bf8c011b36d1ce459227" {
+			t.Fatalf("repair issuance fingerprint = %s", got)
+		}
+		return
+	}
+	t.Fatal("repair issuance ledger insert not found")
+}
+
+func repairHex(value []byte) string {
+	const digits = "0123456789abcdef"
+	encoded := make([]byte, len(value)*2)
+	for index, item := range value {
+		encoded[index*2] = digits[item>>4]
+		encoded[index*2+1] = digits[item&0x0f]
+	}
+	return string(encoded)
+}
+
+func TestRepairRefundCommitsLedgerWithControlFinalization(t *testing.T) {
+	t.Parallel()
+	evidence := repairEvidence{
+		SagaID: uuid.New(), IntentID: uuid.New(), ReservationID: uuid.New(), OwnerID: uuid.New(), OperationID: uuid.New(),
+		AmountMinor: 2500, Currency: "TWD", CompletedAt: time.Now(),
+	}
+	command := paymentshard.ApplyRefundCompensationCommand{CommandID: uuid.New(), CompensationID: uuid.New()}
+	receipt := paymentshard.ApplyRefundCompensationReceipt{
+		CommandID: command.CommandID, CompensationID: command.CompensationID, PaymentIntentID: evidence.IntentID,
+		ReservationID: evidence.ReservationID, TicketOrderID: uuid.New(), ReleasedSeatCount: 1, CancelledTicketCount: 1,
+	}
+	tx := &beginRepairTx{rows: []pgx.Row{beginRow(func(dest []any) {
+		*(dest[0].(*string)) = "refunded"
+		*(dest[1].(*string)) = "refunding"
+		*(dest[2].(*string)) = "compensate"
+		*(dest[3].(*bool)) = true
+	})}}
+	repairer := &Repairer{control: &beginControl{tx: tx}}
+	if err := repairer.finalizeCompensation(context.Background(), evidence, command, receipt, "repair-owner"); err != nil {
+		t.Fatalf("finalizeCompensation() error = %v", err)
+	}
+	if !tx.committed {
+		t.Fatal("refund control fact and ledger did not commit together")
+	}
+	joined := strings.Join(tx.execs, "\n")
+	for _, fragment := range []string{
+		"UPDATE public.ticket_order_shard_locators SET status='cancelled'",
+		"INSERT INTO public.financial_ledger_transactions", "state='cancelled'", "state='compensated'",
+	} {
+		if !strings.Contains(joined, fragment) {
+			t.Fatalf("atomic refund finalization missing %q:\n%s", fragment, joined)
+		}
+	}
+	assertRepairPostings(t, tx.execArgs, ledger.AccountTicketSales, ledger.AccountProviderRefundReceivable)
+}
+
 type beginVerifier struct {
 	called              bool
 	intentID, commandID uuid.UUID
@@ -260,16 +394,21 @@ type beginRepairTx struct {
 	pgx.Tx
 	rows      []pgx.Row
 	execs     []string
+	execArgs  [][]any
 	committed bool
 }
 
-func (tx *beginRepairTx) QueryRow(context.Context, string, ...any) pgx.Row {
+func (tx *beginRepairTx) QueryRow(_ context.Context, query string, _ ...any) pgx.Row {
+	if strings.Contains(query, "FROM public.financial_ledger_transactions") {
+		return beginErrorRow{err: pgx.ErrNoRows}
+	}
 	row := tx.rows[0]
 	tx.rows = tx.rows[1:]
 	return row
 }
-func (tx *beginRepairTx) Exec(_ context.Context, query string, _ ...any) (pgconn.CommandTag, error) {
+func (tx *beginRepairTx) Exec(_ context.Context, query string, args ...any) (pgconn.CommandTag, error) {
 	tx.execs = append(tx.execs, query)
+	tx.execArgs = append(tx.execArgs, append([]any(nil), args...))
 	return pgconn.NewCommandTag("UPDATE 1"), nil
 }
 func (tx *beginRepairTx) Commit(context.Context) error { tx.committed = true; return nil }
@@ -278,3 +417,22 @@ func (*beginRepairTx) Rollback(context.Context) error  { return nil }
 type beginRow func([]any)
 
 func (row beginRow) Scan(dest ...any) error { row(dest); return nil }
+
+type beginErrorRow struct{ err error }
+
+func (row beginErrorRow) Scan(...any) error { return row.err }
+
+func assertRepairPostings(t *testing.T, args [][]any, debit, credit ledger.Account) {
+	t.Helper()
+	var sawDebit, sawCredit bool
+	for _, values := range args {
+		if len(values) != 6 {
+			continue
+		}
+		sawDebit = sawDebit || values[2] == debit && values[3] == ledger.Debit
+		sawCredit = sawCredit || values[2] == credit && values[3] == ledger.Credit
+	}
+	if !sawDebit || !sawCredit {
+		t.Fatalf("ledger postings missing debit=%s credit=%s: %+v", debit, credit, args)
+	}
+}

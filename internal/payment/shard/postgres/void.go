@@ -41,6 +41,9 @@ func (store *Store) CancelVoidedReservation(ctx context.Context, route sharding.
 		}
 		return receipt, nil
 	}
+	if err := store.authorizeRegional(ctx, tx); err != nil {
+		return rollback(err)
+	}
 	if err := lockFence(ctx, tx, route); err != nil {
 		return rollback(err)
 	}

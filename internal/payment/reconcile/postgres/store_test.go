@@ -25,6 +25,24 @@ func TestCandidateQueryIsBoundedAndNeverEnumeratesPhysicalShards(t *testing.T) {
 	}
 }
 
+func TestCandidateQueryDiscoversStaleAwaitingCustomerPayments(t *testing.T) {
+	if !strings.Contains(candidateIntentSQL, "'awaiting_customer'") {
+		t.Fatal("stale awaiting_customer payment is absent from bounded reconciliation candidates")
+	}
+}
+
+func TestControlSnapshotLoadsSucceededAndCompletedPartialRefundTotals(t *testing.T) {
+	for _, required := range []string{
+		"ticket_refund_operations",
+		"operation.state='succeeded'",
+		"request.state='completed'",
+	} {
+		if !strings.Contains(controlSnapshotSQL, required) {
+			t.Fatalf("control snapshot omitted partial-refund evidence %q", required)
+		}
+	}
+}
+
 func TestStoreRejectsInvalidBoundariesBeforeDatabaseUse(t *testing.T) {
 	store, err := New(fakeControl{}, fakeResolver{})
 	if err != nil {

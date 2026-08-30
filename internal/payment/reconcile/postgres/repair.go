@@ -87,7 +87,13 @@ SELECT saga.saga_id,intent.payment_intent_id,intent.reservation_id,intent.train_
        saga.current_step,intent.currency,intent.amount_minor,
        COALESCE(saga.bounded_error_category,''),
        operation.response_fingerprint,operation.completed_at,
-       saga.lease_owner IS NOT NULL AND saga.lease_until>=clock_timestamp()
+       (saga.lease_owner IS NOT NULL AND saga.lease_until>=clock_timestamp())
+       OR EXISTS (
+          SELECT 1 FROM public.payment_saga_actions AS active_action
+          WHERE active_action.saga_id=saga.saga_id
+            AND active_action.state='processing'
+            AND active_action.lease_until>=clock_timestamp()
+       )
 FROM public.payment_intents AS intent
 JOIN public.payment_sagas AS saga ON saga.payment_intent_id=intent.payment_intent_id
 JOIN public.payment_operations AS operation ON operation.payment_intent_id=intent.payment_intent_id
@@ -315,6 +321,9 @@ func (r *Repairer) claimRepairSaga(ctx context.Context, evidence repairEvidence,
 		return "", err
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := lockSagaActionBoundary(ctx, tx, evidence.SagaID, evidence.IntentID); err != nil {
+		return "", err
+	}
 	if manualFinalize {
 		if kind == "issue_tickets" || kind == "mark_refund_pending" {
 			if tag, execErr := tx.Exec(ctx, `UPDATE public.payment_intents SET state=$2
@@ -336,7 +345,13 @@ FROM public.payment_intents AS intent
 WHERE saga.saga_id=$1 AND intent.payment_intent_id=$2
   AND intent.payment_intent_id=saga.payment_intent_id
   AND intent.state=$4 AND saga.state=$5 AND saga.current_step=$6
-  AND (saga.lease_until IS NULL OR saga.lease_until<clock_timestamp())`,
+  AND (saga.lease_until IS NULL OR saga.lease_until<clock_timestamp())
+  AND NOT EXISTS (
+    SELECT 1 FROM public.payment_saga_actions AS active_action
+    WHERE active_action.saga_id=saga.saga_id
+      AND active_action.state='processing'
+      AND active_action.lease_until>=clock_timestamp()
+  )`,
 		evidence.SagaID, evidence.IntentID, leaseOwner, expectedIntent, expectedSaga, expectedStep)
 	if err != nil || tag.RowsAffected() != 1 {
 		return "", paymentreconcile.ErrRepairUnavailable
@@ -405,6 +420,9 @@ WHERE saga_id=$1 AND state='manual_review' AND (lease_until IS NULL OR lease_unt
 		if tag, execErr := tx.Exec(ctx, `UPDATE public.payment_sagas SET state='issuing_tickets',current_step='issue_tickets',next_attempt_at=clock_timestamp(),lease_owner=NULL,lease_until=NULL
 WHERE saga_id=$1 AND state='captured' AND (lease_until IS NULL OR lease_until<clock_timestamp())`, evidence.SagaID); execErr != nil || tag.RowsAffected() != 1 {
 			return paymentreconcile.ErrRepairUnavailable
+		}
+		if err := appendRepairCaptureLedger(ctx, tx, evidence); err != nil {
+			return err
 		}
 		if err := insertRepairAudit(ctx, tx, intentID, paymentreconcile.ScopeTickets, true); err != nil {
 			return err
@@ -540,13 +558,22 @@ func (r *Repairer) MarkManualReview(ctx context.Context, intentID uuid.UUID) err
 		return err
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := lockSagaActionBoundary(ctx, tx, uuid.Nil, intentID); err != nil {
+		return err
+	}
 	if tag, err := tx.Exec(ctx, `UPDATE public.payment_intents SET state='manual_review'
 WHERE payment_intent_id=$1 AND state IN ('reservation_securing','checkout_pending','awaiting_customer','authorization_pending','authorized','capture_pending','captured','ticket_issue_pending','void_pending','refund_pending')`, intentID); err != nil || tag.RowsAffected() != 1 {
 		return paymentreconcile.ErrRepairUnavailable
 	}
 	if tag, err := tx.Exec(ctx, `UPDATE public.payment_sagas SET state='manual_review',lease_owner=NULL,lease_until=NULL,bounded_error_category='operator_requested',next_attempt_at=clock_timestamp()
 WHERE payment_intent_id=$1 AND state NOT IN ('completed','compensated','failed','manual_review')
-  AND (lease_until IS NULL OR lease_until<clock_timestamp())`, intentID); err != nil || tag.RowsAffected() != 1 {
+  AND (lease_until IS NULL OR lease_until<clock_timestamp())
+  AND NOT EXISTS (
+    SELECT 1 FROM public.payment_saga_actions AS active_action
+    WHERE active_action.saga_id=payment_sagas.saga_id
+      AND active_action.state='processing'
+      AND active_action.lease_until>=clock_timestamp()
+  )`, intentID); err != nil || tag.RowsAffected() != 1 {
 		return paymentreconcile.ErrRepairUnavailable
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO public.payment_manual_review_cases(review_case_id,payment_intent_id,reason_category,review_due_at)
@@ -558,6 +585,29 @@ ON CONFLICT(payment_intent_id,reason_category) WHERE payment_intent_id IS NOT NU
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// lockSagaActionBoundary gives repair/admin mutations the same row-lock
+// boundary as ClaimActions. Once the saga row is locked, a processing action
+// cannot appear until this transaction commits; an action already performing
+// external I/O makes the repair fail closed.
+func lockSagaActionBoundary(ctx context.Context, tx pgx.Tx, sagaID, intentID uuid.UUID) error {
+	var activeAction bool
+	err := tx.QueryRow(ctx, `
+SELECT EXISTS (
+  SELECT 1 FROM public.payment_saga_actions AS active_action
+  WHERE active_action.saga_id=saga.saga_id
+    AND active_action.state='processing'
+    AND active_action.lease_until>=clock_timestamp()
+)
+FROM public.payment_sagas AS saga
+WHERE ($1::uuid='00000000-0000-0000-0000-000000000000' OR saga.saga_id=$1)
+  AND ($2::uuid='00000000-0000-0000-0000-000000000000' OR saga.payment_intent_id=$2)
+FOR UPDATE OF saga`, sagaID, intentID).Scan(&activeAction)
+	if err != nil || activeAction {
+		return paymentreconcile.ErrRepairUnavailable
+	}
+	return nil
 }
 
 func insertRepairAudit(ctx context.Context, tx pgx.Tx, intentID uuid.UUID, scope paymentreconcile.Scope, repaired bool) error {
@@ -574,7 +624,7 @@ func insertRepairAudit(ctx context.Context, tx pgx.Tx, intentID uuid.UUID, scope
 
 func issueCommand(e repairEvidence) paymentshard.IssueTicketsCommand {
 	return paymentshard.IssueTicketsCommand{
-		CommandID: deterministicRepairID(e.SagaID, "issue_tickets_command"), IssuanceID: deterministicRepairID(e.SagaID, "ticket_issuance"),
+		CommandID: deterministicRepairID(e.SagaID, "issue_tickets_command"), IssuanceID: paymentshard.DeterministicIssuanceID(e.SagaID),
 		PaymentIntentID: e.IntentID, PaymentOperationID: e.OperationID, ReservationID: e.ReservationID,
 		TrainRunID: e.TrainRunID, OwnerID: e.OwnerID, AmountMinor: e.AmountMinor, Currency: e.Currency,
 		CaptureProofHash: e.Proof, RequestFingerprint: repairFingerprint(e.SagaID, "issue_tickets", e.Proof),
@@ -683,6 +733,9 @@ ON CONFLICT(ticket_code) DO UPDATE SET ticket_id=EXCLUDED.ticket_id
 WHERE ticket_code_directory.ticket_id=EXCLUDED.ticket_id`, ticketCode, ticketID); err != nil || tag.RowsAffected() != 1 {
 			return paymentreconcile.ErrRepairUnavailable
 		}
+	}
+	if err := appendRepairIssuanceLedger(ctx, tx, e, command.IssuanceID, receipt.IssuedAt); err != nil {
+		return err
 	}
 	if tag, err := tx.Exec(ctx, `UPDATE public.payment_intents SET state='completed',completed_at=clock_timestamp()
 WHERE payment_intent_id=$1 AND state='ticket_issue_pending'`, e.IntentID); err != nil || tag.RowsAffected() != 1 {
@@ -808,6 +861,11 @@ WHERE ticket_order_id=$1 AND reservation_id=$2 AND owner_user_id=$3`, orderID, e
 		}
 	} else if requireLocator {
 		return paymentreconcile.ErrRepairUnavailable
+	}
+	if intentState == "refunded" {
+		if err := appendRepairRefundLedger(ctx, tx, e, requireLocator); err != nil {
+			return err
+		}
 	}
 	if tag, err := tx.Exec(ctx, `UPDATE public.payment_intents SET state='cancelled'
 WHERE payment_intent_id=$1 AND state=$2`, e.IntentID, intentState); err != nil || tag.RowsAffected() != 1 {

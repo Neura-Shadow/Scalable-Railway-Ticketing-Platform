@@ -153,3 +153,29 @@ is insufficient: preserve and scan bounded logs/results, then prove provider,
 control, receipt, ticket, inventory, reconciliation and pool invariants before
 recording any result. Tear down explicitly; use `--volumes` only after retained
 migration/recovery evidence is no longer required.
+
+## Milestone 7 active-passive DR topology
+
+`docker-compose.dr.yml` extends the payment topology with one asynchronous
+standby for each of the fixed control/shard databases, a separately mounted
+encrypted pgBackRest repository, isolated restore-validation storage, and
+private `dr-admin`/`backup-admin` tools. Runtime containers remain non-root and
+must receive explicit regional identity; recovery commands use a recovery role
+with writes disabled and cannot act as a generic SQL or shell executor.
+
+The topology requires a fresh synthetic JWT secret, a separately supplied
+pgBackRest cipher secret file, and project-scoped volumes. Never commit or
+publish provider credentials, webhook secrets, replication credentials, backup
+keys, DSNs, WAL, database dumps, or restored data. Validate the rendered config
+before startup and use the Milestone 7 runner for bounded evidence; direct
+`docker compose restart` or PostgreSQL promotion is not an authorized failover.
+
+Failover is operator-controlled: prove external fencing, record positions,
+remove passive readiness, promote the three fixed databases, reset pools,
+verify roles, timelines, and the higher epoch, reconcile, then enable workers
+and switch ingress. Failback requires a fresh reseed from the active writer and
+a newer epoch. Redis is rebuilt and never becomes payment, ticket, ledger,
+settlement, refund, or regional-authority durability. See
+`docs/regional-failover.md`, `docs/regional-failback.md`, and
+`docs/backup-and-pitr.md`. Until the evidence report changes from `not_run`, no
+runtime, RPO/RTO, restore, security, or capacity result is published.

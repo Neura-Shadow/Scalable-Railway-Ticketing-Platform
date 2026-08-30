@@ -226,6 +226,19 @@ func (service *Service) WithProcessingGrace(grace time.Duration) *Service {
 	return service
 }
 
+// WithProvider selects the startup-configured provider identity written into
+// every new intent. Customer input never controls this value.
+func (service *Service) WithProvider(provider string) *Service {
+	if service == nil {
+		return service
+	}
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "sandbox", "stripe":
+		service.provider = strings.ToLower(strings.TrimSpace(provider))
+	}
+	return service
+}
+
 // CreateIntent is deliberately split into control reserve, shard mutation,
 // and control finalization. No transaction spans either database.
 func (service *Service) CreateIntent(ctx context.Context, command CreateIntentCommand) (IntentRecord, error) {

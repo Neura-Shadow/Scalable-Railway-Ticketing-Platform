@@ -1285,6 +1285,186 @@ func TestLoadPaymentWorkerUsesBoundedProcessOwnedSettings(t *testing.T) {
 	}
 }
 
+func TestLoadStripePaymentWorkerRequiresBoundedCheckoutURLs(t *testing.T) {
+	t.Parallel()
+	env := map[string]string{
+		"APP_ENV":                      "test",
+		"DATABASE_URL":                 "postgres://payment-worker@db.example/railway",
+		"PAYMENT_ENABLED":              "true",
+		"PAYMENT_PROVIDER_TYPE":        "stripe",
+		"PAYMENT_PROVIDER_API_VERSION": "2026-07-29.dahlia",
+		"PAYMENT_PROVIDER_BASE_URL":    "https://api.stripe.com",
+		"PAYMENT_PROVIDER_ACCOUNT_ID":  "acct_test_railway",
+		"PAYMENT_PROVIDER_API_KEY":     "sk_test_synthetic_only",
+		"PAYMENT_PROVIDER_SUCCESS_URL": "https://tickets.example/payments/success",
+		"PAYMENT_PROVIDER_CANCEL_URL":  "https://tickets.example/payments/cancel",
+		"PAYMENT_SAGA_WORKER_ENABLED":  "true",
+		"PAYMENT_WORKER_ENABLED":       "true",
+	}
+
+	cfg, err := config.LoadFromFor(mapLookup(env), config.ProcessPaymentWorker)
+	if err != nil {
+		t.Fatalf("LoadFromFor(stripe payment-worker) error = %v", err)
+	}
+	if cfg.PaymentProviderSuccessURL != env["PAYMENT_PROVIDER_SUCCESS_URL"] ||
+		cfg.PaymentProviderCancelURL != env["PAYMENT_PROVIDER_CANCEL_URL"] {
+		t.Fatalf("Stripe checkout URLs = %q / %q", cfg.PaymentProviderSuccessURL, cfg.PaymentProviderCancelURL)
+	}
+
+	delete(env, "PAYMENT_PROVIDER_CANCEL_URL")
+	if _, err := config.LoadFromFor(mapLookup(env), config.ProcessPaymentWorker); err == nil ||
+		!strings.Contains(err.Error(), "PAYMENT_PROVIDER_CANCEL_URL") {
+		t.Fatalf("missing Stripe cancel URL error = %v", err)
+	}
+}
+
+func TestLoadStripeIngressUsesOneMatchingWebhookKeyringAndRegionalAuthority(t *testing.T) {
+	t.Parallel()
+	keyring := "current=whsec_current_contract,previous=whsec_previous_contract"
+	env := validBookingShardAPIEnvironment()
+	env["PAYMENT_ENABLED"] = "true"
+	env["PAYMENT_PROVIDER_TYPE"] = "stripe"
+	env["PAYMENT_PROVIDER_API_VERSION"] = "2026-07-29.dahlia"
+	env["PAYMENT_PROVIDER_BASE_URL"] = "https://api.stripe.com"
+	env["PAYMENT_PROVIDER_ACCOUNT_ID"] = "acct_test_railway"
+	env["PAYMENT_PROVIDER_API_KEY"] = "must-not-enter-ingress-process"
+	env["PAYMENT_PROVIDER_WEBHOOK_KEYRING"] = keyring
+	env["PAYMENT_WEBHOOK_PRIMARY_KEY_ID"] = "current"
+	env["PAYMENT_WEBHOOK_ACCEPT_KEY_IDS"] = "current,previous"
+	env["PAYMENT_WEBHOOK_KEY_RETIREMENT_GRACE_SECONDS"] = "3600"
+	env["DEPLOYMENT_REGION"] = "region-a"
+	env["DEPLOYMENT_ROLE"] = "active"
+	env["REGION_EPOCH"] = "7"
+	env["REGIONAL_WRITES_ENABLED"] = "true"
+	env["DR_FAILOVER_ENABLED"] = "true"
+	env["DR_REQUIRED_DATABASE_COUNT"] = "3"
+
+	cfg, err := config.LoadFromFor(mapLookup(env), config.ProcessAPI)
+	if err != nil {
+		t.Fatalf("LoadFromFor(api) error = %v", err)
+	}
+	if cfg.PaymentProviderType != config.PaymentProviderStripe ||
+		cfg.PaymentProviderAPIVersion != "2026-07-29.dahlia" ||
+		cfg.PaymentProviderAccountID != "acct_test_railway" ||
+		cfg.PaymentWebhookPrimaryKeyID != "current" ||
+		cfg.PaymentWebhookKeyRetirementGrace != time.Hour ||
+		cfg.DeploymentRegion != config.DeploymentRegionA ||
+		cfg.DeploymentRole != config.DeploymentRoleActive || cfg.RegionEpoch != 7 ||
+		!cfg.RegionalWritesEnabled || !cfg.DRFailoverEnabled || cfg.DRRequiredDatabaseCount != 3 {
+		t.Fatalf("stripe/regional settings = %+v", cfg)
+	}
+	if cfg.PaymentProviderAPIKey != "" {
+		t.Fatal("API ingress loaded an outbound provider credential")
+	}
+	ids, secrets, parseErr := cfg.ParseStripeWebhookSecrets()
+	if parseErr != nil || len(ids) != 2 || ids[0] != "current" || ids[1] != "previous" ||
+		secrets[0] != "whsec_current_contract" || secrets[1] != "whsec_previous_contract" {
+		t.Fatalf("Stripe webhook keys ids=%v secrets=%v error=%v", ids, secrets, parseErr)
+	}
+
+	env["PAYMENT_PROVIDER_WEBHOOK_KEYRING"] = "next=whsec_next_contract"
+	if _, err := config.LoadFromFor(mapLookup(env), config.ProcessAPI); err == nil ||
+		!strings.Contains(err.Error(), "accepted Stripe webhook") {
+		t.Fatalf("unaccepted Stripe key error = %v", err)
+	}
+}
+
+func TestLoadSettlementWorkerUsesBoundedProcessOwnedSettings(t *testing.T) {
+	t.Parallel()
+	env := map[string]string{
+		"APP_ENV":                                       "test",
+		"DATABASE_URL":                                  "postgres://settlement-worker@db.example/railway",
+		"PAYMENT_ENABLED":                               "true",
+		"PAYMENT_PROVIDER_TYPE":                         "stripe",
+		"PAYMENT_PROVIDER_API_VERSION":                  "2026-07-29.dahlia",
+		"PAYMENT_PROVIDER_BASE_URL":                     "https://api.stripe.com",
+		"PAYMENT_PROVIDER_ACCOUNT_ID":                   "acct_test_railway",
+		"PAYMENT_PROVIDER_API_KEY":                      "rk_test_settlement_read_only",
+		"SETTLEMENT_WORKER_ENABLED":                     "true",
+		"SETTLEMENT_WORKER_INTERVAL_SECONDS":            "30",
+		"SETTLEMENT_WORKER_PAGE_SIZE":                   "200",
+		"SETTLEMENT_WORKER_MAX_PAGES_PER_RUN":           "5",
+		"SETTLEMENT_WORKER_MAX_ATTEMPTS":                "7",
+		"SETTLEMENT_RECONCILIATION_LOOKBACK_DAYS":       "45",
+		"TICKET_REFUND_CUTOFF_MINUTES_BEFORE_DEPARTURE": "90",
+		"WORKER_HTTP_ADDRESS":                           ":9191",
+		"WORKER_PASS_TIMEOUT":                           "2m",
+		"DEPLOYMENT_REGION":                             "region-a",
+		"DEPLOYMENT_ROLE":                               "active",
+		"REGION_EPOCH":                                  "1",
+		"REGIONAL_WRITES_ENABLED":                       "true",
+		"DR_REQUIRED_DATABASE_COUNT":                    "3",
+	}
+	cfg, err := config.LoadFromFor(mapLookup(env), config.ProcessSettlementWorker)
+	if err != nil {
+		t.Fatalf("LoadFromFor(settlement-worker) error = %v", err)
+	}
+	if !cfg.SettlementWorkerEnabled || cfg.SettlementWorkerInterval != 30*time.Second ||
+		cfg.SettlementWorkerPageSize != 200 || cfg.SettlementWorkerMaxPagesPerRun != 5 ||
+		cfg.SettlementWorkerMaxAttempts != 7 || cfg.SettlementReconciliationLookbackDays != 45 ||
+		cfg.TicketRefundCutoff != 90*time.Minute {
+		t.Fatalf("settlement/refund settings = %+v", cfg)
+	}
+}
+
+func TestStripeOutboundCredentialModeIsBoundToEnvironmentAndProcess(t *testing.T) {
+	t.Parallel()
+
+	worker := map[string]string{
+		"APP_ENV": "test", "DATABASE_URL": "postgres://payment-worker@db.example/railway",
+		"PAYMENT_ENABLED": "true", "PAYMENT_PROVIDER_TYPE": "stripe",
+		"PAYMENT_PROVIDER_API_VERSION": "2026-07-29.dahlia", "PAYMENT_PROVIDER_BASE_URL": "https://api.stripe.com",
+		"PAYMENT_PROVIDER_ACCOUNT_ID": "acct_test_railway", "PAYMENT_PROVIDER_API_KEY": "sk_live_forbidden_in_test",
+		"PAYMENT_PROVIDER_SUCCESS_URL": "https://tickets.example/payments/success", "PAYMENT_PROVIDER_CANCEL_URL": "https://tickets.example/payments/cancel",
+		"PAYMENT_SAGA_WORKER_ENABLED": "true", "PAYMENT_WORKER_ENABLED": "true",
+	}
+	if _, err := config.LoadFromFor(mapLookup(worker), config.ProcessPaymentWorker); err == nil || !strings.Contains(err.Error(), "key mode") {
+		t.Fatalf("test payment worker accepted live Stripe key: %v", err)
+	}
+
+	settlement := map[string]string{
+		"APP_ENV": "test", "DATABASE_URL": "postgres://settlement-worker@db.example/railway",
+		"PAYMENT_ENABLED": "true", "PAYMENT_PROVIDER_TYPE": "stripe",
+		"PAYMENT_PROVIDER_API_VERSION": "2026-07-29.dahlia", "PAYMENT_PROVIDER_BASE_URL": "https://api.stripe.com",
+		"PAYMENT_PROVIDER_ACCOUNT_ID": "acct_test_railway", "PAYMENT_PROVIDER_API_KEY": "sk_test_too_broad_for_settlement",
+		"SETTLEMENT_WORKER_ENABLED": "true", "DEPLOYMENT_REGION": "region-a", "DEPLOYMENT_ROLE": "active",
+		"REGION_EPOCH": "1", "REGIONAL_WRITES_ENABLED": "true", "DR_REQUIRED_DATABASE_COUNT": "3",
+	}
+	if _, err := config.LoadFromFor(mapLookup(settlement), config.ProcessSettlementWorker); err == nil || !strings.Contains(err.Error(), "key mode") {
+		t.Fatalf("settlement worker accepted unrestricted Stripe key: %v", err)
+	}
+	settlement["PAYMENT_PROVIDER_API_KEY"] = "rk_test_settlement_read_only"
+	if _, err := config.LoadFromFor(mapLookup(settlement), config.ProcessSettlementWorker); err != nil {
+		t.Fatalf("settlement worker rejected restricted test key: %v", err)
+	}
+	settlement["APP_ENV"] = "production"
+	settlement["PAYMENT_PROVIDER_API_KEY"] = "rk_test_forbidden_in_production"
+	if _, err := config.LoadFromFor(mapLookup(settlement), config.ProcessSettlementWorker); err == nil || !strings.Contains(err.Error(), "key mode") {
+		t.Fatalf("production settlement worker accepted test Stripe key: %v", err)
+	}
+	settlement["PAYMENT_PROVIDER_API_KEY"] = "rk_live_settlement_read_only"
+	if _, err := config.LoadFromFor(mapLookup(settlement), config.ProcessSettlementWorker); err != nil {
+		t.Fatalf("production settlement worker rejected restricted live key: %v", err)
+	}
+}
+
+func TestRegionalAuthorityRejectsPassiveOrRecoveryWrites(t *testing.T) {
+	t.Parallel()
+	for _, role := range []config.DeploymentRole{config.DeploymentRolePassive, config.DeploymentRoleRecovery} {
+		cfg := config.Defaults()
+		cfg.DatabaseURL = "postgres://runtime@db.example/railway"
+		cfg.DeploymentRegion = config.DeploymentRegionB
+		cfg.DeploymentRole = role
+		cfg.RegionEpoch = 2
+		cfg.RegionalWritesEnabled = true
+		cfg.DRRequiredDatabaseCount = 3
+		if err := cfg.ValidateFor(config.ProcessPaymentReconciler); err == nil ||
+			!strings.Contains(err.Error(), "REGIONAL_WRITES_ENABLED") {
+			t.Fatalf("ValidateFor(%s with writes) error = %v", role, err)
+		}
+	}
+}
+
 func TestPaymentReconcilerDoesNotRequireWebhookSecrets(t *testing.T) {
 	t.Parallel()
 	cfg := config.Defaults()

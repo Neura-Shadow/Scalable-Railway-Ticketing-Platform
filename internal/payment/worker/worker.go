@@ -71,11 +71,13 @@ func (worker *Worker) RunOnce(ctx context.Context) (Result, error) {
 
 	operations, err := worker.store.ClaimOperations(ctx, options)
 	if err != nil {
+		worker.appendFailure(&result, FailureLaneClaimOperations, err)
 		failures = append(failures, fmt.Errorf("claim payment operations: %w", err))
 	} else {
 		result.OperationsClaimed = len(operations)
 		for _, claim := range operations {
 			if err := worker.processOperation(ctx, now, claim, &result); err != nil {
+				worker.appendFailure(&result, FailureLaneProcessOperation, err)
 				failures = append(failures, err)
 			}
 		}
@@ -83,11 +85,13 @@ func (worker *Worker) RunOnce(ctx context.Context) (Result, error) {
 
 	webhooks, err := worker.store.ClaimWebhooks(ctx, options)
 	if err != nil {
+		worker.appendFailure(&result, FailureLaneClaimWebhooks, err)
 		failures = append(failures, fmt.Errorf("claim payment webhooks: %w", err))
 	} else {
 		result.WebhooksClaimed = len(webhooks)
 		for _, claim := range webhooks {
 			if err := worker.processWebhook(ctx, now, claim, &result); err != nil {
+				worker.appendFailure(&result, FailureLaneProcessWebhook, err)
 				failures = append(failures, err)
 			}
 		}
@@ -95,17 +99,40 @@ func (worker *Worker) RunOnce(ctx context.Context) (Result, error) {
 
 	actions, err := worker.store.ClaimActions(ctx, options)
 	if err != nil {
+		worker.appendFailure(&result, FailureLaneClaimActions, err)
 		failures = append(failures, fmt.Errorf("claim payment actions: %w", err))
 	} else {
 		result.ActionsClaimed = len(actions)
 		for _, claim := range actions {
 			if err := worker.processAction(ctx, now, claim, &result); err != nil {
+				worker.appendFailure(&result, FailureLaneProcessAction, err)
 				failures = append(failures, err)
 			}
 		}
 	}
 	result.Failures = len(failures)
 	return result, errors.Join(failures...)
+}
+
+func (worker *Worker) appendFailure(result *Result, lane FailureLane, err error) {
+	reason := boundedFailureReason(err)
+	result.FailureSummaries = append(result.FailureSummaries, FailureSummary{Lane: lane, Reason: reason})
+	worker.record(MetricObservation{Lane: "failure", Operation: string(lane), Result: "failure", Reason: string(reason)})
+}
+
+func boundedFailureReason(err error) FailureReason {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return FailureReasonTimeout
+	case errors.Is(err, ErrLeaseLost):
+		return FailureReasonLeaseLost
+	case errors.Is(err, ErrStoreUnavailable):
+		return FailureReasonStoreUnavailable
+	case errors.Is(err, ErrProviderUnavailable):
+		return FailureReasonProviderUnavailable
+	default:
+		return FailureReasonUnknown
+	}
 }
 
 func (worker *Worker) processOperation(ctx context.Context, now time.Time, claim OperationClaim, result *Result) error {
@@ -163,6 +190,12 @@ func (worker *Worker) processOperation(ctx context.Context, now time.Time, claim
 	}
 	switch evidence.Disposition {
 	case DispositionApplied:
+		if claim.Type == domain.OperationCapture && worker.config.TestAfterExternalEffect != nil {
+			worker.config.TestAfterExternalEffect(ExternalEffectCaptureCommitted, claim.PaymentIntentID)
+		}
+		if claim.Type == domain.OperationRefund && worker.config.TestAfterExternalEffect != nil {
+			worker.config.TestAfterExternalEffect(ExternalEffectRefundCommitted, claim.PaymentIntentID)
+		}
 		if err := worker.store.CompleteOperation(ctx, claim, evidence); err != nil {
 			worker.record(operationObservation(claim, "failure", "database", time.Since(started), false))
 			return fmt.Errorf("complete payment operation: %w", err)
@@ -248,6 +281,15 @@ func (worker *Worker) processWebhook(ctx context.Context, now time.Time, claim W
 		category, retryable, uncertain := classifyProviderError(err)
 		return worker.failWebhook(ctx, now, started, claim, category, !retryable && !uncertain || claim.Attempts >= worker.config.MaxAttempts, result)
 	}
+	if err := provider.EvaluateFinancialObservation(
+		provider.FinancialExpectation{AmountMinor: payment.AmountMinor, Currency: payment.Currency},
+		provider.FinancialObservation{
+			Status: payment.Status, AmountMinor: payment.AmountMinor, Currency: payment.Currency,
+			CapturedMinor: payment.CapturedMinor, RefundedMinor: payment.RefundedMinor,
+		},
+	); err != nil {
+		return worker.failWebhook(ctx, now, started, claim, "inconsistent_response", true, result)
+	}
 	evidence := WebhookEvidence{
 		Status: payment.Status, AmountMinor: payment.AmountMinor, Currency: payment.Currency,
 		CapturedMinor: payment.CapturedMinor, RefundedMinor: payment.RefundedMinor,
@@ -312,6 +354,12 @@ func (worker *Worker) processAction(ctx context.Context, now time.Time, claim Ac
 	if !validActionEvidence(claim, evidence) {
 		return worker.failAction(ctx, now, started, claim, "shard_receipt_conflict", true, result)
 	}
+	if claim.Type == ActionIssueTickets && worker.config.TestAfterExternalEffect != nil {
+		worker.config.TestAfterExternalEffect(ExternalEffectTicketsCommitted, claim.Issue.PaymentIntentID)
+	}
+	if claim.Type == ActionCompensate && worker.config.TestAfterExternalEffect != nil {
+		worker.config.TestAfterExternalEffect(ExternalEffectCompensationCommitted, claim.Compensation.PaymentIntentID)
+	}
 	if err := worker.store.CompleteAction(ctx, claim, evidence); err != nil {
 		failureErr := worker.failAction(ctx, now, started, claim, "database_finalize_failed", claim.Attempts >= worker.config.MaxAttempts, result)
 		return errors.Join(fmt.Errorf("complete payment action: %w", err), failureErr)
@@ -359,10 +407,17 @@ func (worker *Worker) failAction(ctx context.Context, now, started time.Time, cl
 	// A committed shard command followed by a control-finalization failure is
 	// repairable from its immutable receipt. It must never be mistaken for a
 	// permanent issuance failure and trigger an unnecessary refund.
-	compensate := review && claim.Type == ActionIssueTickets && category != "database_finalize_failed"
+	compensate := review && claim.Type == ActionIssueTickets &&
+		(category == "shard_ticket_claim_conflict" || category == "shard_receipt_conflict")
 	failure := Failure{Category: boundedCategory(category), ManualReview: review && !compensate, Compensate: compensate}
 	if !review {
-		failure.NextAttemptAt = now.Add(retryDelay(claim.SagaID, claim.Attempts, worker.config.RetryBase, worker.config.RetryMax))
+		backoffID := claim.ActionID
+		if backoffID == uuid.Nil {
+			// Compatibility for an already-claimed M6 row during a controlled
+			// upgrade; every v11 claim carries a durable action identity.
+			backoffID = claim.SagaID
+		}
+		failure.NextAttemptAt = now.Add(retryDelay(backoffID, claim.Attempts, worker.config.RetryBase, worker.config.RetryMax))
 	}
 	if err := worker.store.FailAction(ctx, claim, failure); err != nil {
 		worker.record(actionObservation(claim, "failure", "database", time.Since(started)))
@@ -412,7 +467,7 @@ func invokeProvider(ctx context.Context, client provider.Client, claim Operation
 		if err != nil {
 			return evidence, err
 		}
-		evidence = operationResultEvidence(value)
+		evidence = operationResultEvidence(claim.Type, value)
 	case domain.OperationCapture:
 		value, err := client.Capture(ctx, provider.CaptureRequest{
 			PaymentIntentID: claim.PaymentIntentID.String(), ProviderPaymentID: claim.ProviderPaymentID,
@@ -422,7 +477,7 @@ func invokeProvider(ctx context.Context, client provider.Client, claim Operation
 		if err != nil {
 			return evidence, err
 		}
-		evidence = operationResultEvidence(value)
+		evidence = operationResultEvidence(claim.Type, value)
 	case domain.OperationVoid:
 		value, err := client.Void(ctx, provider.VoidRequest{
 			PaymentIntentID: claim.PaymentIntentID.String(), ProviderPaymentID: claim.ProviderPaymentID,
@@ -431,7 +486,7 @@ func invokeProvider(ctx context.Context, client provider.Client, claim Operation
 		if err != nil {
 			return evidence, err
 		}
-		evidence = operationResultEvidence(value)
+		evidence = operationResultEvidence(claim.Type, value)
 	case domain.OperationRefund:
 		value, err := client.Refund(ctx, provider.RefundRequest{
 			PaymentIntentID: claim.PaymentIntentID.String(), ProviderPaymentID: claim.ProviderPaymentID,
@@ -441,9 +496,12 @@ func invokeProvider(ctx context.Context, client provider.Client, claim Operation
 		if err != nil {
 			return evidence, err
 		}
-		evidence = operationResultEvidence(value)
+		evidence = operationResultEvidence(claim.Type, value)
 	default:
 		return evidence, &provider.Error{Category: provider.ErrorPermanentValidation, Operation: "unknown", Message: "payment operation is invalid"}
+	}
+	if err := evaluateFinancialEvidence(claim, evidence, claim.Type != domain.OperationQueryStatus); err != nil {
+		return OperationEvidence{}, err
 	}
 	evidence.Disposition = expectedDisposition(claim.Type, evidence.Status)
 	evidence.ResponseFingerprint = fingerprintEvidence(evidence)
@@ -471,6 +529,9 @@ func queryUncertain(ctx context.Context, client provider.Client, claim Operation
 			ProviderPaymentID: value.ProviderPaymentID, HostedSessionRef: value.HostedReference,
 			Status: value.Status, AmountMinor: value.AmountMinor, Currency: value.Currency,
 		}
+		if err := evaluateFinancialEvidence(claim, evidence, true); err != nil {
+			return OperationEvidence{}, err
+		}
 		evidence.Disposition = expectedDisposition(claim.Type, evidence.Status)
 		evidence.ResponseFingerprint = fingerprintEvidence(evidence)
 		return evidence, nil
@@ -497,14 +558,43 @@ func queryStatus(ctx context.Context, client provider.Client, claim OperationCla
 		CapturedMinor: value.CapturedMinor, RefundedMinor: value.RefundedMinor,
 		ProviderObservedTime: value.ProviderUpdatedAt.UTC(),
 	}
+	if err := evaluateFinancialEvidence(claim, evidence, false); err != nil {
+		return OperationEvidence{}, err
+	}
 	evidence.ResponseFingerprint = fingerprintEvidence(evidence)
 	return evidence, nil
 }
 
-func operationResultEvidence(value provider.OperationResult) OperationEvidence {
-	return OperationEvidence{
+func operationResultEvidence(kind domain.OperationType, value provider.OperationResult) OperationEvidence {
+	evidence := OperationEvidence{
 		ProviderPaymentID: value.ProviderPaymentID, ProviderOperationID: value.ProviderOperationID,
 		Status: value.Status, AmountMinor: value.AmountMinor, Currency: value.Currency,
+	}
+	switch kind {
+	case domain.OperationCapture:
+		evidence.CapturedMinor = value.AmountMinor
+	case domain.OperationRefund:
+		evidence.CapturedMinor = value.AmountMinor
+		evidence.RefundedMinor = value.AmountMinor
+	}
+	return evidence
+}
+
+func evaluateFinancialEvidence(claim OperationClaim, evidence OperationEvidence, uncertain bool) error {
+	err := provider.EvaluateFinancialObservation(
+		provider.FinancialExpectation{AmountMinor: claim.AmountMinor, Currency: claim.Currency},
+		provider.FinancialObservation{
+			Status: evidence.Status, AmountMinor: evidence.AmountMinor, Currency: evidence.Currency,
+			CapturedMinor: evidence.CapturedMinor, RefundedMinor: evidence.RefundedMinor,
+		},
+	)
+	if err == nil {
+		return nil
+	}
+	return &provider.Error{
+		Category: provider.ErrorInconsistentResponse, Operation: string(claim.Type),
+		Uncertain: uncertain,
+		Message:   "payment provider response is inconsistent",
 	}
 }
 
@@ -617,7 +707,7 @@ func validWebhookClaim(claim WebhookClaim, workerID string) bool {
 }
 
 func validActionClaim(claim ActionClaim, workerID string) bool {
-	return claim.SagaID != uuid.Nil && claim.Provider != "" && claim.Attempts > 0 && claim.LeaseOwner == workerID && !claim.LeaseUntil.IsZero()
+	return claim.ActionID != uuid.Nil && claim.SagaID != uuid.Nil && claim.Provider != "" && claim.Attempts > 0 && claim.LeaseOwner == workerID && !claim.LeaseUntil.IsZero()
 }
 
 func validActionEvidence(claim ActionClaim, evidence ActionEvidence) bool {

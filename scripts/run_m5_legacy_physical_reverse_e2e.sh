@@ -5,6 +5,15 @@ set -euo pipefail
 : "${BOOKING_SHARD_0_DATABASE_URL:?BOOKING_SHARD_0_DATABASE_URL is required}"
 : "${BOOKING_SHARD_1_DATABASE_URL:?BOOKING_SHARD_1_DATABASE_URL is required}"
 
+# Milestone 7 write guards require every application-shaped write to identify
+# the durable active authority. This acceptance fixture operates against the
+# migration's initial Region A, epoch 1 authority.
+export PGOPTIONS="${PGOPTIONS:-} -c railway.deployment_region=region-a -c railway.deployment_role=active -c railway.region_epoch=1 -c railway.regional_writes_enabled=true"
+export DEPLOYMENT_REGION=region-a
+export DEPLOYMENT_ROLE=active
+export REGION_EPOCH=1
+export REGIONAL_WRITES_ENABLED=true
+
 run_id=86000000-0000-4000-8000-000000000001
 forward_id=86000000-0000-4000-8000-000000000002
 reverse_id=86000000-0000-4000-8000-000000000003
@@ -118,20 +127,22 @@ SQL
 
 admin plan-reverse-migration --migration-id "$forward_id" \
   --reverse-migration-id "$reverse_id" --generation 3 --confirm
+admin start-reverse-migration --migration-id "$reverse_id" --confirm
 
 # A normal or cross-transaction legacy writer remains fenced while physical is
 # authoritative. Test it before target preparation clears the retained rows so
-# success cannot be hidden by a zero-row update. A residual authorization row
-# is inert outside its own txid.
-psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 -c \
-  "INSERT INTO public.physical_control_target_apply_authorizations(migration_id,train_run_id,target_shard_id,target_generation,transaction_id) VALUES('$reverse_id','$run_id','legacy',3,txid_current())"
+# success cannot be hidden by a zero-row update. Transaction-bound target
+# authorization must not survive a transaction without being consumed.
+if psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 -c \
+  "INSERT INTO public.physical_control_target_apply_authorizations(migration_id,train_run_id,target_shard_id,target_generation,transaction_id) VALUES('$reverse_id','$run_id','legacy',3,txid_current())"; then
+  echo 'unconsumed physical target authorization unexpectedly committed' >&2
+  exit 1
+fi
 if psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 -c \
   "UPDATE public.seat_inventory SET version=version+1 WHERE train_run_id='$run_id'"; then
   echo 'cross-transaction legacy write unexpectedly succeeded' >&2
   exit 1
 fi
-psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 -c \
-  "DELETE FROM public.physical_control_target_apply_authorizations WHERE migration_id='$reverse_id'"
 
 admin enable-capture --migration-id "$reverse_id" --confirm
 admin enable-capture --migration-id "$reverse_id" --confirm

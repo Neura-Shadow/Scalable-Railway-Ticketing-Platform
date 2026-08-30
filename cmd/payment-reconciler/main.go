@@ -16,7 +16,9 @@ import (
 	"syscall"
 	"time"
 
+	paymentprovider "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider"
 	providerhttp "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider/httpclient"
+	providerstripe "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider/stripe"
 	paymentreconcile "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/reconcile"
 	reconcilepostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/reconcile/postgres"
 	platformconfig "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
@@ -179,7 +181,10 @@ func openRunner(ctx context.Context, lookup func(string) (string, bool), command
 	if err != nil || cfg.BookingShardMode != platformconfig.BookingShardModePhysical {
 		return nil, func() {}, errRuntimeWiring
 	}
-	control, err := postgresx.NewBoundedPool(ctx, cfg.DatabaseURL, cfg.ControlDatabaseMaxOpenConns)
+	control, err := postgresx.NewRegionalBoundedPool(ctx, cfg.DatabaseURL, cfg.ControlDatabaseMaxOpenConns, postgresx.RegionalSession{
+		Region: string(cfg.DeploymentRegion), Role: string(cfg.DeploymentRole),
+		Epoch: cfg.RegionEpoch, WritesEnabled: cfg.RegionalWritesEnabled,
+	})
 	if err != nil {
 		return nil, func() {}, errRuntimeWiring
 	}
@@ -190,11 +195,7 @@ func openRunner(ctx context.Context, lookup func(string) (string, bool), command
 		}
 		return nil, func() {}, errRuntimeWiring
 	}
-	providerClient, err := providerhttp.New(providerhttp.Config{
-		BaseURL: cfg.PaymentProviderBaseURL, APIKey: cfg.PaymentProviderAPIKey,
-		ConnectTimeout: cfg.PaymentProviderConnectTimeout, RequestTimeout: cfg.PaymentProviderRequestTimeout,
-		MaxResponseBytes: int64(cfg.PaymentProviderMaxResponseBytes), Now: time.Now,
-	})
+	providerClient, err := newReconciliationProvider(cfg)
 	if err != nil {
 		return fail()
 	}
@@ -212,7 +213,7 @@ func openRunner(ctx context.Context, lookup func(string) (string, bool), command
 	if err != nil {
 		return fail()
 	}
-	reconciler, err := paymentreconcile.New(store, providerRegistry{"sandbox": providerClient}, nil, paymentreconcile.Config{
+	reconciler, err := paymentreconcile.New(store, providerRegistry{string(cfg.PaymentProviderType): providerClient}, nil, paymentreconcile.Config{
 		BatchSize: commandConfig.BatchSize, StaleAfter: cfg.PaymentProcessingGrace,
 		ReviewDue: cfg.PaymentManualReviewAfter, Now: time.Now,
 	})
@@ -220,11 +221,33 @@ func openRunner(ctx context.Context, lookup func(string) (string, bool), command
 		return fail()
 	}
 	registry := prometheus.NewRegistry()
-	metrics, err := platformmetrics.New(registry)
+	metrics, err := platformmetrics.NewEventMetrics(registry)
 	if err != nil {
 		return fail()
 	}
-	health, err := workerhttp.New(cfg.WorkerHTTPAddress, registry, readiness(control, physicalRegistry, store, providerClient, cfg), readinessTimeout(cfg))
+	durableOptions := make([]platformmetrics.DurableOperationsOption, 0, 2)
+	providerCapabilities := providerClient.Descriptor().Capabilities
+	durableOptions = append(durableOptions, platformmetrics.WithProviderCapabilityProfile(providerClient.Descriptor().Name, map[string]bool{
+		"hosted_checkout": providerCapabilities.HostedCheckout, "authorize": providerCapabilities.Authorize,
+		"capture": providerCapabilities.Capture, "void": providerCapabilities.Void,
+		"full_refund": providerCapabilities.FullRefund, "partial_refund": providerCapabilities.PartialRefund,
+		"payment_status_query":    providerCapabilities.PaymentStatusQuery,
+		"settlement_transactions": providerCapabilities.SettlementTransactions,
+		"payout_reports":          providerCapabilities.PayoutReports, "webhook_signatures": providerCapabilities.WebhookSignatures,
+		"webhook_key_rotation": providerCapabilities.WebhookKeyRotation,
+	}))
+	for shardID, shardPool := range physicalRegistry.ReadOnlyPools() {
+		metricShardID := strings.TrimPrefix(shardID.String(), "physical-")
+		durableOptions = append(durableOptions, platformmetrics.WithDurableReplicationSource("booking_shard", metricShardID, shardPool))
+	}
+	durableMetrics, err := platformmetrics.NewDurableOperationsCollector(
+		control, string(cfg.DeploymentRegion), readinessTimeout(cfg), durableOptions...,
+	)
+	if err != nil || registry.Register(durableMetrics) != nil {
+		return fail()
+	}
+	authorityReadiness := readiness(control, physicalRegistry, store, providerClient, cfg)
+	health, err := workerhttp.New(cfg.WorkerHTTPAddress, registry, authorityReadiness, readinessTimeout(cfg))
 	if err != nil {
 		return fail()
 	}
@@ -246,17 +269,21 @@ func openRunner(ctx context.Context, lookup func(string) (string, bool), command
 			cleanup[index]()
 		}
 	}
-	return &runtimeRunner{reconciler: reconciler, serverErrors: serverErrors, metrics: metrics}, closeAll, nil
+	return &runtimeRunner{reconciler: reconciler, serverErrors: serverErrors, metrics: metrics, authorityReadiness: authorityReadiness}, closeAll, nil
 }
 
 type runtimeRunner struct {
-	reconciler   *paymentreconcile.Reconciler
-	serverErrors <-chan error
-	metrics      *platformmetrics.Metrics
+	reconciler         *paymentreconcile.Reconciler
+	serverErrors       <-chan error
+	metrics            *platformmetrics.Metrics
+	authorityReadiness workerhttp.ReadinessCheck
 }
 
 func (r *runtimeRunner) ReconcileAll(ctx context.Context, options paymentreconcile.Options) (paymentreconcile.Result, error) {
 	if r == nil || r.reconciler == nil {
+		return paymentreconcile.Result{}, errRuntimeWiring
+	}
+	if r.authorityReadiness == nil || r.authorityReadiness(ctx) != nil {
 		return paymentreconcile.Result{}, errRuntimeWiring
 	}
 	select {
@@ -284,6 +311,34 @@ func (registry providerRegistry) Provider(name string) (paymentreconcile.StatusQ
 	return client, ok
 }
 
+type reconciliationProvider interface {
+	paymentreconcile.StatusQuerier
+	paymentprovider.Described
+	Ready(context.Context) error
+	CloseIdleConnections()
+}
+
+func newReconciliationProvider(cfg platformconfig.Config) (reconciliationProvider, error) {
+	switch cfg.PaymentProviderType {
+	case platformconfig.PaymentProviderSandbox:
+		return providerhttp.New(providerhttp.Config{
+			BaseURL: cfg.PaymentProviderBaseURL, APIKey: cfg.PaymentProviderAPIKey,
+			ConnectTimeout: cfg.PaymentProviderConnectTimeout, RequestTimeout: cfg.PaymentProviderRequestTimeout,
+			MaxResponseBytes: int64(cfg.PaymentProviderMaxResponseBytes), Now: time.Now,
+		})
+	case platformconfig.PaymentProviderStripe:
+		return providerstripe.NewStatusClient(providerstripe.Config{
+			SecretKey: cfg.PaymentProviderAPIKey, AccountID: cfg.PaymentProviderAccountID,
+			APIOrigin: cfg.PaymentProviderBaseURL, ConnectTimeout: cfg.PaymentProviderConnectTimeout,
+			RequestTimeout:       cfg.PaymentProviderRequestTimeout,
+			MaxResponseBodyBytes: int64(cfg.PaymentProviderMaxResponseBytes), Now: time.Now,
+			AllowInsecureForTest: cfg.Environment == platformconfig.EnvironmentTest,
+		})
+	default:
+		return nil, &paymentprovider.Error{Category: paymentprovider.ErrorPermanentValidation, Operation: "reconcile_provider", Message: "provider type unsupported"}
+	}
+}
+
 func platformConfig(lookup func(string) (string, bool)) (platformconfig.Config, error) {
 	return platformconfig.LoadFromFor(lookup, platformconfig.ProcessPaymentReconciler)
 }
@@ -305,7 +360,10 @@ func newPhysicalRegistry(ctx context.Context, cfg platformconfig.Config) (*shard
 			ConnectTimeout: cfg.PhysicalShardConnectTimeout, StatementTimeout: cfg.PhysicalShardQueryTimeout,
 			LockTimeout: cfg.PhysicalShardQueryTimeout,
 		},
-	}, shardphysical.OpenPGXPool)
+	}, shardphysical.RegionalPGXPoolFactory(postgresx.RegionalSession{
+		Region: string(cfg.DeploymentRegion), Role: string(cfg.DeploymentRole),
+		Epoch: cfg.RegionEpoch, WritesEnabled: cfg.RegionalWritesEnabled,
+	}))
 }
 
 type readyStore interface{ Ready(context.Context) error }
@@ -319,6 +377,10 @@ func readiness(control *pgxpool.Pool, registry *shardphysical.Registry, store re
 		if err := control.Ping(ctx); err != nil {
 			return errRuntimeWiring
 		}
+		session := postgresx.RegionalSession{Region: string(cfg.DeploymentRegion), Role: string(cfg.DeploymentRole), Epoch: cfg.RegionEpoch, WritesEnabled: cfg.RegionalWritesEnabled}
+		if postgresx.CheckRegionalReadiness(ctx, control, session) != nil {
+			return errRuntimeWiring
+		}
 		if err := store.Ready(ctx); err != nil {
 			return errRuntimeWiring
 		}
@@ -326,7 +388,7 @@ func readiness(control *pgxpool.Pool, registry *shardphysical.Registry, store re
 			return errRuntimeWiring
 		}
 		for _, rawShardID := range cfg.BookingShardIDs {
-			if err := physicalShardReady(ctx, control, registry, rawShardID); err != nil {
+			if err := physicalShardReady(ctx, control, registry, rawShardID, session); err != nil {
 				return errRuntimeWiring
 			}
 		}
@@ -334,7 +396,7 @@ func readiness(control *pgxpool.Pool, registry *shardphysical.Registry, store re
 	}
 }
 
-func physicalShardReady(ctx context.Context, control *pgxpool.Pool, registry *shardphysical.Registry, rawShardID string) error {
+func physicalShardReady(ctx context.Context, control *pgxpool.Pool, registry *shardphysical.Registry, rawShardID string, session postgresx.RegionalSession) error {
 	var shardIDText, storageKind, connectionRef, healthState, state string
 	var protocolVersion, schemaVersion int32
 	var enabled, writeEnabled bool
@@ -365,6 +427,9 @@ func physicalShardReady(ctx context.Context, control *pgxpool.Pool, registry *sh
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 	var dirty bool
 	if err := tx.QueryRow(ctx, `SELECT version,dirty FROM public.schema_migrations LIMIT 1`).Scan(&schemaVersion, &dirty); err != nil || schemaVersion != shardphysical.SupportedSchemaVersion || dirty {
+		return errRuntimeWiring
+	}
+	if postgresx.CheckRegionalReadiness(ctx, tx, session) != nil {
 		return errRuntimeWiring
 	}
 	return tx.Commit(ctx)

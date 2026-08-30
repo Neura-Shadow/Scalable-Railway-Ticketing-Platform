@@ -21,7 +21,7 @@ type tableSpec struct {
 }
 
 var migrationTables = []tableSpec{
-	{name: "train_run_booking_snapshots", columns: fields("id train_run_id assignment_generation train_id route_id service_date segment_count route_version booking_policy_version source_version status bookable active source_updated_at created_at updated_at")},
+	{name: "train_run_booking_snapshots", columns: fields("id train_run_id assignment_generation train_id route_id service_date scheduled_departure_at segment_count route_version booking_policy_version source_version status bookable active source_updated_at created_at updated_at")},
 	{name: "booking_seat_catalog", columns: fields("id train_run_id assignment_generation train_id coach_id seat_id coach_order seat_order seat_class active source_version source_updated_at created_at updated_at")},
 	{name: "booking_fare_snapshots", columns: fields("id train_run_id assignment_generation segment_count from_stop_index to_stop_index seat_class amount_minor currency source_version active source_updated_at created_at updated_at")},
 	{name: "seat_inventory", columns: fields("id train_run_id assignment_generation segment_count seat_id seat_class occupied_segments version created_at updated_at")},
@@ -35,7 +35,10 @@ var migrationTables = []tableSpec{
 	{name: "ticket_issuance_receipts", columns: fields("id issuance_id payment_intent_id reservation_id payment_operation_id ticket_order_id train_run_id assignment_generation capture_proof_hash amount_minor currency issued_ticket_count created_at")},
 	{name: "payment_refund_receipts", columns: fields("id refund_operation_id payment_intent_id reservation_id ticket_order_id train_run_id assignment_generation refund_proof_hash captured_amount_minor refunded_amount_minor currency refunded_at created_at")},
 	{name: "payment_compensation_receipts", columns: fields("id compensation_id payment_intent_id reservation_id ticket_order_id refund_receipt_id train_run_id assignment_generation released_seat_count cancelled_ticket_count applied_at created_at")},
+	{name: "ticket_refund_prepare_receipts", columns: fields("id command_id refund_request_id refund_operation_id payment_intent_id reservation_id ticket_order_id train_run_id assignment_generation request_fingerprint amount_minor currency ticket_ids prior_order_state prior_reservation_state state requested_at eligibility_cutoff_at prepared_at resolved_at")},
 	{name: "outbox_events", columns: fields("id train_run_id assignment_generation aggregate_type aggregate_id event_type event_version payload status attempts next_attempt_at locked_at locked_by lease_token created_at updated_at published_at")},
+	{name: "ticket_refund_compensation_receipts", columns: fields("id command_id refund_request_id refund_operation_id payment_intent_id reservation_id ticket_order_id train_run_id assignment_generation request_fingerprint provider_proof_hash amount_minor currency selected_ticket_count released_seat_count resulting_active_ticket_count resulting_order_state committed_at")},
+	{name: "selected_ticket_refund_receipts", columns: fields("id compensation_receipt_id refund_request_id ticket_id reservation_seat_id train_run_id assignment_generation fare_amount_minor currency segment_mask_hash released_at")},
 }
 
 type JSONRow struct {
@@ -238,6 +241,9 @@ SELECT
 	if err := tx.QueryRow(ctx, `
 SELECT
     (SELECT count(*) FROM public.outbox_events WHERE train_run_id = $1 AND assignment_generation = $2)
+  + (SELECT count(*) FROM public.selected_ticket_refund_receipts WHERE train_run_id = $1 AND assignment_generation = $2)
+  + (SELECT count(*) FROM public.ticket_refund_compensation_receipts WHERE train_run_id = $1 AND assignment_generation = $2)
+  + (SELECT count(*) FROM public.ticket_refund_prepare_receipts WHERE train_run_id = $1 AND assignment_generation = $2)
   + (SELECT count(*) FROM public.payment_compensation_receipts WHERE train_run_id = $1 AND assignment_generation = $2)
   + (SELECT count(*) FROM public.payment_refund_receipts WHERE train_run_id = $1 AND assignment_generation = $2)
   + (SELECT count(*) FROM public.ticket_issuance_receipts WHERE train_run_id = $1 AND assignment_generation = $2)
@@ -266,8 +272,32 @@ SET capture_enabled = false, disabled_at = COALESCE(disabled_at, clock_timestamp
 WHERE train_run_id = $1 AND source_generation = $2`, record.TrainRunID, record.RetainedTargetGeneration); err != nil {
 		return rollback(fmt.Errorf("%w: disable retained capture", ErrShardOperation))
 	}
+	authorization, err := tx.Exec(ctx, `
+INSERT INTO public.migration_evidence_mutation_authorizations (
+    transaction_id, migration_id, train_run_id, assignment_generation, table_name
+)
+SELECT txid_current(), state.migration_id, state.train_run_id,
+       state.source_generation, required.table_name
+FROM public.migration_capture_state AS state
+CROSS JOIN (VALUES
+    ('ticket_refund_prepare_receipts'),
+    ('ticket_refund_compensation_receipts'),
+    ('selected_ticket_refund_receipts')
+) AS required(table_name)
+WHERE state.train_run_id = $1
+  AND state.source_generation = $2
+  AND NOT state.capture_enabled`, record.TrainRunID, record.RetainedTargetGeneration)
+	if err != nil {
+		return rollback(fmt.Errorf("%w: authorize retained evidence cleanup", ErrShardOperation))
+	}
+	if authorization.RowsAffected() != 3 {
+		return rollback(physicalmigration.ErrCheckpointConflict)
+	}
 	deletes := []string{
 		"DELETE FROM public.outbox_events WHERE train_run_id = $1 AND assignment_generation = $2",
+		"DELETE FROM public.selected_ticket_refund_receipts WHERE train_run_id = $1 AND assignment_generation = $2",
+		"DELETE FROM public.ticket_refund_compensation_receipts WHERE train_run_id = $1 AND assignment_generation = $2",
+		"DELETE FROM public.ticket_refund_prepare_receipts WHERE train_run_id = $1 AND assignment_generation = $2",
 		"DELETE FROM public.payment_compensation_receipts WHERE train_run_id = $1 AND assignment_generation = $2",
 		"DELETE FROM public.payment_refund_receipts WHERE train_run_id = $1 AND assignment_generation = $2",
 		"DELETE FROM public.ticket_issuance_receipts WHERE train_run_id = $1 AND assignment_generation = $2",
@@ -284,12 +314,32 @@ WHERE train_run_id = $1 AND source_generation = $2`, record.TrainRunID, record.R
 		"DELETE FROM public.migration_apply_receipts WHERE train_run_id = $1 AND target_generation = $2",
 		"DELETE FROM public.train_run_mutation_journal WHERE train_run_id = $1 AND source_generation = $2",
 		"DELETE FROM public.train_run_target_write_evidence WHERE train_run_id = $1 AND assignment_generation = $2",
-		"DELETE FROM public.migration_capture_state WHERE train_run_id = $1 AND source_generation = $2",
 	}
 	for _, statement := range deletes {
 		if _, err := tx.Exec(ctx, statement, record.TrainRunID, record.RetainedTargetGeneration); err != nil {
 			return rollback(fmt.Errorf("%w: clean retained predecessor", ErrShardOperation))
 		}
+	}
+	revocation, err := tx.Exec(ctx, `
+DELETE FROM public.migration_evidence_mutation_authorizations
+WHERE transaction_id = txid_current()
+  AND train_run_id = $1
+  AND assignment_generation = $2
+  AND table_name IN (
+      'ticket_refund_prepare_receipts',
+      'ticket_refund_compensation_receipts',
+      'selected_ticket_refund_receipts'
+  )`, record.TrainRunID, record.RetainedTargetGeneration)
+	if err != nil {
+		return rollback(fmt.Errorf("%w: revoke retained evidence cleanup", ErrShardOperation))
+	}
+	if revocation.RowsAffected() != 3 {
+		return rollback(physicalmigration.ErrCheckpointConflict)
+	}
+	if _, err := tx.Exec(ctx,
+		"DELETE FROM public.migration_capture_state WHERE train_run_id = $1 AND source_generation = $2",
+		record.TrainRunID, record.RetainedTargetGeneration); err != nil {
+		return rollback(fmt.Errorf("%w: clean retained predecessor", ErrShardOperation))
 	}
 	if _, err := tx.Exec(ctx, `
 UPDATE public.train_run_booking_snapshots
@@ -433,10 +483,15 @@ func semanticInvariantViolations(ctx context.Context, db DB, trainRunID uuid.UUI
 		          ON reservation.id = seat.reservation_id
 		         AND reservation.train_run_id = seat.train_run_id
 		         AND reservation.assignment_generation = seat.assignment_generation
+		        LEFT JOIN public.tickets AS ticket
+		          ON ticket.reservation_seat_id = seat.id
+		         AND ticket.train_run_id = seat.train_run_id
+		         AND ticket.assignment_generation = seat.assignment_generation
 		        WHERE reservation.status IN (
 		            'held', 'payment_pending', 'payment_review', 'confirmed',
-		            'refund_pending'
+		            'partially_refund_pending', 'partially_refunded', 'refund_pending'
 		        )
+		          AND (ticket.id IS NULL OR ticket.status NOT IN ('refunded', 'cancelled'))
 		        GROUP BY seat.train_run_id, seat.assignment_generation, seat.seat_id
 		    ) AS expected
 		      ON expected.train_run_id = inventory.train_run_id
@@ -507,6 +562,51 @@ func semanticInvariantViolations(ctx context.Context, db DB, trainRunID uuid.UUI
 		               SELECT 1 FROM public.booking_command_receipts WHERE command_id = event.aggregate_id
 		           )))
 		)`,
+		`SELECT 1 WHERE EXISTS (
+		    SELECT 1
+		    FROM public.ticket_refund_compensation_receipts AS compensation
+		    LEFT JOIN LATERAL (
+		        SELECT count(*) AS ticket_count,
+		               COALESCE(sum(selected.fare_amount_minor), 0) AS amount_minor,
+		               count(DISTINCT selected.currency) AS currencies,
+		               min(selected.currency) AS currency
+		        FROM public.selected_ticket_refund_receipts AS selected
+		        WHERE selected.compensation_receipt_id = compensation.id
+		          AND selected.train_run_id = compensation.train_run_id
+		          AND selected.assignment_generation = compensation.assignment_generation
+		    ) AS selected ON true
+		    WHERE compensation.train_run_id = $1
+		      AND compensation.assignment_generation = $2
+		      AND (selected.ticket_count <> compensation.selected_ticket_count
+		           OR selected.ticket_count <> compensation.released_seat_count
+		           OR selected.amount_minor <> compensation.amount_minor
+		           OR selected.currencies <> 1
+		           OR selected.currency <> compensation.currency)
+		)`,
+		`SELECT 1 WHERE EXISTS (
+		    SELECT 1
+		    FROM public.selected_ticket_refund_receipts AS selected
+		    JOIN public.ticket_refund_compensation_receipts AS compensation
+		      ON compensation.id = selected.compensation_receipt_id
+		     AND compensation.train_run_id = selected.train_run_id
+		     AND compensation.assignment_generation = selected.assignment_generation
+		    LEFT JOIN public.tickets AS ticket
+		      ON ticket.id = selected.ticket_id
+		     AND ticket.train_run_id = selected.train_run_id
+		     AND ticket.assignment_generation = selected.assignment_generation
+		    LEFT JOIN public.reservation_seats AS seat
+		      ON seat.id = selected.reservation_seat_id
+		     AND seat.train_run_id = selected.train_run_id
+		     AND seat.assignment_generation = selected.assignment_generation
+		    WHERE selected.train_run_id = $1
+		      AND selected.assignment_generation = $2
+		      AND (ticket.id IS NULL OR ticket.status <> 'refunded'
+		           OR ticket.reservation_seat_id <> selected.reservation_seat_id
+		           OR ticket.ticket_order_id <> compensation.ticket_order_id
+		           OR seat.id IS NULL OR seat.reservation_id <> compensation.reservation_id
+		           OR seat.fare_amount_minor <> selected.fare_amount_minor
+		           OR seat.currency <> selected.currency)
+		)`,
 	)
 	query := "SELECT count(*) FROM (" + strings.Join(parts, " UNION ALL ") + ") AS violations"
 	var count int
@@ -537,6 +637,49 @@ WHERE id = $1 AND train_run_id = $2 AND assignment_generation = $3`, spec.name)
 
 func upsertSQL(spec tableSpec) string {
 	columns := strings.Join(spec.columns, ", ")
+	if immutableEvidenceTable(spec.name) {
+		return fmt.Sprintf(`
+INSERT INTO public.%s (%s)
+SELECT %s
+FROM jsonb_populate_record(
+    NULL::public.%s,
+    $1::jsonb
+)
+ON CONFLICT (id) DO NOTHING`, spec.name, columns, columns, spec.name)
+	}
+	if spec.name == "ticket_refund_prepare_receipts" {
+		updates := make([]string, 0, len(spec.columns)-1)
+		identityMismatch := make([]string, 0, len(spec.columns)-3)
+		for _, column := range spec.columns {
+			if column == "id" {
+				continue
+			}
+			updates = append(updates, column+" = EXCLUDED."+column)
+			if column != "state" && column != "resolved_at" {
+				identityMismatch = append(identityMismatch,
+					"ticket_refund_prepare_receipts."+column+" IS DISTINCT FROM EXCLUDED."+column)
+			}
+		}
+		return fmt.Sprintf(`
+INSERT INTO public.%s (%s)
+SELECT %s
+FROM jsonb_populate_record(
+    NULL::public.%s,
+    $1::jsonb
+)
+ON CONFLICT (id) DO UPDATE SET %s
+WHERE (
+    ticket_refund_prepare_receipts.state = 'prepared'
+    AND EXCLUDED.state IN ('released', 'applied')
+  ) OR (%s)
+  OR (
+    ticket_refund_prepare_receipts.state IN ('released', 'applied')
+    AND EXCLUDED.state IN ('released', 'applied')
+    AND ROW(ticket_refund_prepare_receipts.state, ticket_refund_prepare_receipts.resolved_at)
+        IS DISTINCT FROM ROW(EXCLUDED.state, EXCLUDED.resolved_at)
+  )`, spec.name, columns, columns, spec.name, strings.Join(updates, ", "),
+			strings.Join(identityMismatch, " OR "))
+	}
 	updates := make([]string, 0, len(spec.columns)-1)
 	for _, column := range spec.columns {
 		if column != "id" {
@@ -551,6 +694,11 @@ FROM jsonb_populate_record(
     $1::jsonb
 )
 ON CONFLICT (id) DO UPDATE SET %s`, spec.name, columns, columns, spec.name, strings.Join(updates, ", "))
+}
+
+func immutableEvidenceTable(name string) bool {
+	return name == "ticket_refund_compensation_receipts" ||
+		name == "selected_ticket_refund_receipts"
 }
 
 func parseBaseCursor(cursor string) (int, uuid.UUID, error) {

@@ -23,6 +23,7 @@ import (
 	operatorpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/operatorcommand/postgres"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/clock"
 	platformmetrics "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/metrics"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/workerhttp"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	shardphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physical"
@@ -31,7 +32,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-const controlSchemaVersion = 10
+const controlSchemaVersion = 11
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -59,6 +60,9 @@ func run(logger *slog.Logger, lookup func(string) (string, bool)) error {
 	controlConfig.MaxConns = int32(cfg.controlMaxConns)
 	controlConfig.MinConns = 0
 	controlConfig.ConnConfig.ConnectTimeout = cfg.connectTimeout
+	if err := postgresx.ApplyRegionalSession(controlConfig.ConnConfig, cfg.regionalSession); err != nil {
+		return errors.New("regional postgres configuration invalid")
+	}
 	controlPool, err := pgxpool.NewWithConfig(rootContext, controlConfig)
 	if err != nil {
 		return errors.New("control postgres unavailable")
@@ -79,7 +83,7 @@ func run(logger *slog.Logger, lookup func(string) (string, bool)) error {
 			LockTimeout: cfg.queryTimeout,
 		},
 	}, func(ctx context.Context, dsn string, limits shardphysical.PoolLimits) (shardphysical.Pool, error) {
-		pool, openErr := shardphysical.OpenPGXPool(ctx, dsn, limits)
+		pool, openErr := shardphysical.RegionalPGXPoolFactory(cfg.regionalSession)(ctx, dsn, limits)
 		if openErr == nil {
 			if dsn == cfg.shardZeroURL {
 				shardPools["physical-shard-0"] = pool
@@ -109,7 +113,7 @@ func run(logger *slog.Logger, lookup func(string) (string, bool)) error {
 	if err != nil {
 		return errors.New("metrics unavailable")
 	}
-	physicalMetrics, err := platformmetrics.New(metrics.registry)
+	physicalMetrics, err := platformmetrics.NewEventMetrics(metrics.registry)
 	if err != nil {
 		return errors.New("metrics unavailable")
 	}
@@ -140,6 +144,10 @@ func run(logger *slog.Logger, lookup func(string) (string, bool)) error {
 	runPass := func() {
 		ctx, cancel := context.WithTimeout(rootContext, cfg.passTimeout)
 		defer cancel()
+		if reconcilerReadiness(controlPool, shardPools, cfg)(ctx) != nil {
+			logger.Info("booking command reconciler retained without regional claim authority", "deployment_role", cfg.regionalSession.Role)
+			return
+		}
 		started := time.Now()
 		type bookingOutcome struct {
 			result reconcile.Result
@@ -264,6 +272,7 @@ type runtimeConfig struct {
 	connectTimeout   time.Duration
 	queryTimeout     time.Duration
 	routeTTL         time.Duration
+	regionalSession  postgresx.RegionalSession
 }
 
 func loadConfig(lookup func(string) (string, bool)) (runtimeConfig, error) {
@@ -284,7 +293,17 @@ func loadConfig(lookup func(string) (string, bool)) (runtimeConfig, error) {
 	cfg.shardOneURL = env(lookup, "BOOKING_SHARD_1_DATABASE_URL", "")
 	cfg.workerID = env(lookup, "BOOKING_COMMAND_RECONCILER_ID", cfg.workerID)
 	cfg.httpAddress = env(lookup, "WORKER_HTTP_ADDRESS", cfg.httpAddress)
+	cfg.regionalSession.Region = env(lookup, "DEPLOYMENT_REGION", "")
+	cfg.regionalSession.Role = env(lookup, "DEPLOYMENT_ROLE", "")
+	epoch, epochErr := strconv.ParseInt(env(lookup, "REGION_EPOCH", ""), 10, 64)
+	if epochErr != nil {
+		return runtimeConfig{}, epochErr
+	}
+	cfg.regionalSession.Epoch = epoch
 	var err error
+	if cfg.regionalSession.WritesEnabled, err = envBool(lookup, "REGIONAL_WRITES_ENABLED", false); err != nil {
+		return runtimeConfig{}, err
+	}
 	if cfg.enabled, err = envBool(lookup, "BOOKING_COMMAND_RECONCILER_ENABLED", cfg.enabled); err != nil {
 		return runtimeConfig{}, err
 	}
@@ -326,6 +345,9 @@ func loadConfig(lookup func(string) (string, bool)) (runtimeConfig, error) {
 		cfg.connectTimeout > 10*time.Second || cfg.queryTimeout <= 0 || cfg.queryTimeout > 30*time.Second ||
 		cfg.routeTTL <= 0 || cfg.routeTTL > 5*time.Minute {
 		return runtimeConfig{}, errors.New("bounded configuration invalid")
+	}
+	if err := postgresx.ValidateRegionalSession(cfg.regionalSession); err != nil {
+		return runtimeConfig{}, errors.New("regional configuration invalid")
 	}
 	return cfg, nil
 }
@@ -438,6 +460,9 @@ func reconcilerReadiness(
 		if err := control.Ping(ctx); err != nil {
 			return errors.New("dependency unavailable")
 		}
+		if !cfg.enabled || cfg.regionalSession.Role != "active" || !cfg.regionalSession.WritesEnabled || postgresx.CheckRegionalReadiness(ctx, control, cfg.regionalSession) != nil {
+			return errors.New("regional authority unavailable")
+		}
 		var version int
 		var dirty bool
 		if err := control.QueryRow(ctx, "SELECT version, dirty FROM schema_migrations LIMIT 1").Scan(&version, &dirty); err != nil ||
@@ -452,6 +477,9 @@ func reconcilerReadiness(
 			var shardVersion int
 			var shardDirty bool
 			err = tx.QueryRow(ctx, "SELECT version, dirty FROM public.schema_migrations LIMIT 1").Scan(&shardVersion, &shardDirty)
+			if err == nil {
+				err = postgresx.CheckRegionalReadiness(ctx, tx, cfg.regionalSession)
+			}
 			if err == nil {
 				err = tx.Commit(ctx)
 			} else {

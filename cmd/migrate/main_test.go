@@ -49,3 +49,20 @@ func TestRunRedactsMalformedDatabaseConnectionErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestRunRejectsInvalidUpToBeforeOpeningDatabase(t *testing.T) {
+	t.Parallel()
+	for _, args := range [][]string{
+		{"-database", "postgres://unused.invalid/db", "up-to"},
+		{"-database", "postgres://unused.invalid/db", "up-to", "0"},
+		{"-database", "postgres://unused.invalid/db", "up-to", "11", "extra"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if exitCode := run(args, &stdout, &stderr); exitCode != 2 {
+			t.Fatalf("run(%q) exit code = %d, want 2", args, exitCode)
+		}
+		if strings.Contains(stderr.String(), "unused.invalid") {
+			t.Fatalf("invalid up-to opened or exposed the database URL: %q", stderr.String())
+		}
+	}
+}

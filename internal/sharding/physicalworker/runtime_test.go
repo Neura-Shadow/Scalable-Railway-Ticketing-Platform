@@ -12,6 +12,7 @@ import (
 
 func TestRuntimeUsesOnlyConfiguredCatalogHandlesAndValidatesSchema(t *testing.T) {
 	cfg := config.Defaults()
+	cfg.RegionalWritesEnabled = true
 	cfg.BookingShardMode = config.BookingShardModePhysical
 	cfg.BookingShardIDs = []string{"physical-shard-0", "physical-shard-1"}
 	cfg.PhysicalShardConnections = map[string]string{
@@ -19,8 +20,8 @@ func TestRuntimeUsesOnlyConfiguredCatalogHandlesAndValidatesSchema(t *testing.T)
 		"physical-shard-1": "configured-one",
 	}
 	pools := map[string]*queuePool{
-		"configured-zero": {transactions: []pgx.Tx{&recordingTx{row: fakeRow{values: []any{int(physical.SupportedSchemaVersion), false}}}}},
-		"configured-one":  {transactions: []pgx.Tx{&recordingTx{row: fakeRow{values: []any{int(physical.SupportedSchemaVersion), false}}}}},
+		"configured-zero": {transactions: []pgx.Tx{readyRuntimeTx(false)}},
+		"configured-one":  {transactions: []pgx.Tx{readyRuntimeTx(false)}},
 	}
 	catalog := &runtimeCatalog{rows: map[string]pgx.Row{
 		"physical-shard-0": runtimeCatalogRow("physical-shard-0", true),
@@ -60,9 +61,36 @@ func TestRuntimeUsesOnlyConfiguredCatalogHandlesAndValidatesSchema(t *testing.T)
 	}
 }
 
+func readyRuntimeTx(inRecovery bool) *recordingTx {
+	return &recordingTx{queryRows: []pgx.Row{
+		fakeRow{values: []any{int(physical.SupportedSchemaVersion), false}},
+		fakeRow{values: []any{"region-a", int64(1), "active", true, inRecovery}},
+	}}
+}
+
+func TestRuntimeReadinessRejectsReplicaEvenWithCurrentSchema(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.RegionalWritesEnabled = true
+	cfg.BookingShardMode = config.BookingShardModePhysical
+	cfg.BookingShardIDs = []string{"physical-shard-0"}
+	cfg.PhysicalShardConnections = map[string]string{"physical-shard-0": "configured-zero"}
+	pool := &queuePool{transactions: []pgx.Tx{readyRuntimeTx(true)}}
+	runtime, err := newRuntime(context.Background(), cfg, &runtimeCatalog{rows: map[string]pgx.Row{
+		"physical-shard-0": runtimeCatalogRow("physical-shard-0", true),
+	}}, func(context.Context, string, physical.PoolLimits) (physical.Pool, error) { return pool, nil })
+	if err != nil {
+		t.Fatalf("newRuntime() error = %v", err)
+	}
+	defer runtime.Close()
+	if err := runtime.Ready(context.Background()); !errors.Is(err, ErrRuntimeUnavailable) {
+		t.Fatalf("Ready() error = %v, want ErrRuntimeUnavailable", err)
+	}
+}
+
 func TestRuntimeReadinessRejectsDirtyOrWrongShardMigration(t *testing.T) {
 	for _, values := range [][]any{{0, false}, {int(physical.SupportedSchemaVersion), true}} {
 		cfg := config.Defaults()
+		cfg.RegionalWritesEnabled = true
 		cfg.BookingShardMode = config.BookingShardModePhysical
 		cfg.BookingShardIDs = []string{"physical-shard-0"}
 		cfg.PhysicalShardConnections = map[string]string{"physical-shard-0": "configured-zero"}

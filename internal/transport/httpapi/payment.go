@@ -14,6 +14,10 @@ const defaultPaymentWebhookMaxBodyBytes int64 = 64 << 10
 
 type emptyPaymentRequest struct{}
 
+type createTicketRefundRequest struct {
+	TicketIDs []string `json:"ticket_ids"`
+}
+
 func registerPaymentRoutes(group *gin.RouterGroup, dependencies Dependencies) {
 	reservations := group.Group("/reservations", authenticate(dependencies.TokenParser), authorize(RoleCustomer))
 	reservations.POST("/:id/payment-intents", createPaymentIntentHandler(dependencies))
@@ -21,6 +25,11 @@ func registerPaymentRoutes(group *gin.RouterGroup, dependencies Dependencies) {
 	intents := group.Group("/payment-intents", authenticate(dependencies.TokenParser), authorize(RoleCustomer))
 	intents.GET("/:id", getPaymentIntentHandler(dependencies))
 	intents.POST("/:id/cancel", cancelPaymentIntentHandler(dependencies))
+
+	orders := group.Group("/ticket-orders", authenticate(dependencies.TokenParser), authorize(RoleCustomer))
+	orders.POST("/:id/refunds", createTicketRefundHandler(dependencies))
+	refunds := group.Group("/ticket-refunds", authenticate(dependencies.TokenParser), authorize(RoleCustomer))
+	refunds.GET("/:id", getTicketRefundHandler(dependencies))
 }
 
 func registerPaymentWebhookRoutes(router *gin.Engine, dependencies Dependencies) {
@@ -104,6 +113,51 @@ func cancelPaymentIntentHandler(dependencies Dependencies) gin.HandlerFunc {
 	}
 }
 
+func createTicketRefundHandler(dependencies Dependencies) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if dependencies.TicketRefunds == nil {
+			writeError(c, ErrPaymentNotEnabled)
+			return
+		}
+		var request createTicketRefundRequest
+		if err := decodeJSON(c, dependencies.MaxRequestBodyBytes, &request); err != nil {
+			writeDecodeError(c, err)
+			return
+		}
+		key := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
+		if !validIdempotencyKey(key) || len(request.TicketIDs) == 0 {
+			writeError(c, ErrInvalidInput)
+			return
+		}
+		identity, _ := identityFromContext(c)
+		result, err := dependencies.TicketRefunds.CreateTicketRefund(c.Request.Context(), CreateTicketRefundCommand{
+			OwnerID: identity.Subject, TicketOrderID: c.Param("id"),
+			TicketIDs: append([]string(nil), request.TicketIDs...), IdempotencyKey: key,
+		})
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		c.JSON(http.StatusAccepted, result)
+	}
+}
+
+func getTicketRefundHandler(dependencies Dependencies) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if dependencies.TicketRefunds == nil {
+			writeError(c, ErrPaymentNotEnabled)
+			return
+		}
+		identity, _ := identityFromContext(c)
+		result, err := dependencies.TicketRefunds.GetTicketRefund(c.Request.Context(), identity.Subject, c.Param("id"))
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, result)
+	}
+}
+
 func paymentWebhookHandler(dependencies Dependencies) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if dependencies.PaymentWebhooks == nil {
@@ -112,7 +166,7 @@ func paymentWebhookHandler(dependencies Dependencies) gin.HandlerFunc {
 		}
 		if !enforceRateLimit(c, dependencies.RateLimiter, RateLimitRequest{
 			Scope: RateLimitPaymentWebhook, Key: directClientKey(c),
-		}, false) {
+		}, true) {
 			return
 		}
 		mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
@@ -135,11 +189,16 @@ func paymentWebhookHandler(dependencies Dependencies) gin.HandlerFunc {
 			writeError(c, ErrWebhookInvalid)
 			return
 		}
+		providerName := strings.ToLower(strings.TrimSpace(c.Param("provider")))
+		signature := strings.TrimSpace(c.GetHeader("X-Payment-Signature"))
+		if providerName == "stripe" {
+			signature = strings.TrimSpace(c.GetHeader("Stripe-Signature"))
+		}
 		disposition, err := dependencies.PaymentWebhooks.IngestPaymentWebhook(c.Request.Context(), PaymentWebhookRequest{
-			Provider:  strings.ToLower(strings.TrimSpace(c.Param("provider"))),
+			Provider:  providerName,
 			KeyID:     strings.TrimSpace(c.GetHeader("X-Payment-Key-ID")),
 			Timestamp: strings.TrimSpace(c.GetHeader("X-Payment-Timestamp")),
-			Signature: strings.TrimSpace(c.GetHeader("X-Payment-Signature")),
+			Signature: signature,
 			Body:      body,
 		})
 		if err != nil {
@@ -150,7 +209,8 @@ func paymentWebhookHandler(dependencies Dependencies) gin.HandlerFunc {
 			c.JSON(http.StatusAccepted, gin.H{"status": string(disposition)})
 			return
 		}
-		if disposition != PaymentWebhookDuplicate && disposition != PaymentWebhookIgnored {
+		if disposition != PaymentWebhookDuplicate && disposition != PaymentWebhookIgnored &&
+			disposition != PaymentWebhookConflict {
 			writeError(c, ErrWebhookInvalid)
 			return
 		}

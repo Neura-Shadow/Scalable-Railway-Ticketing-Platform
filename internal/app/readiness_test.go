@@ -50,6 +50,7 @@ func TestReadinessReportsEveryBoundedComponentWithoutLeakingProbeErrors(t *testi
 		{Name: "migrations", Ready: false},
 		{Name: "shard_catalog", Ready: false},
 		{Name: "configuration", Ready: false},
+		{Name: "regional_authority", Ready: false},
 	}
 	if !reflect.DeepEqual(checks, want) {
 		t.Fatalf("checks=%#v", checks)
@@ -97,5 +98,20 @@ func TestReadinessAllowsOneDegradedShardWhenAnotherServingShardExists(t *testing
 	checks, _ := checker.CheckReadiness(context.Background())
 	if !checks[3].Ready || checks[3].Optional {
 		t.Fatalf("shard catalog readiness = %+v", checks[3])
+	}
+}
+
+func TestReadinessIncludesDurableWebhookKeyringProbe(t *testing.T) {
+	checker := newReadinessChecker(
+		func(context.Context) error { return nil },
+		func(context.Context) error { return nil },
+		func(context.Context) (int, bool, error) { return currentSchemaVersion, false, nil },
+		func(context.Context) error { return nil },
+		func() error { return nil },
+	).WithProbe("webhook_keyring", func(context.Context) error { return errors.New("stale replica") })
+	checks, _ := checker.CheckReadiness(context.Background())
+	last := checks[len(checks)-1]
+	if last.Name != "webhook_keyring" || last.Ready || last.Optional {
+		t.Fatalf("webhook keyring readiness = %+v", last)
 	}
 }

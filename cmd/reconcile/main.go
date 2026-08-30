@@ -16,11 +16,11 @@ import (
 	admissionredis "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/admission/redis"
 	bookingpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/postgres"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/clock"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
 	querycache "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/cache"
 	queryreadmodel "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/query/readmodel"
 	shardreconcile "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/reconcile"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -29,6 +29,7 @@ const (
 	maximumShardReconciliationTimeout = 5 * time.Minute
 	defaultPageSize                   = 100
 	defaultMaximumPages               = 10_000
+	maximumPostgresConnections        = 4
 )
 
 var errReconciliationViolations = errors.New("reconciliation violations detected")
@@ -97,6 +98,20 @@ func run(
 		fmt.Fprintln(stderr, "configuration invalid: DATABASE_URL is required")
 		return 2
 	}
+	var session postgresx.RegionalSession
+	if args[0] != "cache-versions" {
+		var sessionErr error
+		session, sessionErr = postgresx.ParseRegionalSession(
+			environmentValue(lookup, "DEPLOYMENT_REGION"),
+			environmentValue(lookup, "DEPLOYMENT_ROLE"),
+			environmentValue(lookup, "REGION_EPOCH"),
+			environmentValue(lookup, "REGIONAL_WRITES_ENABLED"),
+		)
+		if sessionErr != nil {
+			fmt.Fprintln(stderr, "configuration invalid: regional database session is required")
+			return 2
+		}
+	}
 
 	var (
 		envelope resultEnvelope
@@ -104,21 +119,21 @@ func run(
 	)
 	switch args[0] {
 	case "seat-inventory":
-		envelope, err = runSeatInventory(parent, databaseURL, args[1:])
+		envelope, err = runSeatInventory(parent, databaseURL, session, args[1:])
 	case "reservation-quotas":
-		envelope, err = runReservationQuotas(parent, databaseURL, lookup, args[1:])
+		envelope, err = runReservationQuotas(parent, databaseURL, session, lookup, args[1:])
 	case "admission-state":
-		envelope, err = runAdmissionState(parent, databaseURL, lookup, args[1:])
+		envelope, err = runAdmissionState(parent, databaseURL, session, lookup, args[1:])
 	case "read-model":
-		envelope, err = runReadModel(parent, databaseURL, args[1:])
+		envelope, err = runReadModel(parent, databaseURL, session, args[1:])
 	case "cache-versions":
 		envelope, err = runCacheVersions(parent, lookup, args[1:])
 	case shardreconcile.ScopeAssignments:
-		envelope, err = runShardAssignments(parent, databaseURL, args[1:])
+		envelope, err = runShardAssignments(parent, databaseURL, session, args[1:])
 	case shardreconcile.ScopeLocators:
-		envelope, err = runShardLocators(parent, databaseURL, args[1:])
+		envelope, err = runShardLocators(parent, databaseURL, session, args[1:])
 	case shardreconcile.ScopeMigration:
-		envelope, err = runShardMigration(parent, databaseURL, args[1:])
+		envelope, err = runShardMigration(parent, databaseURL, session, args[1:])
 	default:
 		writeUsage(stderr)
 		return 2
@@ -155,6 +170,7 @@ func run(
 func runShardAssignments(
 	parent context.Context,
 	databaseURL string,
+	session postgresx.RegionalSession,
 	args []string,
 ) (resultEnvelope, error) {
 	flags := flag.NewFlagSet(shardreconcile.ScopeAssignments, flag.ContinueOnError)
@@ -174,7 +190,7 @@ func runShardAssignments(
 	if !limits.Valid() {
 		return resultEnvelope{}, errors.New("shard reconciliation limits are invalid")
 	}
-	return runShardInspection(parent, databaseURL, shardreconcile.ScopeAssignments, *timeout,
+	return runShardInspection(parent, databaseURL, session, shardreconcile.ScopeAssignments, *timeout,
 		func(ctx context.Context, inspector *shardreconcile.Inspector) (shardreconcile.Report, error) {
 			return inspector.Assignments(ctx, limits)
 		})
@@ -183,6 +199,7 @@ func runShardAssignments(
 func runShardLocators(
 	parent context.Context,
 	databaseURL string,
+	session postgresx.RegionalSession,
 	args []string,
 ) (resultEnvelope, error) {
 	flags := flag.NewFlagSet(shardreconcile.ScopeLocators, flag.ContinueOnError)
@@ -210,7 +227,7 @@ func runShardLocators(
 		}
 		filter.TrainRunID = &trainRunID
 	}
-	return runShardInspection(parent, databaseURL, shardreconcile.ScopeLocators, *timeout,
+	return runShardInspection(parent, databaseURL, session, shardreconcile.ScopeLocators, *timeout,
 		func(ctx context.Context, inspector *shardreconcile.Inspector) (shardreconcile.Report, error) {
 			return inspector.Locators(ctx, filter, limits)
 		})
@@ -219,6 +236,7 @@ func runShardLocators(
 func runShardMigration(
 	parent context.Context,
 	databaseURL string,
+	session postgresx.RegionalSession,
 	args []string,
 ) (resultEnvelope, error) {
 	flags := flag.NewFlagSet(shardreconcile.ScopeMigration, flag.ContinueOnError)
@@ -242,7 +260,7 @@ func runShardMigration(
 	if err != nil || migrationID == uuid.Nil || migrationID.String() != strings.TrimSpace(*migrationText) {
 		return resultEnvelope{}, errors.New("migration-id must be a canonical UUID")
 	}
-	return runShardInspection(parent, databaseURL, shardreconcile.ScopeMigration, *timeout,
+	return runShardInspection(parent, databaseURL, session, shardreconcile.ScopeMigration, *timeout,
 		func(ctx context.Context, inspector *shardreconcile.Inspector) (shardreconcile.Report, error) {
 			return inspector.Migration(ctx, migrationID, limits)
 		})
@@ -251,13 +269,14 @@ func runShardMigration(
 func runShardInspection(
 	parent context.Context,
 	databaseURL string,
+	session postgresx.RegionalSession,
 	command string,
 	timeout time.Duration,
 	inspect func(context.Context, *shardreconcile.Inspector) (shardreconcile.Report, error),
 ) (resultEnvelope, error) {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	pool, err := pgxpool.New(ctx, databaseURL)
+	pool, err := postgresx.NewRegionalBoundedPool(ctx, databaseURL, maximumPostgresConnections, session)
 	if err != nil {
 		return resultEnvelope{}, errors.New("postgres configuration invalid")
 	}
@@ -280,7 +299,7 @@ func runShardInspection(
 	return envelope, inspectErr
 }
 
-func runReadModel(parent context.Context, databaseURL string, args []string) (resultEnvelope, error) {
+func runReadModel(parent context.Context, databaseURL string, session postgresx.RegionalSession, args []string) (resultEnvelope, error) {
 	flags := flag.NewFlagSet("read-model", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	trainRunText := flags.String("train-run-id", "", "canonical train-run UUID")
@@ -294,7 +313,7 @@ func runReadModel(parent context.Context, databaseURL string, args []string) (re
 	}
 	ctx, cancel := context.WithTimeout(parent, *timeout)
 	defer cancel()
-	pool, err := pgxpool.New(ctx, databaseURL)
+	pool, err := postgresx.NewRegionalBoundedPool(ctx, databaseURL, maximumPostgresConnections, session)
 	if err != nil {
 		return resultEnvelope{}, errors.New("postgres configuration invalid")
 	}
@@ -371,7 +390,7 @@ func runCacheVersions(
 	return envelope, nil
 }
 
-func runSeatInventory(parent context.Context, databaseURL string, args []string) (resultEnvelope, error) {
+func runSeatInventory(parent context.Context, databaseURL string, session postgresx.RegionalSession, args []string) (resultEnvelope, error) {
 	flags := flag.NewFlagSet("seat-inventory", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	trainRunText := flags.String("train-run-id", "", "canonical train-run UUID")
@@ -385,7 +404,7 @@ func runSeatInventory(parent context.Context, databaseURL string, args []string)
 	}
 	ctx, cancel := context.WithTimeout(parent, *timeout)
 	defer cancel()
-	pool, err := pgxpool.New(ctx, databaseURL)
+	pool, err := postgresx.NewRegionalBoundedPool(ctx, databaseURL, maximumPostgresConnections, session)
 	if err != nil {
 		return resultEnvelope{}, errors.New("postgres configuration invalid")
 	}
@@ -404,6 +423,7 @@ func runSeatInventory(parent context.Context, databaseURL string, args []string)
 func runReservationQuotas(
 	parent context.Context,
 	databaseURL string,
+	session postgresx.RegionalSession,
 	lookup environmentLookup,
 	args []string,
 ) (resultEnvelope, error) {
@@ -448,7 +468,7 @@ func runReservationQuotas(
 	}
 	ctx, cancel := context.WithTimeout(parent, *timeout)
 	defer cancel()
-	pool, err := pgxpool.New(ctx, databaseURL)
+	pool, err := postgresx.NewRegionalBoundedPool(ctx, databaseURL, maximumPostgresConnections, session)
 	if err != nil {
 		return resultEnvelope{}, errors.New("postgres configuration invalid")
 	}
@@ -465,6 +485,7 @@ func runReservationQuotas(
 func runAdmissionState(
 	parent context.Context,
 	databaseURL string,
+	session postgresx.RegionalSession,
 	lookup environmentLookup,
 	args []string,
 ) (resultEnvelope, error) {
@@ -485,7 +506,7 @@ func runAdmissionState(
 
 	ctx, cancel := context.WithTimeout(parent, *timeout)
 	defer cancel()
-	pool, err := pgxpool.New(ctx, databaseURL)
+	pool, err := postgresx.NewRegionalBoundedPool(ctx, databaseURL, maximumPostgresConnections, session)
 	if err != nil {
 		return resultEnvelope{}, errors.New("postgres configuration invalid")
 	}

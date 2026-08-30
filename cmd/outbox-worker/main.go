@@ -27,7 +27,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const outboxSchemaVersion = 10
+const outboxSchemaVersion = 11
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -39,7 +39,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := postgresx.NewBoundedPool(ctx, cfg.DatabaseURL, cfg.ControlDatabaseMaxOpenConns)
+	pool, err := postgresx.NewRegionalBoundedPool(ctx, cfg.DatabaseURL, cfg.ControlDatabaseMaxOpenConns, outboxRegionalSession(cfg))
 	if err != nil {
 		logger.Error("outbox worker database unavailable")
 		os.Exit(1)
@@ -68,6 +68,9 @@ func main() {
 		}
 		if err := pool.Ping(checkContext); err != nil {
 			return errors.New("worker dependency unavailable")
+		}
+		if !outboxPassEnabled(cfg) || postgresx.CheckRegionalReadiness(checkContext, pool, outboxRegionalSession(cfg)) != nil {
+			return errors.New("worker regional authority unavailable")
 		}
 		var version int
 		var dirty bool
@@ -120,7 +123,7 @@ func main() {
 		}
 	}
 	registry := prometheus.NewRegistry()
-	metrics, err := platformmetrics.New(registry)
+	metrics, err := platformmetrics.NewEventMetrics(registry)
 	if err != nil {
 		logger.Error("outbox metrics initialization failed")
 		os.Exit(1)
@@ -189,6 +192,10 @@ func main() {
 	run := func() {
 		passContext, cancel := context.WithTimeout(ctx, cfg.WorkerPassTimeout)
 		defer cancel()
+		if !outboxPassEnabled(cfg) || postgresx.CheckRegionalReadiness(passContext, pool, outboxRegionalSession(cfg)) != nil || (physicalRuntime != nil && physicalRuntime.Ready(passContext) != nil) {
+			logger.Info("outbox worker retained without regional claim authority", "deployment_role", cfg.DeploymentRole)
+			return
+		}
 		var physical func(context.Context) (physicalworker.Result, error)
 		if physicalOutbox != nil {
 			physical = physicalOutbox.RunOnce
@@ -217,6 +224,14 @@ func main() {
 			run()
 		}
 	}
+}
+
+func outboxPassEnabled(cfg config.Config) bool {
+	return cfg.OutboxPublisherEnabled && cfg.DeploymentRole == config.DeploymentRoleActive && cfg.RegionalWritesEnabled
+}
+
+func outboxRegionalSession(cfg config.Config) postgresx.RegionalSession {
+	return postgresx.RegionalSession{Region: string(cfg.DeploymentRegion), Role: string(cfg.DeploymentRole), Epoch: cfg.RegionEpoch, WritesEnabled: cfg.RegionalWritesEnabled}
 }
 
 func allReady(checks ...workerhttp.ReadinessCheck) workerhttp.ReadinessCheck {

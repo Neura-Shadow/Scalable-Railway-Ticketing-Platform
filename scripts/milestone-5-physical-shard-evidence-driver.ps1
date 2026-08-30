@@ -66,6 +66,17 @@ function Write-Milestone5DriverArtifact {
     @($Lines) | Out-File -LiteralPath (Join-Path ([string]$Context.RawDirectory) $Name) -Encoding utf8
 }
 
+function Protect-Milestone5DriverDiagnostic {
+    param([AllowNull()][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines)
+    $value = [string](@($Lines | Select-Object -Last 12) -join "`n")
+    $value = $value -replace '(?i)(postgres(?:ql)?://)[^\s/@:]+:[^\s/@]+@', '$1[redacted]@'
+    $value = $value -replace '(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+', '$1[redacted]'
+    $value = $value -replace '(?i)((?:[a-z0-9]+[_-])*(?:api[_-]?key|token)\s*[:=]\s*)[^\s,;]+', '$1[redacted]'
+    $value = $value -replace '(?i)(password|cipher[_-]?pass|secret)(\s*[:=]\s*)[^\s,;]+', '$1$2[redacted]'
+    if ($value.Length -gt 2048) { $value = $value.Substring($value.Length - 2048) }
+    return $value
+}
+
 function Invoke-Milestone5DriverCompose {
     param(
         [Parameter(Mandatory = $true)][object]$Context,
@@ -82,7 +93,8 @@ function Invoke-Milestone5DriverCompose {
         Write-Milestone5DriverArtifact -Context $Context -Name $Artifact -Lines $result.Output
     }
     if ($result.ExitCode -ne 0 -and -not $AllowFailure) {
-        throw 'Milestone 5 Docker Compose command failed'
+        $diagnostic = Protect-Milestone5DriverDiagnostic -Lines $result.Output
+        throw "Milestone 5 Docker Compose command failed with exit code $($result.ExitCode)`n$diagnostic"
     }
     return $result
 }
@@ -107,13 +119,15 @@ function Invoke-Milestone5DriverPSQL {
     )
     $identity = Get-Milestone5DriverDatabaseIdentity -Service $Service
     $composeArguments = [string[]]@($Context.ComposeArguments)
+    $regionalPGOptions = '-c railway.deployment_region=region-a -c railway.deployment_role=active -c railway.region_epoch=1 -c railway.regional_writes_enabled=true'
     if ($AsInput) {
         $result = Invoke-Milestone5DriverNative -AllowFailure -Command {
-            $SQL | & docker @composeArguments exec -T $Service psql -U $identity[0] -d $identity[1] -v ON_ERROR_STOP=1
+            $SQL | & docker @composeArguments exec -T -e "PGOPTIONS=$regionalPGOptions" $Service psql -U $identity[0] -d $identity[1] -v ON_ERROR_STOP=1
         }
     } else {
         $result = Invoke-Milestone5DriverCompose -Context $Context -AllowFailure -Arguments @(
-            'exec', '-T', $Service, 'psql', '-U', $identity[0], '-d', $identity[1],
+            'exec', '-T', '-e', "PGOPTIONS=$regionalPGOptions", $Service,
+            'psql', '-U', $identity[0], '-d', $identity[1],
             '-v', 'ON_ERROR_STOP=1', '-At', '-c', $SQL
         )
     }
@@ -196,11 +210,21 @@ function Invoke-Milestone5DriverAPI {
         $responseHeaders = $response.Headers
     } catch {
         if ($null -eq $_.Exception.Response) { throw }
-        $status = [int]$_.Exception.Response.StatusCode
-        $responseHeaders = $_.Exception.Response.Headers
-        $stream = $_.Exception.Response.GetResponseStream()
-        $reader = [System.IO.StreamReader]::new($stream)
-        try { $content = $reader.ReadToEnd() } finally { $reader.Dispose() }
+        $errorResponse = $_.Exception.Response
+        $status = [int]$errorResponse.StatusCode
+        $responseHeaders = $errorResponse.Headers
+        $contentProperty = $errorResponse.PSObject.Properties['Content']
+        if ($null -ne $_.ErrorDetails -and -not [string]::IsNullOrWhiteSpace([string]$_.ErrorDetails.Message)) {
+            $content = [string]$_.ErrorDetails.Message
+        } elseif ($null -ne $contentProperty -and $null -ne $contentProperty.Value) {
+            $content = $contentProperty.Value.ReadAsStringAsync().GetAwaiter().GetResult()
+        } elseif ($null -ne $errorResponse.PSObject.Methods['GetResponseStream']) {
+            $stream = $errorResponse.GetResponseStream()
+            $reader = [System.IO.StreamReader]::new($stream)
+            try { $content = $reader.ReadToEnd() } finally { $reader.Dispose() }
+        } else {
+            $content = ''
+        }
     }
     $decoded = $null
     if (-not [string]::IsNullOrWhiteSpace($content)) { $decoded = $content | ConvertFrom-Json }

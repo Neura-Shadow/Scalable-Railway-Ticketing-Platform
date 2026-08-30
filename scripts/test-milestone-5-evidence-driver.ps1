@@ -22,6 +22,28 @@ function Assert-Throws {
     if (-not $threw) { throw "$Label did not fail closed" }
 }
 
+function Assert-ThrowsWithMessage {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][scriptblock]$Action,
+        [Parameter(Mandatory = $true)][string[]]$Contains,
+        [string[]]$Excludes = @()
+    )
+    $message = ''
+    try { & $Action } catch { $message = [string]$_.Exception.Message }
+    if ([string]::IsNullOrWhiteSpace($message)) { throw "$Label did not fail closed" }
+    foreach ($expected in $Contains) {
+        if (-not $message.Contains($expected, [System.StringComparison]::Ordinal)) {
+            throw "$Label omitted bounded diagnostic token: $expected"
+        }
+    }
+    foreach ($excluded in $Excludes) {
+        if ($message.Contains($excluded, [System.StringComparison]::Ordinal)) {
+            throw "$Label leaked excluded diagnostic token"
+        }
+    }
+}
+
 $root = Split-Path -Parent $PSScriptRoot
 $driverPath = Join-Path $PSScriptRoot 'milestone-5-physical-shard-evidence-driver.ps1'
 $composePath = Join-Path $root 'docker-compose.physical-shards.yml'
@@ -29,6 +51,41 @@ $composePath = Join-Path $root 'docker-compose.physical-shards.yml'
 Assert-True -Condition (Test-Path -LiteralPath $driverPath -PathType Leaf) `
     -Message 'trusted Milestone 5 evidence driver is missing'
 . $driverPath
+
+function docker {
+    Write-Output 'database postgresql://demo:supersecret@db:5432/app'
+    Write-Output 'Authorization: Bearer live-bearer-token'
+    Write-Output 'X-Admission-Token: live-admission-token'
+    Write-Output 'API_TOKEN=live-api-token'
+    Write-Output 'PAYMENT_PROVIDER_API_KEY=live-provider-key'
+    Write-Output 'reverse planning failed because target evidence was missing'
+    $global:LASTEXITCODE = 17
+}
+$diagnosticDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "m5-driver-diagnostic-$([guid]::NewGuid().ToString('N'))"
+New-Item -ItemType Directory -Path $diagnosticDirectory | Out-Null
+try {
+    $diagnosticContext = [pscustomobject]@{
+        RepositoryPath = $root
+        RawDirectory = $diagnosticDirectory
+        ProjectName = 'm5-driver-diagnostic'
+        ComposeFile = $composePath
+        ComposeArguments = [string[]]@('compose')
+    }
+    Assert-ThrowsWithMessage -Label 'failed Compose diagnostic' -Action {
+        Invoke-Milestone5DriverCompose -Context $diagnosticContext -Arguments @('run','diagnostic') -Artifact 'diagnostic.log' | Out-Null
+    } -Contains @(
+        'exit code 17',
+        'reverse planning failed because target evidence was missing'
+    ) -Excludes @(
+        'supersecret',
+        'live-bearer-token',
+        'live-admission-token',
+        'live-api-token',
+        'live-provider-key'
+    )
+} finally {
+    [System.IO.Directory]::Delete($diagnosticDirectory, $true)
+}
 
 foreach ($name in @(
     'Initialize-Milestone5Evidence',
@@ -92,6 +149,8 @@ Assert-True -Condition (-not $driver.Contains('--header=')) `
     -Message 'stale prewarm must pass BusyBox long-option values as separate arguments'
 Assert-True -Condition (-not $driver.Contains('--post-data=')) `
     -Message 'stale prewarm must pass BusyBox post data as a separate argument'
+Assert-True -Condition ($driver.Contains("PSObject.Properties['Content']") -and $driver.Contains('ReadAsStringAsync().GetAwaiter().GetResult()')) `
+    -Message 'API error handling must read PowerShell 7 HttpResponseMessage bodies without assuming GetResponseStream'
 Assert-True -Condition (-not $driver.Contains("'sh','-c',`$shell")) `
     -Message 'stale prewarm must preserve JSON and header argv boundaries without a shell command string'
 Assert-True -Condition $driver.Contains("'--post-data',`$nativeBody") `

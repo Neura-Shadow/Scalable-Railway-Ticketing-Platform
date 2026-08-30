@@ -1,0 +1,96 @@
+name: Milestone 7 DR evidence
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/milestone-7-dr.yml"
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "docker-compose.dr.yml"
+      - "deploy/**"
+      - "cmd/api/**"
+      - "cmd/payment-sandbox/**"
+      - "cmd/payment-worker/**"
+      - "cmd/payment-reconciler/**"
+      - "cmd/admission-worker/**"
+      - "cmd/read-model-worker/**"
+      - "cmd/hold-expirer/**"
+      - "cmd/outbox-worker/**"
+      - "cmd/booking-command-reconciler/**"
+      - "cmd/payment-stripe-contract/**"
+      - "cmd/settlement-worker/**"
+      - "cmd/settlement-admin/**"
+      - "cmd/migrate/**"
+      - "cmd/physical-shard-admin/**"
+      - "scripts/run-milestone-7-dr-evidence.ps1"
+      - "scripts/test-milestone-7-dr-evidence-runner.ps1"
+      - "scripts/milestone-5-physical-shard-evidence-driver.ps1"
+      - "scripts/milestone-7/**"
+      - "loadtest/k6/**"
+      - "cmd/dr-admin/**"
+      - "cmd/backup-admin/**"
+      - "internal/payment/**"
+      - "internal/regional/**"
+      - "internal/sharding/**"
+      - "internal/platform/**"
+      - "docker-compose.physical-shards.yml"
+      - "migrations/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: milestone-7-dr-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  same-host-dr-drill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Validate workflow syntax
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          actionlint .github/workflows/milestone-7-dr.yml
+
+      - name: Verify static DR guardrails
+        shell: pwsh
+        run: ./scripts/test-milestone-7-dr-evidence-runner.ps1
+
+      - name: Verify bounded admin runtimes
+        run: |
+          go test -race ./cmd/dr-admin ./cmd/backup-admin ./internal/regional/recovery/postgres ./internal/regional/protection/postgres
+          go vet ./cmd/dr-admin ./cmd/backup-admin ./internal/regional/recovery/postgres ./internal/regional/protection/postgres
+
+      - name: Run destructive project-scoped DR evidence drill
+        shell: pwsh
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/milestone-7-dr-evidence
+        run: >-
+          ./scripts/run-milestone-7-dr-evidence.ps1
+          -ProjectName "railway-m7-dr-${{ github.run_id }}-${{ github.run_attempt }}"
+          -EvidenceDirectory $env:EVIDENCE_DIR
+          -ConfirmDestructiveDrill
+
+      - name: Verify produced publication evidence
+        shell: pwsh
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/milestone-7-dr-evidence
+        run: ./scripts/test-milestone-7-dr-evidence-runner.ps1 -EvidenceDirectory $env:EVIDENCE_DIR
+
+      - name: Upload secret-scanned DR evidence
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: milestone-7-dr-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/milestone-7-dr-evidence
+          if-no-files-found: error
+          retention-days: 14

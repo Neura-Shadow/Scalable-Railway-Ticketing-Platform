@@ -39,6 +39,9 @@ func (store *Store) MarkRefundPending(ctx context.Context, route sharding.ShardR
 		}
 		return paymentshard.MarkRefundPendingReceipt{CommandID: command.CommandID, PaymentIntentID: command.PaymentIntentID, ReservationID: command.ReservationID, TicketOrderID: uuid.NewSHA1(command.PaymentIntentID, []byte("ticket-order"))}, nil
 	}
+	if err := store.authorizeRegional(ctx, tx); err != nil {
+		return rollback(err)
+	}
 	if err := lockFence(ctx, tx, route); err != nil {
 		return rollback(err)
 	}
@@ -159,6 +162,9 @@ func (store *Store) ApplyRefundCompensation(ctx context.Context, route sharding.
 			return paymentshard.ApplyRefundCompensationReceipt{}, paymentshard.ErrShardPaymentUnavailable
 		}
 		return receipt, nil
+	}
+	if err := store.authorizeRegional(ctx, tx); err != nil {
+		return rollback(err)
 	}
 	if err := lockFence(ctx, tx, route); err != nil {
 		return rollback(err)

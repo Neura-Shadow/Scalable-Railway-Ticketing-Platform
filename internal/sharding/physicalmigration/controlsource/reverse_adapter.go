@@ -14,9 +14,9 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// ReverseAdapter migrates a physical booking-shard v2 source back into one of
-// the three fixed control-database booking layouts after control migration 10
-// has installed payment-compatible columns and durable receipt relations.
+// ReverseAdapter migrates a physical booking-shard v3 source back into one of
+// the three fixed control-database booking layouts after control migration 11
+// has installed partial-refund-compatible columns and durable receipt relations.
 type ReverseAdapter struct {
 	targetID  string
 	source    physicalpostgres.DB
@@ -27,7 +27,7 @@ type ReverseAdapter struct {
 const reverseSourcePreflightSQL = `
 SELECT current_setting('server_version_num')::integer >= 160000
    AND EXISTS (
-       SELECT 1 FROM public.schema_migrations WHERE version=2 AND NOT dirty
+       SELECT 1 FROM public.schema_migrations WHERE version=3 AND NOT dirty
    )
    AND to_regclass('public.train_run_booking_snapshots') IS NOT NULL
    AND to_regclass('public.train_run_mutation_journal') IS NOT NULL
@@ -37,6 +37,14 @@ SELECT current_setting('server_version_num')::integer >= 160000
    AND to_regclass('public.ticket_issuance_receipts') IS NOT NULL
    AND to_regclass('public.payment_refund_receipts') IS NOT NULL
    AND to_regclass('public.payment_compensation_receipts') IS NOT NULL
+   AND to_regclass('public.ticket_refund_prepare_receipts') IS NOT NULL
+   AND to_regclass('public.ticket_refund_compensation_receipts') IS NOT NULL
+   AND to_regclass('public.selected_ticket_refund_receipts') IS NOT NULL
+   AND to_regclass('public.migration_evidence_mutation_authorizations') IS NOT NULL
+   AND EXISTS (
+       SELECT 1 FROM public.regional_write_authority
+       WHERE singleton AND state='active' AND writes_enabled
+   )
    AND NOT EXISTS (
        SELECT 1 FROM (VALUES
            ('train_run_booking_snapshots_capture_mutation'),
@@ -52,7 +60,10 @@ SELECT current_setting('server_version_num')::integer >= 160000
            ('payment_command_receipts_capture_mutation'),
            ('ticket_issuance_receipts_capture_mutation'),
            ('payment_refund_receipts_capture_mutation'),
-           ('payment_compensation_receipts_capture_mutation')
+           ('payment_compensation_receipts_capture_mutation'),
+           ('ticket_refund_prepare_receipts_capture_mutation'),
+           ('ticket_refund_compensation_receipts_capture_mutation'),
+           ('selected_ticket_refund_receipts_capture_mutation')
        ) AS required(trigger_name)
        WHERE NOT EXISTS (
            SELECT 1 FROM pg_catalog.pg_trigger
@@ -62,6 +73,7 @@ SELECT current_setting('server_version_num')::integer >= 160000
    AND EXISTS (
        SELECT 1 FROM public.train_run_booking_snapshots
        WHERE train_run_id=$1 AND assignment_generation=$2
+         AND isfinite(scheduled_departure_at)
    )
    AND EXISTS (
        SELECT 1 FROM public.train_run_write_fences
@@ -71,10 +83,18 @@ SELECT current_setting('server_version_num')::integer >= 160000
 
 const reverseTargetPreflightSQL = `
 SELECT current_setting('server_version_num')::integer >= 160000
-   AND EXISTS (SELECT 1 FROM public.schema_migrations WHERE version=10 AND NOT dirty)
+   AND EXISTS (SELECT 1 FROM public.schema_migrations WHERE version=11 AND NOT dirty)
    AND to_regclass('public.physical_control_target_apply_receipts') IS NOT NULL
    AND to_regprocedure('public.guard_control_booking_receipt_write()') IS NOT NULL
    AND to_regprocedure('public.capture_physical_source_receipt_mutation()') IS NOT NULL
+   AND to_regprocedure('public.guard_control_ticket_refund_evidence_mutation()') IS NOT NULL
+   AND to_regclass('public.physical_source_ticket_refund_prepare_receipt_rows') IS NOT NULL
+   AND to_regclass('public.physical_source_ticket_refund_compensation_receipt_rows') IS NOT NULL
+   AND to_regclass('public.physical_source_selected_ticket_refund_receipt_rows') IS NOT NULL
+   AND EXISTS (
+       SELECT 1 FROM public.regional_write_authority
+       WHERE singleton AND state='active' AND writes_enabled
+   )
    AND CASE $5
        WHEN 'legacy' THEN
            to_regclass('public.booking_command_receipts') IS NOT NULL
@@ -82,18 +102,27 @@ SELECT current_setting('server_version_num')::integer >= 160000
            AND to_regclass('public.ticket_issuance_receipts') IS NOT NULL
            AND to_regclass('public.payment_refund_receipts') IS NOT NULL
            AND to_regclass('public.payment_compensation_receipts') IS NOT NULL
+           AND to_regclass('public.ticket_refund_prepare_receipts') IS NOT NULL
+           AND to_regclass('public.ticket_refund_compensation_receipts') IS NOT NULL
+           AND to_regclass('public.selected_ticket_refund_receipts') IS NOT NULL
        WHEN 'shard-0' THEN
            to_regclass('booking_shard_0.booking_command_receipts') IS NOT NULL
            AND to_regclass('booking_shard_0.payment_command_receipts') IS NOT NULL
            AND to_regclass('booking_shard_0.ticket_issuance_receipts') IS NOT NULL
            AND to_regclass('booking_shard_0.payment_refund_receipts') IS NOT NULL
            AND to_regclass('booking_shard_0.payment_compensation_receipts') IS NOT NULL
+           AND to_regclass('booking_shard_0.ticket_refund_prepare_receipts') IS NOT NULL
+           AND to_regclass('booking_shard_0.ticket_refund_compensation_receipts') IS NOT NULL
+           AND to_regclass('booking_shard_0.selected_ticket_refund_receipts') IS NOT NULL
        WHEN 'shard-1' THEN
            to_regclass('booking_shard_1.booking_command_receipts') IS NOT NULL
            AND to_regclass('booking_shard_1.payment_command_receipts') IS NOT NULL
            AND to_regclass('booking_shard_1.ticket_issuance_receipts') IS NOT NULL
            AND to_regclass('booking_shard_1.payment_refund_receipts') IS NOT NULL
            AND to_regclass('booking_shard_1.payment_compensation_receipts') IS NOT NULL
+           AND to_regclass('booking_shard_1.ticket_refund_prepare_receipts') IS NOT NULL
+           AND to_regclass('booking_shard_1.ticket_refund_compensation_receipts') IS NOT NULL
+           AND to_regclass('booking_shard_1.selected_ticket_refund_receipts') IS NOT NULL
        ELSE false
    END
    AND NOT EXISTS (
@@ -101,7 +130,10 @@ SELECT current_setting('server_version_num')::integer >= 160000
        FROM (VALUES
            ('booking_command_receipts'), ('payment_command_receipts'),
            ('ticket_issuance_receipts'), ('payment_refund_receipts'),
-           ('payment_compensation_receipts')
+           ('payment_compensation_receipts'),
+           ('ticket_refund_prepare_receipts'),
+           ('ticket_refund_compensation_receipts'),
+           ('selected_ticket_refund_receipts')
        ) AS required_table(table_name)
        CROSS JOIN (VALUES
            ('physical_target_write_guard'), ('physical_source_capture')
@@ -119,6 +151,27 @@ SELECT current_setting('server_version_num')::integer >= 160000
              END
              AND table_row.relname=required_table.table_name
              AND trigger_row.tgname=required_trigger.trigger_name
+       )
+   )
+   AND NOT EXISTS (
+       SELECT 1
+       FROM (VALUES
+           ('ticket_refund_prepare_receipts','ticket_refund_prepare_receipts_guard_evidence'),
+           ('ticket_refund_compensation_receipts','ticket_refund_compensation_receipts_guard_evidence'),
+           ('selected_ticket_refund_receipts','selected_ticket_refund_receipts_guard_evidence')
+       ) AS required(table_name,trigger_name)
+       WHERE NOT EXISTS (
+           SELECT 1 FROM pg_catalog.pg_trigger AS trigger_row
+           JOIN pg_catalog.pg_class AS table_row ON table_row.oid=trigger_row.tgrelid
+           JOIN pg_catalog.pg_namespace AS schema_row ON schema_row.oid=table_row.relnamespace
+           WHERE NOT trigger_row.tgisinternal
+             AND schema_row.nspname=CASE $5
+                 WHEN 'legacy' THEN 'public'
+                 WHEN 'shard-0' THEN 'booking_shard_0'
+                 WHEN 'shard-1' THEN 'booking_shard_1'
+             END
+             AND table_row.relname=required.table_name
+             AND trigger_row.tgname=required.trigger_name
        )
    )
    AND NOT EXISTS (
@@ -165,7 +218,7 @@ func NewReverse(control, source physicalpostgres.DB, targetID string) (*ReverseA
 
 func (adapter *ReverseAdapter) Preflight(ctx context.Context, record physicalmigration.Record) error {
 	if adapter == nil || !record.ReverseMigration || record.TargetShardID != adapter.targetID ||
-		record.SourceProtocolVersion != 1 || record.SourceSchemaVersion != 2 ||
+		record.SourceProtocolVersion != 1 || record.SourceSchemaVersion != 3 ||
 		record.TargetProtocolVersion != 1 || record.TargetSchemaVersion != 8 {
 		return physicalmigration.ErrCheckpointConflict
 	}
@@ -277,7 +330,7 @@ func (adapter *ReverseAdapter) ApplyBaseBatch(ctx context.Context, record physic
 			return rollback(physicalmigration.ErrInvalidBatch)
 		}
 		if _, err := tx.Exec(ctx, statement, normalized); err != nil {
-			return rollback(fmt.Errorf("%w: apply reverse base row", physicalpostgres.ErrShardOperation))
+			return rollback(fmt.Errorf("%w: apply reverse base row: %w", physicalpostgres.ErrShardOperation, err))
 		}
 	}
 	if err := adapter.releaseTargetApply(ctx, tx, record); err != nil {
@@ -452,13 +505,7 @@ WHERE train_run_id=$1 AND shard_id=$2 AND assignment_generation=$3`, record.Trai
 }
 
 func (adapter *ReverseAdapter) Validate(ctx context.Context, request physicalmigration.ValidationRequest) (physicalmigration.ValidationResult, error) {
-	tables := []string{
-		"train_run_booking_snapshots", "booking_seat_catalog", "booking_fare_snapshots",
-		"seat_inventory", "reservations", "reservation_seats", "ticket_orders", "tickets",
-		"idempotency_records", "booking_command_receipts", "payment_command_receipts",
-		"ticket_issuance_receipts", "payment_refund_receipts",
-		"payment_compensation_receipts", "outbox_events",
-	}
+	tables := tableOrder
 	if request.MaxRows <= 0 || request.MaxTables < len(tables) {
 		return physicalmigration.ValidationResult{}, physicalmigration.ErrInvalidInput
 	}
@@ -716,6 +763,9 @@ func normalizeReversePayload(data []byte, table string, record physicalmigration
 		delete(value, "updated_at")
 	case "ticket_orders", "tickets":
 		delete(value, "train_run_id")
+	case "ticket_refund_prepare_receipts":
+		// Control v11 keeps this fence column on each logical target.
+		value["assignment_generation"] = record.TargetGeneration
 	case "outbox_events":
 		delete(value, "lease_token")
 		delete(value, "updated_at")
@@ -764,7 +814,10 @@ func reverseSupportedTable(table string) bool {
 	case "seat_inventory", "reservations", "reservation_seats", "ticket_orders",
 		"tickets", "idempotency_records", "booking_command_receipts",
 		"payment_command_receipts", "ticket_issuance_receipts",
-		"payment_refund_receipts", "payment_compensation_receipts", "outbox_events":
+		"payment_refund_receipts", "payment_compensation_receipts",
+		"ticket_refund_prepare_receipts",
+		"ticket_refund_compensation_receipts", "selected_ticket_refund_receipts",
+		"outbox_events":
 		return true
 	default:
 		return false

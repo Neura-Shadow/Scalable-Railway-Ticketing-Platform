@@ -120,6 +120,35 @@ func TestGatewayClaimsDeterministicTicketPlanBeforeShardIssuance(t *testing.T) {
 	}
 }
 
+func TestGatewayRefreshesSelectedRefundOnceAndPreservesRegionalFence(t *testing.T) {
+	t.Parallel()
+	reservationID, orderID, trainRunID := uuid.New(), uuid.New(), uuid.New()
+	stale := paymentRoute(t, trainRunID, sharding.ShardPhysicalZero, 4)
+	current := paymentRoute(t, trainRunID, sharding.ShardPhysicalOne, 5)
+	store := &selectedRefundStoreFake{
+		shardStoreFake: &shardStoreFake{},
+		applyErrors:    []error{sharding.ErrAssignmentStale, nil},
+	}
+	gateway, err := shard.NewGateway(&directoryFake{routes: []sharding.ShardRoute{stale, current}}, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := shard.ApplySelectedTicketRefundCommand{
+		CommandID: uuid.New(), RefundRequestID: uuid.New(), RefundOperationID: uuid.New(),
+		PaymentIntentID: uuid.New(), ReservationID: reservationID, TicketOrderID: orderID,
+		TrainRunID: trainRunID, OwnerID: uuid.New(), Region: "region-a", RegionalEpoch: 12,
+		AmountMinor: 500, Currency: "TWD", ProviderProofHash: [32]byte{1},
+		RequestFingerprint: [32]byte{2}, TicketIDs: []uuid.UUID{uuid.New()}, RefundedAt: time.Now(),
+	}
+	receipt, err := gateway.ApplySelectedTicketRefund(context.Background(), command)
+	if err != nil || receipt.CommandID != command.CommandID || store.applyCalls != 2 || store.applyRoute != current {
+		t.Fatalf("receipt=%+v error=%v calls=%d route=%+v", receipt, err, store.applyCalls, store.applyRoute)
+	}
+	if store.applyCommand.Region != "region-a" || store.applyCommand.RegionalEpoch != 12 {
+		t.Fatalf("regional fence was not preserved: %+v", store.applyCommand)
+	}
+}
+
 func paymentRoute(t *testing.T, trainRunID uuid.UUID, shardID sharding.ShardID, generation int64) sharding.ShardRoute {
 	t.Helper()
 	gen, err := sharding.NewAssignmentGeneration(generation)
@@ -159,6 +188,25 @@ type shardStoreFake struct {
 	plan         shard.TicketIdentityPlan
 	issueCommand shard.IssueTicketsCommand
 	order        *[]string
+}
+
+type selectedRefundStoreFake struct {
+	*shardStoreFake
+	applyRoute   sharding.ShardRoute
+	applyCommand shard.ApplySelectedTicketRefundCommand
+	applyErrors  []error
+	applyCalls   int
+}
+
+func (fake *selectedRefundStoreFake) ApplySelectedTicketRefund(_ context.Context, route sharding.ShardRoute, command shard.ApplySelectedTicketRefundCommand) (shard.SelectedTicketRefundReceipt, error) {
+	fake.applyRoute = route
+	fake.applyCommand = command
+	index := fake.applyCalls
+	fake.applyCalls++
+	if index < len(fake.applyErrors) && fake.applyErrors[index] != nil {
+		return shard.SelectedTicketRefundReceipt{}, fake.applyErrors[index]
+	}
+	return shard.SelectedTicketRefundReceipt{CommandID: command.CommandID, RefundRequestID: command.RefundRequestID}, nil
 }
 
 func (fake *shardStoreFake) GetPayableReservation(_ context.Context, route sharding.ShardRoute, _ uuid.UUID) (paymentapp.ReservationSnapshot, error) {

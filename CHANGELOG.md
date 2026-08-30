@@ -6,6 +6,22 @@ All notable changes to this project will be documented in this file. The project
 
 ### Added
 
+- Milestone 7 production-oriented Stripe Checkout/PaymentIntent adapter with a
+  closed capability model and shared operation, HTTP uncertainty, webhook-key
+  rotation, settlement, and payout conformance suites. Standard CI remains
+  synthetic; optional Stripe test mode is separately secret-gated.
+- Immutable balanced operational ledger postings, resumable settlement/payout
+  evidence import and detect-only reconciliation, and customer-owned complete-
+  ticket partial refunds with deterministic provider/shard receipts. The ledger
+  is operational evidence, not statutory accounting, and raw card data is not
+  accepted.
+- Control schema v11 and booking-shard schema v3 regional authority guards,
+  one-writer active-passive recovery journals, asynchronous PostgreSQL standby
+  topology, encrypted pgBackRest backup/PITR metadata, isolated restore gates,
+  external-fence-first failover, and reseed-before-failback tooling. The bounded
+  evidence report remains `not_run` until a fresh verified run completes; no
+  zero-RPO/RTO, active-active, or production-capacity claim is made.
+
 - Milestone 6 provider-neutral payment intents and sagas, stable checkout/
   capture/void/full-refund operations, signed durable webhook inbox, bounded
   uncertainty/manual-review state, and a deterministic fault-injectable local

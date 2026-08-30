@@ -212,6 +212,9 @@ UPDATE public.payment_intents SET state='captured'
 WHERE payment_intent_id=$1 AND state='capture_pending'`, claim.PaymentIntentID)); err != nil {
 			return err
 		}
+		if err := appendCaptureLedger(ctx, tx, claim.PaymentIntentID, claim.OperationID, claim.AmountMinor, claim.Currency); err != nil {
+			return err
+		}
 		if err := oneRow(tx.Exec(ctx, `
 UPDATE public.payment_intents SET state='ticket_issue_pending'
 WHERE payment_intent_id=$1 AND state='captured'`, claim.PaymentIntentID)); err != nil {
@@ -237,6 +240,17 @@ SET current_step='compensate',bounded_error_category=NULL,next_attempt_at=clock_
     lease_owner=NULL,lease_until=NULL
 WHERE payment_intent_id=$1 AND state='compensating'`, claim.PaymentIntentID))
 	case domain.OperationRefund:
+		var issued bool
+		if err := tx.QueryRow(ctx, `
+SELECT EXISTS(
+ SELECT 1 FROM public.ticket_order_shard_locators
+ WHERE reservation_id=$1 AND status IN('confirmed','cancelled')
+)`, claim.ReservationID).Scan(&issued); err != nil {
+			return worker.ErrStoreUnavailable
+		}
+		if err := appendRefundLedger(ctx, tx, claim.PaymentIntentID, claim.OperationID, claim.AmountMinor, claim.Currency, issued); err != nil {
+			return err
+		}
 		if err := oneRow(tx.Exec(ctx, `
 UPDATE public.payment_intents SET state='refunded',completed_at=COALESCE(completed_at,clock_timestamp())
 WHERE payment_intent_id=$1 AND state='refund_pending'`, claim.PaymentIntentID)); err != nil {
@@ -247,7 +261,32 @@ UPDATE public.payment_sagas SET current_step='compensate',next_attempt_at=clock_
 WHERE payment_intent_id=$1 AND state='refunding'`, claim.PaymentIntentID)
 		return err
 	case domain.OperationQueryStatus:
-		return nil
+		switch evidence.Status {
+		case provider.StatusCreated, provider.StatusRequiresCustomerAction:
+			return nil
+		case provider.StatusAuthorized:
+			if err := advanceAuthorization(ctx, tx, claim.PaymentIntentID); err != nil {
+				return err
+			}
+			return insertOperation(ctx, tx, claim.PaymentIntentID, claim.Provider,
+				domain.OperationCapture, claim.AmountMinor, claim.Currency)
+		case provider.StatusCaptured:
+			if err := advanceAuthorization(ctx, tx, claim.PaymentIntentID); err != nil {
+				return err
+			}
+			if err := confirmOperation(ctx, tx, claim.PaymentIntentID, claim.Provider,
+				domain.OperationCapture, claim.AmountMinor, claim.Currency, evidence.Status); err != nil {
+				return err
+			}
+			if err := appendCaptureLedger(ctx, tx, claim.PaymentIntentID,
+				deterministicID(claim.PaymentIntentID, "provider_operation:"+string(domain.OperationCapture)),
+				claim.AmountMinor, claim.Currency); err != nil {
+				return err
+			}
+			return advanceCapture(ctx, tx, claim.PaymentIntentID)
+		default:
+			return worker.ErrStoreUnavailable
+		}
 	default:
 		return worker.ErrStoreUnavailable
 	}
@@ -386,22 +425,27 @@ func (store *Store) CompleteWebhook(ctx context.Context, claim worker.WebhookCla
 		return err
 	}
 	defer rollback(ctx, tx)
-	var intentID, sagaID uuid.UUID
+	var intentID, sagaID, reservationID uuid.UUID
 	var amount int64
 	var currency, providerName, intentState string
 	err = tx.QueryRow(ctx, `
-SELECT intent.payment_intent_id,saga.saga_id,intent.amount_minor,intent.currency,intent.provider,intent.state
+SELECT intent.payment_intent_id,saga.saga_id,intent.reservation_id,intent.amount_minor,intent.currency,intent.provider,intent.state
 FROM public.payment_intents AS intent
 JOIN public.payment_sagas AS saga ON saga.payment_intent_id=intent.payment_intent_id
 WHERE intent.provider=$1 AND intent.provider_payment_id=$2
 FOR UPDATE OF intent,saga`, claim.Provider, claim.ProviderPaymentID).Scan(
-		&intentID, &sagaID, &amount, &currency, &providerName, &intentState)
+		&intentID, &sagaID, &reservationID, &amount, &currency, &providerName, &intentState)
 	_ = sagaID
 	if errors.Is(err, pgx.ErrNoRows) {
 		return worker.ErrStoreUnavailable
 	}
-	if err != nil || amount != evidence.AmountMinor || currency != evidence.Currency ||
-		evidence.RefundedMinor < 0 || evidence.CapturedMinor < evidence.RefundedMinor || evidence.CapturedMinor > amount {
+	if err != nil || provider.EvaluateFinancialObservation(
+		provider.FinancialExpectation{AmountMinor: amount, Currency: currency},
+		provider.FinancialObservation{
+			Status: evidence.Status, AmountMinor: evidence.AmountMinor, Currency: evidence.Currency,
+			CapturedMinor: evidence.CapturedMinor, RefundedMinor: evidence.RefundedMinor,
+		},
+	) != nil {
 		return worker.ErrStoreUnavailable
 	}
 	if evidence.Status == provider.StatusRefunded && intentState != "refund_pending" && intentState != "refunded" && intentState != "cancelled" {
@@ -410,7 +454,7 @@ FOR UPDATE OF intent,saga`, claim.Provider, claim.ProviderPaymentID).Scan(
 	if evidence.Status == provider.StatusVoided && intentState != "void_pending" && intentState != "voided" && intentState != "cancelled" {
 		return worker.ErrStoreUnavailable
 	}
-	if err := applyProviderConfirmation(ctx, tx, intentID, providerName, intentState, amount, currency, evidence); err != nil {
+	if err := applyProviderConfirmation(ctx, tx, intentID, reservationID, providerName, intentState, amount, currency, evidence); err != nil {
 		return err
 	}
 	if err := oneRow(tx.Exec(ctx, `
@@ -424,7 +468,7 @@ WHERE inbox_id=$1 AND state='processing' AND lease_owner=$2
 	return commit(ctx, tx)
 }
 
-func applyProviderConfirmation(ctx context.Context, tx pgx.Tx, intentID uuid.UUID, providerName, intentState string, amount int64, currency string, evidence worker.WebhookEvidence) error {
+func applyProviderConfirmation(ctx context.Context, tx pgx.Tx, intentID, reservationID uuid.UUID, providerName, intentState string, amount int64, currency string, evidence worker.WebhookEvidence) error {
 	switch evidence.Status {
 	case provider.StatusCreated, provider.StatusRequiresCustomerAction:
 		return nil
@@ -460,6 +504,9 @@ WHERE payment_intent_id=$1 AND operation_type='void'
 		if err := confirmOperation(ctx, tx, intentID, providerName, domain.OperationCapture, amount, currency, evidence.Status); err != nil {
 			return err
 		}
+		if err := appendCaptureLedger(ctx, tx, intentID, deterministicID(intentID, "provider_operation:"+string(domain.OperationCapture)), amount, currency); err != nil {
+			return err
+		}
 		return advanceCapture(ctx, tx, intentID)
 	case provider.StatusRefunded:
 		if evidence.CapturedMinor != amount || evidence.RefundedMinor != amount {
@@ -468,7 +515,14 @@ WHERE payment_intent_id=$1 AND operation_type='void'
 		if err := confirmOperation(ctx, tx, intentID, providerName, domain.OperationRefund, amount, currency, evidence.Status); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `
+		issued, err := refundWasIssued(ctx, tx, reservationID)
+		if err != nil {
+			return err
+		}
+		if err := appendRefundLedger(ctx, tx, intentID, deterministicID(intentID, "provider_operation:"+string(domain.OperationRefund)), amount, currency, issued); err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `
 UPDATE public.payment_intents SET state='refunded',completed_at=COALESCE(completed_at,clock_timestamp())
 WHERE payment_intent_id=$1 AND state='refund_pending'`, intentID)
 		if err != nil {
@@ -508,6 +562,9 @@ func convergeCapturedCancellation(ctx context.Context, tx pgx.Tx, intentID uuid.
 	if err := confirmOperation(ctx, tx, intentID, providerName, domain.OperationCapture, amount, currency, provider.StatusCaptured); err != nil {
 		return err
 	}
+	if err := appendCaptureLedger(ctx, tx, intentID, deterministicID(intentID, "provider_operation:"+string(domain.OperationCapture)), amount, currency); err != nil {
+		return err
+	}
 	// The v10 transition guard intentionally routes this exceptional edge
 	// through manual_review, but both updates are inside this transaction, so no
 	// observer or worker can claim the transient state.
@@ -534,6 +591,18 @@ WHERE payment_intent_id=$1 AND state='compensating' AND lease_owner=$2
 		return err
 	}
 	return insertOperation(ctx, tx, intentID, providerName, domain.OperationRefund, amount, currency)
+}
+
+func refundWasIssued(ctx context.Context, tx pgx.Tx, reservationID uuid.UUID) (bool, error) {
+	var issued bool
+	err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM public.ticket_order_shard_locators
+WHERE reservation_id=$1 AND status IN ('confirmed','cancelled')
+)`, reservationID).Scan(&issued)
+	if err != nil {
+		return false, worker.ErrStoreUnavailable
+	}
+	return issued, nil
 }
 
 func advanceAuthorization(ctx context.Context, tx pgx.Tx, intentID uuid.UUID) error {
@@ -657,7 +726,7 @@ WHERE provider=$1 AND provider_payment_id=$2`, claim.Provider, claim.ProviderPay
 }
 
 func (store *Store) CompleteAction(ctx context.Context, claim worker.ActionClaim, evidence worker.ActionEvidence) error {
-	if claim.SagaID == uuid.Nil || claim.LeaseOwner == "" {
+	if claim.ActionID == uuid.Nil || claim.SagaID == uuid.Nil || claim.LeaseOwner == "" {
 		return worker.ErrStoreUnavailable
 	}
 	tx, err := store.begin(ctx)
@@ -665,24 +734,33 @@ func (store *Store) CompleteAction(ctx context.Context, claim worker.ActionClaim
 		return err
 	}
 	defer rollback(ctx, tx)
+	if err := oneRow(tx.Exec(ctx, `UPDATE public.payment_saga_actions
+SET state='succeeded',lease_owner=NULL,lease_until=NULL,
+ bounded_error_category=NULL,completed_at=clock_timestamp()
+WHERE action_id=$1 AND saga_id=$2 AND state='processing' AND lease_owner=$3
+ AND lease_until>=clock_timestamp()`, claim.ActionID, claim.SagaID, claim.LeaseOwner)); err != nil {
+		return err
+	}
 	switch claim.Type {
 	case worker.ActionIssueTickets:
 		if err := writeTicketLocators(ctx, tx, claim, evidence.Issue); err != nil {
+			return err
+		}
+		if err := appendIssuanceLedger(ctx, tx, claim.Issue.PaymentIntentID, claim.Issue.IssuanceID,
+			claim.Issue.AmountMinor, claim.Issue.Currency); err != nil {
 			return err
 		}
 		if err := oneRow(tx.Exec(ctx, `UPDATE public.payment_intents AS intent
 SET state='completed',completed_at=clock_timestamp()
 FROM public.payment_sagas AS saga
 WHERE saga.saga_id=$1 AND saga.payment_intent_id=intent.payment_intent_id
- AND saga.lease_owner=$2 AND saga.lease_until>=clock_timestamp()
- AND intent.state='ticket_issue_pending'`, claim.SagaID, claim.LeaseOwner)); err != nil {
+ AND intent.state='ticket_issue_pending'`, claim.SagaID)); err != nil {
 			return err
 		}
 		if err := oneRow(tx.Exec(ctx, `UPDATE public.payment_sagas
 SET state='completed',current_step='complete',completed_at=clock_timestamp(),
  lease_owner=NULL,lease_until=NULL,bounded_error_category=NULL
-WHERE saga_id=$1 AND state='issuing_tickets' AND lease_owner=$2
- AND lease_until>=clock_timestamp()`, claim.SagaID, claim.LeaseOwner)); err != nil {
+WHERE saga_id=$1 AND state='issuing_tickets' AND lease_owner IS NULL`, claim.SagaID)); err != nil {
 			return err
 		}
 	case worker.ActionMarkRefundPending:
@@ -690,7 +768,7 @@ WHERE saga_id=$1 AND state='issuing_tickets' AND lease_owner=$2
 SET state='refunding',current_step='refund',lease_owner=NULL,lease_until=NULL,
  bounded_error_category=NULL,next_attempt_at=clock_timestamp()
 WHERE saga_id=$1 AND state='compensating' AND current_step='refund'
- AND lease_owner=$2 AND lease_until>=clock_timestamp()`, claim.SagaID, claim.LeaseOwner)); err != nil {
+ AND lease_owner IS NULL`, claim.SagaID)); err != nil {
 			return err
 		}
 	case worker.ActionCancelVoided:
@@ -698,15 +776,14 @@ WHERE saga_id=$1 AND state='compensating' AND current_step='refund'
 SET state='cancelled'
 FROM public.payment_sagas AS saga
 WHERE saga.saga_id=$1 AND saga.payment_intent_id=intent.payment_intent_id
- AND saga.lease_owner=$2 AND saga.lease_until>=clock_timestamp()
- AND intent.state='voided'`, claim.SagaID, claim.LeaseOwner)); err != nil {
+ AND intent.state='voided'`, claim.SagaID)); err != nil {
 			return err
 		}
 		if err := oneRow(tx.Exec(ctx, `UPDATE public.payment_sagas
 SET state='compensated',current_step='complete',completed_at=clock_timestamp(),
  lease_owner=NULL,lease_until=NULL,bounded_error_category=NULL
 WHERE saga_id=$1 AND state='compensating' AND current_step='compensate'
- AND lease_owner=$2 AND lease_until>=clock_timestamp()`, claim.SagaID, claim.LeaseOwner)); err != nil {
+ AND lease_owner IS NULL`, claim.SagaID)); err != nil {
 			return err
 		}
 	case worker.ActionCompensate:
@@ -725,15 +802,14 @@ WHERE ticket_order_id=$1 AND reservation_id=$2 AND owner_user_id=$3`,
 SET state='cancelled'
 FROM public.payment_sagas AS saga
 WHERE saga.saga_id=$1 AND saga.payment_intent_id=intent.payment_intent_id
- AND saga.lease_owner=$2 AND saga.lease_until>=clock_timestamp()
- AND intent.state='refunded'`, claim.SagaID, claim.LeaseOwner)); err != nil {
+ AND intent.state='refunded'`, claim.SagaID)); err != nil {
 			return err
 		}
 		if err := oneRow(tx.Exec(ctx, `UPDATE public.payment_sagas
 SET state='compensated',current_step='complete',completed_at=clock_timestamp(),
  lease_owner=NULL,lease_until=NULL,bounded_error_category=NULL
 WHERE saga_id=$1 AND state='refunding' AND current_step='compensate'
- AND lease_owner=$2 AND lease_until>=clock_timestamp()`, claim.SagaID, claim.LeaseOwner)); err != nil {
+ AND lease_owner IS NULL`, claim.SagaID)); err != nil {
 			return err
 		}
 	default:
@@ -814,7 +890,7 @@ WHERE ticket_code_directory.ticket_id=EXCLUDED.ticket_id`, ticketCode, ticketID)
 }
 
 func (store *Store) FailAction(ctx context.Context, claim worker.ActionClaim, failure worker.Failure) error {
-	if claim.SagaID == uuid.Nil || claim.LeaseOwner == "" || failure.Category == "" {
+	if claim.ActionID == uuid.Nil || claim.SagaID == uuid.Nil || claim.LeaseOwner == "" || failure.Category == "" {
 		return worker.ErrStoreUnavailable
 	}
 	tx, err := store.begin(ctx)
@@ -822,6 +898,22 @@ func (store *Store) FailAction(ctx context.Context, claim worker.ActionClaim, fa
 		return err
 	}
 	defer rollback(ctx, tx)
+	if failure.Compensate || failure.ManualReview {
+		if err := oneRow(tx.Exec(ctx, `UPDATE public.payment_saga_actions
+SET state='failed_permanent',lease_owner=NULL,lease_until=NULL,
+ bounded_error_category=$4,completed_at=clock_timestamp()
+WHERE action_id=$1 AND saga_id=$2 AND state='processing' AND lease_owner=$3
+ AND lease_until>=clock_timestamp()`, claim.ActionID, claim.SagaID, claim.LeaseOwner, failure.Category)); err != nil {
+			return err
+		}
+	} else if err := oneRow(tx.Exec(ctx, `UPDATE public.payment_saga_actions
+SET state='failed_retryable',lease_owner=NULL,lease_until=NULL,
+ bounded_error_category=$4,next_attempt_at=$5
+WHERE action_id=$1 AND saga_id=$2 AND state='processing' AND lease_owner=$3
+ AND lease_until>=clock_timestamp()`, claim.ActionID, claim.SagaID, claim.LeaseOwner,
+		failure.Category, failure.NextAttemptAt)); err != nil {
+		return err
+	}
 	if failure.Compensate {
 		if claim.Type != worker.ActionIssueTickets {
 			return worker.ErrStoreUnavailable
@@ -830,15 +922,14 @@ func (store *Store) FailAction(ctx context.Context, claim worker.ActionClaim, fa
 SET state='refund_pending'
 FROM public.payment_sagas AS saga
 WHERE saga.saga_id=$1 AND saga.payment_intent_id=intent.payment_intent_id
- AND saga.lease_owner=$2 AND saga.lease_until>=clock_timestamp()
- AND intent.state='ticket_issue_pending'`, claim.SagaID, claim.LeaseOwner)); err != nil {
+ AND saga.lease_owner IS NULL
+ AND intent.state='ticket_issue_pending'`, claim.SagaID)); err != nil {
 			return err
 		}
 		if err := oneRow(tx.Exec(ctx, `UPDATE public.payment_sagas
 SET state='compensating',current_step='refund',lease_owner=NULL,lease_until=NULL,
- bounded_error_category=$3,next_attempt_at=clock_timestamp()
-WHERE saga_id=$1 AND state='issuing_tickets' AND lease_owner=$2
- AND lease_until>=clock_timestamp()`, claim.SagaID, claim.LeaseOwner, failure.Category)); err != nil {
+ bounded_error_category=$2,next_attempt_at=clock_timestamp()
+WHERE saga_id=$1 AND state='issuing_tickets' AND lease_owner IS NULL`, claim.SagaID, failure.Category)); err != nil {
 			return err
 		}
 		intentID := claim.Issue.PaymentIntentID
@@ -851,9 +942,9 @@ WHERE saga_id=$1 AND state='issuing_tickets' AND lease_owner=$2
 		}
 	} else if failure.ManualReview {
 		if err := oneRow(tx.Exec(ctx, `UPDATE public.payment_sagas
-SET state='manual_review',lease_owner=NULL,lease_until=NULL,bounded_error_category=$3
-WHERE saga_id=$1 AND lease_owner=$2 AND lease_until>=clock_timestamp()
- AND state NOT IN ('completed','compensated','failed')`, claim.SagaID, claim.LeaseOwner, failure.Category)); err != nil {
+SET state='manual_review',lease_owner=NULL,lease_until=NULL,bounded_error_category=$2
+WHERE saga_id=$1 AND lease_owner IS NULL
+ AND state NOT IN ('completed','compensated','failed')`, claim.SagaID, failure.Category)); err != nil {
 			return err
 		}
 		var intentID uuid.UUID
@@ -867,11 +958,6 @@ WHERE payment_intent_id=$1 AND state NOT IN ('completed','voided','refunded','ca
 		if err := insertReview(ctx, tx, intentID, uuid.Nil, uuid.Nil, failure.Category); err != nil {
 			return err
 		}
-	} else if err := oneRow(tx.Exec(ctx, `UPDATE public.payment_sagas
-SET lease_owner=NULL,lease_until=NULL,bounded_error_category=$3,next_attempt_at=$4
-WHERE saga_id=$1 AND lease_owner=$2 AND lease_until>=clock_timestamp()`,
-		claim.SagaID, claim.LeaseOwner, failure.Category, failure.NextAttemptAt)); err != nil {
-		return err
 	}
 	return commit(ctx, tx)
 }

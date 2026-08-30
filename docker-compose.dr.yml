@@ -1,0 +1,645 @@
+name: scalable-railway-ticketing-platform-dr
+
+# Disposable same-host DR laboratory. Docker networks model bounded failure
+# domains only; they are not represented as production regions.
+x-dr-primary-common: &dr-primary-common
+  build: {context: ., target: postgres-dr}
+  image: scalable-railway-ticketing-postgres-dr:local
+  entrypoint: ["sh", "/etc/railway/start-primary.sh"]
+  environment:
+    POSTGRES_INITDB_ARGS: --data-checksums
+    DR_REPLICATION_SOURCE_CIDR: ${DR_REPLICATION_SOURCE_CIDR:-172.31.7.0/24}
+    DR_REPLICATION_TLS_ROOT_CERT_FILE: /run/secrets/dr_replication_tls_root_cert
+  healthcheck:
+    test: ["CMD-SHELL", "sh /etc/railway/primary-health.sh"]
+    interval: 3s
+    timeout: 3s
+    retries: 40
+    start_period: 10s
+  restart: unless-stopped
+  networks: [backend, region-a-data, dr-replication, dr-control]
+
+x-dr-standby-common: &dr-standby-common
+  build: {context: ., target: postgres-dr}
+  image: scalable-railway-ticketing-postgres-dr:local
+  entrypoint: ["sh", "/etc/railway/start-standby.sh"]
+  environment:
+    DR_REPLICATION_TLS_ROOT_CERT_FILE: /run/secrets/dr_replication_tls_root_cert
+    DR_MAX_REPLAY_STALENESS_SECONDS: ${DR_MAX_REPLAY_STALENESS_SECONDS:-30}
+  healthcheck:
+    test: ["CMD-SHELL", "sh /etc/railway/standby-health.sh"]
+    interval: 3s
+    timeout: 3s
+    retries: 40
+    start_period: 10s
+  restart: unless-stopped
+  networks: [region-b-data, dr-replication, dr-control]
+
+x-restore-common: &restore-common
+  profiles: ["dr-restore"]
+  build: {context: ., target: postgres-dr}
+  image: scalable-railway-ticketing-postgres-dr:local
+  entrypoint: ["sh", "/etc/railway/restore-validation.sh"]
+  environment:
+    PGDATA: /var/lib/postgresql/restore
+    # Non-restore Compose commands may parse this anchor before a target exists;
+    # the restore entrypoint rejects this sentinel and requires explicit UTC.
+    PGBACKREST_PITR_TARGET: ${PGBACKREST_PITR_TARGET:-unset}
+    RESTORE_CONFIRM: restore-to-isolated-validation
+  read_only: true
+  tmpfs: [/tmp, /var/run/postgresql]
+  security_opt: [no-new-privileges:true]
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U $${PGUSER} -d $${PGDATABASE} && test \"$$(psql -U $${PGUSER} -d $${PGDATABASE} -tAc 'SELECT pg_is_in_recovery()')\" = f"]
+    interval: 3s
+    timeout: 3s
+    retries: 40
+    start_period: 15s
+  restart: "no"
+  networks: [dr-control]
+
+services:
+  control-postgres:
+    <<: *dr-primary-common
+    networks:
+      backend: {}
+      region-a-data: {}
+      dr-replication:
+        aliases: [control-postgres-replication]
+      dr-control: {}
+    environment:
+      POSTGRES_INITDB_ARGS: --data-checksums
+      DR_REPLICATION_USER: railway_control_replicator
+      DR_REPLICATION_PASSWORD_FILE: /run/secrets/dr_control_replication_password
+      DR_REPLICATION_SOURCE_CIDR: ${DR_REPLICATION_SOURCE_CIDR:-172.31.7.0/24}
+      DR_REPLICATION_TLS_CERT_FILE: /run/secrets/dr_control_region_a_tls_cert
+      DR_REPLICATION_TLS_KEY_FILE: /run/secrets/dr_control_region_a_tls_key
+      DR_REPLICATION_TLS_ROOT_CERT_FILE: /run/secrets/dr_replication_tls_root_cert
+      PGBACKREST_CIPHER_FILE: /run/secrets/pgbackrest_control_cipher_pass
+    secrets: [dr_control_replication_password, dr_control_region_a_tls_cert, dr_control_region_a_tls_key, dr_replication_tls_root_cert, pgbackrest_control_cipher_pass]
+    command:
+      - postgres
+      - -c
+      - max_connections=140
+      - -c
+      - wal_level=replica
+      - -c
+      - synchronous_commit=local
+      - -c
+      - max_wal_senders=5
+      - -c
+      - max_replication_slots=5
+      - -c
+      - max_slot_wal_keep_size=512MB
+      - -c
+      - wal_keep_size=256MB
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=/etc/railway/pgbackrest-secret.sh --stanza=railway-control archive-push %p
+    volumes:
+      - control-postgres-data:/var/lib/postgresql/data
+      - pgbackrest-control-repository:/var/lib/pgbackrest
+      - ./deploy/postgres/dr/10-replication.sh:/docker-entrypoint-initdb.d/10-replication.sh:ro
+      - ./deploy/postgres/dr/10-replication.sh:/etc/railway/configure-replication.sh:ro
+      - ./deploy/postgres/dr/start-primary.sh:/etc/railway/start-primary.sh:ro
+      - ./deploy/postgres/dr/primary-health.sh:/etc/railway/primary-health.sh:ro
+      - ./deploy/postgres/dr/start-standby.sh:/etc/railway/start-standby.sh:ro
+      - ./deploy/postgres/dr/pgbackrest-secret.sh:/etc/railway/pgbackrest-secret.sh:ro
+      - ./deploy/postgres/dr/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+
+  booking-shard-0-postgres:
+    <<: *dr-primary-common
+    networks:
+      backend: {}
+      region-a-data: {}
+      dr-replication:
+        aliases: [booking-shard-0-postgres-replication]
+      dr-control: {}
+    environment:
+      POSTGRES_INITDB_ARGS: --data-checksums
+      DR_REPLICATION_USER: railway_shard_0_replicator
+      DR_REPLICATION_PASSWORD_FILE: /run/secrets/dr_shard_0_replication_password
+      DR_REPLICATION_SOURCE_CIDR: ${DR_REPLICATION_SOURCE_CIDR:-172.31.7.0/24}
+      DR_REPLICATION_TLS_CERT_FILE: /run/secrets/dr_shard_0_region_a_tls_cert
+      DR_REPLICATION_TLS_KEY_FILE: /run/secrets/dr_shard_0_region_a_tls_key
+      DR_REPLICATION_TLS_ROOT_CERT_FILE: /run/secrets/dr_replication_tls_root_cert
+      PGBACKREST_CIPHER_FILE: /run/secrets/pgbackrest_shard_0_cipher_pass
+    secrets: [dr_shard_0_replication_password, dr_shard_0_region_a_tls_cert, dr_shard_0_region_a_tls_key, dr_replication_tls_root_cert, pgbackrest_shard_0_cipher_pass]
+    command:
+      - postgres
+      - -c
+      - max_connections=120
+      - -c
+      - wal_level=replica
+      - -c
+      - synchronous_commit=local
+      - -c
+      - max_wal_senders=5
+      - -c
+      - max_replication_slots=5
+      - -c
+      - max_slot_wal_keep_size=512MB
+      - -c
+      - wal_keep_size=256MB
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=/etc/railway/pgbackrest-secret.sh --stanza=railway-shard-0 archive-push %p
+    volumes:
+      - booking-shard-0-postgres-data:/var/lib/postgresql/data
+      - pgbackrest-shard-0-repository:/var/lib/pgbackrest
+      - ./deploy/postgres/dr/10-replication.sh:/docker-entrypoint-initdb.d/10-replication.sh:ro
+      - ./deploy/postgres/dr/10-replication.sh:/etc/railway/configure-replication.sh:ro
+      - ./deploy/postgres/dr/start-primary.sh:/etc/railway/start-primary.sh:ro
+      - ./deploy/postgres/dr/primary-health.sh:/etc/railway/primary-health.sh:ro
+      - ./deploy/postgres/dr/start-standby.sh:/etc/railway/start-standby.sh:ro
+      - ./deploy/postgres/dr/pgbackrest-secret.sh:/etc/railway/pgbackrest-secret.sh:ro
+      - ./deploy/postgres/dr/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+
+  booking-shard-1-postgres:
+    <<: *dr-primary-common
+    networks:
+      backend: {}
+      region-a-data: {}
+      dr-replication:
+        aliases: [booking-shard-1-postgres-replication]
+      dr-control: {}
+    environment:
+      POSTGRES_INITDB_ARGS: --data-checksums
+      DR_REPLICATION_USER: railway_shard_1_replicator
+      DR_REPLICATION_PASSWORD_FILE: /run/secrets/dr_shard_1_replication_password
+      DR_REPLICATION_SOURCE_CIDR: ${DR_REPLICATION_SOURCE_CIDR:-172.31.7.0/24}
+      DR_REPLICATION_TLS_CERT_FILE: /run/secrets/dr_shard_1_region_a_tls_cert
+      DR_REPLICATION_TLS_KEY_FILE: /run/secrets/dr_shard_1_region_a_tls_key
+      DR_REPLICATION_TLS_ROOT_CERT_FILE: /run/secrets/dr_replication_tls_root_cert
+      PGBACKREST_CIPHER_FILE: /run/secrets/pgbackrest_shard_1_cipher_pass
+    secrets: [dr_shard_1_replication_password, dr_shard_1_region_a_tls_cert, dr_shard_1_region_a_tls_key, dr_replication_tls_root_cert, pgbackrest_shard_1_cipher_pass]
+    command:
+      - postgres
+      - -c
+      - max_connections=120
+      - -c
+      - wal_level=replica
+      - -c
+      - synchronous_commit=local
+      - -c
+      - max_wal_senders=5
+      - -c
+      - max_replication_slots=5
+      - -c
+      - max_slot_wal_keep_size=512MB
+      - -c
+      - wal_keep_size=256MB
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=/etc/railway/pgbackrest-secret.sh --stanza=railway-shard-1 archive-push %p
+    volumes:
+      - booking-shard-1-postgres-data:/var/lib/postgresql/data
+      - pgbackrest-shard-1-repository:/var/lib/pgbackrest
+      - ./deploy/postgres/dr/10-replication.sh:/docker-entrypoint-initdb.d/10-replication.sh:ro
+      - ./deploy/postgres/dr/10-replication.sh:/etc/railway/configure-replication.sh:ro
+      - ./deploy/postgres/dr/start-primary.sh:/etc/railway/start-primary.sh:ro
+      - ./deploy/postgres/dr/primary-health.sh:/etc/railway/primary-health.sh:ro
+      - ./deploy/postgres/dr/start-standby.sh:/etc/railway/start-standby.sh:ro
+      - ./deploy/postgres/dr/pgbackrest-secret.sh:/etc/railway/pgbackrest-secret.sh:ro
+      - ./deploy/postgres/dr/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+
+  control-postgres-region-b:
+    <<: *dr-standby-common
+    networks:
+      region-b-data: {}
+      dr-replication:
+        aliases: [control-postgres-region-b-replication]
+      dr-control: {}
+    environment:
+      POSTGRES_DB: railway_control
+      POSTGRES_USER: railway_control_replicator
+      POSTGRES_PASSWORD_FILE: /run/secrets/dr_control_replication_password
+      PRIMARY_HOST: ${CONTROL_PRIMARY_HOST:-control-postgres-replication}
+      REPLICATION_SLOT: control_region_b
+      PGBACKREST_STANZA: railway-control
+      DR_REPLICATION_TLS_CERT_FILE: /run/secrets/dr_control_region_b_tls_cert
+      DR_REPLICATION_TLS_KEY_FILE: /run/secrets/dr_control_region_b_tls_key
+      DR_REPLICATION_TLS_ROOT_CERT_FILE: /run/secrets/dr_replication_tls_root_cert
+      DR_MAX_REPLAY_STALENESS_SECONDS: ${DR_MAX_REPLAY_STALENESS_SECONDS:-30}
+      PGBACKREST_CIPHER_FILE: /run/secrets/pgbackrest_control_cipher_pass
+    secrets: [dr_control_replication_password, dr_control_region_b_tls_cert, dr_control_region_b_tls_key, dr_replication_tls_root_cert, pgbackrest_control_cipher_pass]
+    volumes:
+      - control-postgres-region-b-data:/var/lib/postgresql/data
+      - pgbackrest-control-repository:/var/lib/pgbackrest
+      - ./deploy/postgres/dr/start-standby.sh:/etc/railway/start-standby.sh:ro
+      - ./deploy/postgres/dr/standby-health.sh:/etc/railway/standby-health.sh:ro
+      - ./deploy/postgres/dr/pgbackrest-secret.sh:/etc/railway/pgbackrest-secret.sh:ro
+      - ./deploy/postgres/dr/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+    depends_on:
+      control-postgres: {condition: service_healthy}
+
+  booking-shard-0-postgres-region-b:
+    <<: *dr-standby-common
+    networks:
+      region-b-data: {}
+      dr-replication:
+        aliases: [booking-shard-0-postgres-region-b-replication]
+      dr-control: {}
+    environment:
+      POSTGRES_DB: railway_booking
+      POSTGRES_USER: railway_shard_0_replicator
+      POSTGRES_PASSWORD_FILE: /run/secrets/dr_shard_0_replication_password
+      PRIMARY_HOST: ${SHARD_0_PRIMARY_HOST:-booking-shard-0-postgres-replication}
+      REPLICATION_SLOT: shard_0_region_b
+      PGBACKREST_STANZA: railway-shard-0
+      DR_REPLICATION_TLS_CERT_FILE: /run/secrets/dr_shard_0_region_b_tls_cert
+      DR_REPLICATION_TLS_KEY_FILE: /run/secrets/dr_shard_0_region_b_tls_key
+      DR_REPLICATION_TLS_ROOT_CERT_FILE: /run/secrets/dr_replication_tls_root_cert
+      DR_MAX_REPLAY_STALENESS_SECONDS: ${DR_MAX_REPLAY_STALENESS_SECONDS:-30}
+      PGBACKREST_CIPHER_FILE: /run/secrets/pgbackrest_shard_0_cipher_pass
+    secrets: [dr_shard_0_replication_password, dr_shard_0_region_b_tls_cert, dr_shard_0_region_b_tls_key, dr_replication_tls_root_cert, pgbackrest_shard_0_cipher_pass]
+    volumes:
+      - booking-shard-0-postgres-region-b-data:/var/lib/postgresql/data
+      - pgbackrest-shard-0-repository:/var/lib/pgbackrest
+      - ./deploy/postgres/dr/start-standby.sh:/etc/railway/start-standby.sh:ro
+      - ./deploy/postgres/dr/standby-health.sh:/etc/railway/standby-health.sh:ro
+      - ./deploy/postgres/dr/pgbackrest-secret.sh:/etc/railway/pgbackrest-secret.sh:ro
+      - ./deploy/postgres/dr/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+    depends_on:
+      booking-shard-0-postgres: {condition: service_healthy}
+
+  booking-shard-1-postgres-region-b:
+    <<: *dr-standby-common
+    networks:
+      region-b-data: {}
+      dr-replication:
+        aliases: [booking-shard-1-postgres-region-b-replication]
+      dr-control: {}
+    environment:
+      POSTGRES_DB: railway_booking
+      POSTGRES_USER: railway_shard_1_replicator
+      POSTGRES_PASSWORD_FILE: /run/secrets/dr_shard_1_replication_password
+      PRIMARY_HOST: ${SHARD_1_PRIMARY_HOST:-booking-shard-1-postgres-replication}
+      REPLICATION_SLOT: shard_1_region_b
+      PGBACKREST_STANZA: railway-shard-1
+      DR_REPLICATION_TLS_CERT_FILE: /run/secrets/dr_shard_1_region_b_tls_cert
+      DR_REPLICATION_TLS_KEY_FILE: /run/secrets/dr_shard_1_region_b_tls_key
+      DR_REPLICATION_TLS_ROOT_CERT_FILE: /run/secrets/dr_replication_tls_root_cert
+      DR_MAX_REPLAY_STALENESS_SECONDS: ${DR_MAX_REPLAY_STALENESS_SECONDS:-30}
+      PGBACKREST_CIPHER_FILE: /run/secrets/pgbackrest_shard_1_cipher_pass
+    secrets: [dr_shard_1_replication_password, dr_shard_1_region_b_tls_cert, dr_shard_1_region_b_tls_key, dr_replication_tls_root_cert, pgbackrest_shard_1_cipher_pass]
+    volumes:
+      - booking-shard-1-postgres-region-b-data:/var/lib/postgresql/data
+      - pgbackrest-shard-1-repository:/var/lib/pgbackrest
+      - ./deploy/postgres/dr/start-standby.sh:/etc/railway/start-standby.sh:ro
+      - ./deploy/postgres/dr/standby-health.sh:/etc/railway/standby-health.sh:ro
+      - ./deploy/postgres/dr/pgbackrest-secret.sh:/etc/railway/pgbackrest-secret.sh:ro
+      - ./deploy/postgres/dr/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+    depends_on:
+      booking-shard-1-postgres: {condition: service_healthy}
+
+  control-postgres-region-a-reseed:
+    <<: *dr-standby-common
+    profiles: ["dr-failback"]
+    environment:
+      POSTGRES_DB: railway_control
+      POSTGRES_USER: railway_control_replicator
+      POSTGRES_PASSWORD_FILE: /run/secrets/dr_control_replication_password
+      PRIMARY_HOST: control-postgres-region-b-replication
+      REPLICATION_SLOT: control_region_a_reseed
+      PGBACKREST_STANZA: railway-control
+      DR_REPLICATION_TLS_CERT_FILE: /run/secrets/dr_control_region_a_reseed_tls_cert
+      DR_REPLICATION_TLS_KEY_FILE: /run/secrets/dr_control_region_a_reseed_tls_key
+      DR_REPLICATION_TLS_ROOT_CERT_FILE: /run/secrets/dr_replication_tls_root_cert
+      DR_MAX_REPLAY_STALENESS_SECONDS: ${DR_MAX_REPLAY_STALENESS_SECONDS:-30}
+      PGBACKREST_CIPHER_FILE: /run/secrets/pgbackrest_control_cipher_pass
+    secrets: [dr_control_replication_password, dr_control_region_a_reseed_tls_cert, dr_control_region_a_reseed_tls_key, dr_replication_tls_root_cert, pgbackrest_control_cipher_pass]
+    volumes:
+      - control-postgres-data:/var/lib/postgresql/data
+      - pgbackrest-control-repository:/var/lib/pgbackrest
+      - ./deploy/postgres/dr/start-standby.sh:/etc/railway/start-standby.sh:ro
+      - ./deploy/postgres/dr/standby-health.sh:/etc/railway/standby-health.sh:ro
+      - ./deploy/postgres/dr/pgbackrest-secret.sh:/etc/railway/pgbackrest-secret.sh:ro
+      - ./deploy/postgres/dr/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+    networks:
+      region-a-data: {}
+      dr-replication:
+        aliases: [control-postgres-region-a-reseed-replication]
+      dr-control: {}
+    depends_on:
+      control-postgres-region-b: {condition: service_healthy}
+
+  booking-shard-0-postgres-region-a-reseed:
+    <<: *dr-standby-common
+    profiles: ["dr-failback"]
+    environment:
+      POSTGRES_DB: railway_booking
+      POSTGRES_USER: railway_shard_0_replicator
+      POSTGRES_PASSWORD_FILE: /run/secrets/dr_shard_0_replication_password
+      PRIMARY_HOST: booking-shard-0-postgres-region-b-replication
+      REPLICATION_SLOT: shard_0_region_a_reseed
+      PGBACKREST_STANZA: railway-shard-0
+      DR_REPLICATION_TLS_CERT_FILE: /run/secrets/dr_shard_0_region_a_reseed_tls_cert
+      DR_REPLICATION_TLS_KEY_FILE: /run/secrets/dr_shard_0_region_a_reseed_tls_key
+      DR_REPLICATION_TLS_ROOT_CERT_FILE: /run/secrets/dr_replication_tls_root_cert
+      DR_MAX_REPLAY_STALENESS_SECONDS: ${DR_MAX_REPLAY_STALENESS_SECONDS:-30}
+      PGBACKREST_CIPHER_FILE: /run/secrets/pgbackrest_shard_0_cipher_pass
+    secrets: [dr_shard_0_replication_password, dr_shard_0_region_a_reseed_tls_cert, dr_shard_0_region_a_reseed_tls_key, dr_replication_tls_root_cert, pgbackrest_shard_0_cipher_pass]
+    volumes:
+      - booking-shard-0-postgres-data:/var/lib/postgresql/data
+      - pgbackrest-shard-0-repository:/var/lib/pgbackrest
+      - ./deploy/postgres/dr/start-standby.sh:/etc/railway/start-standby.sh:ro
+      - ./deploy/postgres/dr/standby-health.sh:/etc/railway/standby-health.sh:ro
+      - ./deploy/postgres/dr/pgbackrest-secret.sh:/etc/railway/pgbackrest-secret.sh:ro
+      - ./deploy/postgres/dr/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+    networks:
+      region-a-data: {}
+      dr-replication:
+        aliases: [booking-shard-0-postgres-region-a-reseed-replication]
+      dr-control: {}
+    depends_on:
+      booking-shard-0-postgres-region-b: {condition: service_healthy}
+
+  booking-shard-1-postgres-region-a-reseed:
+    <<: *dr-standby-common
+    profiles: ["dr-failback"]
+    environment:
+      POSTGRES_DB: railway_booking
+      POSTGRES_USER: railway_shard_1_replicator
+      POSTGRES_PASSWORD_FILE: /run/secrets/dr_shard_1_replication_password
+      PRIMARY_HOST: booking-shard-1-postgres-region-b-replication
+      REPLICATION_SLOT: shard_1_region_a_reseed
+      PGBACKREST_STANZA: railway-shard-1
+      DR_REPLICATION_TLS_CERT_FILE: /run/secrets/dr_shard_1_region_a_reseed_tls_cert
+      DR_REPLICATION_TLS_KEY_FILE: /run/secrets/dr_shard_1_region_a_reseed_tls_key
+      DR_REPLICATION_TLS_ROOT_CERT_FILE: /run/secrets/dr_replication_tls_root_cert
+      DR_MAX_REPLAY_STALENESS_SECONDS: ${DR_MAX_REPLAY_STALENESS_SECONDS:-30}
+      PGBACKREST_CIPHER_FILE: /run/secrets/pgbackrest_shard_1_cipher_pass
+    secrets: [dr_shard_1_replication_password, dr_shard_1_region_a_reseed_tls_cert, dr_shard_1_region_a_reseed_tls_key, dr_replication_tls_root_cert, pgbackrest_shard_1_cipher_pass]
+    volumes:
+      - booking-shard-1-postgres-data:/var/lib/postgresql/data
+      - pgbackrest-shard-1-repository:/var/lib/pgbackrest
+      - ./deploy/postgres/dr/start-standby.sh:/etc/railway/start-standby.sh:ro
+      - ./deploy/postgres/dr/standby-health.sh:/etc/railway/standby-health.sh:ro
+      - ./deploy/postgres/dr/pgbackrest-secret.sh:/etc/railway/pgbackrest-secret.sh:ro
+      - ./deploy/postgres/dr/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+    networks:
+      region-a-data: {}
+      dr-replication:
+        aliases: [booking-shard-1-postgres-region-a-reseed-replication]
+      dr-control: {}
+    depends_on:
+      booking-shard-1-postgres-region-b: {condition: service_healthy}
+
+  restore-validation-control:
+    <<: *restore-common
+    environment:
+      PGDATA: /var/lib/postgresql/restore
+      PGUSER: railway_control
+      PGDATABASE: railway_control
+      PGBACKREST_STANZA: railway-control
+      PGBACKREST_CIPHER_FILE: /run/secrets/pgbackrest_control_cipher_pass
+      PGBACKREST_PITR_TARGET: ${PGBACKREST_PITR_TARGET:-unset}
+      RESTORE_CONFIRM: restore-to-isolated-validation
+    secrets: [pgbackrest_control_cipher_pass]
+    volumes:
+      - restore-validation-control-data:/var/lib/postgresql/restore
+      - pgbackrest-control-repository:/var/lib/pgbackrest:ro
+      - ./deploy/postgres/dr/restore-validation.sh:/etc/railway/restore-validation.sh:ro
+      - ./deploy/postgres/dr/pgbackrest-secret.sh:/etc/railway/pgbackrest-secret.sh:ro
+      - ./deploy/postgres/dr/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+
+  restore-validation-shard-0:
+    <<: *restore-common
+    environment:
+      PGDATA: /var/lib/postgresql/restore
+      PGUSER: railway_booking
+      PGDATABASE: railway_booking
+      PGBACKREST_STANZA: railway-shard-0
+      PGBACKREST_CIPHER_FILE: /run/secrets/pgbackrest_shard_0_cipher_pass
+      PGBACKREST_PITR_TARGET: ${PGBACKREST_PITR_TARGET:-unset}
+      RESTORE_CONFIRM: restore-to-isolated-validation
+    secrets: [pgbackrest_shard_0_cipher_pass]
+    volumes:
+      - restore-validation-shard-0-data:/var/lib/postgresql/restore
+      - pgbackrest-shard-0-repository:/var/lib/pgbackrest:ro
+      - ./deploy/postgres/dr/restore-validation.sh:/etc/railway/restore-validation.sh:ro
+      - ./deploy/postgres/dr/pgbackrest-secret.sh:/etc/railway/pgbackrest-secret.sh:ro
+      - ./deploy/postgres/dr/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+
+  restore-validation-shard-1:
+    <<: *restore-common
+    environment:
+      PGDATA: /var/lib/postgresql/restore
+      PGUSER: railway_booking
+      PGDATABASE: railway_booking
+      PGBACKREST_STANZA: railway-shard-1
+      PGBACKREST_CIPHER_FILE: /run/secrets/pgbackrest_shard_1_cipher_pass
+      PGBACKREST_PITR_TARGET: ${PGBACKREST_PITR_TARGET:-unset}
+      RESTORE_CONFIRM: restore-to-isolated-validation
+    secrets: [pgbackrest_shard_1_cipher_pass]
+    volumes:
+      - restore-validation-shard-1-data:/var/lib/postgresql/restore
+      - pgbackrest-shard-1-repository:/var/lib/pgbackrest:ro
+      - ./deploy/postgres/dr/restore-validation.sh:/etc/railway/restore-validation.sh:ro
+      - ./deploy/postgres/dr/pgbackrest-secret.sh:/etc/railway/pgbackrest-secret.sh:ro
+      - ./deploy/postgres/dr/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+
+  backup-repository:
+    profiles: ["dr-tools"]
+    build: {context: ., target: postgres-dr}
+    image: scalable-railway-ticketing-postgres-dr:local
+    command: ["sh", "-c", "trap 'exit 0' TERM; while :; do sleep 3600; done"]
+    volumes:
+      - pgbackrest-control-repository:/var/lib/pgbackrest/control:ro
+      - pgbackrest-shard-0-repository:/var/lib/pgbackrest/shard-0:ro
+      - pgbackrest-shard-1-repository:/var/lib/pgbackrest/shard-1:ro
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    networks: [dr-control]
+    restart: unless-stopped
+
+  dr-admin:
+    profiles: ["dr-tools"]
+    build: {context: ., target: dr-admin}
+    environment:
+      DR_ADMIN_ENABLED: "true"
+      DR_RECOVERY_EPOCH: ${DR_RECOVERY_EPOCH:-1}
+      DR_JOURNAL_REGION: ${DR_JOURNAL_REGION:-region-a}
+      DR_ALLOWED_OPERATOR_ID: ${DR_ALLOWED_OPERATOR_ID:-operator:local-dr}
+      DR_REGION_A_CONTROL_DATABASE_URL: postgresql://railway_control:${CONTROL_POSTGRES_PASSWORD:-control-local-only}@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3
+      DR_REGION_A_SHARD_0_DATABASE_URL: postgresql://railway_booking:${BOOKING_SHARD_0_POSTGRES_PASSWORD:-shard-0-local-only}@booking-shard-0-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3
+      DR_REGION_A_SHARD_1_DATABASE_URL: postgresql://railway_booking:${BOOKING_SHARD_1_POSTGRES_PASSWORD:-shard-1-local-only}@booking-shard-1-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3
+      DR_REGION_B_CONTROL_DATABASE_URL: postgresql://railway_control:${CONTROL_POSTGRES_PASSWORD:-control-local-only}@control-postgres-region-b:5432/railway_control?sslmode=disable&connect_timeout=3
+      DR_REGION_B_SHARD_0_DATABASE_URL: postgresql://railway_booking:${BOOKING_SHARD_0_POSTGRES_PASSWORD:-shard-0-local-only}@booking-shard-0-postgres-region-b:5432/railway_booking?sslmode=disable&connect_timeout=3
+      DR_REGION_B_SHARD_1_DATABASE_URL: postgresql://railway_booking:${BOOKING_SHARD_1_POSTGRES_PASSWORD:-shard-1-local-only}@booking-shard-1-postgres-region-b:5432/railway_booking?sslmode=disable&connect_timeout=3
+      DR_JOURNAL_DATABASE_URL: ${DR_JOURNAL_DATABASE_URL:-postgresql://railway_control:control-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3}
+      DR_FENCE_ATTESTATION_ISSUER: ${DR_FENCE_ATTESTATION_ISSUER:?DR_FENCE_ATTESTATION_ISSUER is required}
+      DR_FENCE_ATTESTATION_KEY_ID: ${DR_FENCE_ATTESTATION_KEY_ID:?DR_FENCE_ATTESTATION_KEY_ID is required}
+      DR_FENCE_ATTESTATION_PUBLIC_KEY_B64: ${DR_FENCE_ATTESTATION_PUBLIC_KEY_B64:?DR_FENCE_ATTESTATION_PUBLIC_KEY_B64 is required}
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    networks: [backend, region-a-data, region-b-data, dr-replication, dr-control]
+    restart: "no"
+
+  backup-admin:
+    profiles: ["dr-tools"]
+    build: {context: ., target: backup-admin}
+    environment:
+      BACKUP_ADMIN_ENABLED: "true"
+      BACKUP_DEPLOYMENT_REGION: region-a
+      BACKUP_REGION_EPOCH: ${REGION_EPOCH:-1}
+      BACKUP_METADATA_DATABASE_URL: postgresql://railway_backup_admin:${BACKUP_METADATA_POSTGRES_PASSWORD:-backup-admin-local-only}@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3
+      BACKUP_OPERATOR_ID: ${BACKUP_OPERATOR_ID:-operator:local-backup}
+      PGBACKREST_REPOSITORY_ID: repo-dr
+      PGBACKREST_REPOSITORY_NUMBER: "1"
+      PGBACKREST_BINARY: /etc/railway/pgbackrest-secret.sh
+      PGBACKREST_CONTROL_STANZA: railway-control
+      PGBACKREST_SHARD_0_STANZA: railway-shard-0
+      PGBACKREST_SHARD_1_STANZA: railway-shard-1
+      PGBACKREST_CONTROL_CIPHER_FILE: /run/secrets/pgbackrest_control_cipher_pass
+      PGBACKREST_SHARD_0_CIPHER_FILE: /run/secrets/pgbackrest_shard_0_cipher_pass
+      PGBACKREST_SHARD_1_CIPHER_FILE: /run/secrets/pgbackrest_shard_1_cipher_pass
+      PGBACKREST_CONTROL_REPO_PATH: /var/lib/pgbackrest/control
+      PGBACKREST_SHARD_0_REPO_PATH: /var/lib/pgbackrest/shard-0
+      PGBACKREST_SHARD_1_REPO_PATH: /var/lib/pgbackrest/shard-1
+      RESTORE_VALIDATION_ROOT: /var/lib/postgresql/restore
+      RESTORE_CONTROL_TARGET_ID: validation-control
+      RESTORE_CONTROL_TARGET_PATH: /var/lib/postgresql/restore/control
+      RESTORE_SHARD_0_TARGET_ID: validation-shard-0
+      RESTORE_SHARD_0_TARGET_PATH: /var/lib/postgresql/restore/shard-0
+      RESTORE_SHARD_1_TARGET_ID: validation-shard-1
+      RESTORE_SHARD_1_TARGET_PATH: /var/lib/postgresql/restore/shard-1
+    secrets: [pgbackrest_control_cipher_pass, pgbackrest_shard_0_cipher_pass, pgbackrest_shard_1_cipher_pass]
+    volumes:
+      - pgbackrest-control-repository:/var/lib/pgbackrest/control
+      - pgbackrest-shard-0-repository:/var/lib/pgbackrest/shard-0
+      - pgbackrest-shard-1-repository:/var/lib/pgbackrest/shard-1
+      - restore-validation-admin-data:/var/lib/postgresql/restore
+      - ./deploy/postgres/dr/pgbackrest-secret.sh:/etc/railway/pgbackrest-secret.sh:ro
+      - ./deploy/postgres/dr/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+    read_only: true
+    tmpfs: [/tmp, /var/run/postgresql]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    networks: [backend, region-a-data, region-b-data, dr-replication, dr-control]
+    depends_on:
+      runtime-control-role: {condition: service_completed_successfully}
+    restart: "no"
+
+  api-1:
+    security_opt: !override [no-new-privileges:true]
+    cap_drop: !override [ALL]
+    environment:
+      DEPLOYMENT_REGION: region-a
+      DEPLOYMENT_ROLE: active
+      REGION_EPOCH: "1"
+      REGIONAL_WRITES_ENABLED: "true"
+      DR_REQUIRED_DATABASE_COUNT: "3"
+  api-2:
+    security_opt: !override [no-new-privileges:true]
+    cap_drop: !override [ALL]
+    environment:
+      DEPLOYMENT_REGION: region-a
+      DEPLOYMENT_ROLE: active
+      REGION_EPOCH: "1"
+      REGIONAL_WRITES_ENABLED: "true"
+      DR_REQUIRED_DATABASE_COUNT: "3"
+  api-3:
+    security_opt: !override [no-new-privileges:true]
+    cap_drop: !override [ALL]
+    environment:
+      DEPLOYMENT_REGION: region-a
+      DEPLOYMENT_ROLE: active
+      REGION_EPOCH: "1"
+      REGIONAL_WRITES_ENABLED: "true"
+      DR_REQUIRED_DATABASE_COUNT: "3"
+
+  admission-worker-1: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL]}
+  admission-worker-2: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL]}
+  read-model-worker-1: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL]}
+  read-model-worker-2: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL]}
+  hold-expirer: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL]}
+  outbox-worker: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL]}
+  booking-command-reconciler: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL]}
+  bootstrap-booking-shard-0: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL]}
+  bootstrap-booking-shard-1: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL]}
+  physical-shard-admin: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL]}
+  reverse-proxy: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL]}
+
+networks:
+  region-a-app: {internal: true}
+  region-a-data: {internal: true}
+  region-b-app: {internal: true}
+  region-b-data: {internal: true}
+  dr-replication:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${DR_REPLICATION_SOURCE_CIDR:-172.31.7.0/24}
+  dr-control: {internal: true}
+
+volumes:
+  control-postgres-region-b-data:
+  booking-shard-0-postgres-region-b-data:
+  booking-shard-1-postgres-region-b-data:
+  pgbackrest-control-repository:
+  pgbackrest-shard-0-repository:
+  pgbackrest-shard-1-repository:
+  restore-validation-control-data:
+  restore-validation-shard-0-data:
+  restore-validation-shard-1-data:
+  restore-validation-admin-data:
+
+secrets:
+  dr_control_replication_password:
+    file: ${DR_CONTROL_REPLICATION_PASSWORD_FILE:?set DR_CONTROL_REPLICATION_PASSWORD_FILE to an external secret file}
+  dr_shard_0_replication_password:
+    file: ${DR_SHARD_0_REPLICATION_PASSWORD_FILE:?set DR_SHARD_0_REPLICATION_PASSWORD_FILE to an external secret file}
+  dr_shard_1_replication_password:
+    file: ${DR_SHARD_1_REPLICATION_PASSWORD_FILE:?set DR_SHARD_1_REPLICATION_PASSWORD_FILE to an external secret file}
+  dr_control_region_a_tls_cert:
+    file: ${DR_CONTROL_REGION_A_TLS_CERT_FILE:?set DR_CONTROL_REGION_A_TLS_CERT_FILE to an external certificate file}
+  dr_control_region_a_tls_key:
+    file: ${DR_CONTROL_REGION_A_TLS_KEY_FILE:?set DR_CONTROL_REGION_A_TLS_KEY_FILE to an external private-key file}
+  dr_control_region_b_tls_cert:
+    file: ${DR_CONTROL_REGION_B_TLS_CERT_FILE:?set DR_CONTROL_REGION_B_TLS_CERT_FILE to an external certificate file}
+  dr_control_region_b_tls_key:
+    file: ${DR_CONTROL_REGION_B_TLS_KEY_FILE:?set DR_CONTROL_REGION_B_TLS_KEY_FILE to an external private-key file}
+  dr_control_region_a_reseed_tls_cert:
+    file: ${DR_CONTROL_REGION_A_RESEED_TLS_CERT_FILE:?set DR_CONTROL_REGION_A_RESEED_TLS_CERT_FILE to an external certificate file}
+  dr_control_region_a_reseed_tls_key:
+    file: ${DR_CONTROL_REGION_A_RESEED_TLS_KEY_FILE:?set DR_CONTROL_REGION_A_RESEED_TLS_KEY_FILE to an external private-key file}
+  dr_shard_0_region_a_tls_cert:
+    file: ${DR_SHARD_0_REGION_A_TLS_CERT_FILE:?set DR_SHARD_0_REGION_A_TLS_CERT_FILE to an external certificate file}
+  dr_shard_0_region_a_tls_key:
+    file: ${DR_SHARD_0_REGION_A_TLS_KEY_FILE:?set DR_SHARD_0_REGION_A_TLS_KEY_FILE to an external private-key file}
+  dr_shard_0_region_b_tls_cert:
+    file: ${DR_SHARD_0_REGION_B_TLS_CERT_FILE:?set DR_SHARD_0_REGION_B_TLS_CERT_FILE to an external certificate file}
+  dr_shard_0_region_b_tls_key:
+    file: ${DR_SHARD_0_REGION_B_TLS_KEY_FILE:?set DR_SHARD_0_REGION_B_TLS_KEY_FILE to an external private-key file}
+  dr_shard_0_region_a_reseed_tls_cert:
+    file: ${DR_SHARD_0_REGION_A_RESEED_TLS_CERT_FILE:?set DR_SHARD_0_REGION_A_RESEED_TLS_CERT_FILE to an external certificate file}
+  dr_shard_0_region_a_reseed_tls_key:
+    file: ${DR_SHARD_0_REGION_A_RESEED_TLS_KEY_FILE:?set DR_SHARD_0_REGION_A_RESEED_TLS_KEY_FILE to an external private-key file}
+  dr_shard_1_region_a_tls_cert:
+    file: ${DR_SHARD_1_REGION_A_TLS_CERT_FILE:?set DR_SHARD_1_REGION_A_TLS_CERT_FILE to an external certificate file}
+  dr_shard_1_region_a_tls_key:
+    file: ${DR_SHARD_1_REGION_A_TLS_KEY_FILE:?set DR_SHARD_1_REGION_A_TLS_KEY_FILE to an external private-key file}
+  dr_shard_1_region_b_tls_cert:
+    file: ${DR_SHARD_1_REGION_B_TLS_CERT_FILE:?set DR_SHARD_1_REGION_B_TLS_CERT_FILE to an external certificate file}
+  dr_shard_1_region_b_tls_key:
+    file: ${DR_SHARD_1_REGION_B_TLS_KEY_FILE:?set DR_SHARD_1_REGION_B_TLS_KEY_FILE to an external private-key file}
+  dr_shard_1_region_a_reseed_tls_cert:
+    file: ${DR_SHARD_1_REGION_A_RESEED_TLS_CERT_FILE:?set DR_SHARD_1_REGION_A_RESEED_TLS_CERT_FILE to an external certificate file}
+  dr_shard_1_region_a_reseed_tls_key:
+    file: ${DR_SHARD_1_REGION_A_RESEED_TLS_KEY_FILE:?set DR_SHARD_1_REGION_A_RESEED_TLS_KEY_FILE to an external private-key file}
+  dr_replication_tls_root_cert:
+    file: ${DR_REPLICATION_TLS_ROOT_CERT_FILE:?set DR_REPLICATION_TLS_ROOT_CERT_FILE to an external CA certificate file}
+  pgbackrest_control_cipher_pass:
+    file: ${PGBACKREST_CONTROL_CIPHER_FILE:?set PGBACKREST_CONTROL_CIPHER_FILE to an external secret file}
+  pgbackrest_shard_0_cipher_pass:
+    file: ${PGBACKREST_SHARD_0_CIPHER_FILE:?set PGBACKREST_SHARD_0_CIPHER_FILE to an external secret file}
+  pgbackrest_shard_1_cipher_pass:
+    file: ${PGBACKREST_SHARD_1_CIPHER_FILE:?set PGBACKREST_SHARD_1_CIPHER_FILE to an external secret file}

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/migration"
@@ -70,6 +72,66 @@ func TestApplyJournalRejectsAConflictingDuplicateReceipt(t *testing.T) {
 	}
 	if applier.calls != 0 || tx.committed || !tx.rolledBack {
 		t.Fatalf("conflict calls=%d committed=%v rolledBack=%v", applier.calls, tx.committed, tx.rolledBack)
+	}
+}
+
+func TestConcurrentSelectedTicketRefundReplayAppliesInventoryEvidenceOnce(t *testing.T) {
+	t.Parallel()
+
+	record := testRecord()
+	fingerprint := [32]byte{7, 8, 9}
+	entry := physicalmigration.JournalEntry{
+		ID: uuid.New(), Sequence: 23, TableName: "selected_ticket_refund_receipts",
+		Operation: "INSERT", EntityID: uuid.New(), ApplyFingerprint: fingerprint,
+	}
+	winner := &fakeTx{rowsAffected: 1}
+	replay := &fakeTx{rowsAffected: 0, row: fakeRow{values: []any{
+		record.TrainRunID, record.TargetGeneration, entry.Sequence, fingerprint[:],
+	}}}
+	target := &concurrentDB{transactions: []pgx.Tx{winner, replay}}
+	applier := &atomicApplier{}
+	shards, err := physicalpostgres.NewShards(&fakeDB{}, target, fakeCopier{},
+		fakePreparer{}, applier, fakeValidator{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	results := make(chan bool, 2)
+	errors := make(chan error, 2)
+	var group sync.WaitGroup
+	for range 2 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			alreadyApplied, err := shards.ApplyJournal(context.Background(), record, entry)
+			results <- alreadyApplied
+			errors <- err
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(results)
+	close(errors)
+
+	for err := range errors {
+		if err != nil {
+			t.Fatalf("concurrent ApplyJournal() error = %v", err)
+		}
+	}
+	newCount, replayCount := 0, 0
+	for alreadyApplied := range results {
+		if alreadyApplied {
+			replayCount++
+		} else {
+			newCount++
+		}
+	}
+	if newCount != 1 || replayCount != 1 || applier.calls.Load() != 1 ||
+		!winner.committed || !replay.committed {
+		t.Fatalf("concurrent results new=%d replay=%d applies=%d commits=%v/%v",
+			newCount, replayCount, applier.calls.Load(), winner.committed, replay.committed)
 	}
 }
 
@@ -147,12 +209,20 @@ func TestPreflightChecksActualSchemaHistoryAndMutationTriggerCoverage(t *testing
 	}
 	for name, sql := range map[string]string{"source": source.lastSQL, "target": target.lastSQL} {
 		for _, fragment := range []string{
-			"schema_migrations", "version = 2", "NOT dirty", "pg_trigger",
+			"schema_migrations", "version = 3", "NOT dirty", "pg_trigger",
+			"migration_evidence_mutation_authorizations",
+			"regional_write_authority", "state = 'active'", "writes_enabled",
+			"isfinite(scheduled_departure_at)",
 			"booking_command_receipts_capture_mutation",
 			"payment_command_receipts_capture_mutation",
 			"ticket_issuance_receipts_capture_mutation",
 			"payment_refund_receipts_capture_mutation",
 			"payment_compensation_receipts_capture_mutation",
+			"ticket_refund_prepare_receipts",
+			"ticket_refund_prepare_receipts_capture_mutation",
+			"ticket_refund_prepare_receipts_guard_transition",
+			"ticket_refund_compensation_receipts_capture_mutation",
+			"selected_ticket_refund_receipts_capture_mutation",
 		} {
 			if !strings.Contains(sql, fragment) {
 				t.Fatalf("%s preflight omitted %q: %s", name, fragment, sql)
@@ -369,11 +439,11 @@ func TestCaptureOutboxRejectsAnExceededAggregateStagingBudget(t *testing.T) {
 
 func TestBoundedValidatorChecksInventoryAndReferentialSemantics(t *testing.T) {
 	t.Parallel()
-	const physicalV2MigrationTables = 15
+	const physicalV3MigrationTables = 18
 
 	rows := func() []pgx.Row {
 		result := []pgx.Row{fakeRow{values: []any{0}}}
-		for range physicalV2MigrationTables {
+		for range physicalV3MigrationTables {
 			result = append(result, fakeRow{values: []any{0, "", ""}})
 		}
 		return result
@@ -382,12 +452,17 @@ func TestBoundedValidatorChecksInventoryAndReferentialSemantics(t *testing.T) {
 	target := &fakeDB{queryRows: rows()}
 	record := testRecord()
 	result, err := (physicalpostgres.BoundedValidator{}).Validate(context.Background(), source, target,
-		physicalmigration.ValidationRequest{Migration: record, MaxRows: 100, MaxTables: physicalV2MigrationTables})
+		physicalmigration.ValidationRequest{Migration: record, MaxRows: 100, MaxTables: physicalV3MigrationTables})
 	if err != nil || !result.Passed {
 		t.Fatalf("Validate() result=%+v error=%v", result, err)
 	}
 	semanticSQL := source.querySQL[0]
-	for _, fragment := range []string{"bit_or", "payment_pending", "idempotency_records", "booking_command_receipts", "payment_command_receipts", "ticket_issuance_receipts", "payment_refund_receipts", "payment_compensation_receipts", "outbox_events"} {
+	for _, fragment := range []string{
+		"bit_or", "payment_pending", "partially_refund_pending", "partially_refunded",
+		"idempotency_records", "booking_command_receipts", "payment_command_receipts",
+		"ticket_issuance_receipts", "payment_refund_receipts", "payment_compensation_receipts",
+		"ticket_refund_prepare_receipts", "ticket_refund_compensation_receipts", "selected_ticket_refund_receipts", "outbox_events",
+	} {
 		if !strings.Contains(semanticSQL, fragment) {
 			t.Fatalf("semantic validation omitted %q: %s", fragment, semanticSQL)
 		}
@@ -402,7 +477,10 @@ func TestReverseTargetPreparationCleansChildrenButRetainsExactSnapshotAndFenceMa
 	record.RetainedTargetGeneration = 7
 	record.SourceGeneration = 8
 	record.TargetGeneration = 9
-	tx := &fakeTx{rowsAffected: 1, rows: []pgx.Row{
+	tx := &fakeTx{rowsAffected: 1, rowsAffectedByFragment: map[string]int64{
+		"INSERT INTO public.migration_evidence_mutation_authorizations": 3,
+		"DELETE FROM public.migration_evidence_mutation_authorizations": 3,
+	}, rows: []pgx.Row{
 		fakeRow{values: []any{1, 1, 0, 0, 0}},
 		fakeRow{values: []any{5}},
 	}}
@@ -417,6 +495,11 @@ func TestReverseTargetPreparationCleansChildrenButRetainsExactSnapshotAndFenceMa
 		t.Fatalf("preparation deleted the retained snapshot/fence marker: %s", joined)
 	}
 	outbox := strings.Index(joined, "DELETE FROM public.outbox_events")
+	disableCapture := strings.Index(joined, "SET capture_enabled = false")
+	authorizeEvidence := strings.Index(joined, "INSERT INTO public.migration_evidence_mutation_authorizations")
+	selectedTicketRefund := strings.Index(joined, "DELETE FROM public.selected_ticket_refund_receipts")
+	ticketRefundCompensation := strings.Index(joined, "DELETE FROM public.ticket_refund_compensation_receipts")
+	revokeEvidence := strings.Index(joined, "DELETE FROM public.migration_evidence_mutation_authorizations")
 	compensation := strings.Index(joined, "DELETE FROM public.payment_compensation_receipts")
 	refund := strings.Index(joined, "DELETE FROM public.payment_refund_receipts")
 	issuance := strings.Index(joined, "DELETE FROM public.ticket_issuance_receipts")
@@ -424,9 +507,49 @@ func TestReverseTargetPreparationCleansChildrenButRetainsExactSnapshotAndFenceMa
 	tickets := strings.Index(joined, "DELETE FROM public.tickets")
 	snapshot := strings.LastIndex(joined, "UPDATE public.train_run_booking_snapshots")
 	fence := strings.LastIndex(joined, "UPDATE public.train_run_write_fences")
-	if outbox < 0 || compensation <= outbox || refund <= compensation || issuance <= refund ||
-		paymentCommand <= issuance || tickets <= paymentCommand || snapshot <= tickets || fence <= snapshot {
+	if disableCapture < 0 || authorizeEvidence <= disableCapture || outbox <= authorizeEvidence ||
+		selectedTicketRefund <= outbox || ticketRefundCompensation <= selectedTicketRefund ||
+		compensation <= ticketRefundCompensation || refund <= compensation || issuance <= refund ||
+		paymentCommand <= issuance || tickets <= paymentCommand || revokeEvidence <= tickets ||
+		snapshot <= revokeEvidence || fence <= snapshot {
 		t.Fatalf("unsafe reverse cleanup order: %s", joined)
+	}
+	for _, fragment := range []string{
+		"txid_current()", "state.migration_id", "state.train_run_id",
+		"state.source_generation", "NOT state.capture_enabled",
+		"'ticket_refund_compensation_receipts'",
+		"'selected_ticket_refund_receipts'",
+	} {
+		if !strings.Contains(joined, fragment) {
+			t.Fatalf("retained cleanup authorization omitted %q: %s", fragment, joined)
+		}
+	}
+}
+
+func TestReverseTargetPreparationRollsBackBeforeEvidenceDeletionWhenAuthorizationIsIncomplete(t *testing.T) {
+	t.Parallel()
+
+	record := testRecord()
+	record.ReverseMigration = true
+	record.RetainedTargetGeneration = 7
+	record.SourceGeneration = 8
+	record.TargetGeneration = 9
+	tx := &fakeTx{rowsAffected: 1, rowsAffectedByFragment: map[string]int64{
+		"INSERT INTO public.migration_evidence_mutation_authorizations": 1,
+	}, rows: []pgx.Row{
+		fakeRow{values: []any{1, 1, 0, 0, 0}},
+		fakeRow{values: []any{5}},
+	}}
+
+	err := (physicalpostgres.DefaultTargetPreparer{MaxCleanupRows: 10}).Prepare(
+		context.Background(), &fakeDB{transactions: []pgx.Tx{tx}}, record)
+	if !errors.Is(err, physicalmigration.ErrCheckpointConflict) || !tx.rolledBack || tx.committed {
+		t.Fatalf("Prepare() error=%v committed=%v rolledBack=%v", err, tx.committed, tx.rolledBack)
+	}
+	joined := strings.Join(tx.execSQL, "\n")
+	if strings.Contains(joined, "DELETE FROM public.selected_ticket_refund_receipts") ||
+		strings.Contains(joined, "DELETE FROM public.ticket_refund_compensation_receipts") {
+		t.Fatalf("receipt evidence was deleted without both authorizations: %s", joined)
 	}
 }
 
@@ -641,8 +764,8 @@ func testRecord() physicalmigration.Record {
 	return physicalmigration.Record{
 		MigrationID: uuid.New(), TrainRunID: uuid.New(), SourceShardID: "physical-shard-0",
 		TargetShardID: "physical-shard-1", SourceGeneration: 7, TargetGeneration: 8,
-		SourceProtocolVersion: 1, SourceSchemaVersion: 2,
-		TargetProtocolVersion: 1, TargetSchemaVersion: 2,
+		SourceProtocolVersion: 1, SourceSchemaVersion: 3,
+		TargetProtocolVersion: 1, TargetSchemaVersion: 3,
 		State: migration.PhysicalStateCatchingUp,
 	}
 }
@@ -685,21 +808,29 @@ func (db *fakeDB) QueryRow(_ context.Context, sql string, _ ...any) pgx.Row {
 
 type fakeTx struct {
 	pgx.Tx
-	rowsAffected int64
-	committed    bool
-	rolledBack   bool
-	row          pgx.Row
-	rows         []pgx.Row
-	execSQL      []string
-	execArgs     [][]any
-	resultRows   []pgx.Rows
-	querySQL     []string
+	rowsAffected           int64
+	rowsAffectedByFragment map[string]int64
+	committed              bool
+	rolledBack             bool
+	row                    pgx.Row
+	rows                   []pgx.Row
+	execSQL                []string
+	execArgs               [][]any
+	resultRows             []pgx.Rows
+	querySQL               []string
 }
 
 func (tx *fakeTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	tx.execSQL = append(tx.execSQL, sql)
 	tx.execArgs = append(tx.execArgs, args)
-	return pgconn.NewCommandTag(fmt.Sprintf("INSERT 0 %d", tx.rowsAffected)), nil
+	rowsAffected := tx.rowsAffected
+	for fragment, override := range tx.rowsAffectedByFragment {
+		if strings.Contains(sql, fragment) {
+			rowsAffected = override
+			break
+		}
+	}
+	return pgconn.NewCommandTag(fmt.Sprintf("INSERT 0 %d", rowsAffected)), nil
 }
 func (tx *fakeTx) Commit(context.Context) error {
 	tx.committed = true
@@ -766,6 +897,37 @@ type fakeApplier struct{ calls int }
 func (applier *fakeApplier) Apply(context.Context, pgx.Tx, physicalmigration.Record, physicalmigration.JournalEntry) error {
 	applier.calls++
 	return nil
+}
+
+type atomicApplier struct{ calls atomic.Int32 }
+
+func (applier *atomicApplier) Apply(context.Context, pgx.Tx, physicalmigration.Record, physicalmigration.JournalEntry) error {
+	applier.calls.Add(1)
+	return nil
+}
+
+type concurrentDB struct {
+	mu           sync.Mutex
+	transactions []pgx.Tx
+}
+
+func (db *concurrentDB) BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if len(db.transactions) == 0 {
+		return nil, errors.New("no concurrent transaction available")
+	}
+	tx := db.transactions[0]
+	db.transactions = db.transactions[1:]
+	return tx, nil
+}
+
+func (*concurrentDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	panic("unexpected Query")
+}
+
+func (*concurrentDB) QueryRow(context.Context, string, ...any) pgx.Row {
+	panic("unexpected QueryRow")
 }
 
 type fakeCopier struct{}

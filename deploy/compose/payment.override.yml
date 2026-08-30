@@ -1,4 +1,9 @@
 x-payment-settings: &payment-settings
+  DEPLOYMENT_REGION: region-a
+  DEPLOYMENT_ROLE: ${REGION_A_DEPLOYMENT_ROLE:-active}
+  REGION_EPOCH: ${REGION_A_EPOCH:-1}
+  REGIONAL_WRITES_ENABLED: ${REGION_A_WRITES_ENABLED:-true}
+  DR_REQUIRED_DATABASE_COUNT: 3
   PAYMENT_ENABLED: "true"
   PAYMENT_PROVIDER_TYPE: sandbox
   PAYMENT_PROVIDER_BASE_URL: http://payment-sandbox:8099
@@ -15,22 +20,22 @@ x-payment-provider-outbound: &payment-provider-outbound
   PAYMENT_PROVIDER_API_KEY: ${PAYMENT_PROVIDER_API_KEY:-synthetic-sandbox-api-key}
 
 x-payment-webhook-verification: &payment-webhook-verification
-  PAYMENT_WEBHOOK_KEYRING: current=${PAYMENT_WEBHOOK_KEY_B64:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
-  PAYMENT_WEBHOOK_ACCEPT_KEY_IDS: current
+  PAYMENT_WEBHOOK_KEYRING: ${M7_WEBHOOK_KEYRING:-current=${PAYMENT_WEBHOOK_KEY_B64:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}}
+  PAYMENT_WEBHOOK_ACCEPT_KEY_IDS: ${M7_WEBHOOK_ACCEPT_KEY_IDS:-current}
 
 x-payment-control: &payment-control
-  DATABASE_URL: ${CONTROL_DATABASE_URL:-postgresql://railway_control:control-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3}
+  DATABASE_URL: ${CONTROL_DATABASE_URL:-postgresql://railway_runtime:runtime-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3}
   CONTROL_DATABASE_MAX_OPEN_CONNS: 4
 
 x-payment-reconciler-control: &payment-reconciler-control
-  DATABASE_URL: postgresql://payment_reconciler:reconciler-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3
+  DATABASE_URL: ${REGION_A_RECONCILER_CONTROL_DATABASE_URL:-postgresql://payment_reconciler:reconciler-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3}
   CONTROL_DATABASE_MAX_OPEN_CONNS: 4
 
 x-payment-shards: &payment-shards
   BOOKING_SHARD_MODE: physical
   BOOKING_SHARD_IDS: physical-shard-0,physical-shard-1
-  BOOKING_SHARD_0_DATABASE_URL: ${BOOKING_SHARD_0_DATABASE_URL:-postgresql://railway_booking:shard-0-local-only@booking-shard-0-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
-  BOOKING_SHARD_1_DATABASE_URL: ${BOOKING_SHARD_1_DATABASE_URL:-postgresql://railway_booking:shard-1-local-only@booking-shard-1-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
+  BOOKING_SHARD_0_DATABASE_URL: ${BOOKING_SHARD_0_DATABASE_URL:-postgresql://railway_runtime:runtime-local-only@booking-shard-0-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
+  BOOKING_SHARD_1_DATABASE_URL: ${BOOKING_SHARD_1_DATABASE_URL:-postgresql://railway_runtime:runtime-local-only@booking-shard-1-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
   PHYSICAL_SHARD_MAX_COUNT: 2
   PHYSICAL_SHARD_MAX_OPEN_CONNS: 3
   PHYSICAL_SHARD_MAX_IDLE_CONNS: 2
@@ -55,8 +60,38 @@ x-payment-shards: &payment-shards
 x-payment-reconciler-shards: &payment-reconciler-shards
   BOOKING_SHARD_MODE: physical
   BOOKING_SHARD_IDS: physical-shard-0,physical-shard-1
-  BOOKING_SHARD_0_DATABASE_URL: postgresql://payment_reconciler:reconciler-local-only@booking-shard-0-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3&options=-c%20default_transaction_read_only=on
-  BOOKING_SHARD_1_DATABASE_URL: postgresql://payment_reconciler:reconciler-local-only@booking-shard-1-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3&options=-c%20default_transaction_read_only=on
+  BOOKING_SHARD_0_DATABASE_URL: ${REGION_A_RECONCILER_SHARD_0_DATABASE_URL:-postgresql://payment_reconciler:reconciler-local-only@booking-shard-0-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3&options=-c%20default_transaction_read_only=on}
+  BOOKING_SHARD_1_DATABASE_URL: ${REGION_A_RECONCILER_SHARD_1_DATABASE_URL:-postgresql://payment_reconciler:reconciler-local-only@booking-shard-1-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3&options=-c%20default_transaction_read_only=on}
+  PHYSICAL_SHARD_MAX_COUNT: 2
+  PHYSICAL_SHARD_MAX_OPEN_CONNS: 3
+  PHYSICAL_SHARD_MAX_IDLE_CONNS: 2
+  PHYSICAL_SHARD_TOTAL_POOL_BUDGET: 6
+  CONTROL_DATABASE_POOL_COUNT: 13
+  PHYSICAL_SHARD_API_REPLICA_COUNT: 3
+  PHYSICAL_SHARD_WORKER_REPLICA_COUNT: 6
+  WORKER_SHARD_CONCURRENCY: 2
+  PHYSICAL_SHARD_MIGRATION_ADMIN_RESERVE: 8
+  PHYSICAL_SHARD_OPERATIONAL_RESERVE: 16
+  POSTGRES_MAX_CONNECTIONS_LIMIT: 140
+  PHYSICAL_SHARD_CONN_MAX_LIFETIME_SECONDS: 900
+  PHYSICAL_SHARD_CONN_MAX_IDLE_TIME_SECONDS: 300
+  PHYSICAL_SHARD_CONNECT_TIMEOUT: 3s
+  PHYSICAL_SHARD_QUERY_TIMEOUT: 2s
+  PHYSICAL_WORKER_SHARD_TIMEOUT: 30s
+  BOOKING_ROUTE_CACHE_ENABLED: "true"
+  BOOKING_ROUTE_CACHE_TTL_SECONDS: 5
+  BOOKING_ROUTE_CACHE_MAX_ENTRIES: 1000
+  BOOKING_SHARD_QUERY_TIMEOUT: 2s
+
+x-payment-operator-control: &payment-operator-control
+  DATABASE_URL: ${PAYMENT_OPERATOR_CONTROL_DATABASE_URL:-postgresql://payment_operator:operator-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3}
+  CONTROL_DATABASE_MAX_OPEN_CONNS: 4
+
+x-payment-operator-shards: &payment-operator-shards
+  BOOKING_SHARD_MODE: physical
+  BOOKING_SHARD_IDS: physical-shard-0,physical-shard-1
+  BOOKING_SHARD_0_DATABASE_URL: ${PAYMENT_OPERATOR_SHARD_0_DATABASE_URL:-postgresql://payment_operator:operator-local-only@booking-shard-0-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
+  BOOKING_SHARD_1_DATABASE_URL: ${PAYMENT_OPERATOR_SHARD_1_DATABASE_URL:-postgresql://payment_operator:operator-local-only@booking-shard-1-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
   PHYSICAL_SHARD_MAX_COUNT: 2
   PHYSICAL_SHARD_MAX_OPEN_CONNS: 3
   PHYSICAL_SHARD_MAX_IDLE_CONNS: 2
@@ -102,6 +137,12 @@ x-payment-dependencies: &payment-dependencies
     condition: service_completed_successfully
   bootstrap-booking-shard-1:
     condition: service_completed_successfully
+  runtime-control-role:
+    condition: service_completed_successfully
+  runtime-booking-shard-0-role:
+    condition: service_completed_successfully
+  runtime-booking-shard-1-role:
+    condition: service_completed_successfully
   payment-sandbox:
     condition: service_healthy
 
@@ -125,6 +166,84 @@ x-payment-worker-common: &payment-worker-common
   depends_on: *payment-dependencies
 
 services:
+  payment-operator-control-role:
+    image: postgres:16-alpine
+    environment:
+      PGPASSWORD: control-local-only
+    command:
+      - sh
+      - -ec
+      - |
+        for attempt in 1 2 3 4 5; do
+        if psql -h control-postgres -U railway_control -d railway_control -v ON_ERROR_STOP=1 <<'SQL'
+        DO $$$$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='operator') THEN CREATE ROLE operator NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT; END IF; END $$$$;
+        DO $$$$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='payment_operator') THEN CREATE ROLE payment_operator LOGIN PASSWORD 'operator-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT; END IF; END $$$$;
+        ALTER ROLE payment_operator PASSWORD 'operator-local-only';
+        GRANT railway_runtime TO payment_operator;
+        GRANT operator TO payment_operator;
+        SQL
+        then exit 0; fi
+        test "$$attempt" -lt 5
+        sleep 1
+        done
+    depends_on:
+      runtime-control-role:
+        condition: service_completed_successfully
+    networks: [backend]
+    restart: "no"
+
+  payment-operator-shard-0-role:
+    image: postgres:16-alpine
+    environment:
+      PGPASSWORD: shard-0-local-only
+    command:
+      - sh
+      - -ec
+      - |
+        for attempt in 1 2 3 4 5; do
+        if psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 <<'SQL'
+        DO $$$$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='operator') THEN CREATE ROLE operator NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT; END IF; END $$$$;
+        DO $$$$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='payment_operator') THEN CREATE ROLE payment_operator LOGIN PASSWORD 'operator-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT; END IF; END $$$$;
+        ALTER ROLE payment_operator PASSWORD 'operator-local-only';
+        GRANT railway_runtime TO payment_operator;
+        GRANT operator TO payment_operator;
+        SQL
+        then exit 0; fi
+        test "$$attempt" -lt 5
+        sleep 1
+        done
+    depends_on:
+      runtime-booking-shard-0-role:
+        condition: service_completed_successfully
+    networks: [backend]
+    restart: "no"
+
+  payment-operator-shard-1-role:
+    image: postgres:16-alpine
+    environment:
+      PGPASSWORD: shard-1-local-only
+    command:
+      - sh
+      - -ec
+      - |
+        for attempt in 1 2 3 4 5; do
+        if psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 <<'SQL'
+        DO $$$$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='operator') THEN CREATE ROLE operator NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT; END IF; END $$$$;
+        DO $$$$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='payment_operator') THEN CREATE ROLE payment_operator LOGIN PASSWORD 'operator-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT; END IF; END $$$$;
+        ALTER ROLE payment_operator PASSWORD 'operator-local-only';
+        GRANT railway_runtime TO payment_operator;
+        GRANT operator TO payment_operator;
+        SQL
+        then exit 0; fi
+        test "$$attempt" -lt 5
+        sleep 1
+        done
+    depends_on:
+      runtime-booking-shard-1-role:
+        condition: service_completed_successfully
+    networks: [backend]
+    restart: "no"
+
   payment-reconciler-control-role:
     image: postgres:16-alpine
     environment:
@@ -133,16 +252,22 @@ services:
       - sh
       - -ec
       - |
-        if ! psql -h control-postgres -U railway_control -d railway_control -tAc "SELECT 1 FROM pg_roles WHERE rolname='payment_reconciler'" | grep -qx 1; then
-          psql -h control-postgres -U railway_control -d railway_control -v ON_ERROR_STOP=1 -c "CREATE ROLE payment_reconciler LOGIN PASSWORD 'reconciler-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
-        fi
-        psql -h control-postgres -U railway_control -d railway_control -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_control TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM payment_reconciler; GRANT SELECT ON public.schema_migrations,public.booking_shards,public.train_run_shard_assignments,public.payment_intents,public.payment_sagas,public.payment_operations,public.payment_webhook_inbox,public.payment_provider_event_conflicts,public.payment_reconciliation_checkpoints,public.payment_manual_review_cases,public.ticket_code_directory,public.ticket_shard_locators,public.reservations,public.reservation_seats,public.ticket_orders,public.tickets,public.ticket_issuance_receipts,public.payment_command_receipts,public.payment_compensation_receipts TO payment_reconciler; GRANT INSERT,UPDATE ON public.payment_reconciliation_checkpoints TO payment_reconciler; GRANT INSERT ON public.payment_manual_review_cases TO payment_reconciler; REVOKE UPDATE ON public.payment_manual_review_cases FROM payment_reconciler"
-        if psql -h control-postgres -U railway_control -d railway_control -tAc "SELECT has_table_privilege('payment_reconciler','public.users','SELECT')" | grep -qx t; then
-          echo 'payment_reconciler must not read account credentials' >&2
-          exit 1
-        fi
+        for attempt in 1 2 3 4 5; do
+        if (
+          if ! psql -h control-postgres -U railway_control -d railway_control -tAc "SELECT 1 FROM pg_roles WHERE rolname='payment_reconciler'" | grep -qx 1; then
+            psql -h control-postgres -U railway_control -d railway_control -v ON_ERROR_STOP=1 -c "CREATE ROLE payment_reconciler LOGIN PASSWORD 'reconciler-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT" || exit 1
+          fi
+          psql -h control-postgres -U railway_control -d railway_control -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_control TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM payment_reconciler; GRANT SELECT ON public.schema_migrations,public.booking_shards,public.train_run_shard_assignments,public.payment_intents,public.payment_sagas,public.payment_saga_actions,public.payment_operations,public.payment_webhook_inbox,public.payment_provider_event_conflicts,public.payment_reconciliation_checkpoints,public.payment_manual_review_cases,public.ticket_code_directory,public.ticket_shard_locators,public.reservations,public.reservation_seats,public.ticket_orders,public.tickets,public.ticket_issuance_receipts,public.payment_command_receipts,public.payment_compensation_receipts,public.ticket_refund_requests,public.ticket_refund_operations,public.financial_ledger_transactions,public.financial_ledger_reversals,public.provider_balance_transactions,public.provider_settlement_batches,public.provider_settlement_lines,public.provider_payouts,public.provider_payout_lines,public.provider_settlement_import_conflicts,public.settlement_reconciliation_runs,public.settlement_reconciliation_mismatches,public.payment_provider_capabilities,public.payment_webhook_key_versions,public.payment_webhook_key_version_archive,public.payment_webhook_key_rotation_audit,public.regional_write_authority,public.regional_failover_operations,public.backup_artifacts,public.backup_verifications,public.restore_validations TO payment_reconciler; GRANT EXECUTE ON FUNCTION public.lock_regional_write_authority() TO payment_reconciler; GRANT INSERT,UPDATE ON public.payment_reconciliation_checkpoints TO payment_reconciler; GRANT INSERT ON public.payment_manual_review_cases TO payment_reconciler; REVOKE UPDATE ON public.payment_manual_review_cases FROM payment_reconciler" || exit 1
+          credential_access="$$(psql -h control-postgres -U railway_control -d railway_control -v ON_ERROR_STOP=1 -tAc "SELECT has_table_privilege('payment_reconciler','public.users','SELECT')")" || exit 1
+          test "$$credential_access" = f
+        ); then exit 0; fi
+        test "$$attempt" -lt 5
+        sleep 1
+        done
     depends_on:
       migrate-control:
+        condition: service_completed_successfully
+      runtime-control-role:
         condition: service_completed_successfully
     networks: [backend]
     restart: "no"
@@ -155,12 +280,20 @@ services:
       - sh
       - -ec
       - |
-        if ! psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -tAc "SELECT 1 FROM pg_roles WHERE rolname='payment_reconciler'" | grep -qx 1; then
-          psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "CREATE ROLE payment_reconciler LOGIN PASSWORD 'reconciler-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
-        fi
-        psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_booking TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM payment_reconciler; GRANT SELECT ON public.schema_migrations,public.reservations,public.reservation_seats,public.ticket_orders,public.tickets,public.ticket_issuance_receipts,public.payment_command_receipts,public.payment_compensation_receipts TO payment_reconciler"
+        for attempt in 1 2 3 4 5; do
+        if (
+          if ! psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -tAc "SELECT 1 FROM pg_roles WHERE rolname='payment_reconciler'" | grep -qx 1; then
+            psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "CREATE ROLE payment_reconciler LOGIN PASSWORD 'reconciler-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT" || exit 1
+          fi
+          psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_booking TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM payment_reconciler; GRANT SELECT ON public.schema_migrations,public.regional_write_authority,public.reservations,public.reservation_seats,public.ticket_orders,public.tickets,public.ticket_issuance_receipts,public.payment_command_receipts,public.payment_compensation_receipts TO payment_reconciler; GRANT EXECUTE ON FUNCTION public.lock_regional_write_authority() TO payment_reconciler" || exit 1
+        ); then exit 0; fi
+        test "$$attempt" -lt 5
+        sleep 1
+        done
     depends_on:
       migrate-booking-shard-0:
+        condition: service_completed_successfully
+      runtime-booking-shard-0-role:
         condition: service_completed_successfully
     networks: [backend]
     restart: "no"
@@ -173,12 +306,20 @@ services:
       - sh
       - -ec
       - |
-        if ! psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -tAc "SELECT 1 FROM pg_roles WHERE rolname='payment_reconciler'" | grep -qx 1; then
-          psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "CREATE ROLE payment_reconciler LOGIN PASSWORD 'reconciler-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
-        fi
-        psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_booking TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM payment_reconciler; GRANT SELECT ON public.schema_migrations,public.reservations,public.reservation_seats,public.ticket_orders,public.tickets,public.ticket_issuance_receipts,public.payment_command_receipts,public.payment_compensation_receipts TO payment_reconciler"
+        for attempt in 1 2 3 4 5; do
+        if (
+          if ! psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -tAc "SELECT 1 FROM pg_roles WHERE rolname='payment_reconciler'" | grep -qx 1; then
+            psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "CREATE ROLE payment_reconciler LOGIN PASSWORD 'reconciler-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT" || exit 1
+          fi
+          psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE railway_booking TO payment_reconciler; GRANT USAGE ON SCHEMA public TO payment_reconciler; REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM payment_reconciler; GRANT SELECT ON public.schema_migrations,public.regional_write_authority,public.reservations,public.reservation_seats,public.ticket_orders,public.tickets,public.ticket_issuance_receipts,public.payment_command_receipts,public.payment_compensation_receipts TO payment_reconciler; GRANT EXECUTE ON FUNCTION public.lock_regional_write_authority() TO payment_reconciler" || exit 1
+        ); then exit 0; fi
+        test "$$attempt" -lt 5
+        sleep 1
+        done
     depends_on:
       migrate-booking-shard-1:
+        condition: service_completed_successfully
+      runtime-booking-shard-1-role:
         condition: service_completed_successfully
     networks: [backend]
     restart: "no"
@@ -224,7 +365,7 @@ services:
     environment:
       PAYMENT_SANDBOX_ENVIRONMENT: test
       PAYMENT_SANDBOX_ADDRESS: :8099
-      PAYMENT_SANDBOX_WEBHOOK_KEYRING: current=${PAYMENT_WEBHOOK_KEY_B64:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
+      PAYMENT_SANDBOX_WEBHOOK_KEYRING: ${M7_WEBHOOK_KEYRING:-current=${PAYMENT_WEBHOOK_KEY_B64:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}}
       PAYMENT_SANDBOX_WEBHOOK_ISSUE_KEY_ID: current
       PAYMENT_SANDBOX_MAX_BODY_BYTES: 65536
       PAYMENT_SANDBOX_WEBHOOK_REPLAY_SECONDS: 300
@@ -276,6 +417,12 @@ services:
       PAYMENT_RECONCILER_TIMEOUT: 30s
     depends_on:
       <<: *payment-dependencies
+      payment-operator-control-role:
+        condition: service_completed_successfully
+      payment-operator-shard-0-role:
+        condition: service_completed_successfully
+      payment-operator-shard-1-role:
+        condition: service_completed_successfully
       payment-reconciler-control-role:
         condition: service_completed_successfully
       payment-reconciler-shard-0-role:
@@ -290,13 +437,20 @@ services:
       context: .
       target: payment-admin
     environment:
-      <<: [*payment-control, *payment-shards, *payment-settings, *payment-provider-outbound]
+      <<: [*payment-operator-control, *payment-operator-shards, *payment-settings, *payment-provider-outbound]
       APP_ENV: test
       PAYMENT_RECONCILER_ENABLED: "true"
       CONTROL_DATABASE_POOL_COUNT: 14
       PHYSICAL_SHARD_WORKER_REPLICA_COUNT: 7
       POSTGRES_MAX_CONNECTIONS_LIMIT: 140
-    depends_on: *payment-dependencies
+    depends_on:
+      <<: *payment-dependencies
+      payment-operator-control-role:
+        condition: service_completed_successfully
+      payment-operator-shard-0-role:
+        condition: service_completed_successfully
+      payment-operator-shard-1-role:
+        condition: service_completed_successfully
     restart: "no"
 
 volumes:

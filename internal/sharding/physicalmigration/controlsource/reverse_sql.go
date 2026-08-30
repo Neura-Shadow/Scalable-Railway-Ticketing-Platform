@@ -10,9 +10,26 @@ func reverseUpsertSQL(targetID, table string) string {
 		return reverseOutboxUpsertSQL
 	}
 	if relation, columns, ok := reverseReceiptRelation(targetID, table); ok {
+		if table == "ticket_refund_compensation_receipts" || table == "selected_ticket_refund_receipts" {
+			return fmt.Sprintf("INSERT INTO %s SELECT (jsonb_populate_record(NULL::%s,$1::jsonb)).* ON CONFLICT (id) DO NOTHING",
+				relation, relation)
+		}
 		assignments := make([]string, 0, len(columns))
 		for _, column := range columns {
 			assignments = append(assignments, column+"=EXCLUDED."+column)
+		}
+		if table == "ticket_refund_prepare_receipts" {
+			const existing = "existing"
+			identityMismatch := make([]string, 0, len(columns)-2)
+			for _, column := range columns {
+				if column != "state" && column != "resolved_at" {
+					identityMismatch = append(identityMismatch,
+						existing+"."+column+" IS DISTINCT FROM EXCLUDED."+column)
+				}
+			}
+			return fmt.Sprintf("INSERT INTO %s AS %s SELECT (jsonb_populate_record(NULL::%s,$1::jsonb)).* ON CONFLICT (id) DO UPDATE SET %s WHERE (%s.state='prepared' AND EXCLUDED.state IN ('released','applied')) OR (%s) OR (%s.state IN ('released','applied') AND EXCLUDED.state IN ('released','applied') AND ROW(%s.state,%s.resolved_at) IS DISTINCT FROM ROW(EXCLUDED.state,EXCLUDED.resolved_at))",
+				relation, existing, relation, strings.Join(assignments, ","), existing,
+				strings.Join(identityMismatch, " OR "), existing, existing, existing)
 		}
 		return fmt.Sprintf("INSERT INTO %s SELECT (jsonb_populate_record(NULL::%s,$1::jsonb)).* ON CONFLICT (id) DO UPDATE SET %s",
 			relation, relation, strings.Join(assignments, ","))
@@ -91,6 +108,12 @@ func reverseReceiptRelation(targetID, table string) (string, []string, bool) {
 		columns = []string{"refund_operation_id", "payment_intent_id", "reservation_id", "ticket_order_id", "train_run_id", "refund_proof_hash", "captured_amount_minor", "refunded_amount_minor", "currency", "refunded_at", "created_at"}
 	case "payment_compensation_receipts":
 		columns = []string{"compensation_id", "payment_intent_id", "reservation_id", "ticket_order_id", "refund_receipt_id", "train_run_id", "released_seat_count", "cancelled_ticket_count", "applied_at", "created_at"}
+	case "ticket_refund_prepare_receipts":
+		columns = []string{"command_id", "refund_request_id", "refund_operation_id", "payment_intent_id", "reservation_id", "ticket_order_id", "train_run_id", "request_fingerprint", "amount_minor", "currency", "ticket_ids", "prior_order_state", "prior_reservation_state", "state", "requested_at", "eligibility_cutoff_at", "prepared_at", "resolved_at"}
+	case "ticket_refund_compensation_receipts":
+		columns = []string{"command_id", "refund_request_id", "refund_operation_id", "payment_intent_id", "reservation_id", "ticket_order_id", "train_run_id", "request_fingerprint", "provider_proof_hash", "amount_minor", "currency", "selected_ticket_count", "released_seat_count", "resulting_active_ticket_count", "resulting_order_state", "committed_at"}
+	case "selected_ticket_refund_receipts":
+		columns = []string{"compensation_receipt_id", "refund_request_id", "ticket_id", "reservation_seat_id", "train_run_id", "fare_amount_minor", "currency", "segment_mask_hash", "released_at"}
 	default:
 		return "", nil, false
 	}
@@ -344,6 +367,9 @@ func reverseCleanupCountSQL(targetID string) string {
 	switch targetID {
 	case SourceLegacy:
 		return `SELECT
+ (SELECT count(*) FROM public.selected_ticket_refund_receipts WHERE train_run_id=$1)+
+ (SELECT count(*) FROM public.ticket_refund_compensation_receipts WHERE train_run_id=$1)+
+ (SELECT count(*) FROM public.ticket_refund_prepare_receipts WHERE train_run_id=$1)+
  (SELECT count(*) FROM public.payment_compensation_receipts WHERE train_run_id=$1)+
  (SELECT count(*) FROM public.payment_refund_receipts WHERE train_run_id=$1)+
  (SELECT count(*) FROM public.ticket_issuance_receipts WHERE train_run_id=$1)+
@@ -358,6 +384,9 @@ func reverseCleanupCountSQL(targetID string) string {
  (SELECT count(*) FROM public.outbox_events WHERE train_run_id=$1 AND shard_id=$2)`
 	case SourceZero:
 		return `SELECT
+ (SELECT count(*) FROM booking_shard_0.selected_ticket_refund_receipts WHERE train_run_id=$1)+
+ (SELECT count(*) FROM booking_shard_0.ticket_refund_compensation_receipts WHERE train_run_id=$1)+
+ (SELECT count(*) FROM booking_shard_0.ticket_refund_prepare_receipts WHERE train_run_id=$1)+
  (SELECT count(*) FROM booking_shard_0.payment_compensation_receipts WHERE train_run_id=$1)+
  (SELECT count(*) FROM booking_shard_0.payment_refund_receipts WHERE train_run_id=$1)+
  (SELECT count(*) FROM booking_shard_0.ticket_issuance_receipts WHERE train_run_id=$1)+
@@ -372,6 +401,9 @@ func reverseCleanupCountSQL(targetID string) string {
  (SELECT count(*) FROM public.outbox_events WHERE train_run_id=$1 AND shard_id=$2)`
 	case SourceOne:
 		return `SELECT
+ (SELECT count(*) FROM booking_shard_1.selected_ticket_refund_receipts WHERE train_run_id=$1)+
+ (SELECT count(*) FROM booking_shard_1.ticket_refund_compensation_receipts WHERE train_run_id=$1)+
+ (SELECT count(*) FROM booking_shard_1.ticket_refund_prepare_receipts WHERE train_run_id=$1)+
  (SELECT count(*) FROM booking_shard_1.payment_compensation_receipts WHERE train_run_id=$1)+
  (SELECT count(*) FROM booking_shard_1.payment_refund_receipts WHERE train_run_id=$1)+
  (SELECT count(*) FROM booking_shard_1.ticket_issuance_receipts WHERE train_run_id=$1)+
@@ -393,6 +425,9 @@ func reverseCleanupStatements(targetID string) []string {
 	switch targetID {
 	case SourceLegacy:
 		return []string{
+			`DELETE FROM public.selected_ticket_refund_receipts WHERE train_run_id=$1`,
+			`DELETE FROM public.ticket_refund_compensation_receipts WHERE train_run_id=$1`,
+			`DELETE FROM public.ticket_refund_prepare_receipts WHERE train_run_id=$1`,
 			`DELETE FROM public.payment_compensation_receipts WHERE train_run_id=$1`,
 			`DELETE FROM public.payment_refund_receipts WHERE train_run_id=$1`,
 			`DELETE FROM public.ticket_issuance_receipts WHERE train_run_id=$1`,
@@ -408,6 +443,9 @@ func reverseCleanupStatements(targetID string) []string {
 		}
 	case SourceZero:
 		return []string{
+			`DELETE FROM booking_shard_0.selected_ticket_refund_receipts WHERE train_run_id=$1`,
+			`DELETE FROM booking_shard_0.ticket_refund_compensation_receipts WHERE train_run_id=$1`,
+			`DELETE FROM booking_shard_0.ticket_refund_prepare_receipts WHERE train_run_id=$1`,
 			`DELETE FROM booking_shard_0.payment_compensation_receipts WHERE train_run_id=$1`,
 			`DELETE FROM booking_shard_0.payment_refund_receipts WHERE train_run_id=$1`,
 			`DELETE FROM booking_shard_0.ticket_issuance_receipts WHERE train_run_id=$1`,
@@ -423,6 +461,9 @@ func reverseCleanupStatements(targetID string) []string {
 		}
 	case SourceOne:
 		return []string{
+			`DELETE FROM booking_shard_1.selected_ticket_refund_receipts WHERE train_run_id=$1`,
+			`DELETE FROM booking_shard_1.ticket_refund_compensation_receipts WHERE train_run_id=$1`,
+			`DELETE FROM booking_shard_1.ticket_refund_prepare_receipts WHERE train_run_id=$1`,
 			`DELETE FROM booking_shard_1.payment_compensation_receipts WHERE train_run_id=$1`,
 			`DELETE FROM booking_shard_1.payment_refund_receipts WHERE train_run_id=$1`,
 			`DELETE FROM booking_shard_1.ticket_issuance_receipts WHERE train_run_id=$1`,

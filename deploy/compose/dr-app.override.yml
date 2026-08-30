@@ -1,0 +1,460 @@
+# Application layer for the disposable same-host DR laboratory. The dedicated
+# networks are bounded fault domains, not a claim of production multi-region
+# infrastructure. Region B processes are deployed passive and are recreated
+# with active epoch settings only after database promotion and reconciliation.
+
+x-region-b-control: &region-b-control
+  DATABASE_URL: postgresql://railway_runtime:runtime-local-only@control-postgres-region-b:5432/railway_control?sslmode=disable&connect_timeout=3
+  CONTROL_DATABASE_MAX_OPEN_CONNS: 4
+
+x-region-b-shards: &region-b-shards
+  BOOKING_SHARD_MODE: physical
+  BOOKING_SHARD_IDS: physical-shard-0,physical-shard-1
+  BOOKING_SHARD_0_DATABASE_URL: postgresql://railway_runtime:runtime-local-only@booking-shard-0-postgres-region-b:5432/railway_booking?sslmode=disable&connect_timeout=3
+  BOOKING_SHARD_1_DATABASE_URL: postgresql://railway_runtime:runtime-local-only@booking-shard-1-postgres-region-b:5432/railway_booking?sslmode=disable&connect_timeout=3
+  PHYSICAL_SHARD_MAX_COUNT: 2
+  PHYSICAL_SHARD_MAX_OPEN_CONNS: 3
+  PHYSICAL_SHARD_MAX_IDLE_CONNS: 2
+  PHYSICAL_SHARD_TOTAL_POOL_BUDGET: 6
+  CONTROL_DATABASE_POOL_COUNT: 13
+  PHYSICAL_SHARD_API_REPLICA_COUNT: 3
+  PHYSICAL_SHARD_WORKER_REPLICA_COUNT: 6
+  WORKER_SHARD_CONCURRENCY: 2
+  PHYSICAL_SHARD_MIGRATION_ADMIN_RESERVE: 8
+  PHYSICAL_SHARD_OPERATIONAL_RESERVE: 16
+  POSTGRES_MAX_CONNECTIONS_LIMIT: 140
+  PHYSICAL_SHARD_CONN_MAX_LIFETIME_SECONDS: 900
+  PHYSICAL_SHARD_CONN_MAX_IDLE_TIME_SECONDS: 300
+  PHYSICAL_SHARD_CONNECT_TIMEOUT: 3s
+  PHYSICAL_SHARD_QUERY_TIMEOUT: 2s
+  PHYSICAL_WORKER_SHARD_TIMEOUT: 30s
+  BOOKING_ROUTE_CACHE_ENABLED: "true"
+  BOOKING_ROUTE_CACHE_TTL_SECONDS: 5
+  BOOKING_ROUTE_CACHE_MAX_ENTRIES: 1000
+  BOOKING_SHARD_QUERY_TIMEOUT: 2s
+
+x-region-b-role: &region-b-role
+  APP_ENV: test
+  DEPLOYMENT_REGION: region-b
+  DEPLOYMENT_ROLE: ${REGION_B_DEPLOYMENT_ROLE:-passive}
+  REGION_EPOCH: ${REGION_B_EPOCH:-1}
+  REGIONAL_WRITES_ENABLED: ${REGION_B_WRITES_ENABLED:-false}
+  DR_REQUIRED_DATABASE_COUNT: 3
+  REDIS_ADDR: redis-region-b:6379
+  PAYMENT_WEBHOOK_KEYRING: ${M7_WEBHOOK_KEYRING}
+  PAYMENT_WEBHOOK_ACCEPT_KEY_IDS: ${M7_WEBHOOK_ACCEPT_KEY_IDS:-previous,current}
+
+x-region-b-payment: &region-b-payment
+  PAYMENT_ENABLED: "true"
+  PAYMENT_PROVIDER_TYPE: sandbox
+  PAYMENT_PROVIDER_BASE_URL: http://payment-sandbox:8099
+  PAYMENT_PROVIDER_API_KEY: synthetic-sandbox-api-key
+  PAYMENT_PROVIDER_CONNECT_TIMEOUT: 2s
+  PAYMENT_PROVIDER_REQUEST_TIMEOUT: 5s
+  PAYMENT_PROVIDER_MAX_RESPONSE_BYTES: 65536
+  PAYMENT_PROCESSING_GRACE_SECONDS: 900
+  PAYMENT_MANUAL_REVIEW_AFTER_SECONDS: 3600
+  PAYMENT_MAX_UNCERTAIN_SECONDS: 86400
+
+x-region-b-api: &region-b-api
+  HTTP_ADDR: :8080
+  JWT_SECRET: ${JWT_SECRET}
+  JWT_ISSUER: scalable-railway-ticketing-platform
+  JWT_AUDIENCE: railway-api
+  TRUSTED_PROXIES: 172.16.0.0/12
+
+x-region-a-control: &region-a-control
+  DATABASE_URL: postgresql://railway_runtime:runtime-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3
+  CONTROL_DATABASE_MAX_OPEN_CONNS: 4
+
+x-region-a-shards: &region-a-shards
+  BOOKING_SHARD_MODE: physical
+  BOOKING_SHARD_IDS: physical-shard-0,physical-shard-1
+  BOOKING_SHARD_0_DATABASE_URL: postgresql://railway_runtime:runtime-local-only@booking-shard-0-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3
+  BOOKING_SHARD_1_DATABASE_URL: postgresql://railway_runtime:runtime-local-only@booking-shard-1-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3
+  PHYSICAL_SHARD_MAX_COUNT: 2
+  PHYSICAL_SHARD_MAX_OPEN_CONNS: 3
+  PHYSICAL_SHARD_MAX_IDLE_CONNS: 2
+  PHYSICAL_SHARD_TOTAL_POOL_BUDGET: 6
+  CONTROL_DATABASE_POOL_COUNT: 13
+  PHYSICAL_SHARD_API_REPLICA_COUNT: 3
+  PHYSICAL_SHARD_WORKER_REPLICA_COUNT: 6
+  WORKER_SHARD_CONCURRENCY: 2
+  PHYSICAL_SHARD_MIGRATION_ADMIN_RESERVE: 8
+  PHYSICAL_SHARD_OPERATIONAL_RESERVE: 16
+  POSTGRES_MAX_CONNECTIONS_LIMIT: 140
+  PHYSICAL_SHARD_CONN_MAX_LIFETIME_SECONDS: 900
+  PHYSICAL_SHARD_CONN_MAX_IDLE_TIME_SECONDS: 300
+  PHYSICAL_SHARD_CONNECT_TIMEOUT: 3s
+  PHYSICAL_SHARD_QUERY_TIMEOUT: 2s
+  PHYSICAL_WORKER_SHARD_TIMEOUT: 30s
+  BOOKING_ROUTE_CACHE_ENABLED: "true"
+  BOOKING_ROUTE_CACHE_TTL_SECONDS: 5
+  BOOKING_ROUTE_CACHE_MAX_ENTRIES: 1000
+  BOOKING_SHARD_QUERY_TIMEOUT: 2s
+
+x-region-a-api: &region-a-api
+  HTTP_ADDR: :8080
+  JWT_SECRET: ${JWT_SECRET}
+  JWT_ISSUER: scalable-railway-ticketing-platform
+  JWT_AUDIENCE: railway-api
+  TRUSTED_PROXIES: 172.16.0.0/12
+
+x-region-b-worker: &region-b-worker
+  PAYMENT_SAGA_WORKER_ENABLED: "true"
+  PAYMENT_WORKER_ENABLED: "true"
+  PAYMENT_WORKER_INTERVAL_MILLISECONDS: 250
+  PAYMENT_WORKER_BATCH_SIZE: 25
+  PAYMENT_WORKER_LEASE_SECONDS: 30
+  PAYMENT_WORKER_MAX_ATTEMPTS: 8
+  PAYMENT_WORKER_RETRY_BASE_SECONDS: 1
+  WORKER_HTTP_ADDRESS: :9090
+  WORKER_PASS_TIMEOUT: 60s
+
+x-region-b-reconciler: &region-b-reconciler
+  PAYMENT_RECONCILER_ENABLED: "true"
+  PAYMENT_RECONCILER_INTERVAL: 15s
+  PAYMENT_RECONCILER_BATCH_SIZE: 100
+  PAYMENT_RECONCILER_TIMEOUT: 30s
+  PAYMENT_RECONCILER_SCOPE: payment-all
+  WORKER_HTTP_ADDRESS: :9090
+  WORKER_PASS_TIMEOUT: 60s
+
+x-region-a-role: &region-a-role
+  APP_ENV: test
+  DEPLOYMENT_REGION: region-a
+  DEPLOYMENT_ROLE: ${REGION_A_DEPLOYMENT_ROLE:-active}
+  REGION_EPOCH: ${REGION_A_EPOCH:-1}
+  REGIONAL_WRITES_ENABLED: ${REGION_A_WRITES_ENABLED:-true}
+  DR_REQUIRED_DATABASE_COUNT: 3
+  REDIS_ADDR: redis:6379
+  PAYMENT_WEBHOOK_KEYRING: ${M7_WEBHOOK_KEYRING}
+  PAYMENT_WEBHOOK_ACCEPT_KEY_IDS: ${M7_WEBHOOK_ACCEPT_KEY_IDS:-previous,current}
+
+x-stripe-webhook: &stripe-webhook
+  PAYMENT_ENABLED: "true"
+  PAYMENT_PROVIDER_TYPE: stripe
+  PAYMENT_PROVIDER_API_VERSION: 2026-07-29.dahlia
+  PAYMENT_PROVIDER_ACCOUNT_ID: acct_m7_contract
+  PAYMENT_PROVIDER_BASE_URL: http://payment-stripe-contract.test:8100
+  PAYMENT_PROVIDER_CONNECT_TIMEOUT: 2s
+  PAYMENT_PROVIDER_REQUEST_TIMEOUT: 5s
+  PAYMENT_PROVIDER_MAX_RESPONSE_BYTES: 65536
+  PAYMENT_PROVIDER_WEBHOOK_KEYRING: ${M7_STRIPE_WEBHOOK_KEYRING}
+  PAYMENT_WEBHOOK_MAX_BODY_BYTES: 65536
+  PAYMENT_WEBHOOK_CLOCK_SKEW_SECONDS: 300
+  PAYMENT_WEBHOOK_KEYRING: ""
+  PAYMENT_WEBHOOK_PRIMARY_KEY_ID: ${M7_STRIPE_WEBHOOK_PRIMARY_KEY_ID:-previous}
+  PAYMENT_WEBHOOK_ACCEPT_KEY_IDS: ${M7_STRIPE_WEBHOOK_ACCEPT_KEY_IDS:-previous}
+  PAYMENT_WEBHOOK_KEY_RETIREMENT_GRACE_SECONDS: ${M7_STRIPE_WEBHOOK_GRACE_SECONDS:-5}
+  PAYMENT_PROCESSING_GRACE_SECONDS: 900
+  PAYMENT_MANUAL_REVIEW_AFTER_SECONDS: 3600
+  PAYMENT_MAX_UNCERTAIN_SECONDS: 86400
+
+# Compose re-applies sequence merge rules across all four DR layers. Pin the
+# final process-hardening sequences here so adding the DR database layer cannot
+# duplicate an inherited no-new-privileges/cap-drop entry.
+x-final-app-security: &final-app-security
+  security_opt: !override [no-new-privileges:true]
+  cap_drop: !override [ALL]
+
+x-region-b-app: &region-b-app
+  <<: *final-app-security
+  profiles: ["dr-app"]
+  networks: !override [region-b-app, region-b-data]
+  restart: unless-stopped
+
+x-dr-proxy: &dr-proxy
+  profiles: ["dr-app"]
+  user: "101:101"
+  read_only: true
+  tmpfs:
+    - /var/cache/nginx:size=16m,mode=0755,uid=101,gid=101
+    - /var/run:size=1m,mode=0755,uid=101,gid=101
+    - /etc/nginx/conf.d:size=1m,mode=0755,uid=101,gid=101
+  security_opt: !override [no-new-privileges:true]
+  cap_drop: !override [ALL]
+  restart: unless-stopped
+
+services:
+  # Region A services inherited from the M6 topology are restricted to the
+  # active regional fault domain for the application drill.
+  api-1: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL], networks: !override [region-a-app, region-a-data], environment: {<<: *region-a-role}}
+  api-2: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL], networks: !override [region-a-app, region-a-data], environment: {<<: *region-a-role}}
+  api-3: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL], networks: !override [region-a-app, region-a-data], environment: {<<: *region-a-role}}
+  payment-worker-1: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL], networks: !override [region-a-app, region-a-data], environment: {<<: *region-a-role}}
+  payment-worker-2: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL], networks: !override [region-a-app, region-a-data], environment: {<<: *region-a-role}}
+  payment-reconciler:
+    security_opt: !override [no-new-privileges:true]
+    cap_drop: !override [ALL]
+    networks: !override [region-a-app, region-a-data]
+    environment:
+      <<: *region-a-role
+      DATABASE_URL: ${REGION_A_RECONCILER_CONTROL_DATABASE_URL:-postgresql://payment_reconciler:reconciler-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3}
+      BOOKING_SHARD_0_DATABASE_URL: ${REGION_A_RECONCILER_SHARD_0_DATABASE_URL:-postgresql://payment_reconciler:reconciler-local-only@booking-shard-0-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3&options=-c%20default_transaction_read_only=on}
+      BOOKING_SHARD_1_DATABASE_URL: ${REGION_A_RECONCILER_SHARD_1_DATABASE_URL:-postgresql://payment_reconciler:reconciler-local-only@booking-shard-1-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3&options=-c%20default_transaction_read_only=on}
+  admission-worker-1: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL], networks: !override [region-a-app, region-a-data], environment: {<<: *region-a-role}}
+  admission-worker-2: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL], networks: !override [region-a-app, region-a-data], environment: {<<: *region-a-role}}
+  read-model-worker-1: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL], networks: !override [region-a-app, region-a-data], environment: {<<: *region-a-role}}
+  read-model-worker-2: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL], networks: !override [region-a-app, region-a-data], environment: {<<: *region-a-role}}
+  hold-expirer:
+    security_opt: !override [no-new-privileges:true]
+    cap_drop: !override [ALL]
+    networks: !override [region-a-app, region-a-data]
+    environment: {<<: *region-a-role}
+  outbox-worker: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL], networks: !override [region-a-app, region-a-data], environment: {<<: *region-a-role}}
+  booking-command-reconciler: {security_opt: !override [no-new-privileges:true], cap_drop: !override [ALL], networks: !override [region-a-app, region-a-data], environment: {<<: *region-a-role}}
+  redis: {networks: !override [region-a-app]}
+
+  payment-sandbox:
+    networks: !override [region-a-app, region-b-app, dr-test-provider]
+
+  payment-stripe-contract:
+    profiles: ["dr-app"]
+    build: {context: ., target: payment-stripe-contract}
+    image: scalable-railway-ticketing-payment-stripe-contract:local
+    environment:
+      PAYMENT_STRIPE_CONTRACT_TEST_ONLY: "true"
+      PAYMENT_STRIPE_CONTRACT_ADDRESS: :8100
+      PAYMENT_PROVIDER_ACCOUNT_ID: acct_m7_contract
+      PAYMENT_PROVIDER_API_KEY: ${PAYMENT_CONTRACT_API_KEY}
+      PAYMENT_PROVIDER_API_VERSION: 2026-07-29.dahlia
+      PAYMENT_STRIPE_CONTRACT_ADAPTER_ORIGIN: http://payment-stripe-contract.test:8100
+      PAYMENT_STRIPE_CONTRACT_PAGE_BARRIER_DELAY: 8s
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:8100/readyz"]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: !override [no-new-privileges:true]
+    cap_drop: !override [ALL]
+    networks:
+      region-a-app:
+        aliases: [payment-stripe-contract.test]
+      region-b-app:
+        aliases: [payment-stripe-contract.test]
+      dr-test-provider: {}
+    restart: unless-stopped
+
+  stripe-webhook-api-region-a:
+    profiles: ["dr-app"]
+    extends: {service: api-1}
+    build: {context: ., target: api}
+    ports: !override []
+    security_opt: !override [no-new-privileges:true]
+    cap_drop: !override [ALL]
+    environment:
+      <<: [*region-a-control, *region-a-shards, *region-a-api, *stripe-webhook, *region-a-role]
+    networks: !override [region-a-app, region-a-data]
+    restart: "no"
+
+  stripe-webhook-api-region-b:
+    profiles: ["dr-app"]
+    extends: {service: api-1}
+    build: {context: ., target: api}
+    ports: !override []
+    security_opt: !override [no-new-privileges:true]
+    cap_drop: !override [ALL]
+    environment:
+      <<: [*region-b-control, *region-b-shards, *region-b-api, *stripe-webhook, *region-b-role]
+    networks: !override [region-b-app, region-b-data]
+    restart: "no"
+
+  settlement-worker-region-a:
+    profiles: ["dr-app"]
+    build: {context: ., target: settlement-worker}
+    image: scalable-railway-ticketing-settlement-worker:local
+    environment:
+      APP_ENV: test
+      DATABASE_URL: ${REGION_A_CONTROL_DATABASE_URL:-postgresql://railway_runtime:runtime-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3}
+      PAYMENT_ENABLED: "true"
+      PAYMENT_PROVIDER_TYPE: stripe
+      PAYMENT_PROVIDER_ACCOUNT_ID: acct_m7_contract
+      PAYMENT_PROVIDER_BASE_URL: http://payment-stripe-contract.test:8100
+      PAYMENT_PROVIDER_API_KEY: ${PAYMENT_CONTRACT_API_KEY}
+      PAYMENT_PROVIDER_API_VERSION: 2026-07-29.dahlia
+      PAYMENT_PROVIDER_CONNECT_TIMEOUT: 2s
+      PAYMENT_PROVIDER_REQUEST_TIMEOUT: 15s
+      PAYMENT_PROVIDER_MAX_RESPONSE_BYTES: 65536
+      SETTLEMENT_WORKER_ENABLED: ${REGION_A_SETTLEMENT_ENABLED:-true}
+      SETTLEMENT_WORKER_PAGE_SIZE: 1
+      SETTLEMENT_WORKER_MAX_PAGES_PER_RUN: 10
+      SETTLEMENT_WORKER_MAX_ATTEMPTS: 3
+      SETTLEMENT_WORKER_INTERVAL_SECONDS: 60
+      SETTLEMENT_WORKER_TIMEOUT: 30s
+      SETTLEMENT_RECONCILIATION_LOOKBACK_DAYS: 30
+      WORKER_HTTP_ADDRESS: :9090
+      DEPLOYMENT_REGION: region-a
+      DEPLOYMENT_ROLE: ${REGION_A_DEPLOYMENT_ROLE:-active}
+      REGION_EPOCH: ${REGION_A_EPOCH:-1}
+      REGIONAL_WRITES_ENABLED: ${REGION_A_WRITES_ENABLED:-true}
+      DR_REQUIRED_DATABASE_COUNT: 3
+    depends_on:
+      payment-stripe-contract: {condition: service_healthy}
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: !override [no-new-privileges:true]
+    cap_drop: !override [ALL]
+    networks: [region-a-app, region-a-data]
+    restart: unless-stopped
+
+  settlement-admin:
+    profiles: ["dr-tools"]
+    build: {context: ., target: settlement-admin}
+    image: scalable-railway-ticketing-settlement-admin:local
+    environment:
+      DATABASE_URL: ${SETTLEMENT_ADMIN_DATABASE_URL:-postgresql://railway_control:control-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3}
+      DEPLOYMENT_REGION: ${SETTLEMENT_ADMIN_REGION:-region-a}
+      DEPLOYMENT_ROLE: active
+      REGION_EPOCH: ${SETTLEMENT_ADMIN_EPOCH:-1}
+      REGIONAL_WRITES_ENABLED: "true"
+      DR_REQUIRED_DATABASE_COUNT: 3
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: !override [no-new-privileges:true]
+    cap_drop: !override [ALL]
+    networks: [region-a-app, region-a-data]
+    restart: "no"
+
+  redis-region-b:
+    <<: *region-b-app
+    extends: {service: redis}
+    image: redis:7-alpine
+    volumes: !override [redis-region-b-data:/data]
+    networks: !override [region-b-app]
+
+  api-region-b-1:
+    <<: *region-b-app
+    extends: {service: api-1}
+    build: {context: ., target: api}
+    environment:
+      <<: [*region-b-control, *region-b-shards, *region-b-payment, *region-b-api, *region-b-role]
+  api-region-b-2:
+    <<: *region-b-app
+    extends: {service: api-2}
+    build: {context: ., target: api}
+    environment:
+      <<: [*region-b-control, *region-b-shards, *region-b-payment, *region-b-api, *region-b-role]
+  api-region-b-3:
+    <<: *region-b-app
+    extends: {service: api-3}
+    build: {context: ., target: api}
+    environment:
+      <<: [*region-b-control, *region-b-shards, *region-b-payment, *region-b-api, *region-b-role]
+
+  payment-worker-region-b-1:
+    <<: *region-b-app
+    extends: {service: payment-worker-1}
+    build: {context: ., target: payment-worker}
+    environment:
+      <<: [*region-b-control, *region-b-shards, *region-b-payment, *region-b-worker, *region-b-role]
+  payment-worker-region-b-2:
+    <<: *region-b-app
+    extends: {service: payment-worker-2}
+    build: {context: ., target: payment-worker}
+    environment:
+      <<: [*region-b-control, *region-b-shards, *region-b-payment, *region-b-worker, *region-b-role]
+
+  payment-reconciler-region-b:
+    <<: *region-b-app
+    extends: {service: payment-reconciler}
+    build: {context: ., target: payment-reconciler}
+    environment:
+      <<: [*region-b-shards, *region-b-payment, *region-b-reconciler, *region-b-role]
+      DATABASE_URL: postgresql://payment_reconciler:reconciler-local-only@control-postgres-region-b:5432/railway_control?sslmode=disable&connect_timeout=3
+      BOOKING_SHARD_0_DATABASE_URL: postgresql://payment_reconciler:reconciler-local-only@booking-shard-0-postgres-region-b:5432/railway_booking?sslmode=disable&connect_timeout=3&options=-c%20default_transaction_read_only=on
+      BOOKING_SHARD_1_DATABASE_URL: postgresql://payment_reconciler:reconciler-local-only@booking-shard-1-postgres-region-b:5432/railway_booking?sslmode=disable&connect_timeout=3&options=-c%20default_transaction_read_only=on
+
+  settlement-worker-region-b:
+    <<: *region-b-app
+    extends: {service: settlement-worker-region-a}
+    environment:
+      <<: [*region-b-role]
+      DATABASE_URL: postgresql://railway_runtime:runtime-local-only@control-postgres-region-b:5432/railway_control?sslmode=disable&connect_timeout=3
+
+  admission-worker-region-b-1:
+    <<: *region-b-app
+    extends: {service: admission-worker-1}
+    build: {context: ., target: admission-worker}
+    environment:
+      <<: [*region-b-control, *region-b-shards, *region-b-role]
+  admission-worker-region-b-2:
+    <<: *region-b-app
+    extends: {service: admission-worker-2}
+    build: {context: ., target: admission-worker}
+    environment:
+      <<: [*region-b-control, *region-b-shards, *region-b-role]
+  read-model-worker-region-b-1:
+    <<: *region-b-app
+    extends: {service: read-model-worker-1}
+    build: {context: ., target: read-model-worker}
+    environment:
+      <<: [*region-b-control, *region-b-shards, *region-b-role]
+  read-model-worker-region-b-2:
+    <<: *region-b-app
+    extends: {service: read-model-worker-2}
+    build: {context: ., target: read-model-worker}
+    environment:
+      <<: [*region-b-control, *region-b-shards, *region-b-role]
+  hold-expirer-region-b:
+    <<: *region-b-app
+    extends: {service: hold-expirer}
+    build: {context: ., target: hold-expirer}
+    environment:
+      <<: [*region-b-control, *region-b-shards, *region-b-role]
+  outbox-worker-region-b:
+    <<: *region-b-app
+    extends: {service: outbox-worker}
+    build: {context: ., target: outbox-worker}
+    environment:
+      <<: [*region-b-control, *region-b-shards, *region-b-role]
+  booking-command-reconciler-region-b:
+    <<: *region-b-app
+    extends: {service: booking-command-reconciler}
+    build: {context: ., target: booking-command-reconciler}
+    environment:
+      <<: [*region-b-control, *region-b-shards, *region-b-role]
+
+  proxy-region-a:
+    <<: *dr-proxy
+    build: {context: ., dockerfile: deploy/nginx/Dockerfile.dr, target: region-a}
+    image: scalable-railway-ticketing-proxy-region-a:local
+    networks: [region-a-app, dr-test-ingress]
+
+  proxy-region-b:
+    <<: *dr-proxy
+    build: {context: ., dockerfile: deploy/nginx/Dockerfile.dr, target: region-b}
+    image: scalable-railway-ticketing-proxy-region-b:local
+    networks: [region-b-app, dr-test-ingress]
+
+  global-test-ingress:
+    <<: *dr-proxy
+    build: {context: ., dockerfile: deploy/nginx/Dockerfile.dr, target: global}
+    image: scalable-railway-ticketing-global-test-ingress:local
+    environment:
+      ACTIVE_REGION_UPSTREAM: ${ACTIVE_REGION_UPSTREAM:-proxy-region-a}
+    ports: ["127.0.0.1::8080"]
+    networks: [dr-test-ingress]
+
+  k6-milestone-7:
+    profiles: ["dr-tests"]
+    image: grafana/k6:0.57.0
+    entrypoint: ["k6"]
+    volumes:
+      - ../../loadtest/k6:/scripts:ro
+      - ${DR_EVIDENCE_DIRECTORY}:/evidence
+    networks: [region-a-app, region-b-app, dr-test-provider, dr-test-ingress]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: !override [no-new-privileges:true]
+    cap_drop: !override [ALL]
+    restart: "no"
+
+networks:
+  dr-test-provider: {internal: true}
+  dr-test-ingress: {}
+
+volumes:
+  redis-region-b-data: {}

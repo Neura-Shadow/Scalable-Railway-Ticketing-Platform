@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/worker"
 	platformmetrics "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -102,6 +103,125 @@ func TestPaymentMetricDurationsAreNonNegativeAndCapped(t *testing.T) {
 			if got, want := family.Metric[0].GetHistogram().GetSampleSum(), (30 * 24 * time.Hour).Seconds(); got != want {
 				t.Fatalf("lag sample sum = %v, want %v", got, want)
 			}
+		}
+	}
+}
+
+func TestPaymentOperationPreservesBoundedProviderFailureReason(t *testing.T) {
+	t.Parallel()
+	registry := prometheus.NewRegistry()
+	metrics, err := platformmetrics.New(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics.RecordPaymentOperationWithReason("stripe", "capture", "failure", "rate_limited", time.Second, false)
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		if family.GetName() != "provider_adapter_error_total" {
+			continue
+		}
+		for _, metric := range family.Metric {
+			labels := map[string]string{}
+			for _, label := range metric.Label {
+				labels[label.GetName()] = label.GetValue()
+			}
+			if labels["provider"] == "stripe" && labels["operation"] == "capture" && labels["reason"] == "rate_limited" && metric.GetCounter().GetValue() == 1 {
+				return
+			}
+		}
+	}
+	t.Fatal("actual bounded provider reason was not gathered")
+}
+
+func TestPaymentWorkerLaneFailureMetricUsesBoundedLabels(t *testing.T) {
+	t.Parallel()
+	registry := prometheus.NewRegistry()
+	metrics, err := platformmetrics.New(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics.RecordPaymentWorkerLaneFailure("claim_actions", "store_unavailable")
+	metrics.RecordPaymentWorkerLaneFailure("postgres://user:secret@example", "synthetic-password-never-log")
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		if family.GetName() != "payment_worker_lane_failure_total" {
+			continue
+		}
+		seen := map[string]bool{}
+		for _, metric := range family.Metric {
+			labels := map[string]string{}
+			for _, label := range metric.Label {
+				labels[label.GetName()] = label.GetValue()
+			}
+			seen[labels["lane"]+"/"+labels["reason"]] = metric.GetCounter().GetValue() == 1
+		}
+		if !seen["claim_actions/store_unavailable"] || !seen["unknown/unknown"] {
+			t.Fatalf("bounded lane failure labels = %#v", seen)
+		}
+		return
+	}
+	t.Fatal("payment_worker_lane_failure_total was not gathered")
+}
+
+func TestPaymentWorkerLaneFailureMetricAcceptsEveryWorkerEnum(t *testing.T) {
+	t.Parallel()
+	registry := prometheus.NewRegistry()
+	metrics, err := platformmetrics.New(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lanes := []worker.FailureLane{
+		worker.FailureLaneClaimOperations, worker.FailureLaneProcessOperation,
+		worker.FailureLaneClaimWebhooks, worker.FailureLaneProcessWebhook,
+		worker.FailureLaneClaimActions, worker.FailureLaneProcessAction,
+	}
+	reasons := []worker.FailureReason{
+		worker.FailureReasonStoreUnavailable, worker.FailureReasonLeaseLost,
+		worker.FailureReasonInvalidClaim, worker.FailureReasonProviderUnavailable,
+		worker.FailureReasonProviderOutcomeUnknown, worker.FailureReasonDatabaseFinalizeFailed,
+		worker.FailureReasonShardUnavailable, worker.FailureReasonRegionalAuthorityUnavailable,
+		worker.FailureReasonConstraintRejected, worker.FailureReasonTimeout, worker.FailureReasonUnknown,
+	}
+	for _, lane := range lanes {
+		metrics.RecordPaymentWorkerLaneFailure(string(lane), string(worker.FailureReasonUnknown))
+	}
+	for _, reason := range reasons {
+		metrics.RecordPaymentWorkerLaneFailure(string(worker.FailureLaneClaimActions), string(reason))
+	}
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seenLanes, seenReasons := map[string]bool{}, map[string]bool{}
+	for _, family := range families {
+		if family.GetName() != "payment_worker_lane_failure_total" {
+			continue
+		}
+		for _, metric := range family.Metric {
+			for _, label := range metric.Label {
+				switch label.GetName() {
+				case "lane":
+					seenLanes[label.GetValue()] = true
+				case "reason":
+					seenReasons[label.GetValue()] = true
+				}
+			}
+		}
+	}
+	for _, lane := range lanes {
+		if !seenLanes[string(lane)] {
+			t.Fatalf("worker failure lane %q collapsed in metrics", lane)
+		}
+	}
+	for _, reason := range reasons {
+		if !seenReasons[string(reason)] {
+			t.Fatalf("worker failure reason %q collapsed in metrics", reason)
 		}
 	}
 }

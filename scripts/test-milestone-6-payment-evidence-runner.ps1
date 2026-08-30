@@ -22,6 +22,42 @@ if ($parseErrors.Count -ne 0) {
 }
 
 $source = Get-Content -Raw -LiteralPath $runnerPath
+$paymentComposePath = Join-Path $root 'deploy/compose/payment.override.yml'
+if (-not (Test-Path -LiteralPath $paymentComposePath)) { throw 'payment Compose overlay is missing' }
+$paymentCompose = Get-Content -Raw -LiteralPath $paymentComposePath
+foreach ($operatorBinding in @(
+    'x-payment-operator-control: &payment-operator-control',
+    'x-payment-operator-shards: &payment-operator-shards',
+    'payment-operator-control-role:',
+    'payment-operator-shard-0-role:',
+    'payment-operator-shard-1-role:',
+    "CREATE ROLE payment_operator LOGIN PASSWORD 'operator-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT",
+    'GRANT railway_runtime TO payment_operator',
+    'GRANT operator TO payment_operator',
+    '<<: [*payment-operator-control, *payment-operator-shards, *payment-settings, *payment-provider-outbound]'
+)) {
+    if (-not $paymentCompose.Contains($operatorBinding)) {
+        throw "payment Compose omits the private operator binding: $operatorBinding"
+    }
+}
+foreach ($operatorRole in @(
+    'payment-operator-control-role:',
+    'payment-operator-shard-0-role:',
+    'payment-operator-shard-1-role:'
+)) {
+    if ([regex]::Matches($paymentCompose, [regex]::Escape($operatorRole)).Count -lt 3) {
+        throw "payment operator role is not provisioned before reconciler and admin startup: $operatorRole"
+    }
+}
+foreach ($reconciliationReadTable in @(
+    'public.payment_saga_actions',
+    'public.ticket_refund_requests',
+    'public.ticket_refund_operations'
+)) {
+    if (-not $paymentCompose.Contains($reconciliationReadTable)) {
+        throw "payment reconciler control role cannot read M7 reconciliation state: $reconciliationReadTable"
+    }
+}
 $requiredScripts = @(
     'payment-intent-create.js',
     'payment-idempotency.js',

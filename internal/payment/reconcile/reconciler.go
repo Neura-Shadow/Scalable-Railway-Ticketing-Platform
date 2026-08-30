@@ -294,6 +294,12 @@ func checkControl(scope Scope, snapshot ControlSnapshot, add func(string, bool))
 	if refunded > captured {
 		add("refund_exceeds_capture", false)
 	}
+	if snapshot.SucceededPartialRefundMinor < 0 || snapshot.CompletedPartialRefundMinor < 0 ||
+		snapshot.CompletedPartialRefundMinor > snapshot.SucceededPartialRefundMinor ||
+		refunded > 0 && snapshot.SucceededPartialRefundMinor > 0 ||
+		snapshot.SucceededPartialRefundMinor > captured-refunded {
+		add("partial_refund_control_mismatch", false)
+	}
 	if snapshot.Saga.State == "completed" && (succeededCaptures != 1 || captured != snapshot.Intent.AmountMinor) {
 		add("completed_saga_without_full_capture", false)
 	}
@@ -323,6 +329,11 @@ func checkShard(scope Scope, control ControlSnapshot, shard ShardSnapshot, add f
 	captured := hasSucceeded(control.Operations, "capture")
 	refunded := hasSucceeded(control.Operations, "refund")
 	voided := hasSucceeded(control.Operations, "void")
+	completedPartial := control.CompletedPartialRefundMinor
+	partialShardTerminal := completedPartial > 0 && (completedPartial < control.Intent.AmountMinor && shard.ReservationState == "partially_refunded" ||
+		completedPartial == control.Intent.AmountMinor && shard.ReservationState == "cancelled")
+	partialOrderTerminal := completedPartial > 0 && (completedPartial < control.Intent.AmountMinor && shard.TicketOrderState == "partially_refunded" ||
+		completedPartial == control.Intent.AmountMinor && shard.TicketOrderState == "refunded")
 	if (scope == ScopeIntents || scope == ScopeAll) && control.Intent.State == "reservation_securing" && shard.BeginReceiptFound {
 		if shard.ReceiptFingerprint == control.Intent.Fingerprint {
 			add("begin_payment_shard_committed_control_incomplete", false)
@@ -331,17 +342,19 @@ func checkShard(scope Scope, control ControlSnapshot, shard ShardSnapshot, add f
 		}
 	}
 	if scope == ScopeIntents || scope == ScopeAll {
-		if captured && shard.ReservationState != "payment_pending" && shard.ReservationState != "confirmed" && shard.ReservationState != "refund_pending" && shard.ReservationState != "cancelled" {
+		if captured && shard.ReservationState != "payment_pending" && shard.ReservationState != "confirmed" &&
+			shard.ReservationState != "refund_pending" && shard.ReservationState != "cancelled" && !partialShardTerminal {
 			add("captured_payment_reservation_state_mismatch", false)
 		}
 	}
 	if scope != ScopeTickets && scope != ScopeAll {
 		return
 	}
-	if control.Intent.State == "completed" && (!shard.TicketOrderFound || shard.TicketOrderState != "issued") {
+	if control.Intent.State == "completed" && (!shard.TicketOrderFound || shard.TicketOrderState != "issued" && !partialOrderTerminal) {
 		add("completed_payment_without_issued_ticket_order", false)
 	}
-	if captured && capturedRequiresIssuedTickets(control, shard, refunded, voided) && (!shard.TicketOrderFound || shard.TicketOrderState != "issued") {
+	if captured && capturedRequiresIssuedTickets(control, shard, refunded, voided) &&
+		(!shard.TicketOrderFound || shard.TicketOrderState != "issued" && !partialOrderTerminal) {
 		add("captured_payment_without_ticket", false)
 	}
 	if !captured && (shard.TicketOrderState == "issued" || shard.ActiveTicketCount > 0) {
@@ -352,6 +365,9 @@ func checkShard(scope Scope, control ControlSnapshot, shard ShardSnapshot, add f
 	}
 	if shard.TicketOrderFound && shard.TicketOrderCurrency != control.Intent.Currency {
 		add("ticket_order_currency_mismatch", false)
+	}
+	if completedPartial > 0 && shard.TicketOrderFound && shard.TicketOrderRefundedMinor != completedPartial {
+		add("partial_refund_shard_amount_mismatch", false)
 	}
 	if shard.TicketOrderState == "issued" && !shard.IssuanceReceiptFound {
 		add("issued_ticket_order_without_receipt", false)
@@ -383,7 +399,7 @@ func checkShard(scope Scope, control ControlSnapshot, shard ShardSnapshot, add f
 	if voided && shard.ReservationState != "cancelled" {
 		add("voided_payment_with_live_reservation", false)
 	}
-	if shard.CancelledTicketCount > 0 && captured && !refunded && control.Intent.State != "refund_pending" {
+	if shard.CancelledTicketCount > 0 && captured && !refunded && completedPartial == 0 && control.Intent.State != "refund_pending" {
 		add("cancelled_ticket_without_required_refund", false)
 	}
 	if shard.DuplicateTicketCodeCount > 0 {
@@ -442,15 +458,40 @@ func checkProvider(ctx context.Context, registry ProviderRegistry, control Contr
 		add("provider_status_query_failed", false)
 		return
 	}
+	if err := provider.EvaluateFinancialObservation(
+		provider.FinancialExpectation{AmountMinor: control.Intent.AmountMinor, Currency: control.Intent.Currency},
+		provider.FinancialObservation{
+			Status: status.Status, AmountMinor: status.AmountMinor, Currency: status.Currency,
+			CapturedMinor: status.CapturedMinor, RefundedMinor: status.RefundedMinor,
+		},
+	); err != nil {
+		add("provider_financial_observation_inconsistent", false)
+		return
+	}
 	if status.AmountMinor != control.Intent.AmountMinor || status.Currency != control.Intent.Currency {
 		add("provider_money_mismatch", false)
 	}
 	localCaptured := succeededAmount(control.Operations, "capture")
-	localRefunded := succeededAmount(control.Operations, "refund")
-	if status.CapturedMinor != localCaptured || hasSucceeded(control.Operations, "capture") && status.Status != provider.StatusCaptured && status.Status != provider.StatusRefunded {
+	fullRefunded := succeededAmount(control.Operations, "refund")
+	localRefunded := int64(0)
+	validLocalRefundTotal := fullRefunded >= 0 && control.SucceededPartialRefundMinor >= 0 &&
+		fullRefunded <= control.Intent.AmountMinor &&
+		control.SucceededPartialRefundMinor <= control.Intent.AmountMinor-fullRefunded
+	if validLocalRefundTotal {
+		localRefunded = fullRefunded + control.SucceededPartialRefundMinor
+	}
+	partialStatus := control.SucceededPartialRefundMinor > 0 && fullRefunded == 0
+	captureStatusMatches := status.Status == provider.StatusCaptured || status.Status == provider.StatusRefunded ||
+		partialStatus && status.Status == provider.StatusUnknown
+	if status.CapturedMinor != localCaptured || hasSucceeded(control.Operations, "capture") && !captureStatusMatches {
 		add("provider_capture_mismatch", false)
 	}
-	if status.RefundedMinor != localRefunded || hasSucceeded(control.Operations, "refund") && status.Status != provider.StatusRefunded {
+	refundStatusMatches := fullRefunded == 0 || status.Status == provider.StatusRefunded
+	if partialStatus {
+		refundStatusMatches = status.Status == provider.StatusUnknown ||
+			localRefunded == localCaptured && status.Status == provider.StatusRefunded
+	}
+	if !validLocalRefundTotal || status.RefundedMinor != localRefunded || !refundStatusMatches {
 		add("provider_refund_mismatch", false)
 	}
 }

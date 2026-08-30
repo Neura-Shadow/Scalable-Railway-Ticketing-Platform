@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/safeerror"
@@ -34,13 +35,25 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if databaseURL == "" {
 		databaseURL = strings.TrimSpace(os.Getenv("DATABASE_URL"))
 	}
-	if databaseURL == "" || flags.NArg() != 1 {
-		fmt.Fprintln(stderr, "usage: migrate -path migrations [-database DATABASE_URL] {up|down|version}")
+	if databaseURL == "" || flags.NArg() < 1 {
+		fmt.Fprintln(stderr, "usage: migrate -path migrations [-database DATABASE_URL] {up|down|version|up-to VERSION}")
 		return 2
 	}
 	action := flags.Arg(0)
-	if action != "up" && action != "down" && action != "version" {
-		fmt.Fprintln(stderr, "action must be up, down, or version")
+	var targetVersion uint64
+	if action == "up-to" {
+		if flags.NArg() != 2 {
+			fmt.Fprintln(stderr, "up-to requires exactly one positive target version")
+			return 2
+		}
+		parsed, parseErr := strconv.ParseUint(flags.Arg(1), 10, 32)
+		if parseErr != nil || parsed == 0 {
+			fmt.Fprintln(stderr, "up-to target must be a positive 32-bit version")
+			return 2
+		}
+		targetVersion = parsed
+	} else if (action != "up" && action != "down" && action != "version") || flags.NArg() != 1 {
+		fmt.Fprintln(stderr, "action must be up, down, version, or up-to VERSION")
 		return 2
 	}
 
@@ -67,6 +80,25 @@ func run(args []string, stdout, stderr io.Writer) int {
 		version, dirty, err = runner.Version()
 		if err == nil {
 			fmt.Fprintf(stdout, "version=%d dirty=%t\n", version, dirty)
+		}
+	case "up-to":
+		var current uint
+		var dirty bool
+		current, dirty, err = runner.Version()
+		if errors.Is(err, migrate.ErrNilVersion) {
+			current, dirty, err = 0, false, nil
+		}
+		if err == nil && dirty {
+			err = errors.New("migration state is dirty")
+		}
+		if err == nil && uint64(current) > targetVersion {
+			err = errors.New("up-to target precedes current version")
+		}
+		if err == nil && uint64(current) == targetVersion {
+			err = migrate.ErrNoChange
+		}
+		if err == nil {
+			err = runner.Migrate(uint(targetVersion))
 		}
 	}
 

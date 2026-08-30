@@ -22,6 +22,7 @@ import (
 	paymentworkerpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/worker/postgres"
 	platformconfig "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/regional/authority"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	shardphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physical"
 	"github.com/google/uuid"
@@ -263,7 +264,10 @@ func openBackend(ctx context.Context, lookup func(string) (string, bool), req re
 	if err != nil || cfg.BookingShardMode != platformconfig.BookingShardModePhysical {
 		return nil, func() {}, errRuntimeWiring
 	}
-	control, err := postgresx.NewBoundedPool(ctx, cfg.DatabaseURL, cfg.ControlDatabaseMaxOpenConns)
+	control, err := postgresx.NewRegionalBoundedPool(ctx, cfg.DatabaseURL, cfg.ControlDatabaseMaxOpenConns, postgresx.RegionalSession{
+		Region: string(cfg.DeploymentRegion), Role: string(cfg.DeploymentRole),
+		Epoch: cfg.RegionEpoch, WritesEnabled: cfg.RegionalWritesEnabled,
+	})
 	if err != nil {
 		return nil, func() {}, errRuntimeWiring
 	}
@@ -305,15 +309,19 @@ func openBackend(ctx context.Context, lookup func(string) (string, bool), req re
 	}
 	var repairer *reconcilepostgres.Repairer
 	if (isMutation(req.Command) || req.Repair) && req.Confirm && !req.DryRun {
+		deployment, err := adminRegionalDeployment(cfg)
+		if err != nil {
+			return fail()
+		}
 		directory, err := paymentshardpostgres.NewDirectory(control)
 		if err != nil {
 			return fail()
 		}
-		shardStore, err := paymentshardpostgres.NewStore(router)
+		shardStore, err := paymentshardpostgres.NewStore(router, paymentshardpostgres.WithRegionalAuthority(deployment))
 		if err != nil {
 			return fail()
 		}
-		claimStore, err := paymentworkerpostgres.New(control)
+		claimStore, err := paymentworkerpostgres.NewWithRegionalAuthority(control, deployment)
 		if err != nil {
 			return fail()
 		}
@@ -343,6 +351,18 @@ func openBackend(ctx context.Context, lookup func(string) (string, bool), req re
 		operator = repairer
 	}
 	return &runtimeBackend{store: store, reconciler: reconciler, provider: providerClient, operator: operator, ticketBackfill: ticketBackfill}, closeAll, nil
+}
+
+func adminRegionalDeployment(cfg platformconfig.Config) (authority.Deployment, error) {
+	region, err := authority.ParseRegion(string(cfg.DeploymentRegion))
+	if err != nil || cfg.RegionEpoch <= 0 {
+		return authority.Deployment{}, authority.ErrInvalidDeployment
+	}
+	epoch, err := authority.NewEpoch(uint64(cfg.RegionEpoch))
+	if err != nil {
+		return authority.Deployment{}, err
+	}
+	return authority.NewDeployment(region, authority.Role(cfg.DeploymentRole), epoch, cfg.RegionalWritesEnabled)
 }
 
 type queryRower interface {
@@ -602,7 +622,10 @@ func newAdminPhysicalRegistry(ctx context.Context, cfg platformconfig.Config) (*
 			ConnectTimeout: cfg.PhysicalShardConnectTimeout, StatementTimeout: cfg.PhysicalShardQueryTimeout,
 			LockTimeout: cfg.PhysicalShardQueryTimeout,
 		},
-	}, shardphysical.OpenPGXPool)
+	}, shardphysical.RegionalPGXPoolFactory(postgresx.RegionalSession{
+		Region: string(cfg.DeploymentRegion), Role: string(cfg.DeploymentRole),
+		Epoch: cfg.RegionEpoch, WritesEnabled: cfg.RegionalWritesEnabled,
+	}))
 }
 
 func writeJSON(writer io.Writer, value envelope) error {

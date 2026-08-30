@@ -10,6 +10,7 @@ import (
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command"
 	commandreconcile "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command/reconcile"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/migration"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physical"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physicalmigration"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physicalmigration/controlsource"
 	physicalpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physicalmigration/postgres"
@@ -18,7 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-func TestBootstrapRequiresTheFixedShardAndCleanV2Schema(t *testing.T) {
+func TestBootstrapRequiresTheFixedShardAndCleanCurrentSchema(t *testing.T) {
 	t.Parallel()
 	for _, testCase := range []struct {
 		name    string
@@ -27,9 +28,9 @@ func TestBootstrapRequiresTheFixedShardAndCleanV2Schema(t *testing.T) {
 		dirty   bool
 		wantErr error
 	}{
-		{name: "clean v2", shardID: "physical-shard-0", version: 2},
+		{name: "clean current", shardID: "physical-shard-0", version: int64(physical.SupportedSchemaVersion)},
 		{name: "old schema", shardID: "physical-shard-0", version: 0, wantErr: errState},
-		{name: "dirty schema", shardID: "physical-shard-0", version: 2, dirty: true, wantErr: errState},
+		{name: "dirty schema", shardID: "physical-shard-0", version: int64(physical.SupportedSchemaVersion), dirty: true, wantErr: errState},
 		{name: "unknown shard", shardID: "attacker-shard", wantErr: errArguments},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -46,7 +47,7 @@ func TestBootstrapRequiresTheFixedShardAndCleanV2Schema(t *testing.T) {
 	}
 }
 
-func TestBootstrapMutatesCatalogOnlyAfterCleanV2Check(t *testing.T) {
+func TestBootstrapMutatesCatalogOnlyAfterCleanCurrentSchemaCheck(t *testing.T) {
 	t.Parallel()
 	for _, testCase := range []struct {
 		name      string
@@ -55,8 +56,8 @@ func TestBootstrapMutatesCatalogOnlyAfterCleanV2Check(t *testing.T) {
 		wantExec  int
 		wantError error
 	}{
-		{name: "clean v2", version: 2, wantExec: 1},
-		{name: "dirty v2", version: 2, dirty: true, wantError: errState},
+		{name: "clean current", version: int64(physical.SupportedSchemaVersion), wantExec: 1},
+		{name: "dirty current", version: int64(physical.SupportedSchemaVersion), dirty: true, wantError: errState},
 		{name: "unsupported v1", version: 1, wantError: errState},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -178,10 +179,10 @@ func TestReversePhysicalMigrationUsesTheFixedControlTargetAdapter(t *testing.T) 
 func TestReconcileValidationExecutesTheCompleteFixedTableSet(t *testing.T) {
 	t.Parallel()
 	record := migrationRecord(migration.PhysicalStateValidatingOnline)
-	const physicalV2MigrationTables = 15
-	rows := make([]pgx.Row, 0, physicalV2MigrationTables+1)
+	const physicalV3MigrationTables = 18
+	rows := make([]pgx.Row, 0, physicalV3MigrationTables+1)
 	rows = append(rows, valueRow{0})
-	for range physicalV2MigrationTables {
+	for range physicalV3MigrationTables {
 		rows = append(rows, valueRow{0, "", ""})
 	}
 	sourceRows := append([]pgx.Row(nil), rows...)
@@ -201,7 +202,7 @@ func TestReconcileValidationExecutesTheCompleteFixedTableSet(t *testing.T) {
 		Tables       int  `json:"tables"`
 		Truncated    bool `json:"truncated"`
 	})
-	if !ok || !summary.Passed || summary.Tables != physicalV2MigrationTables || summary.Truncated {
+	if !ok || !summary.Passed || summary.Tables != physicalV3MigrationTables || summary.Truncated {
 		t.Fatalf("reconcile() result = %#v", result)
 	}
 }

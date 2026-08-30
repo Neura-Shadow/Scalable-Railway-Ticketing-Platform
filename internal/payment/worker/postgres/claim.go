@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"regexp"
+	"strconv"
+	"time"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/domain"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider"
@@ -16,6 +18,10 @@ import (
 )
 
 var leaseOwnerPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+
+const awaitingCustomerRecoveryInterval = 5 * time.Minute
+
+var statusRecoveryNamespace = uuid.MustParse("18995477-863a-545a-8ca6-431c4999f537")
 
 func validClaimOptions(options worker.ClaimOptions) bool {
 	return leaseOwnerPattern.MatchString(options.WorkerID) && options.BatchSize > 0 &&
@@ -48,6 +54,9 @@ UPDATE public.payment_operations
 SET state='pending',bounded_error_category=NULL
 WHERE state='failed_retryable' AND next_attempt_at<=$1 AND attempts<$2`, options.Now, options.MaxAttempts); err != nil {
 		return nil, worker.ErrStoreUnavailable
+	}
+	if err := queueStaleAwaitingCustomerQueries(ctx, tx, options); err != nil {
+		return nil, err
 	}
 
 	claims := make([]worker.OperationClaim, 0, options.BatchSize)
@@ -147,6 +156,58 @@ ORDER BY operation.updated_at,operation.operation_id`,
 	return claims, nil
 }
 
+func queueStaleAwaitingCustomerQueries(ctx context.Context, tx pgx.Tx, options worker.ClaimOptions) error {
+	rows, err := tx.Query(ctx, `
+SELECT intent.payment_intent_id,intent.provider,intent.amount_minor,intent.currency,intent.updated_at
+FROM public.payment_intents AS intent
+JOIN public.payment_sagas AS saga ON saga.payment_intent_id=intent.payment_intent_id
+WHERE intent.state='awaiting_customer'
+  AND intent.provider_payment_id IS NOT NULL
+  AND intent.updated_at<=$1::timestamptz-($2::bigint*interval '1 millisecond')
+  AND saga.state='awaiting_provider' AND saga.current_step='await_provider'
+  AND NOT EXISTS (
+    SELECT 1 FROM public.payment_operations AS operation
+    WHERE operation.payment_intent_id=intent.payment_intent_id
+      AND operation.operation_type='query_status'
+      AND operation.state IN ('pending','claimed','in_flight','failed_retryable','uncertain')
+  )
+ORDER BY intent.updated_at,intent.payment_intent_id
+FOR UPDATE OF intent SKIP LOCKED
+LIMIT $3`, options.Now, awaitingCustomerRecoveryInterval.Milliseconds(), options.BatchSize)
+	if err != nil {
+		return worker.ErrStoreUnavailable
+	}
+	defer rows.Close()
+	cycle := options.Now.Truncate(awaitingCustomerRecoveryInterval).Unix()
+	for rows.Next() {
+		var (
+			intentID               uuid.UUID
+			providerName, currency string
+			amount                 int64
+			updatedAt              time.Time
+		)
+		if err := rows.Scan(&intentID, &providerName, &amount, &currency, &updatedAt); err != nil ||
+			intentID == uuid.Nil || providerName == "" || amount <= 0 || len(currency) != 3 || updatedAt.IsZero() {
+			return worker.ErrStoreUnavailable
+		}
+		cycleText := strconv.FormatInt(cycle, 10)
+		operationID := uuid.NewSHA1(statusRecoveryNamespace, []byte(intentID.String()+":"+cycleText))
+		keyHash := sha256.Sum256([]byte("payment-provider-status-recovery-v1:" + intentID.String() + ":" + cycleText))
+		if _, err := tx.Exec(ctx, `
+INSERT INTO public.payment_operations (
+ operation_id,payment_intent_id,provider,operation_type,
+ provider_idempotency_key_hash,amount_minor,currency
+) VALUES($1,$2,$3,'query_status',$4,$5,$6)
+ON CONFLICT DO NOTHING`, operationID, intentID, providerName, keyHash[:], amount, currency); err != nil {
+			return worker.ErrStoreUnavailable
+		}
+	}
+	if rows.Err() != nil {
+		return worker.ErrStoreUnavailable
+	}
+	return nil
+}
+
 func scanOperationClaims(rows pgx.Rows, claims []worker.OperationClaim) ([]worker.OperationClaim, error) {
 	defer rows.Close()
 	for rows.Next() {
@@ -241,34 +302,143 @@ func (store *Store) ClaimActions(ctx context.Context, options worker.ClaimOption
 		return nil, err
 	}
 	defer rollback(ctx, tx)
+	if _, err = tx.Exec(ctx, `
+INSERT INTO public.payment_saga_actions (
+ action_id,saga_id,payment_intent_id,action_type,next_attempt_at
+)
+SELECT gen_random_uuid(),saga.saga_id,saga.payment_intent_id,
+ CASE
+  WHEN saga.state='issuing_tickets' THEN 'issue_tickets'
+  WHEN saga.state='compensating' AND saga.current_step='refund' THEN 'mark_refund_pending'
+  WHEN saga.state='compensating' AND saga.current_step='compensate' THEN 'cancel_voided_reservation'
+  WHEN saga.state='refunding' THEN 'compensate'
+ END,$1
+FROM public.payment_sagas AS saga
+WHERE (saga.state='issuing_tickets' AND saga.current_step='issue_tickets')
+   OR (saga.state='compensating' AND saga.current_step IN ('refund','compensate'))
+   OR (saga.state='refunding' AND saga.current_step='compensate')
+ON CONFLICT DO NOTHING`, options.Now); err != nil {
+		return nil, worker.ErrStoreUnavailable
+	}
 	// Expired action leases are safe to reclaim because all shard commands use
-	// deterministic command IDs and shard-local durable receipts.
+	// deterministic command IDs and shard-local durable receipts. Provider and
+	// saga attempt counters are deliberately untouched. A crash on the configured
+	// final attempt receives exactly one receipt-recovery claim: that claim can
+	// replay only the deterministic shard command, never a provider mutation. If
+	// the recovery claim itself crashes, fail closed into durable manual review.
+	if _, err = tx.Exec(ctx, `
+WITH exhausted AS (
+ UPDATE public.payment_saga_actions AS action
+ SET state='failed_permanent',lease_owner=NULL,lease_until=NULL,
+     bounded_error_category='action_recovery_exhausted',completed_at=clock_timestamp()
+ WHERE action.state='processing' AND action.lease_until<$1 AND action.attempts>$2
+ RETURNING action.saga_id
+), moved_sagas AS (
+ UPDATE public.payment_sagas AS saga
+ SET state='manual_review',lease_owner=NULL,lease_until=NULL,
+     bounded_error_category='action_recovery_exhausted',next_attempt_at=clock_timestamp()
+ FROM exhausted
+ WHERE saga.saga_id=exhausted.saga_id
+   AND saga.state NOT IN ('completed','compensated','failed','manual_review')
+ RETURNING saga.payment_intent_id
+), moved_intents AS (
+ UPDATE public.payment_intents AS intent
+ SET state='manual_review'
+ FROM moved_sagas
+ WHERE intent.payment_intent_id=moved_sagas.payment_intent_id
+   AND intent.state NOT IN ('completed','voided','refunded','cancelled','failed','expired','manual_review')
+ RETURNING intent.payment_intent_id
+)
+INSERT INTO public.payment_manual_review_cases (
+ review_case_id,payment_intent_id,reason_category,review_due_at
+)
+SELECT gen_random_uuid(),moved_sagas.payment_intent_id,
+       'action_recovery_exhausted',clock_timestamp()+interval '24 hours'
+FROM moved_sagas
+ON CONFLICT(payment_intent_id,reason_category)
+WHERE payment_intent_id IS NOT NULL AND state IN ('open','assigned','investigating')
+DO NOTHING`, options.Now, options.MaxAttempts); err != nil {
+		return nil, worker.ErrStoreUnavailable
+	}
+	if _, err = tx.Exec(ctx, `
+UPDATE public.payment_saga_actions
+SET state='failed_retryable',lease_owner=NULL,lease_until=NULL,
+    bounded_error_category=CASE WHEN attempts=$2
+      THEN 'worker_lease_expired_final_attempt'
+      ELSE 'worker_lease_expired' END,
+    next_attempt_at=$1
+WHERE state='processing' AND lease_until<$1 AND attempts<=$2`, options.Now, options.MaxAttempts); err != nil {
+		return nil, worker.ErrStoreUnavailable
+	}
 	rows, err := tx.Query(ctx, `
 WITH candidates AS (
- SELECT saga.saga_id
- FROM public.payment_sagas AS saga
- WHERE saga.next_attempt_at<=$1 AND (saga.lease_until IS NULL OR saga.lease_until<$1)
-   AND (
-     (saga.state='issuing_tickets' AND saga.current_step='issue_tickets')
-     OR (saga.state='compensating' AND saga.current_step='refund')
-     OR (saga.state='compensating' AND saga.current_step='compensate')
-     OR (saga.state='refunding' AND saga.current_step='compensate')
+ SELECT action.action_id
+ FROM public.payment_saga_actions AS action
+ JOIN public.payment_sagas AS saga ON saga.saga_id=action.saga_id
+ WHERE action.state IN ('pending','failed_retryable')
+   AND action.next_attempt_at<=$1 AND (
+     action.attempts<$5 OR (
+       action.attempts=$5
+       AND action.bounded_error_category='worker_lease_expired_final_attempt'
+     )
    )
- ORDER BY saga.next_attempt_at,saga.updated_at,saga.saga_id
- FOR UPDATE OF saga SKIP LOCKED LIMIT $2
+   AND (action.lease_until IS NULL OR action.lease_until<$1)
+   AND (saga.lease_until IS NULL OR saga.lease_until<$1)
+   AND (
+     (action.action_type='issue_tickets' AND saga.state='issuing_tickets' AND saga.current_step='issue_tickets')
+     OR (action.action_type='mark_refund_pending' AND saga.state='compensating' AND saga.current_step='refund')
+     OR (action.action_type='cancel_voided_reservation' AND saga.state='compensating' AND saga.current_step='compensate')
+     OR (action.action_type='compensate' AND saga.state='refunding' AND saga.current_step='compensate')
+   )
+   AND (
+     (
+       action.action_type IN ('issue_tickets','mark_refund_pending')
+       AND EXISTS (
+         SELECT 1 FROM public.payment_operations AS operation
+         WHERE operation.payment_intent_id=action.payment_intent_id
+           AND operation.operation_type='capture' AND operation.state='succeeded'
+           AND octet_length(operation.response_fingerprint)=32
+       )
+     )
+     OR (
+       action.action_type='cancel_voided_reservation'
+       AND EXISTS (
+         SELECT 1 FROM public.payment_operations AS operation
+         WHERE operation.payment_intent_id=action.payment_intent_id
+           AND operation.operation_type='void' AND operation.state='succeeded'
+           AND operation.completed_at IS NOT NULL
+           AND octet_length(operation.response_fingerprint)=32
+       )
+     )
+     OR (
+       action.action_type='compensate'
+       AND EXISTS (
+         SELECT 1 FROM public.payment_operations AS operation
+         WHERE operation.payment_intent_id=action.payment_intent_id
+           AND operation.operation_type='refund' AND operation.state='succeeded'
+           AND operation.completed_at IS NOT NULL
+           AND octet_length(operation.response_fingerprint)=32
+       )
+     )
+   )
+ ORDER BY action.next_attempt_at,action.updated_at,action.action_id
+ FOR UPDATE OF action,saga SKIP LOCKED LIMIT $2
 ), claimed AS (
- UPDATE public.payment_sagas AS saga
- SET lease_owner=$3,lease_until=$1+($4::bigint*interval '1 millisecond'),attempts=attempts+1
- FROM candidates WHERE saga.saga_id=candidates.saga_id
- RETURNING saga.*
+ UPDATE public.payment_saga_actions AS action
+ SET state='processing',attempts=action.attempts+1,lease_owner=$3,
+     lease_until=$1+($4::bigint*interval '1 millisecond'),bounded_error_category=NULL
+ FROM candidates WHERE action.action_id=candidates.action_id
+ RETURNING action.*
 )
-SELECT saga.saga_id,saga.state,saga.current_step,saga.attempts,saga.lease_owner,saga.lease_until,
+SELECT action.action_id,saga.saga_id,saga.state,saga.current_step,
+       action.attempts,action.lease_owner,action.lease_until,
        intent.payment_intent_id,intent.reservation_id,intent.train_run_id,intent.owner_user_id,
        intent.amount_minor,intent.currency,intent.provider,
        capture.operation_id,capture.response_fingerprint,
        void_operation.operation_id,void_operation.response_fingerprint,void_operation.completed_at,
        refund.operation_id,refund.response_fingerprint,refund.completed_at
-FROM claimed AS saga
+FROM claimed AS action
+JOIN public.payment_sagas AS saga ON saga.saga_id=action.saga_id
 JOIN public.payment_intents AS intent ON intent.payment_intent_id=saga.payment_intent_id
 LEFT JOIN public.payment_operations AS capture ON capture.payment_intent_id=intent.payment_intent_id
  AND capture.operation_type='capture' AND capture.state='succeeded'
@@ -276,8 +446,8 @@ LEFT JOIN public.payment_operations AS void_operation ON void_operation.payment_
  AND void_operation.operation_type='void' AND void_operation.state='succeeded'
 LEFT JOIN public.payment_operations AS refund ON refund.payment_intent_id=intent.payment_intent_id
  AND refund.operation_type='refund' AND refund.state='succeeded'
-ORDER BY saga.next_attempt_at,saga.updated_at,saga.saga_id`,
-		options.Now, options.BatchSize, options.WorkerID, options.LeaseTTL.Milliseconds())
+ORDER BY action.next_attempt_at,action.updated_at,action.action_id`,
+		options.Now, options.BatchSize, options.WorkerID, options.LeaseTTL.Milliseconds(), options.MaxAttempts)
 	if err != nil {
 		return nil, worker.ErrStoreUnavailable
 	}
@@ -293,7 +463,7 @@ ORDER BY saga.next_attempt_at,saga.updated_at,saga.saga_id`,
 			captureProof, voidProof, refundProof         []byte
 			voidedAt, refundedAt                         pgtype.Timestamptz
 		)
-		if err := rows.Scan(&claim.SagaID, &state, &step, &claim.Attempts,
+		if err := rows.Scan(&claim.ActionID, &claim.SagaID, &state, &step, &claim.Attempts,
 			&claim.LeaseOwner, &claim.LeaseUntil, &intentID, &reservationID,
 			&trainRunID, &ownerID, &amount, &currency, &claim.Provider, &captureID, &captureProof,
 			&voidID, &voidProof, &voidedAt,
@@ -332,7 +502,7 @@ func buildActionClaim(
 		claim.Type = worker.ActionIssueTickets
 		copy(claim.Issue.CaptureProofHash[:], captureProof)
 		claim.Issue.CommandID = deterministicID(claim.SagaID, "issue_tickets_command")
-		claim.Issue.IssuanceID = deterministicID(claim.SagaID, "ticket_issuance")
+		claim.Issue.IssuanceID = shard.DeterministicIssuanceID(claim.SagaID)
 		claim.Issue.PaymentIntentID = intentID
 		claim.Issue.PaymentOperationID = captureID.Bytes
 		claim.Issue.ReservationID = reservationID

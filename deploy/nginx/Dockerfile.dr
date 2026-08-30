@@ -1,0 +1,17 @@
+# syntax=docker/dockerfile:1.7
+
+FROM nginx:1.29.8-alpine-slim@sha256:c9366b8c560169b101ca0e5422ed063b20779e6454c2326b9c9704225c9b0c08 AS base
+RUN apk upgrade --no-cache
+
+FROM base AS region-a
+COPY deploy/nginx/dr-region-a.conf /etc/nginx/nginx.conf
+USER 101:101
+
+FROM base AS region-b
+COPY deploy/nginx/dr-region-b.conf /etc/nginx/nginx.conf
+USER 101:101
+
+FROM base AS global
+COPY deploy/nginx/dr-global.conf /etc/nginx/nginx.conf
+COPY deploy/nginx/dr-global.conf.template /etc/nginx/templates/default.conf.template
+USER 101:101

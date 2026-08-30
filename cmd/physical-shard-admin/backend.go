@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	commandreconcile "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command/reconcile"
 	commandphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command/reconcile/physical"
 	commandpostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/booking/command/reconcile/postgres"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/migration"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physical"
@@ -20,7 +22,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const (
@@ -86,7 +87,11 @@ func openBackend(ctx context.Context, lookup func(string) (string, bool)) (backe
 		}
 		values[name] = value
 	}
-	control, err := pgxpool.New(ctx, values[controlEnv])
+	session, err := regionalSessionFromLookup(lookup)
+	if err != nil {
+		return nil, errArguments
+	}
+	control, err := postgresx.NewRegionalBoundedPool(ctx, values[controlEnv], 4, session)
 	if err != nil {
 		return nil, errUnavailable
 	}
@@ -101,7 +106,7 @@ func openBackend(ctx context.Context, lookup func(string) (string, bool)) (backe
 		},
 		MaxCount: 2,
 		Limits:   physical.PoolLimits{MaxOpenConns: 4, MaxIdleConns: 2, MaxLifetime: 30 * time.Minute, MaxIdleTime: 5 * time.Minute, ConnectTimeout: 3 * time.Second},
-	}, physical.OpenPGXPool)
+	}, physical.RegionalPGXPoolFactory(session))
 	if err != nil {
 		control.Close()
 		return nil, errUnavailable
@@ -121,6 +126,34 @@ func openBackend(ctx context.Context, lookup func(string) (string, bool)) (backe
 		result.shards[shardID.String()] = db
 	}
 	return result, nil
+}
+
+func regionalSessionFromLookup(lookup func(string) (string, bool)) (postgresx.RegionalSession, error) {
+	if lookup == nil {
+		return postgresx.RegionalSession{}, errArguments
+	}
+	epoch, err := strconv.ParseInt(strings.TrimSpace(envValue(lookup, "REGION_EPOCH")), 10, 64)
+	if err != nil {
+		return postgresx.RegionalSession{}, errArguments
+	}
+	writesEnabled, err := strconv.ParseBool(strings.TrimSpace(envValue(lookup, "REGIONAL_WRITES_ENABLED")))
+	if err != nil {
+		return postgresx.RegionalSession{}, errArguments
+	}
+	session := postgresx.RegionalSession{
+		Region: strings.TrimSpace(envValue(lookup, "DEPLOYMENT_REGION")),
+		Role:   strings.TrimSpace(envValue(lookup, "DEPLOYMENT_ROLE")),
+		Epoch:  epoch, WritesEnabled: writesEnabled,
+	}
+	if err := postgresx.ValidateRegionalSession(session); err != nil {
+		return postgresx.RegionalSession{}, errArguments
+	}
+	return session, nil
+}
+
+func envValue(lookup func(string) (string, bool), name string) string {
+	value, _ := lookup(name)
+	return value
 }
 
 type queryRower interface {

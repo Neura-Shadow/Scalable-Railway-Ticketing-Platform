@@ -35,7 +35,7 @@ func (store *Store) ClaimTicketCodes(ctx context.Context, command paymentshard.I
 		seenIDs[ticketID] = struct{}{}
 		seenCodes[code] = struct{}{}
 	}
-	tx, err := store.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	tx, err := store.beginWithOptions(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		return paymentapp.ErrPaymentUnavailable
 	}

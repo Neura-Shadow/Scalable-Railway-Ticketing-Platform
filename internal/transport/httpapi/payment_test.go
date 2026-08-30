@@ -103,6 +103,64 @@ func TestPaymentWebhookIsUnauthenticatedButBoundedAndContentTyped(t *testing.T) 
 	}
 }
 
+func TestStripeWebhookUsesRawStripeSignatureHeader(t *testing.T) {
+	t.Parallel()
+	webhooks := &webhookServiceStub{result: httpapi.PaymentWebhookAccepted}
+	router := httpapi.New(httpapi.Dependencies{PaymentWebhooks: webhooks, PaymentWebhookMaxBodyBytes: 64})
+	request := httptest.NewRequest(http.MethodPost, "/webhooks/payments/stripe", strings.NewReader(`{"id":"evt-1"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Stripe-Signature", "t=1786449600,v1=abcdef")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted || webhooks.request.Provider != "stripe" ||
+		webhooks.request.Signature != "t=1786449600,v1=abcdef" || webhooks.request.KeyID != "" || webhooks.request.Timestamp != "" {
+		t.Fatalf("status=%d request=%#v", response.Code, webhooks.request)
+	}
+}
+
+func TestTicketRefundEndpointsAreOwnerScopedAndAcceptOnlyTicketSelection(t *testing.T) {
+	t.Parallel()
+	parser := &tokenParserStub{identity: httpapi.Identity{Subject: "customer-1", Role: httpapi.RoleCustomer}}
+	refunds := &ticketRefundServiceStub{result: httpapi.TicketRefundView{
+		ID: "refund-1", TicketOrderID: "order-1", TicketIDs: []string{"ticket-1"},
+		State: "created", AmountMinor: 500, Currency: "TWD",
+	}}
+	router := httpapi.New(httpapi.Dependencies{TokenParser: parser, TicketRefunds: refunds})
+
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/ticket-orders/order-1/refunds", strings.NewReader(`{"ticket_ids":["ticket-1"]}`))
+	request.Header.Set("Authorization", "Bearer signed-token")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "refund-request-1")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted || refunds.create.OwnerID != "customer-1" ||
+		refunds.create.TicketOrderID != "order-1" || refunds.create.IdempotencyKey != "refund-request-1" ||
+		len(refunds.create.TicketIDs) != 1 || refunds.create.TicketIDs[0] != "ticket-1" {
+		t.Fatalf("status=%d command=%#v body=%s", response.Code, refunds.create, response.Body.String())
+	}
+
+	get := httptest.NewRequest(http.MethodGet, "/api/v1/ticket-refunds/refund-1", nil)
+	get.Header.Set("Authorization", "Bearer signed-token")
+	getResponse := httptest.NewRecorder()
+	router.ServeHTTP(getResponse, get)
+	if getResponse.Code != http.StatusOK || refunds.getOwner != "customer-1" || refunds.getID != "refund-1" {
+		t.Fatalf("status=%d owner=%q id=%q", getResponse.Code, refunds.getOwner, refunds.getID)
+	}
+
+	for _, body := range []string{`{"ticket_ids":["ticket-1"],"amount_minor":1}`, `{"ticket_ids":["ticket-1"],"provider":"stripe"}`, `{"ticket_ids":["ticket-1"],"currency":"USD"}`} {
+		refunds.create = httpapi.CreateTicketRefundCommand{}
+		request = httptest.NewRequest(http.MethodPost, "/api/v1/ticket-orders/order-1/refunds", strings.NewReader(body))
+		request.Header.Set("Authorization", "Bearer signed-token")
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", "refund-request-2")
+		response = httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest || refunds.create.OwnerID != "" {
+			t.Fatalf("forbidden payload=%s status=%d command=%#v", body, response.Code, refunds.create)
+		}
+	}
+}
+
 func TestPaymentWebhookEnforcesConfiguredRequestTimeout(t *testing.T) {
 	webhooks := &webhookServiceStub{waitForCancellation: true}
 	router := httpapi.New(httpapi.Dependencies{
@@ -121,7 +179,7 @@ func TestPaymentWebhookEnforcesConfiguredRequestTimeout(t *testing.T) {
 	}
 }
 
-func TestPaymentWebhookRateLimitRunsBeforeBodyAndFailsClosed(t *testing.T) {
+func TestPaymentWebhookRateLimitRejectsKnownExcessAndFailsOpenOnBackendOutage(t *testing.T) {
 	t.Parallel()
 	webhooks := &webhookServiceStub{result: httpapi.PaymentWebhookAccepted}
 	limiter := &rateLimiterStub{allowed: false}
@@ -145,8 +203,34 @@ func TestPaymentWebhookRateLimitRunsBeforeBodyAndFailsClosed(t *testing.T) {
 	request.Header.Set("Content-Type", "application/json")
 	response = httptest.NewRecorder()
 	router.ServeHTTP(response, request)
-	if response.Code != http.StatusServiceUnavailable || outageWebhooks.request.Provider != "" {
+	if response.Code != http.StatusAccepted || outageWebhooks.request.Provider != "sandbox" {
 		t.Fatalf("outage status=%d request=%+v", response.Code, outageWebhooks.request)
+	}
+}
+
+func TestCommittedWebhookConflictReturnsSuccess(t *testing.T) {
+	t.Parallel()
+	webhooks := &webhookServiceStub{result: httpapi.PaymentWebhookConflict}
+	router := httpapi.New(httpapi.Dependencies{PaymentWebhooks: webhooks})
+	request := httptest.NewRequest(http.MethodPost, "/webhooks/payments/sandbox", strings.NewReader(`{}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"status":"conflict"`) {
+		t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
+	}
+}
+
+func TestUncommittedWebhookEvidenceReturnsServerError(t *testing.T) {
+	t.Parallel()
+	webhooks := &webhookServiceStub{err: errors.New("persistence unavailable")}
+	router := httpapi.New(httpapi.Dependencies{PaymentWebhooks: webhooks})
+	request := httptest.NewRequest(http.MethodPost, "/webhooks/payments/sandbox", strings.NewReader(`{}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
 	}
 }
 
@@ -186,6 +270,24 @@ type webhookServiceStub struct {
 	err                 error
 	waitForCancellation bool
 	contextCancelled    bool
+}
+
+type ticketRefundServiceStub struct {
+	create   httpapi.CreateTicketRefundCommand
+	getOwner string
+	getID    string
+	result   httpapi.TicketRefundView
+	err      error
+}
+
+func (stub *ticketRefundServiceStub) CreateTicketRefund(_ context.Context, command httpapi.CreateTicketRefundCommand) (httpapi.TicketRefundView, error) {
+	stub.create = command
+	return stub.result, stub.err
+}
+
+func (stub *ticketRefundServiceStub) GetTicketRefund(_ context.Context, ownerID, refundID string) (httpapi.TicketRefundView, error) {
+	stub.getOwner, stub.getID = ownerID, refundID
+	return stub.result, stub.err
 }
 
 func (stub *webhookServiceStub) IngestPaymentWebhook(ctx context.Context, request httpapi.PaymentWebhookRequest) (httpapi.PaymentWebhookDisposition, error) {

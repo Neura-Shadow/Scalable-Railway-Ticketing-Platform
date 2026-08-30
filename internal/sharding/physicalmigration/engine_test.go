@@ -309,12 +309,15 @@ func TestCompleteDisablesCaptureAndRetainsTheSourceBeforeControlCompletion(t *te
 	}
 }
 
-func TestAdvanceRetriesAnAppliedBaseBatchAfterCheckpointCrash(t *testing.T) {
+func TestAdvanceRetriesAppliedPartialRefundEvidenceAfterCheckpointCrash(t *testing.T) {
 	t.Parallel()
 
 	record := testRecord(migration.PhysicalStateBaseCopying)
 	control := &fakeControl{record: record, failPersistOnce: true}
-	batch := physicalmigration.BaseBatch{ObjectName: "reservations", NextCursor: "reservations:000010", Rows: 10}
+	batch := physicalmigration.BaseBatch{
+		ObjectName: "selected_ticket_refund_receipts",
+		NextCursor: "selected_ticket_refund_receipts:000010", Rows: 10,
+	}
 	shards := &fakeShards{baseBatches: []physicalmigration.BaseBatch{batch, batch}}
 	engine := newTestEngine(t, control, shards)
 
@@ -328,7 +331,7 @@ func TestAdvanceRetriesAnAppliedBaseBatchAfterCheckpointCrash(t *testing.T) {
 	if err != nil {
 		t.Fatalf("retry Advance() error = %v", err)
 	}
-	if got.BaseCopyCursor != "reservations:000010" || len(shards.appliedBase) != 2 {
+	if got.BaseCopyCursor != "selected_ticket_refund_receipts:000010" || len(shards.appliedBase) != 2 {
 		t.Fatalf("retry result = %+v, applied batches = %d", got, len(shards.appliedBase))
 	}
 }
@@ -437,6 +440,29 @@ func TestAdvanceAcceptsOnlyFixedSourceEndpointSchemaContracts(t *testing.T) {
 	}
 }
 
+func TestAdvanceRequiresPhysicalSchemaV3ForPartialRefundSafeMigration(t *testing.T) {
+	t.Parallel()
+
+	v2 := testRecord(migration.PhysicalStatePlanned)
+	v2.SourceSchemaVersion = 2
+	v2.TargetSchemaVersion = 2
+	v2Control := &fakeControl{record: v2}
+	v2Engine := newTestEngine(t, v2Control, &fakeShards{})
+	if _, err := v2Engine.Advance(context.Background(), v2.MigrationID); !errors.Is(err, physicalmigration.ErrInvalidInput) {
+		t.Fatalf("schema-v2 Advance() error = %v, want fail-closed invalid input", err)
+	}
+
+	v3 := testRecord(migration.PhysicalStatePlanned)
+	v3.SourceSchemaVersion = 3
+	v3.TargetSchemaVersion = 3
+	v3Control := &fakeControl{record: v3}
+	v3Engine := newTestEngine(t, v3Control, &fakeShards{})
+	got, err := v3Engine.Advance(context.Background(), v3.MigrationID)
+	if err != nil || got.State != migration.PhysicalStatePreparingTarget {
+		t.Fatalf("schema-v3 Advance() = (%s, %v)", got.State, err)
+	}
+}
+
 var errSimulatedCrash = errors.New("simulated checkpoint crash")
 
 func testRecord(state migration.PhysicalState) physicalmigration.Record {
@@ -448,9 +474,9 @@ func testRecord(state migration.PhysicalState) physicalmigration.Record {
 		SourceGeneration:      7,
 		TargetGeneration:      8,
 		SourceProtocolVersion: 1,
-		SourceSchemaVersion:   2,
+		SourceSchemaVersion:   3,
 		TargetProtocolVersion: 1,
-		TargetSchemaVersion:   2,
+		TargetSchemaVersion:   3,
 		State:                 state,
 	}
 }

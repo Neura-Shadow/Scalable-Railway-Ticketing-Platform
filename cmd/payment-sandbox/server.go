@@ -103,6 +103,18 @@ func newHandler(service *sandbox.Service, config handlerConfig) (http.Handler, e
 		result, err := service.Refund(r.Context(), request)
 		writeOperation(w, result, err, config.maxBodyBytes)
 	})
+	mux.HandleFunc("POST /v1/refund-lookups", func(w http.ResponseWriter, r *http.Request) {
+		var request provider.RefundLookupRequest
+		if !decodeJSON(w, r, config.maxBodyBytes, &request) {
+			return
+		}
+		result, err := service.LookupRefund(r.Context(), request)
+		if err != nil {
+			writeProviderError(w, err, config.maxBodyBytes)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
 	if config.faultControlEnabled {
 		mux.HandleFunc("POST /_sandbox/faults", func(w http.ResponseWriter, r *http.Request) {
 			if !safeTokenEqual(r.Header.Get("X-Sandbox-Control-Token"), config.faultControlToken) {

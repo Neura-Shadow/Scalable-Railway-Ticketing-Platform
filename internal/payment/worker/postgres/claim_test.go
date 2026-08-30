@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -9,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/domain"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/ledger"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/shard"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/worker"
@@ -94,6 +97,138 @@ func TestOperationClaimRecoversInFlightAsUncertainNotRetryable(t *testing.T) {
 	}
 }
 
+func TestClaimOperationsQueuesBoundedStaleAwaitingCustomerStatusQuery(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 8, 1, 0, 0, 0, time.UTC)
+	intentID := uuid.New()
+	tx := &recordingTx{rows: []pgx.Rows{
+		&staticRows{values: [][]any{{intentID, "sandbox", int64(2500), "TWD", now.Add(-10 * time.Minute)}}},
+		&emptyRows{},
+		&emptyRows{},
+	}}
+	store, err := New(&recordingDB{tx: tx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.ClaimOperations(context.Background(), worker.ClaimOptions{
+		WorkerID: "payment-test", BatchSize: 1, MaxAttempts: 3,
+		LeaseTTL: time.Minute, Now: now,
+	})
+	if err != nil {
+		t.Fatalf("ClaimOperations() error = %v", err)
+	}
+	joined := strings.Join(tx.execs, "\n")
+	if !strings.Contains(joined, "INSERT INTO public.payment_operations") ||
+		!strings.Contains(joined, "'query_status'") ||
+		!strings.Contains(strings.Join(tx.queries, "\n"), "intent.state='awaiting_customer'") ||
+		!strings.Contains(strings.Join(tx.queries, "\n"), "$1::timestamptz-") {
+		t.Fatalf("stale recovery did not enqueue a durable query operation:\nqueries=%s\nexecs=%s",
+			strings.Join(tx.queries, "\n"), joined)
+	}
+}
+
+func TestShardActionsUsePurposeBuiltDurableAttemptAndLeaseBudget(t *testing.T) {
+	t.Parallel()
+	tx := &recordingTx{}
+	store, err := New(&recordingDB{tx: tx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.ClaimActions(context.Background(), worker.ClaimOptions{
+		WorkerID: "payment-test", BatchSize: 4, MaxAttempts: 8,
+		LeaseTTL: time.Minute, Now: time.Date(2026, 8, 8, 1, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("ClaimActions() error = %v", err)
+	}
+	joined := strings.Join(append(append([]string{}, tx.execs...), tx.queries...), "\n")
+	if !strings.Contains(joined, "payment_saga_actions") || !strings.Contains(joined, "action.attempts") ||
+		!strings.Contains(joined, "action.lease_owner") || strings.Contains(joined, "SET lease_owner=$3,lease_until=$1") {
+		t.Fatalf("shard actions still inherit saga retry/lease state:\n%s", joined)
+	}
+}
+
+func TestClaimActionsSeedsNewActionAtRunClock(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 8, 1, 0, 0, 0, time.UTC)
+	tx := &recordingTx{}
+	store, err := New(&recordingDB{tx: tx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.ClaimActions(context.Background(), worker.ClaimOptions{
+		WorkerID: "payment-test", BatchSize: 1, MaxAttempts: 3,
+		LeaseTTL: time.Minute, Now: now,
+	})
+	if err != nil {
+		t.Fatalf("ClaimActions() error = %v", err)
+	}
+	if len(tx.execs) == 0 || !strings.Contains(tx.execs[0], "action_type,next_attempt_at") ||
+		!strings.Contains(tx.execs[0], "END,$1") || len(tx.execArgs[0]) != 1 || tx.execArgs[0][0] != now {
+		t.Fatalf("new action was not made eligible at the fixed run clock: sql=%q args=%v", tx.execs[0], tx.execArgs[0])
+	}
+}
+
+func TestClaimActionsLeavesHistoricalActionsWithoutDurableProofPending(t *testing.T) {
+	t.Parallel()
+	tx := &recordingTx{}
+	store, err := New(&recordingDB{tx: tx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.ClaimActions(context.Background(), worker.ClaimOptions{
+		WorkerID: "payment-test", BatchSize: 4, MaxAttempts: 8,
+		LeaseTTL: time.Minute, Now: time.Date(2026, 8, 8, 1, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("ClaimActions() error = %v", err)
+	}
+	joined := strings.Join(tx.queries, "\n")
+	for _, required := range []string{
+		"action.action_type IN ('issue_tickets','mark_refund_pending')",
+		"operation.operation_type='capture'",
+		"action.action_type='cancel_voided_reservation'",
+		"operation.operation_type='void'",
+		"action.action_type='compensate'",
+		"operation.operation_type='refund'",
+		"octet_length(operation.response_fingerprint)=32",
+	} {
+		if !strings.Contains(joined, required) {
+			t.Fatalf("action candidate can claim a historical row without durable proof %q:\n%s", required, joined)
+		}
+	}
+}
+
+func TestShardActionFinalAttemptCrashGetsOneBoundedReceiptRecovery(t *testing.T) {
+	t.Parallel()
+	tx := &recordingTx{}
+	store, err := New(&recordingDB{tx: tx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.ClaimActions(context.Background(), worker.ClaimOptions{
+		WorkerID: "payment-test", BatchSize: 1, MaxAttempts: 1,
+		LeaseTTL: time.Minute, Now: time.Date(2026, 8, 8, 1, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("ClaimActions() error = %v", err)
+	}
+	joined := strings.Join(append(append([]string{}, tx.execs...), tx.queries...), "\n")
+	for _, required := range []string{
+		"worker_lease_expired_final_attempt",
+		"FOR UPDATE OF action,saga",
+		"action.attempts=$5",
+		"action.bounded_error_category='worker_lease_expired_final_attempt'",
+		"attempts>$2",
+		"action_recovery_exhausted",
+		"payment_manual_review_cases",
+	} {
+		if !strings.Contains(joined, required) {
+			t.Fatalf("final-attempt action crash recovery omitted %q:\n%s", required, joined)
+		}
+	}
+}
+
 func TestUnknownMutationFailurePersistsUncertainRegardlessOfRetryability(t *testing.T) {
 	t.Parallel()
 	tx := &recordingTx{}
@@ -127,18 +262,22 @@ func TestCompleteTicketIssuanceWritesAllLocatorsInSameControlTransaction(t *test
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
+	sagaID := uuid.MustParse("79000000-0000-4000-8000-000000000001")
+	intentID := uuid.MustParse("75000000-0000-4000-8000-000000000001")
+	issuanceID := shard.DeterministicIssuanceID(sagaID)
 	claim := worker.ActionClaim{
-		SagaID: uuid.New(), Type: worker.ActionIssueTickets, Provider: "sandbox",
+		ActionID: uuid.MustParse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"), SagaID: sagaID, Type: worker.ActionIssueTickets, Provider: "sandbox",
 		LeaseOwner: "payment-test", LeaseUntil: time.Now().Add(time.Minute),
 		Issue: shard.IssueTicketsCommand{
+			IssuanceID: issuanceID, PaymentIntentID: intentID,
 			ReservationID: uuid.New(), TrainRunID: trainRunID, OwnerID: ownerID,
-			AmountMinor: 2500, Currency: "TWD",
+			AmountMinor: 12500, Currency: "TWD",
 		},
 	}
 	receipt := shard.IssueTicketsReceipt{
 		TicketOrderID: uuid.New(), TicketIDs: []uuid.UUID{uuid.New(), uuid.New()},
 		TicketCodes: []string{"ticket_code_000001", "ticket_code_000002"},
-		AmountMinor: 2500, Currency: "TWD",
+		AmountMinor: 12500, Currency: "TWD",
 		OrderCreatedAt: time.Now().Add(-time.Minute).UTC(), IssuedAt: time.Now().UTC(),
 	}
 	if err := store.CompleteAction(context.Background(), claim, worker.ActionEvidence{Issue: receipt}); err != nil {
@@ -148,10 +287,38 @@ func TestCompleteTicketIssuanceWritesAllLocatorsInSameControlTransaction(t *test
 	if strings.Count(joined, "insert into public.ticket_order_shard_locators") != 1 ||
 		strings.Count(joined, "insert into public.ticket_shard_locators") != len(receipt.TicketIDs) ||
 		strings.Count(joined, "insert into public.ticket_code_directory") != len(receipt.TicketIDs) ||
+		strings.Count(joined, "insert into public.financial_ledger_transactions") != 1 ||
+		strings.Count(joined, "insert into public.financial_ledger_postings") != 2 ||
 		!strings.Contains(joined, "update public.payment_intents") ||
 		!strings.Contains(joined, "update public.payment_sagas") || !tx.committed {
 		t.Fatalf("control finalize SQL missing atomic locator writes:\n%s", joined)
 	}
+	for index, query := range tx.execs {
+		if !strings.Contains(query, "INSERT INTO public.financial_ledger_transactions") {
+			continue
+		}
+		args := tx.execArgs[index]
+		if args[0] != uuid.MustParse("f020d39d-d1cb-5f81-955e-e84dc3fa6244") ||
+			args[1] != "ticket_issuance:ddb62b09-9c50-526a-adb4-e32a16aa7c66" ||
+			args[2] != "payment:75000000-0000-4000-8000-000000000001" {
+			t.Fatalf("worker issuance ledger identity args = %+v", args)
+		}
+		if got := stringHexBytes(args[5].([]byte)); got != "d9e0ae58551a9829103246f613d371b754af2a68fec8bf8c011b36d1ce459227" {
+			t.Fatalf("worker issuance fingerprint = %s", got)
+		}
+		return
+	}
+	t.Fatal("worker issuance ledger insert not found")
+}
+
+func stringHexBytes(value []byte) string {
+	const digits = "0123456789abcdef"
+	encoded := make([]byte, len(value)*2)
+	for index, item := range value {
+		encoded[index*2] = digits[item>>4]
+		encoded[index*2+1] = digits[item&0x0f]
+	}
+	return string(encoded)
 }
 
 func TestCompleteTicketIssuanceRejectsDuplicateGlobalCodeClaims(t *testing.T) {
@@ -163,7 +330,7 @@ func TestCompleteTicketIssuanceRejectsDuplicateGlobalCodeClaims(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 	claim := worker.ActionClaim{
-		SagaID: uuid.New(), Type: worker.ActionIssueTickets, LeaseOwner: "payment-test",
+		ActionID: uuid.New(), SagaID: uuid.New(), Type: worker.ActionIssueTickets, LeaseOwner: "payment-test",
 		Issue: shard.IssueTicketsCommand{ReservationID: uuid.New(), TrainRunID: trainRunID, OwnerID: ownerID},
 	}
 	receipt := shard.IssueTicketsReceipt{
@@ -187,7 +354,7 @@ func TestCompleteCompensationCancelsTicketOrderLocator(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 	claim := worker.ActionClaim{
-		SagaID: uuid.New(), Type: worker.ActionCompensate, Provider: "sandbox",
+		ActionID: uuid.New(), SagaID: uuid.New(), Type: worker.ActionCompensate, Provider: "sandbox",
 		LeaseOwner: "payment-test", LeaseUntil: time.Now().Add(time.Minute),
 		Compensation: shard.ApplyRefundCompensationCommand{ReservationID: uuid.New(), OwnerID: uuid.New()},
 	}
@@ -204,13 +371,13 @@ func TestCompleteCompensationCancelsTicketOrderLocator(t *testing.T) {
 
 func TestCompleteCompensationWithoutIssuedTicketsRequiresNoControlLocator(t *testing.T) {
 	t.Parallel()
-	tx := &recordingTx{execTags: []pgconn.CommandTag{pgconn.NewCommandTag("UPDATE 0")}}
+	tx := &recordingTx{execTags: []pgconn.CommandTag{pgconn.NewCommandTag("UPDATE 1"), pgconn.NewCommandTag("UPDATE 0")}}
 	store, err := New(&recordingDB{tx: tx})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
 	claim := worker.ActionClaim{
-		SagaID: uuid.New(), Type: worker.ActionCompensate, Provider: "sandbox",
+		ActionID: uuid.New(), SagaID: uuid.New(), Type: worker.ActionCompensate, Provider: "sandbox",
 		LeaseOwner: "payment-test", LeaseUntil: time.Now().Add(time.Minute),
 		Compensation: shard.ApplyRefundCompensationCommand{ReservationID: uuid.New(), OwnerID: uuid.New()},
 	}
@@ -232,7 +399,7 @@ func TestVoidActionIdentityIsStableAndBindsProviderOperation(t *testing.T) {
 	proof := make([]byte, 32)
 	proof[0] = 7
 	voidedAt := pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true}
-	base := worker.ActionClaim{SagaID: sagaID, Provider: "sandbox", Attempts: 1, LeaseOwner: "worker", LeaseUntil: time.Now().Add(time.Minute)}
+	base := worker.ActionClaim{ActionID: uuid.New(), SagaID: sagaID, Provider: "sandbox", Attempts: 1, LeaseOwner: "worker", LeaseUntil: time.Now().Add(time.Minute)}
 	first, err := buildActionClaim(base, "compensating", "compensate", intentID, reservationID,
 		trainRunID, ownerID, 2500, "TWD", pgtype.UUID{}, nil,
 		pgtype.UUID{Bytes: voidID, Valid: true}, proof, voidedAt, pgtype.UUID{}, nil, pgtype.Timestamptz{})
@@ -269,7 +436,7 @@ func TestCompleteVoidCancellationFinalizesOnlyCompensatingSaga(t *testing.T) {
 		t.Fatal(err)
 	}
 	claim := worker.ActionClaim{
-		SagaID: uuid.New(), Type: worker.ActionCancelVoided, Provider: "sandbox",
+		ActionID: uuid.New(), SagaID: uuid.New(), Type: worker.ActionCancelVoided, Provider: "sandbox",
 		LeaseOwner: "payment-test", LeaseUntil: time.Now().Add(time.Minute),
 	}
 	if err := store.CompleteAction(context.Background(), claim, worker.ActionEvidence{
@@ -310,7 +477,7 @@ func TestProviderVoidSuccessSchedulesShardCancellation(t *testing.T) {
 	t.Parallel()
 	tx := &recordingTx{}
 	claim := worker.OperationClaim{
-		OperationID: uuid.New(), PaymentIntentID: uuid.New(), Provider: "sandbox",
+		OperationID: uuid.New(), PaymentIntentID: uuid.New(), ReservationID: uuid.New(), Provider: "sandbox",
 		Type: domain.OperationVoid, AmountMinor: 2500, Currency: "TWD",
 	}
 	if err := applyOperationSuccess(context.Background(), tx, claim, worker.OperationEvidence{}); err != nil {
@@ -322,7 +489,7 @@ func TestProviderVoidSuccessSchedulesShardCancellation(t *testing.T) {
 func TestVerifiedVoidWebhookSchedulesSameShardCancellation(t *testing.T) {
 	t.Parallel()
 	tx := &recordingTx{row: staticRow{values: []any{uuid.New(), "pending"}}}
-	if err := applyProviderConfirmation(context.Background(), tx, uuid.New(), "sandbox", "void_pending", 2500, "TWD", worker.WebhookEvidence{
+	if err := applyProviderConfirmation(context.Background(), tx, uuid.New(), uuid.New(), "sandbox", "void_pending", 2500, "TWD", worker.WebhookEvidence{
 		Status: provider.StatusVoided, AmountMinor: 2500, Currency: "TWD",
 	}); err != nil {
 		t.Fatalf("applyProviderConfirmation() error = %v", err)
@@ -333,7 +500,7 @@ func TestVerifiedVoidWebhookSchedulesSameShardCancellation(t *testing.T) {
 func TestVerifiedCapturedWebhookRacingVoidConvergesToRefund(t *testing.T) {
 	t.Parallel()
 	tx := &recordingTx{row: staticRow{values: []any{uuid.New(), "pending"}}}
-	if err := applyProviderConfirmation(context.Background(), tx, uuid.New(), "sandbox", "void_pending", 2500, "TWD", worker.WebhookEvidence{
+	if err := applyProviderConfirmation(context.Background(), tx, uuid.New(), uuid.New(), "sandbox", "void_pending", 2500, "TWD", worker.WebhookEvidence{
 		Status: provider.StatusCaptured, AmountMinor: 2500, Currency: "TWD", CapturedMinor: 2500,
 	}); err != nil {
 		t.Fatalf("applyProviderConfirmation() error = %v", err)
@@ -349,6 +516,52 @@ func TestVerifiedCapturedWebhookRacingVoidConvergesToRefund(t *testing.T) {
 	}
 	if strings.Contains(joined, "issue_tickets") || strings.Contains(joined, "state='issuing_tickets'") {
 		t.Fatalf("captured webhook regressed into issuance:\n%s", joined)
+	}
+}
+
+func TestCaptureLedgerIsExactReplayAcrossWebhookAndVoidRace(t *testing.T) {
+	t.Parallel()
+	intentID := uuid.New()
+	reservationID := uuid.New()
+	operationID := deterministicID(intentID, "provider_operation:"+string(domain.OperationCapture))
+
+	webhookTx := &recordingTx{queryRows: []pgx.Row{staticRow{values: []any{operationID, "pending"}}}}
+	evidence := worker.WebhookEvidence{
+		Status: provider.StatusCaptured, AmountMinor: 2500, Currency: "TWD", CapturedMinor: 2500,
+	}
+	if err := applyProviderConfirmation(context.Background(), webhookTx, intentID, reservationID, "sandbox", "authorization_pending", 2500, "TWD", evidence); err != nil {
+		t.Fatalf("applyProviderConfirmation() error = %v", err)
+	}
+	if got := countSQL(webhookTx.execs, "INSERT INTO public.financial_ledger_transactions"); got != 1 {
+		t.Fatalf("first capture inserted %d ledger transactions, want 1: %v", got, webhookTx.execs)
+	}
+	if got := countSQL(webhookTx.execs, "INSERT INTO public.financial_ledger_postings"); got != 2 {
+		t.Fatalf("first capture inserted %d ledger postings, want 2: %v", got, webhookTx.execs)
+	}
+
+	stored, err := ledger.PrepareAppend(ledger.AppendRequest{
+		EventID: "capture:" + operationID.String(), Correlation: "payment:" + intentID.String(),
+		Purpose: ledger.PurposeCapture, Currency: "TWD",
+		Postings: []ledger.Posting{
+			{Account: ledger.AccountProviderReceivable, Side: ledger.Debit, AmountMinor: 2500, Currency: "TWD"},
+			{Account: ledger.AccountCustomerFundsPending, Side: ledger.Credit, AmountMinor: 2500, Currency: "TWD"},
+		},
+	}, time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	voidRaceTx := &recordingTx{
+		queryRows:  []pgx.Row{staticRow{values: []any{operationID, "succeeded"}}},
+		ledgerRows: []pgx.Row{ledgerRow(t, stored)},
+	}
+	if err := applyProviderConfirmation(context.Background(), voidRaceTx, intentID, reservationID, "sandbox", "void_pending", 2500, "TWD", evidence); err != nil {
+		t.Fatalf("void-race applyProviderConfirmation() replay error = %v\nqueries: %v\nexecs: %v", err, voidRaceTx.queryRowSQL, voidRaceTx.execs)
+	}
+	if got := countSQL(voidRaceTx.execs, "INSERT INTO public.financial_ledger_transactions"); got != 0 {
+		t.Fatalf("exact replay inserted %d ledger transactions, want 0: %v", got, voidRaceTx.execs)
+	}
+	if got := countSQL(voidRaceTx.execs, "INSERT INTO public.financial_ledger_postings"); got != 0 {
+		t.Fatalf("exact replay inserted %d ledger postings, want 0: %v", got, voidRaceTx.execs)
 	}
 }
 
@@ -421,11 +634,186 @@ type recordingTx struct {
 	rolledBack   bool
 	row          pgx.Row
 	queryRows    []pgx.Row
+	ledgerRows   []pgx.Row
+	ledgerIndex  int
 	queryRowSQL  []string
 	queryRowArgs [][]any
 	rowIndex     int
 	execTags     []pgconn.CommandTag
 	execIndex    int
+	rows         []pgx.Rows
+	queryIndex   int
+}
+
+func TestCompleteActionConsumesActionLeaseWithoutSagaAttemptLease(t *testing.T) {
+	t.Parallel()
+	tx := &recordingTx{}
+	store, err := New(&recordingDB{tx: tx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := worker.ActionClaim{
+		ActionID: uuid.New(), SagaID: uuid.New(), Type: worker.ActionMarkRefundPending,
+		Provider: "sandbox", Attempts: 1, LeaseOwner: "payment-test", LeaseUntil: time.Now().Add(time.Minute),
+	}
+	if err := store.CompleteAction(context.Background(), claim, worker.ActionEvidence{}); err != nil {
+		t.Fatalf("CompleteAction() error = %v", err)
+	}
+	joined := strings.Join(tx.execs, "\n")
+	if !strings.Contains(joined, "UPDATE public.payment_saga_actions") ||
+		!strings.Contains(joined, "action_id=$1") || !strings.Contains(joined, "state='processing'") ||
+		strings.Contains(joined, "saga.lease_owner=$2") {
+		t.Fatalf("action completion did not consume its independent lease:\n%s", joined)
+	}
+}
+
+func TestRetryableActionFailurePersistsOnlyOnIndependentActionBudget(t *testing.T) {
+	t.Parallel()
+	tx := &recordingTx{}
+	store, err := New(&recordingDB{tx: tx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := worker.ActionClaim{
+		ActionID: uuid.New(), SagaID: uuid.New(), Type: worker.ActionIssueTickets,
+		Provider: "sandbox", Attempts: 1, LeaseOwner: "payment-test", LeaseUntil: time.Now().Add(time.Minute),
+	}
+	failure := worker.Failure{Category: "shard_command_failed", NextAttemptAt: time.Now().Add(time.Minute)}
+	if err := store.FailAction(context.Background(), claim, failure); err != nil {
+		t.Fatalf("FailAction() error = %v", err)
+	}
+	joined := strings.Join(tx.execs, "\n")
+	if !strings.Contains(joined, "UPDATE public.payment_saga_actions") ||
+		!strings.Contains(joined, "state='failed_retryable'") ||
+		strings.Contains(joined, "UPDATE public.payment_sagas") {
+		t.Fatalf("retryable shard action failure leaked into saga attempt state:\n%s", joined)
+	}
+}
+
+func TestAuthorizedStatusRecoverySchedulesCaptureWithoutShardMutation(t *testing.T) {
+	t.Parallel()
+	tx := &recordingTx{}
+	store, err := New(&recordingDB{tx: tx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := worker.OperationClaim{
+		OperationID: uuid.New(), PaymentIntentID: uuid.New(), Provider: "sandbox",
+		Type: domain.OperationQueryStatus, PreviousState: domain.OperationPending,
+		ProviderPaymentID: "pay-1", AmountMinor: 2500, Currency: "TWD", LeaseOwner: "payment-test",
+	}
+	evidence := worker.OperationEvidence{
+		Disposition: worker.DispositionApplied, ProviderPaymentID: claim.ProviderPaymentID,
+		Status: provider.StatusAuthorized, AmountMinor: claim.AmountMinor, Currency: claim.Currency,
+		ResponseFingerprint: sha256.Sum256([]byte("authorized-status-recovery")),
+	}
+	if err := store.CompleteOperation(context.Background(), claim, evidence); err != nil {
+		t.Fatalf("CompleteOperation() error = %v", err)
+	}
+	joined := strings.Join(tx.execs, "\n")
+	for _, required := range []string{"state='authorization_pending'", "state='authorized'", "INSERT INTO public.payment_operations"} {
+		if !strings.Contains(joined, required) {
+			t.Fatalf("authorized recovery omitted %q:\n%s", required, joined)
+		}
+	}
+	for _, forbidden := range []string{"ticket_order_shard_locators", "reservation_shard_locators", "ticket_shard_locators"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("status recovery directly mutated shard/control locator %q:\n%s", forbidden, joined)
+		}
+	}
+}
+
+func TestCapturedStatusRecoverySchedulesDurableIssuanceWithoutShardMutation(t *testing.T) {
+	t.Parallel()
+	captureID := uuid.New()
+	tx := &recordingTx{queryRows: []pgx.Row{staticRow{values: []any{captureID, "pending"}}}}
+	store, err := New(&recordingDB{tx: tx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := worker.OperationClaim{
+		OperationID: uuid.New(), PaymentIntentID: uuid.New(), Provider: "sandbox",
+		Type: domain.OperationQueryStatus, PreviousState: domain.OperationPending,
+		ProviderPaymentID: "pay-1", AmountMinor: 2500, Currency: "TWD", LeaseOwner: "payment-test",
+	}
+	evidence := worker.OperationEvidence{
+		Disposition: worker.DispositionApplied, ProviderPaymentID: claim.ProviderPaymentID,
+		Status: provider.StatusCaptured, AmountMinor: claim.AmountMinor, Currency: claim.Currency,
+		CapturedMinor:       claim.AmountMinor,
+		ResponseFingerprint: sha256.Sum256([]byte("captured-status-recovery")),
+	}
+	if err := store.CompleteOperation(context.Background(), claim, evidence); err != nil {
+		t.Fatalf("CompleteOperation() error = %v", err)
+	}
+	joined := strings.Join(tx.execs, "\n")
+	for _, required := range []string{
+		"provider_operation_id=$2,normalized_provider_state=$3", "state='ticket_issue_pending'",
+		"state='issuing_tickets'", "INSERT INTO public.financial_ledger_transactions",
+	} {
+		if !strings.Contains(joined, required) {
+			t.Fatalf("captured recovery omitted %q:\n%s", required, joined)
+		}
+	}
+	for _, forbidden := range []string{"ticket_order_shard_locators", "reservation_shard_locators", "ticket_shard_locators"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("captured recovery directly mutated shard/control locator %q:\n%s", forbidden, joined)
+		}
+	}
+}
+
+func TestRefundSuccessSelectsLedgerSourceFromIssuanceState(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name       string
+		issued     bool
+		wantSource ledger.Account
+		reject     ledger.Account
+	}{
+		{name: "pre-issued reverses pending funds", issued: false, wantSource: ledger.AccountCustomerFundsPending, reject: ledger.AccountTicketSales},
+		{name: "issued reverses ticket sales", issued: true, wantSource: ledger.AccountTicketSales, reject: ledger.AccountCustomerFundsPending},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			tx := &recordingTx{row: staticRow{values: []any{test.issued}}}
+			store, err := New(&recordingDB{tx: tx})
+			if err != nil {
+				t.Fatal(err)
+			}
+			claim := worker.OperationClaim{
+				OperationID: uuid.New(), PaymentIntentID: uuid.New(), ReservationID: uuid.New(), Provider: "sandbox",
+				Type: domain.OperationRefund, PreviousState: domain.OperationPending,
+				ProviderPaymentID: "pay-1", AmountMinor: 2500, Currency: "TWD", LeaseOwner: "payment-test",
+			}
+			evidence := worker.OperationEvidence{
+				Disposition: worker.DispositionApplied, ProviderPaymentID: claim.ProviderPaymentID,
+				Status: provider.StatusRefunded, AmountMinor: claim.AmountMinor, Currency: claim.Currency,
+				CapturedMinor: claim.AmountMinor, RefundedMinor: claim.AmountMinor,
+				ResponseFingerprint: sha256.Sum256([]byte("refund-ledger-" + test.name)),
+			}
+			if err := store.CompleteOperation(context.Background(), claim, evidence); err != nil {
+				t.Fatalf("CompleteOperation() error = %v", err)
+			}
+			joined := strings.Join(tx.execs, "\n")
+			if !strings.Contains(joined, "INSERT INTO public.financial_ledger_transactions") ||
+				strings.Count(joined, "INSERT INTO public.financial_ledger_postings") != 2 {
+				t.Fatalf("refund ledger was not atomic with control finalization:\n%s", joined)
+			}
+			var sawSourceDebit, sawRejectedDebit, sawProviderRefundCredit bool
+			for _, args := range tx.execArgs {
+				if len(args) != 6 {
+					continue
+				}
+				account, side := args[2], args[3]
+				sawSourceDebit = sawSourceDebit || account == test.wantSource && side == ledger.Debit
+				sawRejectedDebit = sawRejectedDebit || account == test.reject && side == ledger.Debit
+				sawProviderRefundCredit = sawProviderRefundCredit || account == ledger.AccountProviderRefundReceivable && side == ledger.Credit
+			}
+			if !sawSourceDebit || sawRejectedDebit || !sawProviderRefundCredit {
+				t.Fatalf("refund posting direction mismatch: %+v", tx.execArgs)
+			}
+		})
+	}
 }
 
 func (tx *recordingTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
@@ -441,18 +829,63 @@ func (tx *recordingTx) Exec(_ context.Context, sql string, args ...any) (pgconn.
 
 func (tx *recordingTx) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
 	tx.queries = append(tx.queries, sql)
+	if tx.queryIndex < len(tx.rows) {
+		rows := tx.rows[tx.queryIndex]
+		tx.queryIndex++
+		return rows, nil
+	}
 	return &emptyRows{}, nil
 }
 
 func (tx *recordingTx) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
 	tx.queryRowSQL = append(tx.queryRowSQL, sql)
 	tx.queryRowArgs = append(tx.queryRowArgs, append([]any(nil), args...))
+	if strings.Contains(sql, "FROM public.financial_ledger_transactions") {
+		if tx.ledgerIndex < len(tx.ledgerRows) {
+			row := tx.ledgerRows[tx.ledgerIndex]
+			tx.ledgerIndex++
+			return row
+		}
+		return staticRow{err: pgx.ErrNoRows}
+	}
 	if tx.rowIndex < len(tx.queryRows) {
 		row := tx.queryRows[tx.rowIndex]
 		tx.rowIndex++
 		return row
 	}
-	return tx.row
+	if tx.row != nil {
+		return tx.row
+	}
+	return staticRow{err: pgx.ErrNoRows}
+}
+
+func countSQL(statements []string, fragment string) int {
+	count := 0
+	for _, statement := range statements {
+		if strings.Contains(statement, fragment) {
+			count++
+		}
+	}
+	return count
+}
+
+func ledgerRow(t *testing.T, transaction ledger.Transaction) pgx.Row {
+	t.Helper()
+	postings := make([]map[string]any, len(transaction.Postings))
+	for index, posting := range transaction.Postings {
+		postings[index] = map[string]any{
+			"account": posting.Account, "side": posting.Side,
+			"amount_minor": posting.AmountMinor, "currency": posting.Currency,
+		}
+	}
+	encoded, err := json.Marshal(postings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return staticRow{values: []any{
+		transaction.ID, transaction.EventID, transaction.Correlation, string(transaction.Purpose),
+		transaction.Currency, transaction.Fingerprint[:], transaction.CreatedAt, transaction.ReversalOf, encoded,
+	}}
 }
 
 func (tx *recordingTx) Commit(context.Context) error {
@@ -478,9 +911,39 @@ func (*emptyRows) Values() ([]any, error)                       { return nil, ni
 func (*emptyRows) RawValues() [][]byte                          { return nil }
 func (*emptyRows) Conn() *pgx.Conn                              { return nil }
 
-type staticRow struct{ values []any }
+type staticRows struct {
+	pgx.Rows
+	values [][]any
+	index  int
+}
+
+func (*staticRows) Close()                                       {}
+func (*staticRows) Err() error                                   { return nil }
+func (rows *staticRows) Next() bool                              { rows.index++; return rows.index <= len(rows.values) }
+func (*staticRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (*staticRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (*staticRows) Values() ([]any, error)                       { return nil, nil }
+func (*staticRows) RawValues() [][]byte                          { return nil }
+func (*staticRows) Conn() *pgx.Conn                              { return nil }
+func (rows *staticRows) Scan(destinations ...any) error {
+	if rows.index < 1 || rows.index > len(rows.values) || len(destinations) != len(rows.values[rows.index-1]) {
+		return errors.New("unexpected scan width")
+	}
+	for index := range destinations {
+		reflect.ValueOf(destinations[index]).Elem().Set(reflect.ValueOf(rows.values[rows.index-1][index]))
+	}
+	return nil
+}
+
+type staticRow struct {
+	values []any
+	err    error
+}
 
 func (row staticRow) Scan(destinations ...any) error {
+	if row.err != nil {
+		return row.err
+	}
 	if len(destinations) != len(row.values) {
 		return errors.New("unexpected scan width")
 	}

@@ -49,8 +49,11 @@ Required keys, scoped to the process that consumes them:
 - `admission-token-keyring`: one to eight `key-id=base64url` entries whose decoded material is exactly 32 bytes, mounted only into APIs and admission workers with separately configured issue and accept key IDs;
 - payment provider API credentials, mounted only into payment workers,
   reconciler/admin as needed; and
-- payment webhook HMAC keyring plus accepted key IDs, mounted only into
-  payment-enabled API ingress. Never reuse these keys for
+- payment webhook provider keyring, primary key ID, accepted key IDs, and
+  provider-specific retirement grace, mounted only into payment-enabled API
+  ingress. The active region serializes durable lifecycle transitions; passive
+  regions prove the same ID-to-secret material bindings read-only. Never reuse
+  these keys for
   JWT, admission, database, Redis, or sandbox fault control.
 
 Admission derivation keys are not JWT keys and must not be reused for database,
@@ -80,7 +83,7 @@ Set `APP_ENV=production` and validate process-owned settings:
   limits, webhook keyring, processing/review/uncertainty deadlines, physical
   mode, and no provider credential in public output;
 - payment-worker: explicit enablement, bounded batch/lease/retry/pass settings,
-  control schema v10, booking-shard schema v2, provider and configured-shard
+  control schema v11, booking-shard schema v3, provider and configured-shard
   readiness;
 - payment-reconciler: detect-only scope/batch/interval/timeout with bounded
   control/current-shard/provider reads, SELECT-only shard roles, and a control
@@ -340,3 +343,47 @@ Replica counts, fixed schemas, local Compose, and baseline resource requests
 are evidence fixtures, not capacity or physical-shard claims. Production
 sizing requires [Milestone 4 load testing](milestone-4-load-testing.md) and a
 completed [benchmark report](benchmark-report-milestone-4.md).
+
+## Milestone 7 payment operations and regional recovery boundary
+
+Milestone 7 is not enabled by the baseline Kubernetes manifests. A reviewed
+deployment overlay must separately provision the selected Stripe test/live
+credentials, endpoint-specific webhook current/previous secrets, settlement
+read credentials, regional application roles, replication roles, backup writer,
+restore/decryption operator, and fence/promotion operator. Do not mount provider
+API credentials into webhook ingress or backup keys into application/worker
+processes. Hosted checkout must remain a provider-originated redirect; this
+repository accepts no PAN, CVC, track, PIN, or raw payment credential.
+Webhook rotation must follow [webhook-key-rotation.md](webhook-key-rotation.md):
+stage both versions without starting grace, demote the previous primary, wait
+through its durable deadline and provider retry horizon, then retire it. Every
+region must fail readiness if its local secret binding disagrees with replicated
+metadata; only the active writer may advance lifecycle state.
+
+Migration 11 and booking-shard Migration 3 are coordinated maintenance gates.
+After migration, every write connection must carry the exact deployment region,
+role, epoch, and writes-enabled identity and the database-local authority row
+must agree in the same transaction. A passive or recovery deployment is never
+customer-write-ready. Activation additionally requires all three required
+database identities to be promoted, writable primaries on the same epoch, clean
+v11/v3 schemas, reset pools, non-empty clean payment/ledger/refund/settlement
+reconciliation, and independently verified external ingress/process/credential/
+network fencing of the old writer.
+
+The selected DR pilot uses PostgreSQL asynchronous streaming plus encrypted
+pgBackRest full/WAL protection. Create finite physical slots and WAL-retention
+bounds per database, alert on replay/archive lag, and keep the repository and
+encryption key outside all PostgreSQL data volumes. A successful backup or
+checksum is not restore proof: boot an isolated allowlisted restore target and
+run schema, authority, ledger, payment, refund, ticket, and settlement checks.
+Failback never reactivates a divergent old primary; reseed it from the current
+writer, verify catch-up, fence again, and allocate a higher epoch.
+
+The Docker DR topology and any optional Stripe test-mode run are bounded
+acceptance evidence only. They do not establish live-production provider
+approval, PCI certification, statutory accounting, zero RPO/RTO, active-active
+writes, automatic split-brain consensus, or production capacity. Follow
+[regional-failover.md](regional-failover.md),
+[regional-failback.md](regional-failback.md), and
+[backup-and-pitr.md](backup-and-pitr.md); publish measurements only through the
+Milestone 7 evidence verifier.

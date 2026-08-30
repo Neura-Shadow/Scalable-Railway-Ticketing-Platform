@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VERSION: "1.25.12"
+  GO_VERSION: "1.25.13"
   IMAGE_NAME: scalable-railway-ticketing-platform:milestone-5
   EVIDENCE_PROXY_IMAGE: scalable-railway-ticketing-proxy:milestone-5
 
@@ -121,8 +121,10 @@ jobs:
           --health-timeout 3s
           --health-retries 20
     env:
-      DATABASE_URL: postgres://railway:ci-local-password@localhost:5432/railway?sslmode=disable
-      MIGRATION_REHEARSAL_DATABASE_URL: postgres://railway:ci-local-password@localhost:5432/railway_migration_rehearsal?sslmode=disable
+      DATABASE_URL: postgres://railway:ci-local-password@localhost:5432/railway?sslmode=disable&options=-c%20railway.deployment_region%3Dregion-a%20-c%20railway.deployment_role%3Dactive%20-c%20railway.region_epoch%3D1%20-c%20railway.regional_writes_enabled%3Dtrue
+      MIGRATION_REHEARSAL_DATABASE_URL: postgres://railway:ci-local-password@localhost:5432/railway_migration_rehearsal?sslmode=disable&options=-c%20railway.deployment_region%3Dregion-a%20-c%20railway.deployment_role%3Dactive%20-c%20railway.region_epoch%3D1%20-c%20railway.regional_writes_enabled%3Dtrue
+      M7_LEDGER_DATABASE_URL: postgres://railway:ci-local-password@localhost:5432/railway_m7_populated_rehearsal?sslmode=disable&options=-c%20railway.deployment_region%3Dregion-a%20-c%20railway.deployment_role%3Dactive%20-c%20railway.region_epoch%3D1%20-c%20railway.regional_writes_enabled%3Dtrue
+      SETTLEMENT_POSTGRES_TEST_DATABASE_URL: postgres://railway:ci-local-password@localhost:5432/railway?sslmode=disable&options=-c%20railway.deployment_region%3Dregion-a%20-c%20railway.deployment_role%3Dactive%20-c%20railway.region_epoch%3D1%20-c%20railway.regional_writes_enabled%3Dtrue
       REDIS_ADDR: localhost:6379
       TEST_REDIS_ADDR: localhost:6379
       APP_ENV: test
@@ -274,9 +276,12 @@ jobs:
             --file migrations/testdata/assert_milestone4_v8_schema.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone4_v8_data.sql
-      - name: Rehearse the populated version-8 through version-10 upgrade
+      - name: Rehearse the populated version-8 through version-11 upgrade
         shell: bash
         run: |
+          mkdir -p "$RUNNER_TEMP/migrations-v10"
+          cp migrations/00000[1-9]_*.sql migrations/000010_*.sql \
+            "$RUNNER_TEMP/migrations-v10/"
           go run ./cmd/migrate \
             -path "$RUNNER_TEMP/migrations-v9" \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
@@ -290,11 +295,11 @@ jobs:
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone5_v9_data.sql
           go run ./cmd/migrate \
-            -path migrations \
+            -path "$RUNNER_TEMP/migrations-v10" \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             up
           go run ./cmd/migrate \
-            -path migrations \
+            -path "$RUNNER_TEMP/migrations-v10" \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             version
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
@@ -303,15 +308,43 @@ jobs:
             --file migrations/testdata/assert_milestone6_v10_reverse_compat.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone6_v10_ticket_code_backfill.sql
+          psql "$DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --command 'CREATE DATABASE railway_m7_populated_rehearsal TEMPLATE railway_migration_rehearsal'
+          psql "$M7_LEDGER_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/seed_milestone7_v10_fixture.sql
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$M7_LEDGER_DATABASE_URL" \
+            up
+          psql "$M7_LEDGER_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone7_v11_schema.sql
+          psql "$M7_LEDGER_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone7_v11_data.sql
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            up
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone7_v11_schema.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_populated_v5_data.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_hot_train_v6_data.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_read_model_v7_data.sql
-      - name: Rehearse Milestone 6 one-step down to v9 and replay to v10
+      - name: Rehearse Milestone 7 down to v10, Milestone 6 down to v9, and replay
         shell: bash
         run: |
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            down
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            version
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone6_v10_schema.sql
           go run ./cmd/migrate \
             -path migrations \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
@@ -337,13 +370,19 @@ jobs:
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             up
           go run ./cmd/migrate \
-            -path migrations \
+            -path "$RUNNER_TEMP/migrations-v10" \
             -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
             up
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone6_v10_schema.sql
           psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone6_v10_reverse_compat.sql
+          go run ./cmd/migrate \
+            -path migrations \
+            -database "$MIGRATION_REHEARSAL_DATABASE_URL" \
+            up
+          psql "$MIGRATION_REHEARSAL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone7_v11_schema.sql
       - name: Apply migrations to an empty database
         run: go run ./cmd/migrate -path migrations up
       - name: Verify migration-up is safe to repeat
@@ -355,6 +394,8 @@ jobs:
         # database. Serialize package binaries while preserving each package's
         # internal concurrency and race probes.
         run: go test -p 1 ./... -count=1 -timeout 420s
+      - name: Run focused ledger and settlement persistence contracts
+        run: go test -p 1 ./internal/payment/ledger/postgres ./internal/payment/settlement/postgres -count=3 -timeout 180s
       - name: Run focused admission, token, quota, and concurrency tests
         run: go test -p 1 ./internal/admission/... ./internal/booking/postgres ./internal/app -count=3 -timeout 300s
       - name: Run focused projection, cache, fallback, and reconciliation tests repeatedly
@@ -412,9 +453,9 @@ jobs:
       CONTROL_DATABASE_URL: postgres://railway_control:control-ci-local@localhost:55430/railway_control?sslmode=disable
       BOOKING_SHARD_0_DATABASE_URL: postgres://railway_booking:shard-0-ci-local@localhost:55431/railway_booking?sslmode=disable
       BOOKING_SHARD_1_DATABASE_URL: postgres://railway_booking:shard-1-ci-local@localhost:55432/railway_booking?sslmode=disable
-      TEST_CONTROL_DATABASE_URL: postgres://railway_control:control-ci-local@localhost:55430/railway_control?sslmode=disable
-      TEST_BOOKING_SHARD_0_DATABASE_URL: postgres://railway_booking:shard-0-ci-local@localhost:55431/railway_booking?sslmode=disable
-      TEST_BOOKING_SHARD_1_DATABASE_URL: postgres://railway_booking:shard-1-ci-local@localhost:55432/railway_booking?sslmode=disable
+      TEST_CONTROL_DATABASE_URL: postgres://railway_control:control-ci-local@localhost:55430/railway_control?sslmode=disable&options=-c%20railway.deployment_region=region-a%20-c%20railway.deployment_role=active%20-c%20railway.region_epoch=1%20-c%20railway.regional_writes_enabled=true
+      TEST_BOOKING_SHARD_0_DATABASE_URL: postgres://railway_booking:shard-0-ci-local@localhost:55431/railway_booking?sslmode=disable&options=-c%20railway.deployment_region=region-a%20-c%20railway.deployment_role=active%20-c%20railway.region_epoch=1%20-c%20railway.regional_writes_enabled=true
+      TEST_BOOKING_SHARD_1_DATABASE_URL: postgres://railway_booking:shard-1-ci-local@localhost:55432/railway_booking?sslmode=disable&options=-c%20railway.deployment_region=region-a%20-c%20railway.deployment_role=active%20-c%20railway.region_epoch=1%20-c%20railway.regional_writes_enabled=true
     steps:
       - name: Check out source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -428,37 +469,64 @@ jobs:
       - name: Apply and verify independent migration histories
         shell: bash
         run: |
+          mkdir -p "$RUNNER_TEMP/control-v10"
+          cp migrations/00000[1-9]_*.sql migrations/000010_*.sql \
+            "$RUNNER_TEMP/control-v10/"
+          go run ./cmd/migrate -path "$RUNNER_TEMP/control-v10" -database "$CONTROL_DATABASE_URL" up
+          go run ./cmd/migrate -path "$RUNNER_TEMP/control-v10" -database "$CONTROL_DATABASE_URL" up
+          go run ./cmd/migrate -path "$RUNNER_TEMP/control-v10" -database "$CONTROL_DATABASE_URL" version
+          psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone6_v10_schema.sql
           go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" up
-          go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" up
-          go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" version
+          psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone7_v11_schema.sql
+          go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" down
           psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone6_v10_schema.sql
           go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" down
           psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone5_v9_schema.sql
-          go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" up
+          go run ./cmd/migrate -path "$RUNNER_TEMP/control-v10" -database "$CONTROL_DATABASE_URL" up
           psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
             --file migrations/testdata/assert_milestone6_v10_schema.sql
+          go run ./cmd/migrate -path migrations -database "$CONTROL_DATABASE_URL" up
+          psql "$CONTROL_DATABASE_URL" --set=ON_ERROR_STOP=1 \
+            --file migrations/testdata/assert_milestone7_v11_schema.sql
+          mkdir -p "$RUNNER_TEMP/booking-shard-v2"
+          cp migrations/booking-shard/00000[1-2]_*.sql \
+            "$RUNNER_TEMP/booking-shard-v2/"
           for database_url in \
             "$BOOKING_SHARD_0_DATABASE_URL" \
             "$BOOKING_SHARD_1_DATABASE_URL"
           do
-            go run ./cmd/migrate -path migrations/booking-shard \
+            go run ./cmd/migrate -path "$RUNNER_TEMP/booking-shard-v2" \
               -database "$database_url" up
-            go run ./cmd/migrate -path migrations/booking-shard \
+            go run ./cmd/migrate -path "$RUNNER_TEMP/booking-shard-v2" \
               -database "$database_url" up
-            go run ./cmd/migrate -path migrations/booking-shard \
+            go run ./cmd/migrate -path "$RUNNER_TEMP/booking-shard-v2" \
               -database "$database_url" version
+            psql "$database_url" --set=ON_ERROR_STOP=1 \
+              --file migrations/testdata/assert_booking_shard_v2_schema.sql
+            go run ./cmd/migrate -path migrations/booking-shard \
+              -database "$database_url" up
+            psql "$database_url" --set=ON_ERROR_STOP=1 \
+              --file migrations/testdata/assert_booking_shard_v3_schema.sql
+            go run ./cmd/migrate -path migrations/booking-shard \
+              -database "$database_url" down
             psql "$database_url" --set=ON_ERROR_STOP=1 \
               --file migrations/testdata/assert_booking_shard_v2_schema.sql
             go run ./cmd/migrate -path migrations/booking-shard \
               -database "$database_url" down
             psql "$database_url" --set=ON_ERROR_STOP=1 \
               --file migrations/testdata/assert_booking_shard_v1_schema.sql
-            go run ./cmd/migrate -path migrations/booking-shard \
+            go run ./cmd/migrate -path "$RUNNER_TEMP/booking-shard-v2" \
               -database "$database_url" up
             psql "$database_url" --set=ON_ERROR_STOP=1 \
               --file migrations/testdata/assert_booking_shard_v2_schema.sql
+            go run ./cmd/migrate -path migrations/booking-shard \
+              -database "$database_url" up
+            psql "$database_url" --set=ON_ERROR_STOP=1 \
+              --file migrations/testdata/assert_booking_shard_v3_schema.sql
           done
       - name: Run legacy to physical to legacy reverse acceptance
         shell: bash

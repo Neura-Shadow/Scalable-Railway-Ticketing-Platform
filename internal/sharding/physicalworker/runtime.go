@@ -5,6 +5,9 @@ import (
 	"errors"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/regional/authority"
+	authoritypostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/regional/authority/postgres"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physical"
 	"github.com/jackc/pgx/v5"
@@ -20,12 +23,16 @@ type catalogReader interface {
 // control catalog can select metadata for those pools, but can never introduce
 // a connection endpoint.
 type Runtime struct {
-	registry *physical.Registry
-	handles  []physical.Handle
+	registry   *physical.Registry
+	handles    []physical.Handle
+	deployment authority.Deployment
 }
 
 func NewRuntime(ctx context.Context, cfg config.Config, control catalogReader) (*Runtime, error) {
-	return newRuntime(ctx, cfg, control, physical.OpenPGXPool)
+	return newRuntime(ctx, cfg, control, physical.RegionalPGXPoolFactory(postgresx.RegionalSession{
+		Region: string(cfg.DeploymentRegion), Role: string(cfg.DeploymentRole),
+		Epoch: cfg.RegionEpoch, WritesEnabled: cfg.RegionalWritesEnabled,
+	}))
 }
 
 func newRuntime(
@@ -67,7 +74,22 @@ func newRuntime(
 	if err != nil {
 		return nil, ErrRuntimeUnavailable
 	}
-	runtime := &Runtime{registry: registry}
+	region, err := authority.ParseRegion(string(cfg.DeploymentRegion))
+	if err != nil || cfg.RegionEpoch < 1 {
+		registry.Close()
+		return nil, ErrRuntimeUnavailable
+	}
+	epoch, err := authority.NewEpoch(uint64(cfg.RegionEpoch))
+	if err != nil {
+		registry.Close()
+		return nil, ErrRuntimeUnavailable
+	}
+	deployment, err := authority.NewDeployment(region, authority.Role(cfg.DeploymentRole), epoch, cfg.RegionalWritesEnabled)
+	if err != nil {
+		registry.Close()
+		return nil, ErrRuntimeUnavailable
+	}
+	runtime := &Runtime{registry: registry, deployment: deployment}
 	for _, rawShardID := range cfg.BookingShardIDs {
 		handle, resolveErr := resolveConfiguredHandle(ctx, control, registry, rawShardID)
 		if resolveErr != nil {
@@ -150,10 +172,15 @@ func (runtime *Runtime) Ready(ctx context.Context) error {
 		var version int
 		var dirty bool
 		err = tx.QueryRow(ctx, `SELECT version, dirty FROM schema_migrations LIMIT 1`).Scan(&version, &dirty)
-		_ = tx.Rollback(context.Background())
 		if err != nil || version != int(physical.SupportedSchemaVersion) || dirty {
+			_ = tx.Rollback(context.Background())
 			return ErrRuntimeUnavailable
 		}
+		if err = authoritypostgres.CheckActiveReadiness(ctx, tx, runtime.deployment); err != nil {
+			_ = tx.Rollback(context.Background())
+			return ErrRuntimeUnavailable
+		}
+		_ = tx.Rollback(context.Background())
 	}
 	return nil
 }

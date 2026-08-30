@@ -5,6 +5,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -46,7 +47,10 @@ type Error struct {
 	Operation string
 	Retryable bool
 	Uncertain bool
-	Message   string
+	// RetryAfter is bounded provider guidance for read-only callers. Financial
+	// mutation callers must still use their durable query-before-retry policy.
+	RetryAfter time.Duration
+	Message    string
 }
 
 func (e *Error) Error() string {
@@ -89,6 +93,72 @@ type Payment struct {
 	CapturedMinor     int64     `json:"captured_minor"`
 	RefundedMinor     int64     `json:"refunded_minor"`
 	ProviderUpdatedAt time.Time `json:"provider_updated_at"`
+}
+
+// FinancialExpectation is the server-owned monetary identity against which a
+// provider observation is evaluated. Callers must source it from durable
+// merchant state, never from the provider response being authorized to cause
+// a financial or inventory transition.
+type FinancialExpectation struct {
+	AmountMinor int64
+	Currency    string
+}
+
+// FinancialObservation is the smallest provider-neutral monetary snapshot
+// shared by synchronous operations, status queries, webhooks, and
+// reconciliation.
+type FinancialObservation struct {
+	Status        Status
+	AmountMinor   int64
+	Currency      string
+	CapturedMinor int64
+	RefundedMinor int64
+}
+
+var ErrInconsistentFinancialObservation = errors.New("payment provider financial observation is inconsistent")
+
+// EvaluateFinancialObservation is a pure, fail-closed evaluator. It performs
+// no I/O and returns the same bounded error for all inconsistencies so provider
+// payloads can never escape through an error message.
+func EvaluateFinancialObservation(expectation FinancialExpectation, observation FinancialObservation) error {
+	if expectation.AmountMinor <= 0 || !validFinancialCurrency(expectation.Currency) ||
+		observation.AmountMinor != expectation.AmountMinor || observation.Currency != expectation.Currency ||
+		observation.CapturedMinor < 0 || observation.RefundedMinor < 0 ||
+		observation.CapturedMinor > observation.AmountMinor || observation.RefundedMinor > observation.CapturedMinor {
+		return ErrInconsistentFinancialObservation
+	}
+	switch observation.Status {
+	case StatusCreated, StatusRequiresCustomerAction, StatusAuthorized, StatusVoided, StatusFailed, StatusCancelled:
+		if observation.CapturedMinor != 0 || observation.RefundedMinor != 0 {
+			return ErrInconsistentFinancialObservation
+		}
+	case StatusCaptured:
+		if observation.CapturedMinor != observation.AmountMinor || observation.RefundedMinor != 0 {
+			return ErrInconsistentFinancialObservation
+		}
+	case StatusRefunded:
+		if observation.CapturedMinor != observation.AmountMinor || observation.RefundedMinor != observation.AmountMinor {
+			return ErrInconsistentFinancialObservation
+		}
+	case StatusUnknown:
+		// Unknown is never authority to advance state, but its bounded totals
+		// remain useful evidence for manual reconciliation.
+	default:
+		return ErrInconsistentFinancialObservation
+	}
+	return nil
+}
+
+func validFinancialCurrency(currency string) bool {
+	if len(currency) != 3 {
+		return false
+	}
+	for _, character := range currency {
+		if character < 'A' || character > 'Z' {
+			return false
+		}
+	}
+	return true
 }
 
 type AuthorizeRequest struct {
@@ -142,6 +212,13 @@ type WebhookHeaders struct {
 
 type EventType string
 
+type WebhookEnvironment string
+
+const (
+	WebhookEnvironmentTest WebhookEnvironment = "test"
+	WebhookEnvironmentLive WebhookEnvironment = "live"
+)
+
 const (
 	EventCheckoutCreated EventType = "payment.checkout_created"
 	EventAuthorized      EventType = "payment.authorized"
@@ -152,14 +229,17 @@ const (
 )
 
 type WebhookEvent struct {
-	ProviderEventID   string    `json:"provider_event_id"`
-	Type              EventType `json:"type"`
-	OriginalType      string    `json:"-"`
-	ProviderPaymentID string    `json:"provider_payment_id"`
-	Status            Status    `json:"status"`
-	AmountMinor       int64     `json:"amount_minor"`
-	Currency          string    `json:"currency"`
-	OccurredAt        time.Time `json:"occurred_at"`
+	ProviderEventID   string             `json:"provider_event_id"`
+	VerifiedKeyID     string             `json:"-"`
+	ProviderAccountID string             `json:"-"`
+	Environment       WebhookEnvironment `json:"-"`
+	Type              EventType          `json:"type"`
+	OriginalType      string             `json:"-"`
+	ProviderPaymentID string             `json:"provider_payment_id"`
+	Status            Status             `json:"status"`
+	AmountMinor       int64              `json:"amount_minor"`
+	Currency          string             `json:"currency"`
+	OccurredAt        time.Time          `json:"occurred_at"`
 }
 
 // Client is the complete provider boundary used by the payment saga.

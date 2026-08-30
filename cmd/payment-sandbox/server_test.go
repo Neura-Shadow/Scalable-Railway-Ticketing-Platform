@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider"
+	providerhttp "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider/httpclient"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider/sandbox"
 )
 
@@ -171,6 +173,63 @@ func TestHTTPResponseLossCommitsOnceAndStatusQueryRecovers(t *testing.T) {
 	var replay provider.OperationResult
 	if status := doHTTPJSON(t, client, http.MethodPost, server.URL+"/v1/payments/"+checkout.ProviderPaymentID+"/capture", captureBody, &replay); status != http.StatusOK || replay.Status != provider.StatusCaptured {
 		t.Fatalf("capture replay = %d, %#v", status, replay)
+	}
+}
+
+func TestHTTPRefundLookupIsExactAndReadOnly(t *testing.T) {
+	t.Parallel()
+	service := newHTTPService(t, nil)
+	handler, err := newHandler(service, handlerConfig{maxBodyBytes: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	client, err := providerhttp.New(providerhttp.Config{
+		BaseURL: server.URL, ConnectTimeout: time.Second, RequestTimeout: 2 * time.Second,
+		MaxResponseBytes: 4096,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	checkout, err := client.CreateCheckout(context.Background(), provider.CreateCheckoutRequest{
+		PaymentIntentID: "intent-lookup", MerchantReference: "booking-lookup", AmountMinor: 100,
+		Currency: "TWD", IdempotencyKey: "checkout-lookup",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = client.Authorize(context.Background(), provider.AuthorizeRequest{
+		PaymentIntentID: "intent-lookup", ProviderPaymentID: checkout.ProviderPaymentID,
+		SyntheticToken: checkout.SyntheticToken, AmountMinor: 100, Currency: "TWD", IdempotencyKey: "authorize-lookup",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = client.Capture(context.Background(), provider.CaptureRequest{
+		PaymentIntentID: "intent-lookup", ProviderPaymentID: checkout.ProviderPaymentID,
+		AmountMinor: 100, Currency: "TWD", IdempotencyKey: "capture-lookup",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metadata := provider.Metadata{"refund_request_id": "request-lookup", "refund_operation_id": "operation-lookup", "refund_idempotency_key": "refund-lookup"}
+	refunded, err := client.Refund(context.Background(), provider.RefundRequest{
+		PaymentIntentID: "intent-lookup", ProviderPaymentID: checkout.ProviderPaymentID,
+		AmountMinor: 50, Currency: "TWD", IdempotencyKey: "refund-lookup", Metadata: metadata,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookup, err := client.LookupRefund(context.Background(), provider.RefundLookupRequest{
+		PaymentIntentID: "intent-lookup", ProviderPaymentID: checkout.ProviderPaymentID,
+		AmountMinor: 50, Currency: "TWD", IdempotencyKey: "refund-lookup", Metadata: metadata, Limit: 100,
+	})
+	if err != nil || !lookup.Found || !lookup.Definitive || lookup.Refund != refunded {
+		t.Fatalf("LookupRefund() = %#v, %v; want %#v", lookup, err, refunded)
+	}
+	status, err := client.GetPaymentStatus(context.Background(), checkout.ProviderPaymentID)
+	if err != nil || status.RefundedMinor != 50 {
+		t.Fatalf("lookup replayed mutation: status=%#v err=%v", status, err)
 	}
 }
 

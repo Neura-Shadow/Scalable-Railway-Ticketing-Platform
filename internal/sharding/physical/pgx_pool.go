@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/postgresx"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -77,6 +78,18 @@ func (pool *localTimeoutPool) PoolSnapshot() PoolSnapshot {
 // Parse and construction failures intentionally collapse to ErrInvalidRegistry
 // so a DSN can never enter an error returned to callers.
 func OpenPGXPool(ctx context.Context, dsn string, limits PoolLimits) (Pool, error) {
+	return openPGXPool(ctx, dsn, limits, nil)
+}
+
+// RegionalPGXPoolFactory binds every physical connection to the same bounded
+// process authority identity used by the control pool.
+func RegionalPGXPoolFactory(session postgresx.RegionalSession) PoolFactory {
+	return func(ctx context.Context, dsn string, limits PoolLimits) (Pool, error) {
+		return openPGXPool(ctx, dsn, limits, &session)
+	}
+}
+
+func openPGXPool(ctx context.Context, dsn string, limits PoolLimits, session *postgresx.RegionalSession) (Pool, error) {
 	if ctx == nil || limits.MaxOpenConns < 1 || limits.MaxOpenConns > 100 ||
 		limits.MaxIdleConns < 0 || limits.MaxIdleConns > limits.MaxOpenConns ||
 		!validLocalTimeouts(limits.StatementTimeout, limits.LockTimeout) {
@@ -85,6 +98,11 @@ func OpenPGXPool(ctx context.Context, dsn string, limits PoolLimits) (Pool, erro
 	config, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, ErrInvalidRegistry
+	}
+	if session != nil {
+		if err := postgresx.ApplyRegionalSession(config.ConnConfig, *session); err != nil {
+			return nil, ErrInvalidRegistry
+		}
 	}
 	config.MaxConns = int32(limits.MaxOpenConns)
 	// pgxpool has no MaxIdleConns setting. MaxConns is also the hard idle

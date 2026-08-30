@@ -41,6 +41,9 @@ var tableOrder = []string{
 	"payment_refund_receipts",
 	"payment_compensation_receipts",
 	"outbox_events",
+	"ticket_refund_prepare_receipts",
+	"ticket_refund_compensation_receipts",
+	"selected_ticket_refund_receipts",
 }
 
 // Adapter performs each source or target mutation in one database-local
@@ -70,13 +73,13 @@ func validSource(value string) bool {
 func (adapter *Adapter) Preflight(ctx context.Context, record physicalmigration.Record) error {
 	if adapter == nil || record.SourceShardID != adapter.sourceID || !validSource(record.SourceShardID) ||
 		record.SourceProtocolVersion != 1 || record.SourceSchemaVersion != 8 ||
-		record.TargetProtocolVersion != 1 || record.TargetSchemaVersion != 2 {
+		record.TargetProtocolVersion != 1 || record.TargetSchemaVersion != 3 {
 		return physicalmigration.ErrCheckpointConflict
 	}
 	var sourceReady bool
 	if err := adapter.control.QueryRow(ctx, `
 SELECT current_setting('server_version_num')::integer >= 160000
-   AND EXISTS (SELECT 1 FROM public.schema_migrations WHERE version=10 AND NOT dirty)
+   AND EXISTS (SELECT 1 FROM public.schema_migrations WHERE version=11 AND NOT dirty)
    AND to_regclass('public.physical_source_migration_capture_state') IS NOT NULL
    AND to_regclass('public.physical_source_train_run_mutation_journal') IS NOT NULL
    AND to_regclass('public.physical_source_booking_command_receipt_rows') IS NOT NULL
@@ -84,12 +87,23 @@ SELECT current_setting('server_version_num')::integer >= 160000
    AND to_regclass('public.physical_source_ticket_issuance_receipt_rows') IS NOT NULL
    AND to_regclass('public.physical_source_payment_refund_receipt_rows') IS NOT NULL
    AND to_regclass('public.physical_source_payment_compensation_receipt_rows') IS NOT NULL
+   AND to_regclass('public.physical_source_ticket_refund_prepare_receipt_rows') IS NOT NULL
+   AND to_regclass('public.physical_source_ticket_refund_compensation_receipt_rows') IS NOT NULL
+   AND to_regclass('public.physical_source_selected_ticket_refund_receipt_rows') IS NOT NULL
+   AND to_regprocedure('public.guard_control_ticket_refund_evidence_mutation()') IS NOT NULL
+   AND EXISTS (
+       SELECT 1 FROM public.regional_write_authority
+       WHERE singleton AND state='active' AND writes_enabled
+   )
    AND NOT EXISTS (
        SELECT 1
        FROM (VALUES
            ('booking_command_receipts'), ('payment_command_receipts'),
            ('ticket_issuance_receipts'), ('payment_refund_receipts'),
-           ('payment_compensation_receipts')
+           ('payment_compensation_receipts'),
+           ('ticket_refund_prepare_receipts'),
+           ('ticket_refund_compensation_receipts'),
+           ('selected_ticket_refund_receipts')
        ) AS required(table_name)
        WHERE NOT EXISTS (
            SELECT 1
@@ -104,6 +118,27 @@ SELECT current_setting('server_version_num')::integer >= 160000
              END
              AND table_row.relname=required.table_name
              AND trigger_row.tgname='physical_source_capture'
+       )
+   )
+   AND NOT EXISTS (
+       SELECT 1
+       FROM (VALUES
+           ('ticket_refund_prepare_receipts','ticket_refund_prepare_receipts_guard_evidence'),
+           ('ticket_refund_compensation_receipts','ticket_refund_compensation_receipts_guard_evidence'),
+           ('selected_ticket_refund_receipts','selected_ticket_refund_receipts_guard_evidence')
+       ) AS required(table_name,trigger_name)
+       WHERE NOT EXISTS (
+           SELECT 1 FROM pg_catalog.pg_trigger AS trigger_row
+           JOIN pg_catalog.pg_class AS table_row ON table_row.oid=trigger_row.tgrelid
+           JOIN pg_catalog.pg_namespace AS schema_row ON schema_row.oid=table_row.relnamespace
+           WHERE NOT trigger_row.tgisinternal
+             AND schema_row.nspname=CASE $2
+                 WHEN 'legacy' THEN 'public'
+                 WHEN 'shard-0' THEN 'booking_shard_0'
+                 WHEN 'shard-1' THEN 'booking_shard_1'
+             END
+             AND table_row.relname=required.table_name
+             AND trigger_row.tgname=required.trigger_name
        )
    )
    AND assignment.shard_id = $2
@@ -128,7 +163,7 @@ WHERE assignment.train_run_id = $1`, record.TrainRunID, adapter.sourceID,
 SELECT current_setting('server_version_num')::integer >= 160000
 	AND EXISTS (
 	    SELECT 1 FROM public.schema_migrations
-	    WHERE version = 2 AND NOT dirty
+	    WHERE version = 3 AND NOT dirty
 	)
    AND to_regclass('public.train_run_booking_snapshots') IS NOT NULL
    AND to_regclass('public.migration_apply_receipts') IS NOT NULL
@@ -138,6 +173,14 @@ SELECT current_setting('server_version_num')::integer >= 160000
 	AND to_regclass('public.ticket_issuance_receipts') IS NOT NULL
 	AND to_regclass('public.payment_refund_receipts') IS NOT NULL
 	AND to_regclass('public.payment_compensation_receipts') IS NOT NULL
+	AND to_regclass('public.ticket_refund_prepare_receipts') IS NOT NULL
+	AND to_regclass('public.ticket_refund_compensation_receipts') IS NOT NULL
+	AND to_regclass('public.selected_ticket_refund_receipts') IS NOT NULL
+	AND to_regclass('public.migration_evidence_mutation_authorizations') IS NOT NULL
+	AND EXISTS (
+	    SELECT 1 FROM public.regional_write_authority
+	    WHERE singleton AND state = 'active' AND writes_enabled
+	)
 	AND NOT EXISTS (
 	    SELECT 1 FROM (VALUES
 	        ('train_run_booking_snapshots_capture_mutation'),
@@ -153,7 +196,10 @@ SELECT current_setting('server_version_num')::integer >= 160000
 	        ('payment_command_receipts_capture_mutation'),
 	        ('ticket_issuance_receipts_capture_mutation'),
 	        ('payment_refund_receipts_capture_mutation'),
-	        ('payment_compensation_receipts_capture_mutation')
+	        ('payment_compensation_receipts_capture_mutation'),
+	        ('ticket_refund_prepare_receipts_capture_mutation'),
+	        ('ticket_refund_compensation_receipts_capture_mutation'),
+	        ('selected_ticket_refund_receipts_capture_mutation')
 	    ) AS required(trigger_name)
 	    WHERE NOT EXISTS (
 	        SELECT 1 FROM pg_catalog.pg_trigger
@@ -163,6 +209,10 @@ SELECT current_setting('server_version_num')::integer >= 160000
    AND NOT EXISTS (
        SELECT 1 FROM public.train_run_write_fences
        WHERE train_run_id = $1 AND write_enabled
+   )
+   AND NOT EXISTS (
+       SELECT 1 FROM public.train_run_booking_snapshots
+       WHERE train_run_id = $1 AND NOT isfinite(scheduled_departure_at)
    )`, record.TrainRunID).Scan(&targetReady); err != nil || !targetReady {
 		return physicalmigration.ErrCheckpointConflict
 	}
@@ -314,7 +364,6 @@ LIMIT $7`, request.Migration.MigrationID, request.Migration.TrainRunID,
 		if !knownTable(entry.TableName) {
 			return physicalmigration.JournalBatch{}, physicalmigration.ErrInvalidBatch
 		}
-		entry.ApplyFingerprint = entryFingerprint(entry)
 		batch.Entries = append(batch.Entries, entry)
 	}
 	if err := rows.Err(); err != nil {
@@ -339,6 +388,9 @@ LIMIT $7`, request.Migration.MigrationID, request.Migration.TrainRunID,
 		}
 		payload := rowBatch.Payload.(physicalpostgres.BasePayload)
 		entry.Payload = payload.Rows[0].Data
+	}
+	for index := range batch.Entries {
+		batch.Entries[index].ApplyFingerprint = entryFingerprint(batch.Entries[index])
 	}
 	return batch, nil
 }
@@ -666,6 +718,10 @@ func entryFingerprint(entry physicalmigration.JournalEntry) [32]byte {
 	_, _ = hash.Write(entry.EntityID[:])
 	_, _ = hash.Write(entry.PrimaryKey)
 	_, _ = hash.Write(entry.Metadata)
+	if payload, ok := entry.Payload.([]byte); ok {
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write(payload)
+	}
 	var result [32]byte
 	copy(result[:], hash.Sum(nil))
 	return result

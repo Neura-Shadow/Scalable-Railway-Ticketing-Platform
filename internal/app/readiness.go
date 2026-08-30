@@ -5,6 +5,8 @@ import (
 	"errors"
 
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/regional/authority"
+	authoritypostgres "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/regional/authority/postgres"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding"
 	shardphysical "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/sharding/physical"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/transport/httpapi"
@@ -16,7 +18,7 @@ import (
 type readinessProbe func(context.Context) error
 type migrationProbe func(context.Context) (int, bool, error)
 
-const currentSchemaVersion = 10
+const currentSchemaVersion = 11
 
 const shardReadinessQuery = `
 SELECT
@@ -48,10 +50,21 @@ type namedReadinessProbe struct {
 }
 
 type ReadinessChecker struct {
-	postgres, redis, shards readinessProbe
-	migrations              migrationProbe
-	configuration           func() error
-	physical                []namedReadinessProbe
+	postgres, redis, shards, regional readinessProbe
+	migrations                        migrationProbe
+	configuration                     func() error
+	physical                          []namedReadinessProbe
+	additional                        []namedReadinessProbe
+	physicalRequired                  bool
+}
+
+// WithProbe adds a bounded process-owned readiness invariant. It is used for
+// dependencies whose durable state is assembled after the base checker.
+func (r *ReadinessChecker) WithProbe(name string, probe func(context.Context) error) *ReadinessChecker {
+	if r != nil && name != "" && probe != nil {
+		r.additional = append(r.additional, namedReadinessProbe{name: name, probe: probe})
+	}
+	return r
 }
 
 func NewReadinessChecker(
@@ -60,6 +73,13 @@ func NewReadinessChecker(
 	cfg config.Config,
 	physicalRegistries ...*shardphysical.Registry,
 ) *ReadinessChecker {
+	region, regionErr := authority.ParseRegion(string(cfg.DeploymentRegion))
+	var epoch authority.Epoch
+	epochErr := errors.New("regional epoch invalid")
+	if cfg.RegionEpoch > 0 {
+		epoch, epochErr = authority.NewEpoch(uint64(cfg.RegionEpoch))
+	}
+	deployment, deploymentErr := authority.NewDeployment(region, authority.Role(cfg.DeploymentRole), epoch, cfg.RegionalWritesEnabled)
 	postgresProbe := func(ctx context.Context) error {
 		if pool == nil {
 			return errors.New("postgres unavailable")
@@ -106,16 +126,31 @@ func NewReadinessChecker(
 		}
 		return nil
 	}
+	regionalProbe := func(ctx context.Context) error {
+		if pool == nil || regionErr != nil || epochErr != nil || deploymentErr != nil {
+			return errors.New("regional authority unavailable")
+		}
+		if err := authoritypostgres.CheckActiveReadiness(ctx, pool, deployment); err != nil {
+			return errors.New("regional authority unavailable")
+		}
+		return nil
+	}
 	checker := newReadinessChecker(postgresProbe, redisProbe, migrationsProbe, shardProbe, cfg.Validate)
+	checker.regional = regionalProbe
+	checker.physicalRequired = cfg.DeploymentRole == config.DeploymentRoleActive && cfg.DRRequiredDatabaseCount == 3
 	if cfg.BookingShardMode == config.BookingShardModePhysical && len(physicalRegistries) == 1 && physicalRegistries[0] != nil {
-		for _, rawShardID := range cfg.BookingShardIDs {
+		probeShardIDs := cfg.BookingShardIDs
+		if checker.physicalRequired {
+			probeShardIDs = []string{"physical-shard-0", "physical-shard-1"}
+		}
+		for _, rawShardID := range probeShardIDs {
 			shardID, err := sharding.ParseShardID(rawShardID)
 			if err != nil {
 				continue
 			}
 			checker.physical = append(checker.physical, namedReadinessProbe{
 				name:  rawShardID,
-				probe: physicalShardReadiness(pool, physicalRegistries[0], shardID),
+				probe: physicalShardReadiness(pool, physicalRegistries[0], shardID, deployment),
 			})
 		}
 	}
@@ -126,6 +161,7 @@ func physicalShardReadiness(
 	control *pgxpool.Pool,
 	registry *shardphysical.Registry,
 	shardID sharding.ShardID,
+	deployment authority.Deployment,
 ) readinessProbe {
 	return func(ctx context.Context) error {
 		if control == nil || registry == nil {
@@ -165,6 +201,9 @@ WHERE shard_id = $1`, shardID.String()).Scan(
 		); err != nil || version != int(shardphysical.SupportedSchemaVersion) || dirty {
 			return errors.New("physical shard migration unavailable")
 		}
+		if err := authoritypostgres.CheckActiveReadiness(ctx, tx, deployment); err != nil {
+			return errors.New("physical shard authority unavailable")
+		}
 		return nil
 	}
 }
@@ -185,6 +224,7 @@ func (r *ReadinessChecker) CheckReadiness(ctx context.Context) ([]httpapi.Readin
 		{Name: "migrations"},
 		{Name: "shard_catalog"},
 		{Name: "configuration"},
+		{Name: "regional_authority"},
 	}
 	if r == nil {
 		return checks, nil
@@ -197,11 +237,17 @@ func (r *ReadinessChecker) CheckReadiness(ctx context.Context) ([]httpapi.Readin
 	}
 	checks[3].Ready = r.shards != nil && r.shards(ctx) == nil
 	checks[4].Ready = r.configuration != nil && r.configuration() == nil
+	checks[5].Ready = r.regional != nil && r.regional(ctx) == nil
 	for _, physical := range r.physical {
 		checks = append(checks, httpapi.ReadinessCheck{
 			Name:     "booking_" + physical.name,
 			Ready:    physical.probe != nil && physical.probe(ctx) == nil,
-			Optional: true,
+			Optional: !r.physicalRequired,
+		})
+	}
+	for _, additional := range r.additional {
+		checks = append(checks, httpapi.ReadinessCheck{
+			Name: additional.name, Ready: additional.probe(ctx) == nil,
 		})
 	}
 	return checks, nil

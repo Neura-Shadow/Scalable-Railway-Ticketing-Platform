@@ -3,14 +3,18 @@ name: scalable-railway-ticketing-platform-physical-shards
 # Local, single-region Milestone 5 evidence topology. All credential defaults
 # below are synthetic and must never be reused outside an isolated workstation.
 x-control-dsn: &control-dsn
-  DATABASE_URL: ${CONTROL_DATABASE_URL:-postgresql://railway_control:control-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3}
+  DATABASE_URL: ${CONTROL_DATABASE_URL:-postgresql://railway_runtime:runtime-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3}
   CONTROL_DATABASE_MAX_OPEN_CONNS: 4
+  DEPLOYMENT_REGION: region-a
+  DEPLOYMENT_ROLE: ${REGION_A_DEPLOYMENT_ROLE:-active}
+  REGION_EPOCH: ${REGION_A_EPOCH:-1}
+  REGIONAL_WRITES_ENABLED: ${REGION_A_WRITES_ENABLED:-true}
 
 x-physical-shard-dsns: &physical-shard-dsns
   BOOKING_SHARD_MODE: physical
   BOOKING_SHARD_IDS: physical-shard-0,physical-shard-1
-  BOOKING_SHARD_0_DATABASE_URL: ${BOOKING_SHARD_0_DATABASE_URL:-postgresql://railway_booking:shard-0-local-only@booking-shard-0-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
-  BOOKING_SHARD_1_DATABASE_URL: ${BOOKING_SHARD_1_DATABASE_URL:-postgresql://railway_booking:shard-1-local-only@booking-shard-1-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
+  BOOKING_SHARD_0_DATABASE_URL: ${BOOKING_SHARD_0_DATABASE_URL:-postgresql://railway_runtime:runtime-local-only@booking-shard-0-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
+  BOOKING_SHARD_1_DATABASE_URL: ${BOOKING_SHARD_1_DATABASE_URL:-postgresql://railway_runtime:runtime-local-only@booking-shard-1-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
   PHYSICAL_SHARD_MAX_COUNT: 2
   PHYSICAL_SHARD_MAX_OPEN_CONNS: 3
   PHYSICAL_SHARD_MAX_IDLE_CONNS: 2
@@ -34,15 +38,15 @@ x-physical-shard-dsns: &physical-shard-dsns
 
 x-app-security: &app-security
   read_only: true
-  tmpfs:
+  tmpfs: !override
     - /tmp:size=16m,mode=1777
-  security_opt:
+  security_opt: !override
     - no-new-privileges:true
-  cap_drop:
+  cap_drop: !override
     - ALL
   init: true
   restart: unless-stopped
-  networks:
+  networks: !override
     - backend
 
 x-api-common: &api-common
@@ -90,6 +94,12 @@ x-api-common: &api-common
       condition: service_completed_successfully
     bootstrap-booking-shard-1:
       condition: service_completed_successfully
+    runtime-control-role:
+      condition: service_completed_successfully
+    runtime-booking-shard-0-role:
+      condition: service_completed_successfully
+    runtime-booking-shard-1-role:
+      condition: service_completed_successfully
     redis:
       condition: service_healthy
   networks:
@@ -135,6 +145,97 @@ x-read-model-worker-common: &read-model-worker-common
   depends_on: *application-dependencies
 
 services:
+  runtime-control-role:
+    image: postgres:16-alpine
+    environment: {PGPASSWORD: "${CONTROL_POSTGRES_PASSWORD:-control-local-only}"}
+    command:
+      - sh
+      - -ec
+      - |
+        for attempt in 1 2 3 4 5; do
+        if psql -h control-postgres -U railway_control -d railway_control -v ON_ERROR_STOP=1 <<'SQL'
+        DO $$$$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='railway_runtime') THEN CREATE ROLE railway_runtime LOGIN PASSWORD 'runtime-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT; END IF; END $$$$;
+        DO $$$$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='railway_backup_admin') THEN CREATE ROLE railway_backup_admin LOGIN PASSWORD 'backup-admin-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION; END IF; END $$$$;
+        GRANT CONNECT ON DATABASE railway_control TO railway_runtime;
+        GRANT USAGE ON SCHEMA public TO railway_runtime;
+        GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO railway_runtime;
+        GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO railway_runtime;
+        ALTER DEFAULT PRIVILEGES FOR ROLE railway_control IN SCHEMA public GRANT SELECT,INSERT,UPDATE,DELETE ON TABLES TO railway_runtime;
+        ALTER DEFAULT PRIVILEGES FOR ROLE railway_control IN SCHEMA public GRANT USAGE,SELECT ON SEQUENCES TO railway_runtime;
+        REVOKE ALL ON public.regional_write_authority,public.regional_failover_operations,public.backup_artifacts,public.backup_operations,public.backup_verifications,public.restore_validations,public.backup_expiration_operations FROM railway_runtime;
+        GRANT SELECT ON public.schema_migrations,public.regional_write_authority TO railway_runtime;
+        GRANT EXECUTE ON FUNCTION public.lock_regional_write_authority() TO railway_runtime;
+        GRANT CONNECT ON DATABASE railway_control TO railway_backup_admin;
+        GRANT USAGE ON SCHEMA public TO railway_backup_admin;
+        REVOKE ALL ON ALL TABLES IN SCHEMA public FROM railway_backup_admin;
+        GRANT SELECT,INSERT,UPDATE ON public.backup_artifacts,public.backup_operations,public.backup_verifications,public.restore_validations,public.backup_expiration_operations TO railway_backup_admin;
+        GRANT SELECT ON public.schema_migrations,public.regional_write_authority TO railway_backup_admin;
+        GRANT EXECUTE ON FUNCTION public.lock_regional_write_authority() TO railway_backup_admin;
+        SQL
+        then exit 0; fi
+        test "$$attempt" -lt 5
+        sleep 1
+        done
+    depends_on: {migrate-control: {condition: service_completed_successfully}}
+    networks: [backend]
+    restart: "no"
+
+  runtime-booking-shard-0-role:
+    image: postgres:16-alpine
+    environment: {PGPASSWORD: "${BOOKING_SHARD_0_POSTGRES_PASSWORD:-shard-0-local-only}"}
+    command:
+      - sh
+      - -ec
+      - |
+        for attempt in 1 2 3 4 5; do
+        if psql -h booking-shard-0-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 <<'SQL'
+        DO $$$$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='railway_runtime') THEN CREATE ROLE railway_runtime LOGIN PASSWORD 'runtime-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT; END IF; END $$$$;
+        GRANT CONNECT ON DATABASE railway_booking TO railway_runtime;
+        GRANT USAGE ON SCHEMA public TO railway_runtime;
+        GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO railway_runtime;
+        GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO railway_runtime;
+        ALTER DEFAULT PRIVILEGES FOR ROLE railway_booking IN SCHEMA public GRANT SELECT,INSERT,UPDATE,DELETE ON TABLES TO railway_runtime;
+        ALTER DEFAULT PRIVILEGES FOR ROLE railway_booking IN SCHEMA public GRANT USAGE,SELECT ON SEQUENCES TO railway_runtime;
+        REVOKE ALL ON public.regional_write_authority FROM railway_runtime;
+        GRANT SELECT ON public.schema_migrations,public.regional_write_authority TO railway_runtime;
+        GRANT EXECUTE ON FUNCTION public.lock_regional_write_authority() TO railway_runtime;
+        SQL
+        then exit 0; fi
+        test "$$attempt" -lt 5
+        sleep 1
+        done
+    depends_on: {migrate-booking-shard-0: {condition: service_completed_successfully}}
+    networks: [backend]
+    restart: "no"
+
+  runtime-booking-shard-1-role:
+    image: postgres:16-alpine
+    environment: {PGPASSWORD: "${BOOKING_SHARD_1_POSTGRES_PASSWORD:-shard-1-local-only}"}
+    command:
+      - sh
+      - -ec
+      - |
+        for attempt in 1 2 3 4 5; do
+        if psql -h booking-shard-1-postgres -U railway_booking -d railway_booking -v ON_ERROR_STOP=1 <<'SQL'
+        DO $$$$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='railway_runtime') THEN CREATE ROLE railway_runtime LOGIN PASSWORD 'runtime-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT; END IF; END $$$$;
+        GRANT CONNECT ON DATABASE railway_booking TO railway_runtime;
+        GRANT USAGE ON SCHEMA public TO railway_runtime;
+        GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO railway_runtime;
+        GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO railway_runtime;
+        ALTER DEFAULT PRIVILEGES FOR ROLE railway_booking IN SCHEMA public GRANT SELECT,INSERT,UPDATE,DELETE ON TABLES TO railway_runtime;
+        ALTER DEFAULT PRIVILEGES FOR ROLE railway_booking IN SCHEMA public GRANT USAGE,SELECT ON SEQUENCES TO railway_runtime;
+        REVOKE ALL ON public.regional_write_authority FROM railway_runtime;
+        GRANT SELECT ON public.schema_migrations,public.regional_write_authority TO railway_runtime;
+        GRANT EXECUTE ON FUNCTION public.lock_regional_write_authority() TO railway_runtime;
+        SQL
+        then exit 0; fi
+        test "$$attempt" -lt 5
+        sleep 1
+        done
+    depends_on: {migrate-booking-shard-1: {condition: service_completed_successfully}}
+    networks: [backend]
+    restart: "no"
+
   control-postgres:
     image: postgres:16-alpine
     environment:
@@ -300,6 +401,10 @@ services:
       context: .
       target: physical-shard-admin
     environment:
+      DEPLOYMENT_REGION: region-a
+      DEPLOYMENT_ROLE: active
+      REGION_EPOCH: "1"
+      REGIONAL_WRITES_ENABLED: "true"
       CONTROL_DATABASE_URL: ${CONTROL_DATABASE_URL:-postgresql://railway_control:control-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3}
       BOOKING_SHARD_0_DATABASE_URL: ${BOOKING_SHARD_0_DATABASE_URL:-postgresql://railway_booking:shard-0-local-only@booking-shard-0-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
       BOOKING_SHARD_1_DATABASE_URL: ${BOOKING_SHARD_1_DATABASE_URL:-postgresql://railway_booking:shard-1-local-only@booking-shard-1-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
@@ -319,6 +424,10 @@ services:
       context: .
       target: physical-shard-admin
     environment:
+      DEPLOYMENT_REGION: region-a
+      DEPLOYMENT_ROLE: active
+      REGION_EPOCH: "1"
+      REGIONAL_WRITES_ENABLED: "true"
       CONTROL_DATABASE_URL: ${CONTROL_DATABASE_URL:-postgresql://railway_control:control-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3}
       BOOKING_SHARD_0_DATABASE_URL: ${BOOKING_SHARD_0_DATABASE_URL:-postgresql://railway_booking:shard-0-local-only@booking-shard-0-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
       BOOKING_SHARD_1_DATABASE_URL: ${BOOKING_SHARD_1_DATABASE_URL:-postgresql://railway_booking:shard-1-local-only@booking-shard-1-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
@@ -417,6 +526,10 @@ services:
       context: .
       target: physical-shard-admin
     environment:
+      DEPLOYMENT_REGION: region-a
+      DEPLOYMENT_ROLE: ${REGION_A_DEPLOYMENT_ROLE:-active}
+      REGION_EPOCH: ${REGION_A_EPOCH:-1}
+      REGIONAL_WRITES_ENABLED: ${REGION_A_WRITES_ENABLED:-true}
       CONTROL_DATABASE_URL: ${CONTROL_DATABASE_URL:-postgresql://railway_control:control-local-only@control-postgres:5432/railway_control?sslmode=disable&connect_timeout=3}
       BOOKING_SHARD_0_DATABASE_URL: ${BOOKING_SHARD_0_DATABASE_URL:-postgresql://railway_booking:shard-0-local-only@booking-shard-0-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}
       BOOKING_SHARD_1_DATABASE_URL: ${BOOKING_SHARD_1_DATABASE_URL:-postgresql://railway_booking:shard-1-local-only@booking-shard-1-postgres:5432/railway_booking?sslmode=disable&connect_timeout=3}

@@ -41,6 +41,10 @@ func TestLoadConfigUsesBoundedIndependentConnections(t *testing.T) {
 		"DATABASE_URL":                          "postgres://control/db",
 		"BOOKING_SHARD_0_DATABASE_URL":          "postgres://shard-0/db",
 		"BOOKING_SHARD_1_DATABASE_URL":          "postgres://shard-1/db",
+		"DEPLOYMENT_REGION":                     "region-a",
+		"DEPLOYMENT_ROLE":                       "active",
+		"REGION_EPOCH":                          "1",
+		"REGIONAL_WRITES_ENABLED":               "true",
 		"BOOKING_COMMAND_RECONCILER_ID":         "reconciler-1",
 		"BOOKING_COMMAND_RECONCILER_BATCH_SIZE": "25",
 		"BOOKING_COMMAND_RECONCILER_LEASE_TTL":  "45s",
@@ -64,6 +68,8 @@ func TestLoadConfigRejectsUnboundedOrAliasedShardSettings(t *testing.T) {
 	base := map[string]string{
 		"DATABASE_URL": "postgres://control/db", "BOOKING_SHARD_0_DATABASE_URL": "postgres://same/db",
 		"BOOKING_SHARD_1_DATABASE_URL": "postgres://same/db",
+		"DEPLOYMENT_REGION":            "region-a", "DEPLOYMENT_ROLE": "active", "REGION_EPOCH": "1",
+		"REGIONAL_WRITES_ENABLED": "true",
 	}
 	if _, err := loadConfig(mapLookup(base)); err == nil {
 		t.Fatal("loadConfig() accepted aliased shard connections")

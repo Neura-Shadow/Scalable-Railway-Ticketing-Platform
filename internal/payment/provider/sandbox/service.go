@@ -87,6 +87,17 @@ type Service struct {
 	stateFailed     bool
 }
 
+func (service *Service) Descriptor() provider.Descriptor {
+	return Descriptor()
+}
+
+func Descriptor() provider.Descriptor {
+	capabilities := provider.SagaCapabilities()
+	capabilities.PartialRefund = true
+	capabilities.WebhookKeyRotation = true
+	return provider.Descriptor{Name: "sandbox", APIVersion: "v1", Capabilities: capabilities}
+}
+
 func New(config Config) (*Service, error) {
 	environment := strings.ToLower(strings.TrimSpace(config.Environment))
 	if environment == "production" && !config.AllowSandboxInProductionForDisposableTestOnly {
@@ -271,6 +282,49 @@ func (s *Service) Refund(ctx context.Context, request provider.RefundRequest) (p
 	return s.transition(ctx, OperationRefund, request.PaymentIntentID, request.ProviderPaymentID, request.AmountMinor, request.Currency, request.IdempotencyKey, request.Metadata, "")
 }
 
+// LookupRefund resolves only the exact durable idempotency identity supplied
+// for the original refund. It never calls Refund and therefore cannot replay a
+// hidden provider mutation while recovering an uncertain outcome.
+func (s *Service) LookupRefund(ctx context.Context, request provider.RefundLookupRequest) (provider.RefundLookupResult, error) {
+	if err := ctx.Err(); err != nil {
+		return provider.RefundLookupResult{}, transportError(OperationGetStatus, false)
+	}
+	if !validIdentifier(request.PaymentIntentID) || !validIdentifier(request.ProviderPaymentID) ||
+		!validIdentifier(request.IdempotencyKey) || request.AmountMinor <= 0 ||
+		normalizeCurrency(request.Currency) == "" || request.Limit < 1 || request.Limit > 100 {
+		return provider.RefundLookupResult{}, validationError(OperationGetStatus, "refund lookup identity is invalid")
+	}
+	if err := provider.ValidateMetadata(request.Metadata); err != nil {
+		return provider.RefundLookupResult{}, withOperation(err, OperationGetStatus)
+	}
+	expectedFingerprint := fingerprint(struct {
+		Operation Operation
+		IntentID  string
+		Payment   string
+		Amount    int64
+		Currency  string
+		Token     string
+		Metadata  provider.Metadata
+	}{OperationRefund, request.PaymentIntentID, request.ProviderPaymentID, request.AmountMinor,
+		normalizeCurrency(request.Currency), "", request.Metadata})
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fault := s.nextFault(OperationGetStatus, request.ProviderPaymentID)
+	if err := beforeFault(OperationGetStatus, fault); err != nil {
+		return provider.RefundLookupResult{}, err
+	}
+	replay, ok := s.idempotency[idempotencyIdentity(request.IdempotencyKey)]
+	if !ok {
+		return provider.RefundLookupResult{Definitive: true}, nil
+	}
+	if replay.fingerprint != expectedFingerprint || replay.operation.ProviderPaymentID != request.ProviderPaymentID ||
+		replay.operation.Status != provider.StatusRefunded {
+		return provider.RefundLookupResult{}, conflictError(OperationGetStatus)
+	}
+	return provider.RefundLookupResult{Found: true, Definitive: true, Refund: replay.operation}, nil
+}
+
 func (s *Service) transition(ctx context.Context, operation Operation, intentID, paymentID string, amount int64, currency, idempotencyKey string, metadata provider.Metadata, token string) (provider.OperationResult, error) {
 	if err := ctx.Err(); err != nil {
 		return provider.OperationResult{}, transportError(operation, false)
@@ -318,10 +372,13 @@ func (s *Service) transition(ctx context.Context, operation Operation, intentID,
 	if operation == OperationAuthorize && record.token != token {
 		return provider.OperationResult{}, validationError(operation, "synthetic payment token is invalid")
 	}
-	if operation != OperationVoid && (record.amount != amount || record.currency != normalizeCurrency(currency)) {
+	if operation != OperationVoid && operation != OperationRefund && (record.amount != amount || record.currency != normalizeCurrency(currency)) {
 		return provider.OperationResult{}, conflictError(operation)
 	}
-	nextStatus, eventType, err := validateTransition(record, operation)
+	if operation == OperationRefund && (record.currency != normalizeCurrency(currency) || amount > record.captured-record.refunded) {
+		return provider.OperationResult{}, conflictError(operation)
+	}
+	nextStatus, eventType, err := validateTransition(record, operation, amount)
 	if err != nil {
 		return provider.OperationResult{}, err
 	}
@@ -337,10 +394,15 @@ func (s *Service) transition(ctx context.Context, operation Operation, intentID,
 		record.captured = amount
 	}
 	if operation == OperationRefund {
-		record.refunded = amount
+		record.refunded += amount
+		if record.refunded < record.captured {
+			record.status = provider.StatusCaptured
+		}
 	}
 	s.idempotency[keyIdentity] = idempotentResult{fingerprint: fingerprint, operation: result}
-	s.enqueueWebhook(record, eventType, fault)
+	if eventType != provider.EventUnknown {
+		s.enqueueWebhook(record, eventType, fault)
+	}
 	if err := s.persistLocked(); err != nil {
 		s.restoreMutableStateLocked(previous)
 		s.stateFailed = true
@@ -352,7 +414,7 @@ func (s *Service) transition(ctx context.Context, operation Operation, intentID,
 	return result, nil
 }
 
-func validateTransition(record *paymentRecord, operation Operation) (provider.Status, provider.EventType, error) {
+func validateTransition(record *paymentRecord, operation Operation, amount int64) (provider.Status, provider.EventType, error) {
 	switch operation {
 	case OperationAuthorize:
 		if record.status != provider.StatusCreated && record.status != provider.StatusRequiresCustomerAction {
@@ -370,8 +432,12 @@ func validateTransition(record *paymentRecord, operation Operation) (provider.St
 		}
 		return provider.StatusVoided, provider.EventVoided, nil
 	case OperationRefund:
-		if record.status != provider.StatusCaptured || record.captured <= 0 || record.refunded != 0 {
+		if record.status != provider.StatusCaptured || record.captured <= 0 || amount <= 0 ||
+			record.refunded < 0 || record.refunded > record.captured || amount > record.captured-record.refunded {
 			return "", "", conflictError(operation)
+		}
+		if record.refunded+amount < record.captured {
+			return provider.StatusRefunded, provider.EventUnknown, nil
 		}
 		return provider.StatusRefunded, provider.EventRefunded, nil
 	default:
@@ -507,7 +573,11 @@ func withOperation(err error, operation Operation) error {
 }
 
 func paymentFrom(record *paymentRecord) provider.Payment {
-	return provider.Payment{ProviderPaymentID: record.id, Status: record.status, AmountMinor: record.amount, Currency: record.currency, CapturedMinor: record.captured, RefundedMinor: record.refunded, ProviderUpdatedAt: record.updatedAt}
+	status := record.status
+	if record.refunded > 0 && record.refunded < record.captured {
+		status = provider.StatusUnknown
+	}
+	return provider.Payment{ProviderPaymentID: record.id, Status: status, AmountMinor: record.amount, Currency: record.currency, CapturedMinor: record.captured, RefundedMinor: record.refunded, ProviderUpdatedAt: record.updatedAt}
 }
 
 func (s *Service) enqueueWebhook(record *paymentRecord, eventType provider.EventType, fault Fault) {
@@ -689,3 +759,4 @@ func validStatus(status provider.Status) bool {
 }
 
 var _ provider.Client = (*Service)(nil)
+var _ provider.RefundLookupReader = (*Service)(nil)

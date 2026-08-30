@@ -1,17 +1,159 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider"
+	providerhttp "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider/httpclient"
+	providerstripe "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/provider/stripe"
+	paymentrefund "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/refund"
+	paymentshard "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/shard"
 	paymentworker "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/payment/worker"
 	"github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/config"
 	platformmetrics "github.com/Neura-Shadow/Scalable-Railway-Ticketing-Platform/internal/platform/metrics"
+	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
+
+func TestPaymentFailureLogExcludesRawDatabaseError(t *testing.T) {
+	t.Parallel()
+	var output bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&output, nil))
+	result := paymentworker.Result{
+		Failures: 1,
+		FailureSummaries: []paymentworker.FailureSummary{{
+			Lane: paymentworker.FailureLaneClaimActions, Reason: paymentworker.FailureReasonStoreUnavailable,
+		}},
+	}
+	raw := errors.New("postgres://user:secret@example synthetic-password-never-log")
+
+	logPaymentPassFailure(logger, result, raw)
+	got := output.String()
+	if strings.Contains(got, "postgres://") || strings.Contains(got, "synthetic-password") {
+		t.Fatalf("payment failure log leaked raw database error: %s", got)
+	}
+	for _, want := range []string{"claim_actions", "store_unavailable", "failure_lanes", "failure_reasons"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("payment failure log = %s, want bounded value %q", got, want)
+		}
+	}
+}
+
+func TestExternalEffectCrashIsExactAndTestOnly(t *testing.T) {
+	t.Parallel()
+	target := uuid.New()
+	base := map[string]string{
+		"APP_ENV": "test",
+		"PAYMENT_WORKER_TEST_CRASH_AFTER_EFFECT_ENABLED": "true",
+		"PAYMENT_WORKER_TEST_CRASH_AFTER_EFFECT_POINT":   string(paymentworker.ExternalEffectCaptureCommitted),
+		"PAYMENT_WORKER_TEST_CRASH_TARGET_ID":            target.String(),
+	}
+	lookup := func(key string) (string, bool) { value, ok := base[key]; return value, ok }
+	exitCode := 0
+	hook := newTestExternalEffectCrash(lookup, func(code int) { exitCode = code })
+	hook.payment(paymentworker.ExternalEffectCaptureCommitted, uuid.New())
+	hook.refund(paymentrefund.ExternalEffectProviderRefundCommitted, target)
+	if exitCode != 0 {
+		t.Fatalf("non-matching crash barrier exited with %d", exitCode)
+	}
+	hook.payment(paymentworker.ExternalEffectCaptureCommitted, target)
+	if exitCode != 86 {
+		t.Fatalf("matching crash barrier exit = %d", exitCode)
+	}
+
+	base["APP_ENV"] = "production"
+	exitCode = 0
+	hook = newTestExternalEffectCrash(lookup, func(code int) { exitCode = code })
+	hook.payment(paymentworker.ExternalEffectCaptureCommitted, target)
+	if exitCode != 0 {
+		t.Fatalf("production environment enabled test crash barrier")
+	}
+}
+
+func TestExternalEffectCrashAllowsExactSixApplicationBoundaries(t *testing.T) {
+	t.Parallel()
+	target := uuid.New()
+	points := []string{
+		string(paymentworker.ExternalEffectCaptureCommitted),
+		string(paymentworker.ExternalEffectTicketsCommitted),
+		string(paymentworker.ExternalEffectRefundCommitted),
+		string(paymentworker.ExternalEffectCompensationCommitted),
+		string(paymentrefund.ExternalEffectProviderRefundCommitted),
+		string(paymentrefund.ExternalEffectShardRefundCommitted),
+	}
+	for _, point := range points {
+		point := point
+		t.Run(point, func(t *testing.T) {
+			exitCode := 0
+			values := map[string]string{
+				"APP_ENV": "test",
+				"PAYMENT_WORKER_TEST_CRASH_AFTER_EFFECT_ENABLED": "true",
+				"PAYMENT_WORKER_TEST_CRASH_AFTER_EFFECT_POINT":   point,
+				"PAYMENT_WORKER_TEST_CRASH_TARGET_ID":            target.String(),
+			}
+			lookup := func(key string) (string, bool) { value, ok := values[key]; return value, ok }
+			hook := newTestExternalEffectCrash(lookup, func(code int) { exitCode = code })
+			if point == string(paymentrefund.ExternalEffectProviderRefundCommitted) ||
+				point == string(paymentrefund.ExternalEffectShardRefundCommitted) {
+				hook.refund(paymentrefund.ExternalEffectPoint(point), target)
+			} else {
+				hook.payment(paymentworker.ExternalEffectPoint(point), target)
+			}
+			if exitCode != 86 {
+				t.Fatalf("exact application boundary %q exit = %d", point, exitCode)
+			}
+		})
+	}
+}
+
+func TestTicketIssueConflictIsTargetSpecificAndTestOnly(t *testing.T) {
+	t.Parallel()
+	target := uuid.New()
+	values := map[string]string{
+		"APP_ENV": "test",
+		"PAYMENT_WORKER_TEST_TICKET_ISSUE_CONFLICT_ENABLED":   "true",
+		"PAYMENT_WORKER_TEST_TICKET_ISSUE_CONFLICT_TARGET_ID": target.String(),
+	}
+	lookup := func(key string) (string, bool) { value, ok := values[key]; return value, ok }
+	next := &paymentWorkerShardFake{}
+	fault := newTestTicketIssueConflict(next, lookup)
+	if fault == nil {
+		t.Fatal("test-gated ticket conflict was not enabled")
+	}
+	if _, err := fault.IssueTickets(context.Background(), paymentshard.IssueTicketsCommand{PaymentIntentID: target}); !errors.Is(err, paymentshard.ErrTicketClaimConflict) {
+		t.Fatalf("target fault = %v", err)
+	}
+	if _, err := fault.IssueTickets(context.Background(), paymentshard.IssueTicketsCommand{PaymentIntentID: uuid.New()}); err != nil || next.issueCalls != 1 {
+		t.Fatalf("non-target delegation err=%v calls=%d", err, next.issueCalls)
+	}
+	values["APP_ENV"] = "production"
+	if newTestTicketIssueConflict(next, lookup) != nil {
+		t.Fatal("production enabled ticket conflict hook")
+	}
+}
+
+type paymentWorkerShardFake struct{ issueCalls int }
+
+func (fake *paymentWorkerShardFake) IssueTickets(context.Context, paymentshard.IssueTicketsCommand) (paymentshard.IssueTicketsReceipt, error) {
+	fake.issueCalls++
+	return paymentshard.IssueTicketsReceipt{}, nil
+}
+func (*paymentWorkerShardFake) MarkRefundPending(context.Context, paymentshard.MarkRefundPendingCommand) (paymentshard.MarkRefundPendingReceipt, error) {
+	return paymentshard.MarkRefundPendingReceipt{}, nil
+}
+func (*paymentWorkerShardFake) CancelVoidedReservation(context.Context, paymentshard.CancelVoidedReservationCommand) (paymentshard.CancelVoidedReservationReceipt, error) {
+	return paymentshard.CancelVoidedReservationReceipt{}, nil
+}
+func (*paymentWorkerShardFake) ApplyRefundCompensation(context.Context, paymentshard.ApplyRefundCompensationCommand) (paymentshard.ApplyRefundCompensationReceipt, error) {
+	return paymentshard.ApplyRefundCompensationReceipt{}, nil
+}
 
 func TestRetryMaximumIsBounded(t *testing.T) {
 	t.Parallel()
@@ -45,9 +187,79 @@ func TestPublicReasonDoesNotExposeUnexpectedErrorText(t *testing.T) {
 
 func TestPaymentWorkerControlSchemaVersionMatchesLatestMigration(t *testing.T) {
 	t.Parallel()
-	if paymentControlSchemaVersion != 10 {
-		t.Fatalf("paymentControlSchemaVersion = %d, want 10", paymentControlSchemaVersion)
+	if paymentControlSchemaVersion != 11 {
+		t.Fatalf("paymentControlSchemaVersion = %d, want 11", paymentControlSchemaVersion)
 	}
+}
+
+func TestNewPaymentProviderSelectsConfiguredAdapter(t *testing.T) {
+	t.Parallel()
+
+	sandboxConfig := config.Defaults()
+	sandboxConfig.PaymentProviderType = config.PaymentProviderSandbox
+	sandboxConfig.PaymentProviderBaseURL = "https://sandbox.example"
+	sandboxConfig.PaymentProviderAPIKey = "sandbox-contract-key"
+	sandbox, err := newPaymentProvider(sandboxConfig)
+	if err != nil {
+		t.Fatalf("newPaymentProvider(sandbox): %v", err)
+	}
+	defer sandbox.CloseIdleConnections()
+	if _, ok := sandbox.(*providerhttp.Client); !ok {
+		t.Fatalf("sandbox adapter = %T", sandbox)
+	}
+	if _, ok := any(sandbox).(interface {
+		LookupRefund(context.Context, provider.RefundLookupRequest) (provider.RefundLookupResult, error)
+	}); !ok {
+		t.Fatalf("sandbox adapter cannot compose the partial-refund recovery processor: %T", sandbox)
+	}
+
+	stripeConfig := config.Defaults()
+	stripeConfig.PaymentProviderType = config.PaymentProviderStripe
+	stripeConfig.PaymentProviderBaseURL = "https://api.stripe.com"
+	stripeConfig.PaymentProviderAPIKey = "sk_test_contract"
+	stripeConfig.PaymentProviderAccountID = "acct_contract"
+	stripeConfig.PaymentProviderSuccessURL = "https://merchant.example/payments/success"
+	stripeConfig.PaymentProviderCancelURL = "https://merchant.example/payments/cancel"
+	stripe, err := newPaymentProvider(stripeConfig)
+	if err != nil {
+		t.Fatalf("newPaymentProvider(stripe): %v", err)
+	}
+	defer stripe.CloseIdleConnections()
+	if _, ok := stripe.(*providerstripe.Client); !ok {
+		t.Fatalf("stripe adapter = %T", stripe)
+	}
+}
+
+func TestNewPaymentProviderRejectsUnsupportedType(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	cfg.PaymentProviderType = config.PaymentProviderDisabled
+	if _, err := newPaymentProvider(cfg); err == nil {
+		t.Fatal("newPaymentProvider(disabled) succeeded")
+	}
+}
+
+func TestNewPaymentProviderAllowsHTTPStripeContractOnlyInTest(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	cfg.PaymentProviderType = config.PaymentProviderStripe
+	cfg.PaymentProviderBaseURL = "http://stripe-contract.test"
+	cfg.PaymentProviderAPIKey = "sk_test_contract"
+	cfg.PaymentProviderAccountID = "acct_contract"
+	cfg.PaymentProviderSuccessURL = "https://merchant.example/payments/success"
+	cfg.PaymentProviderCancelURL = "https://merchant.example/payments/cancel"
+
+	cfg.Environment = config.EnvironmentProduction
+	if provider, err := newPaymentProvider(cfg); err == nil {
+		provider.CloseIdleConnections()
+		t.Fatal("production accepted an insecure Stripe origin")
+	}
+	cfg.Environment = config.EnvironmentTest
+	provider, err := newPaymentProvider(cfg)
+	if err != nil {
+		t.Fatalf("test contract rejected: %v", err)
+	}
+	provider.CloseIdleConnections()
 }
 
 func TestPaymentMetricsAdapterUsesMeasuredValuesAndDurableUncertainty(t *testing.T) {

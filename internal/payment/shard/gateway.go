@@ -13,19 +13,20 @@ import (
 )
 
 var (
-	ErrInvalidGateway          = errors.New("invalid payment shard gateway")
-	ErrShardPaymentUnavailable = errors.New("payment shard unavailable")
-	ErrTicketPlanUnavailable   = errors.New("ticket issue plan unavailable")
-	ErrTicketClaimUnavailable  = errors.New("ticket code claim unavailable")
-	ErrTicketClaimReadFailed   = errors.New("ticket code claim authorization unavailable")
-	ErrTicketClaimReadTimeout  = errors.New("ticket code claim authorization timeout")
-	ErrTicketClaimSQLFailed    = errors.New("ticket code claim authorization query failed")
-	ErrTicketClaimScanFailed   = errors.New("ticket code claim authorization scan failed")
-	ErrTicketClaimDecodeFailed = errors.New("ticket code claim authorization decode failed")
-	ErrTicketClaimUnauthorized = errors.New("ticket code claim not authorized")
-	ErrTicketClaimConflict     = errors.New("ticket code claim conflict")
-	ErrTicketClaimCommitFailed = errors.New("ticket code claim commit unavailable")
-	ErrTicketIssueUnavailable  = errors.New("ticket issue command unavailable")
+	ErrInvalidGateway            = errors.New("invalid payment shard gateway")
+	ErrShardPaymentUnavailable   = errors.New("payment shard unavailable")
+	ErrTicketPlanUnavailable     = errors.New("ticket issue plan unavailable")
+	ErrTicketClaimUnavailable    = errors.New("ticket code claim unavailable")
+	ErrTicketClaimReadFailed     = errors.New("ticket code claim authorization unavailable")
+	ErrTicketClaimReadTimeout    = errors.New("ticket code claim authorization timeout")
+	ErrTicketClaimSQLFailed      = errors.New("ticket code claim authorization query failed")
+	ErrTicketClaimScanFailed     = errors.New("ticket code claim authorization scan failed")
+	ErrTicketClaimDecodeFailed   = errors.New("ticket code claim authorization decode failed")
+	ErrTicketClaimUnauthorized   = errors.New("ticket code claim not authorized")
+	ErrTicketClaimConflict       = errors.New("ticket code claim conflict")
+	ErrTicketClaimCommitFailed   = errors.New("ticket code claim commit unavailable")
+	ErrTicketIssueUnavailable    = errors.New("ticket issue command unavailable")
+	ErrSelectedRefundUnavailable = errors.New("selected ticket refund command unavailable")
 )
 
 type Directory interface {
@@ -47,6 +48,122 @@ type Store interface {
 // ticket identity has been exclusively reserved in control PostgreSQL.
 type TicketCodeClaimer interface {
 	ClaimTicketCodes(context.Context, IssueTicketsCommand, TicketIdentityPlan) error
+}
+
+type SelectedRefundStore interface {
+	ApplySelectedTicketRefund(context.Context, sharding.ShardRoute, ApplySelectedTicketRefundCommand) (SelectedTicketRefundReceipt, error)
+}
+
+type RefundOrderStore interface {
+	LoadRefundOrder(context.Context, sharding.ShardRoute, uuid.UUID, uuid.UUID) (RefundOrderSnapshot, error)
+}
+
+type PreparedRefundStore interface {
+	PrepareSelectedTicketRefund(context.Context, sharding.ShardRoute, PrepareSelectedTicketRefundCommand) (SelectedTicketRefundPrepareReceipt, error)
+	ReleaseSelectedTicketRefund(context.Context, sharding.ShardRoute, ReleaseSelectedTicketRefundCommand) (SelectedTicketRefundReleaseReceipt, error)
+}
+
+func (gateway *Gateway) PrepareSelectedTicketRefund(ctx context.Context, command PrepareSelectedTicketRefundCommand) (SelectedTicketRefundPrepareReceipt, error) {
+	if gateway == nil || ctx == nil || command.ReservationID == uuid.Nil || command.TrainRunID == uuid.Nil {
+		return SelectedTicketRefundPrepareReceipt{}, ErrSelectedRefundUnavailable
+	}
+	store, ok := gateway.store.(PreparedRefundStore)
+	if !ok {
+		return SelectedTicketRefundPrepareReceipt{}, ErrSelectedRefundUnavailable
+	}
+	route, err := gateway.directory.ResolveReservation(ctx, command.ReservationID, false)
+	if err != nil || route.TrainRunID() != command.TrainRunID {
+		return SelectedTicketRefundPrepareReceipt{}, mapShardError(err)
+	}
+	receipt, err := store.PrepareSelectedTicketRefund(ctx, route, command)
+	if errors.Is(err, sharding.ErrAssignmentStale) || errors.Is(err, sharding.ErrWriteFenced) {
+		refreshed, refreshErr := gateway.directory.ResolveReservation(ctx, command.ReservationID, true)
+		if refreshErr != nil || refreshed.TrainRunID() != command.TrainRunID {
+			return SelectedTicketRefundPrepareReceipt{}, ErrShardPaymentUnavailable
+		}
+		return store.PrepareSelectedTicketRefund(ctx, refreshed, command)
+	}
+	if err != nil {
+		return SelectedTicketRefundPrepareReceipt{}, mapShardError(err)
+	}
+	return receipt, nil
+}
+
+func (gateway *Gateway) ReleaseSelectedTicketRefund(ctx context.Context, command ReleaseSelectedTicketRefundCommand) (SelectedTicketRefundReleaseReceipt, error) {
+	if gateway == nil || ctx == nil || command.ReservationID == uuid.Nil || command.TrainRunID == uuid.Nil {
+		return SelectedTicketRefundReleaseReceipt{}, ErrSelectedRefundUnavailable
+	}
+	store, ok := gateway.store.(PreparedRefundStore)
+	if !ok {
+		return SelectedTicketRefundReleaseReceipt{}, ErrSelectedRefundUnavailable
+	}
+	route, err := gateway.directory.ResolveReservation(ctx, command.ReservationID, false)
+	if err != nil || route.TrainRunID() != command.TrainRunID {
+		return SelectedTicketRefundReleaseReceipt{}, mapShardError(err)
+	}
+	receipt, err := store.ReleaseSelectedTicketRefund(ctx, route, command)
+	if errors.Is(err, sharding.ErrAssignmentStale) || errors.Is(err, sharding.ErrWriteFenced) {
+		refreshed, refreshErr := gateway.directory.ResolveReservation(ctx, command.ReservationID, true)
+		if refreshErr != nil || refreshed.TrainRunID() != command.TrainRunID {
+			return SelectedTicketRefundReleaseReceipt{}, ErrShardPaymentUnavailable
+		}
+		return store.ReleaseSelectedTicketRefund(ctx, refreshed, command)
+	}
+	if err != nil {
+		return SelectedTicketRefundReleaseReceipt{}, mapShardError(err)
+	}
+	return receipt, nil
+}
+
+func (gateway *Gateway) ApplySelectedTicketRefund(ctx context.Context, command ApplySelectedTicketRefundCommand) (SelectedTicketRefundReceipt, error) {
+	if gateway == nil || ctx == nil || command.ReservationID == uuid.Nil || command.TrainRunID == uuid.Nil {
+		return SelectedTicketRefundReceipt{}, ErrSelectedRefundUnavailable
+	}
+	store, ok := gateway.store.(SelectedRefundStore)
+	if !ok {
+		return SelectedTicketRefundReceipt{}, ErrSelectedRefundUnavailable
+	}
+	route, err := gateway.directory.ResolveReservation(ctx, command.ReservationID, false)
+	if err != nil || route.TrainRunID() != command.TrainRunID {
+		return SelectedTicketRefundReceipt{}, mapShardError(err)
+	}
+	receipt, err := store.ApplySelectedTicketRefund(ctx, route, command)
+	if errors.Is(err, sharding.ErrAssignmentStale) || errors.Is(err, sharding.ErrWriteFenced) {
+		refreshed, refreshErr := gateway.directory.ResolveReservation(ctx, command.ReservationID, true)
+		if refreshErr != nil || refreshed.TrainRunID() != command.TrainRunID {
+			return SelectedTicketRefundReceipt{}, ErrShardPaymentUnavailable
+		}
+		return store.ApplySelectedTicketRefund(ctx, refreshed, command)
+	}
+	if err != nil {
+		return SelectedTicketRefundReceipt{}, mapShardError(err)
+	}
+	return receipt, nil
+}
+
+func (gateway *Gateway) LoadRefundOrder(ctx context.Context, reservationID, orderID, ownerID uuid.UUID) (RefundOrderSnapshot, error) {
+	if gateway == nil || ctx == nil || reservationID == uuid.Nil || orderID == uuid.Nil || ownerID == uuid.Nil {
+		return RefundOrderSnapshot{}, ErrSelectedRefundUnavailable
+	}
+	store, ok := gateway.store.(RefundOrderStore)
+	if !ok {
+		return RefundOrderSnapshot{}, ErrSelectedRefundUnavailable
+	}
+	route, err := gateway.directory.ResolveReservation(ctx, reservationID, false)
+	if err != nil {
+		return RefundOrderSnapshot{}, mapShardError(err)
+	}
+	snapshot, err := store.LoadRefundOrder(ctx, route, orderID, ownerID)
+	if errors.Is(err, sharding.ErrAssignmentStale) || errors.Is(err, sharding.ErrWriteFenced) {
+		refreshed, refreshErr := gateway.directory.ResolveReservation(ctx, reservationID, true)
+		if refreshErr == nil {
+			snapshot, err = store.LoadRefundOrder(ctx, refreshed, orderID, ownerID)
+		}
+	}
+	if err != nil {
+		return RefundOrderSnapshot{}, mapShardError(err)
+	}
+	return snapshot, nil
 }
 
 func (gateway *Gateway) CancelVoidedReservation(ctx context.Context, command CancelVoidedReservationCommand) (CancelVoidedReservationReceipt, error) {

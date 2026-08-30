@@ -197,6 +197,7 @@ type recordingTx struct {
 	calls        []recordedCall
 	rows         pgx.Rows
 	row          pgx.Row
+	queryRows    []pgx.Row
 	rowsAffected map[string]int64
 }
 
@@ -225,6 +226,11 @@ func (tx *recordingTx) QueryRow(_ context.Context, query string, args ...any) pg
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
 	tx.calls = append(tx.calls, recordedCall{query: query, args: append([]any(nil), args...)})
+	if len(tx.queryRows) > 0 {
+		row := tx.queryRows[0]
+		tx.queryRows = tx.queryRows[1:]
+		return row
+	}
 	return tx.row
 }
 

@@ -117,7 +117,7 @@ WHERE changed.last_changed_at <= $2
       SELECT 1 FROM public.payment_intents AS recovering
       WHERE recovering.payment_intent_id=changed.payment_intent_id
         AND recovering.state IN (
-          'reservation_securing','checkout_pending','authorization_pending',
+          'reservation_securing','checkout_pending','awaiting_customer','authorization_pending',
           'capture_pending','captured','ticket_issue_pending','void_pending',
           'refund_pending','manual_review'
         )
@@ -155,7 +155,8 @@ func (s *Store) LoadControlSnapshot(ctx context.Context, intentID uuid.UUID) (pa
 		&snapshot.Intent.AmountMinor, &snapshot.Intent.Currency, &fingerprint,
 		&activeIntents, &sagaIDText, &snapshot.Saga.State, &snapshot.Saga.Step, &snapshot.Saga.ErrorCategory,
 		&activeSagas, &duplicateEvents, &conflicts, &openReviews,
-		&activeReconciliations,
+		&activeReconciliations, &snapshot.SucceededPartialRefundMinor,
+		&snapshot.CompletedPartialRefundMinor,
 	)
 	if err != nil {
 		return paymentreconcile.ControlSnapshot{}, err
@@ -247,9 +248,20 @@ SELECT intent.payment_intent_id,intent.reservation_id,intent.train_run_id,
        (SELECT count(*) FROM public.payment_manual_review_cases
         WHERE payment_intent_id=intent.payment_intent_id
           AND state IN ('open','assigned','investigating')),
-       (SELECT count(*) FROM public.payment_reconciliation_checkpoints
-        WHERE payment_intent_id=intent.payment_intent_id
-          AND state IN ('pending','running'))
+	       (SELECT count(*) FROM public.payment_reconciliation_checkpoints
+	        WHERE payment_intent_id=intent.payment_intent_id
+	          AND state IN ('pending','running')),
+	       COALESCE((SELECT sum(operation.amount_minor)
+	         FROM public.ticket_refund_operations AS operation
+	         JOIN public.ticket_refund_requests AS request USING(refund_request_id)
+	        WHERE request.payment_intent_id=intent.payment_intent_id
+	          AND operation.state='succeeded'),0)::bigint,
+	       COALESCE((SELECT sum(operation.amount_minor)
+	         FROM public.ticket_refund_operations AS operation
+	         JOIN public.ticket_refund_requests AS request USING(refund_request_id)
+	        WHERE request.payment_intent_id=intent.payment_intent_id
+	          AND operation.state='succeeded'
+	          AND request.state='completed'),0)::bigint
 FROM public.payment_intents AS intent
 WHERE intent.payment_intent_id=$1`
 
@@ -295,10 +307,11 @@ WHERE reservation.payment_intent_id=$1
 	}
 	snapshot.Found = true
 	err = tx.QueryRow(ctx, `
-SELECT id,status,total_amount_minor,currency
+	SELECT id,status,total_amount_minor,refunded_amount_minor,currency
 FROM public.ticket_orders
 WHERE payment_intent_id=$1 AND train_run_id=$2 AND assignment_generation=$3`, intentID, trainRunID, generation).Scan(
-		&snapshot.TicketOrderID, &snapshot.TicketOrderState, &snapshot.TicketOrderAmountMinor, &snapshot.TicketOrderCurrency,
+		&snapshot.TicketOrderID, &snapshot.TicketOrderState, &snapshot.TicketOrderAmountMinor,
+		&snapshot.TicketOrderRefundedMinor, &snapshot.TicketOrderCurrency,
 	)
 	if err == nil {
 		snapshot.TicketOrderFound = true
@@ -693,7 +706,7 @@ func (s *Store) Ready(ctx context.Context) error {
 	}
 	var version int
 	var dirty bool
-	if err := s.control.QueryRow(ctx, `SELECT version,dirty FROM public.schema_migrations LIMIT 1`).Scan(&version, &dirty); err != nil || version != 10 || dirty {
+	if err := s.control.QueryRow(ctx, `SELECT version,dirty FROM public.schema_migrations LIMIT 1`).Scan(&version, &dirty); err != nil || version != 11 || dirty {
 		return errors.New("payment reconciliation control schema unavailable")
 	}
 	return nil
