@@ -66,6 +66,15 @@ function Write-Milestone5DriverArtifact {
     @($Lines) | Out-File -LiteralPath (Join-Path ([string]$Context.RawDirectory) $Name) -Encoding utf8
 }
 
+function Protect-Milestone5DriverDiagnostic {
+    param([AllowNull()][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines)
+    $value = [string](@($Lines | Select-Object -Last 12) -join "`n")
+    $value = $value -replace '(?i)(postgres(?:ql)?://)[^\s/@:]+:[^\s/@]+@', '$1[redacted]@'
+    $value = $value -replace '(?i)(password|cipher[_-]?pass|secret)(\s*[:=]\s*)[^\s,;]+', '$1$2[redacted]'
+    if ($value.Length -gt 2048) { $value = $value.Substring($value.Length - 2048) }
+    return $value
+}
+
 function Invoke-Milestone5DriverCompose {
     param(
         [Parameter(Mandatory = $true)][object]$Context,
@@ -82,7 +91,8 @@ function Invoke-Milestone5DriverCompose {
         Write-Milestone5DriverArtifact -Context $Context -Name $Artifact -Lines $result.Output
     }
     if ($result.ExitCode -ne 0 -and -not $AllowFailure) {
-        throw 'Milestone 5 Docker Compose command failed'
+        $diagnostic = Protect-Milestone5DriverDiagnostic -Lines $result.Output
+        throw "Milestone 5 Docker Compose command failed with exit code $($result.ExitCode)`n$diagnostic"
     }
     return $result
 }
