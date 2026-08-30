@@ -448,6 +448,28 @@ $runnerAst = [System.Management.Automation.Language.Parser]::ParseFile(
     $runnerPath, [ref]$tokens, [ref]$parseErrors
 )
 if ($parseErrors.Count -ne 0) { throw "Milestone 7 DR runner has $($parseErrors.Count) PowerShell parse errors" }
+$settlementBooleanDefinitions = @($runnerAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ceq 'Get-M7RequiredSettlementAdminBoolean'
+}, $true))
+if ($settlementBooleanDefinitions.Count -ne 1) {
+    throw "Milestone 7 DR runner must define exactly one Get-M7RequiredSettlementAdminBoolean function; found $($settlementBooleanDefinitions.Count)"
+}
+. ([scriptblock]::Create($settlementBooleanDefinitions[0].Extent.Text))
+$completeBoundedValue = Get-M7RequiredSettlementAdminBoolean -Value ([pscustomobject]@{ bounded=$false }) -Name 'bounded'
+if ($completeBoundedValue -ne $false) { throw 'settlement-admin Boolean contract did not preserve an explicit false value' }
+foreach ($invalidSettlementEnvelope in @(
+    [pscustomobject]@{},
+    [pscustomobject]@{ bounded='false' }
+)) {
+    try {
+        Get-M7RequiredSettlementAdminBoolean -Value $invalidSettlementEnvelope -Name 'bounded' | Out-Null
+        throw 'invalid settlement-admin Boolean contract was accepted'
+    } catch {
+        if ([string]$_.Exception.Message -cne 'settlement-admin output omitted or invalid Boolean property: bounded') { throw }
+    }
+}
 $tokens = $null
 $parseErrors = $null
 [System.Management.Automation.Language.Parser]::ParseFile(
@@ -1338,6 +1360,8 @@ if (-not [string]::IsNullOrWhiteSpace($EvidenceDirectory)) {
         [int]$summary.settlement_reconciliation.missing_provider -lt 1 -or [int]$summary.settlement_reconciliation.missing_local -lt 1 -or
         [int]$summary.settlement_reconciliation.amount -lt 1 -or [int]$summary.settlement_reconciliation.currency -lt 1 -or
         [int]$summary.settlement_reconciliation.fee -lt 1 -or [int]$summary.settlement_reconciliation.payout -lt 1 -or
+        $null -eq $summary.settlement_reconciliation.PSObject.Properties['truncated'] -or
+        $summary.settlement_reconciliation.PSObject.Properties['truncated'].Value -isnot [bool] -or [bool]$summary.settlement_reconciliation.truncated -or
         -not [bool]$summary.settlement_reconciliation.mismatch_immutable -or -not [bool]$summary.settlement_reconciliation.manual_review_append_only -or
         [string]$summary.software.pgbackrest -cne 'pgBackRest 2.59.0' -or
         @($summary.software.databases).Count -ne 3 -or @($summary.software.databases | Where-Object { [bool]$_.schema_dirty -or [int]$_.schema_version -notin @(3,11) }).Count -ne 0) {

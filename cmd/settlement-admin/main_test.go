@@ -33,6 +33,7 @@ func TestReconcilePaymentRunsBoundedDetectorAndSanitizesOutput(t *testing.T) {
 	for _, fragment := range []string{
 		`"status":"completed"`, `"command":"reconcile-payment"`, `"read_only":true`,
 		`"financial_mutation":false`, `"pages":2`, `"finding_count":2`, `"amount":1`, `"fee":1`,
+		`"completed":true`, `"bounded":false`,
 	} {
 		if !strings.Contains(stdout.String(), fragment) {
 			t.Fatalf("stdout=%q missing %q", stdout.String(), fragment)
@@ -40,6 +41,26 @@ func TestReconcilePaymentRunsBoundedDetectorAndSanitizesOutput(t *testing.T) {
 	}
 	if strings.Contains(stdout.String(), "payment-secret") {
 		t.Fatalf("output disclosed correlation: %q", stdout.String())
+	}
+}
+
+func TestBoundedDetectionOutputPreservesFalseCompletedBoolean(t *testing.T) {
+	t.Parallel()
+
+	backend := &fakeAdminBackend{report: settlement.DetectionReport{Pages: 3, Examined: 21, Bounded: true}}
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{
+		"reconcile-payment", "--payment", "pay_1", "--page-size", "7", "--max-pages", "3",
+	}, adminEnv, &stdout, &stderr, func(context.Context, func(string) (string, bool), commandConfig) (adminBackend, func(), error) {
+		return backend, func() {}, nil
+	})
+	if code != 0 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	for _, fragment := range []string{`"completed":false`, `"bounded":true`} {
+		if !strings.Contains(stdout.String(), fragment) {
+			t.Fatalf("stdout=%q missing %q", stdout.String(), fragment)
+		}
 	}
 }
 
@@ -101,6 +122,11 @@ func TestMarkReviewedAppendsHashedEvidenceWithoutFinancialMutation(t *testing.T)
 	for _, secret := range []string{runID, "operator:oncall", evidenceHash} {
 		if strings.Contains(stdout.String(), secret) || strings.Contains(stderr.String(), secret) {
 			t.Fatalf("output disclosed review input %q: stdout=%q stderr=%q", secret, stdout.String(), stderr.String())
+		}
+	}
+	for _, detectionField := range []string{`"completed":`, `"bounded":`} {
+		if strings.Contains(stdout.String(), detectionField) {
+			t.Fatalf("review output included detection-only field %q: %q", detectionField, stdout.String())
 		}
 	}
 }

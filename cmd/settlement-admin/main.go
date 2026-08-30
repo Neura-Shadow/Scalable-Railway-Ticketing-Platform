@@ -67,8 +67,8 @@ type adminEnvelope struct {
 	Examined          int            `json:"examined,omitempty"`
 	FindingCount      int            `json:"finding_count,omitempty"`
 	Findings          map[string]int `json:"findings,omitempty"`
-	Completed         bool           `json:"completed,omitempty"`
-	Bounded           bool           `json:"bounded,omitempty"`
+	Completed         *bool          `json:"completed,omitempty"`
+	Bounded           *bool          `json:"bounded,omitempty"`
 	Error             string         `json:"error,omitempty"`
 }
 
@@ -129,10 +129,12 @@ func run(parent context.Context, args []string, lookup func(string) (string, boo
 		status = "failed"
 	}
 	findings := summarizeFindings(report.Findings)
+	completed := report.Completed
+	bounded := report.Bounded
 	_ = writeAdminEnvelope(stdout, adminEnvelope{
 		Status: status, Command: cfg.Command, ReadOnly: true, AppendOnly: true, FinancialMutation: false,
 		Pages: report.Pages, Examined: report.Examined, FindingCount: len(report.Findings), Findings: findings,
-		Completed: report.Completed, Bounded: report.Bounded, Error: boundedAdminError(err, false),
+		Completed: &completed, Bounded: &bounded, Error: boundedAdminError(err, false),
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "settlement-admin: detection failed")

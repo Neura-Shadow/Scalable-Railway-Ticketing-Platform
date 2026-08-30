@@ -1007,6 +1007,18 @@ function Invoke-M7DRAdmin {
     return $value
 }
 
+function Get-M7RequiredSettlementAdminBoolean {
+    param(
+        [Parameter(Mandatory=$true)][object]$Value,
+        [Parameter(Mandatory=$true)][ValidateSet('completed','bounded')][string]$Name
+    )
+    $property = $Value.PSObject.Properties[$Name]
+    if ($null -eq $property -or $property.Value -isnot [bool]) {
+        throw "settlement-admin output omitted or invalid Boolean property: $Name"
+    }
+    return [bool]$property.Value
+}
+
 function Invoke-M7SettlementAdmin {
     param([string]$Artifact, [string[]]$Arguments)
     if ($Artifact -notmatch '^[a-z0-9][a-z0-9-]{0,80}$') { throw 'settlement admin artifact name is invalid' }
@@ -1015,6 +1027,10 @@ function Invoke-M7SettlementAdmin {
     if ([string]::IsNullOrWhiteSpace($line)) { throw 'settlement-admin omitted strict JSON output' }
     $value = $line | ConvertFrom-Json
     if ([string]$value.status -ne 'completed' -or [bool]$value.financial_mutation) { throw 'settlement-admin did not complete without financial mutation' }
+    if ($Arguments.Count -gt 0 -and [string]$Arguments[0] -ne 'mark-reviewed') {
+        Get-M7RequiredSettlementAdminBoolean -Value $value -Name 'completed' | Out-Null
+        Get-M7RequiredSettlementAdminBoolean -Value $value -Name 'bounded' | Out-Null
+    }
     Write-M7JSON -Name "$Artifact.json" -Value $value
     return $value
 }
@@ -1061,7 +1077,7 @@ COMMIT;
     $report = Invoke-M7SettlementAdmin -Artifact 'settlement-mismatch-detection' -Arguments @(
 		'reconcile-period','--from',$periodFrom,'--to',$periodTo,'--page-size','2','--max-pages','20','--timeout','2m'
     )
-    if (-not [bool]$report.read_only -or -not [bool]$report.append_only -or -not [bool]$report.completed -or [int]$report.finding_count -lt 6) {
+    if (-not [bool]$report.read_only -or -not [bool]$report.append_only -or -not [bool]$report.completed -or [bool]$report.bounded -or [int]$report.finding_count -lt 6) {
         throw 'settlement detector did not emit bounded read-only mismatch evidence'
     }
 	$runID = Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL "SELECT run_id::text FROM public.settlement_reconciliation_runs WHERE scope_type='period' AND scope_value='$periodFrom/$periodTo' ORDER BY created_at DESC LIMIT 1"
@@ -1084,7 +1100,7 @@ FROM public.settlement_reconciliation_mismatches WHERE run_id='$runID'::uuid
     $reviewCount = Get-M7Scalar -Service 'control-postgres' -User 'railway_control' -Database 'railway_control' -SQL "SELECT count(*) FROM public.settlement_reconciliation_reviews WHERE run_id='$runID'::uuid AND disposition='investigating'"
     if ($immutableMismatch.ExitCode -eq 0 -or $immutableReview.ExitCode -eq 0 -or $reviewCount -ne '1') { throw 'settlement mismatch/review evidence was not immutable and append-only' }
     return [ordered]@{
-        run_id_sha256=(Get-M7SHA256 -Text $runID); read_only=$true; financial_mutation=$false; completed=$true; bounded=[bool]$report.bounded;
+        run_id_sha256=(Get-M7SHA256 -Text $runID); read_only=$true; financial_mutation=$false; completed=$true; truncated=[bool]$report.bounded;
         finding_count=[int]$report.finding_count; missing_provider=[int]$matrixParts[0]; missing_local=[int]$matrixParts[1];
         amount=[int]$matrixParts[2]; currency=[int]$matrixParts[3]; fee=[int]$matrixParts[4]; payout=[int]$matrixParts[5];
         mismatch_immutable=$true; manual_review_append_only=$true; manual_review_count=1
