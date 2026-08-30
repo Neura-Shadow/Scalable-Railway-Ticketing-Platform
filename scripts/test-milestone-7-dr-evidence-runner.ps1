@@ -1058,7 +1058,25 @@ foreach ($required in @(
         throw "DR app/failback contract omits required token: $required"
     }
 }
-if (-not ((Get-Content -Raw -LiteralPath (Join-Path $root 'deploy/compose/payment.override.yml')).Contains('PAYMENT_SANDBOX_WEBHOOK_KEYRING: ${M7_WEBHOOK_KEYRING:-current=${PAYMENT_WEBHOOK_KEY_B64:-'))) {
+$paymentCompose = Get-Content -Raw -LiteralPath (Join-Path $root 'deploy/compose/payment.override.yml')
+$controlRoleService = [regex]::Match(
+    $paymentCompose,
+    '(?ms)^  payment-reconciler-control-role:\r?\n(?<body>.*?)(?=^  [a-zA-Z0-9_-]+:|\z)'
+)
+if (-not $controlRoleService.Success) {
+    throw 'payment Compose omits the bounded control-database reconciler role service'
+}
+$reconcilerGrant = [regex]::Match($controlRoleService.Groups['body'].Value, 'GRANT SELECT ON (?<tables>[^\"]+) TO payment_reconciler;')
+if (-not $reconcilerGrant.Success) {
+    throw 'payment Compose omits the bounded control-database reconciler SELECT grant'
+}
+$reconcilerTables = @($reconcilerGrant.Groups['tables'].Value.Split(',') | ForEach-Object { $_.Trim() })
+foreach ($required in @('public.payment_webhook_key_version_archive', 'public.payment_webhook_key_rotation_audit')) {
+    if ($reconcilerTables -cnotcontains $required) {
+        throw "payment reconciler cannot collect required durable metric evidence: $required"
+    }
+}
+if (-not $paymentCompose.Contains('PAYMENT_SANDBOX_WEBHOOK_KEYRING: ${M7_WEBHOOK_KEYRING:-current=${PAYMENT_WEBHOOK_KEY_B64:-')) {
     throw 'payment sandbox signer and API verifier must consume the same M7 webhook keyring'
 }
 if ($appCompose -match 'PAYMENT_CONTRACT_API_KEY:-') {
