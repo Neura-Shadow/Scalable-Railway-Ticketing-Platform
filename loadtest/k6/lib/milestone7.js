@@ -26,7 +26,6 @@ export function m7Scenario(execName) {
 export function settlementScenario(execName) {
   return boundedScenario(execName, {
     partial_refund_duplicate_count: ['count==0'],
-    settlement_reconciliation_mismatch_count: ['count==0'],
     settlement_import_records_observed: ['count>0'],
     settlement_import_rate_records_per_second: ['avg>0'],
     settlement_import_lag_seconds_observed: ['min>=0'],

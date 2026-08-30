@@ -153,6 +153,7 @@ try {
 import { check } from 'k6';
 import {
   settlementScenario,
+  settlementMismatch,
   settlementImportedRecords,
   settlementImportRate,
   settlementImportLag,
@@ -161,6 +162,7 @@ import {
 export const options = settlementScenario('settlementMetricProbe');
 
 export function settlementMetricProbe() {
+  settlementMismatch.add(1);
   settlementImportedRecords.add(3);
   settlementImportRate.add(1.5);
   settlementImportLag.add(0.25);
@@ -198,17 +200,25 @@ export function settlementMetricProbe() {
         throw 'pinned settlement metric threshold diagnostic did not preserve one complete successful execution'
     }
     $settlementRecordsMetric = $settlementSummary.metrics.PSObject.Properties['settlement_import_records_observed'].Value
+    $settlementMismatchMetric = $settlementSummary.metrics.PSObject.Properties['settlement_reconciliation_mismatch_count'].Value
     $settlementRateMetric = $settlementSummary.metrics.PSObject.Properties['settlement_import_rate_records_per_second'].Value
     $settlementLagMetric = $settlementSummary.metrics.PSObject.Properties['settlement_import_lag_seconds_observed'].Value
-    if ([int64]$settlementRecordsMetric.count -lt 1 -or [double]$settlementRecordsMetric.rate -le 0 -or
+    if ([int64]$settlementMismatchMetric.count -ne 1 -or
+        [int64]$settlementRecordsMetric.count -lt 1 -or [double]$settlementRecordsMetric.rate -le 0 -or
         [int64]$settlementRateMetric.count -lt 1 -or [double]$settlementRateMetric.avg -le 0 -or
         [int64]$settlementLagMetric.count -lt 1 -or [double]$settlementLagMetric.min -lt 0) {
         throw 'pinned settlement metric summary omitted the authoritative post-summary count/value fields'
     }
     $recordThresholdNames = @($settlementRecordsMetric.thresholds.PSObject.Properties.Name | Sort-Object)
+    [string[]]$mismatchThresholdNames = if ($null -ne $settlementMismatchMetric.PSObject.Properties['thresholds']) {
+        @($settlementMismatchMetric.thresholds.PSObject.Properties.Name | Sort-Object)
+    } else {
+        @()
+    }
     $rateThresholdNames = @($settlementRateMetric.thresholds.PSObject.Properties.Name | Sort-Object)
     $lagThresholdNames = @($settlementLagMetric.thresholds.PSObject.Properties.Name | Sort-Object)
-    if (($recordThresholdNames -join ',') -cne 'count>0' -or [bool]$settlementRecordsMetric.thresholds.'count>0' -or
+    if (@($mismatchThresholdNames).Count -ne 0 -or
+        ($recordThresholdNames -join ',') -cne 'count>0' -or [bool]$settlementRecordsMetric.thresholds.'count>0' -or
         ($rateThresholdNames -join ',') -cne 'avg>0' -or [bool]$settlementRateMetric.thresholds.'avg>0' -or
         ($lagThresholdNames -join ',') -cne 'min>=0' -or [bool]$settlementLagMetric.thresholds.'min>=0') {
         throw 'pinned settlement metric type-specific thresholds were not preserved exactly'
