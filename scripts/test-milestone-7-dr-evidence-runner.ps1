@@ -141,6 +141,88 @@ if (-not $containerCapabilityProof -or -not $negativeContainerSummaryCopied -or 
     throw 'unprivileged k6 stopped-container evidence regression did not complete or clean up'
 }
 
+$settlementThresholdDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "railway-m7-settlement-threshold-test-$([guid]::NewGuid().ToString('N'))"
+[System.IO.Directory]::CreateDirectory($settlementThresholdDirectory) | Out-Null
+$settlementThresholdToken = "railway-m7-settlement-threshold-$([guid]::NewGuid().ToString('N').Substring(0,12))"
+$settlementThresholdContainer = "$settlementThresholdToken-positive"
+$settlementThresholdSummaryPath = Join-Path $settlementThresholdDirectory 'settlement-threshold-summary.json'
+$settlementThresholdContainerRemoved = $false
+try {
+    $settlementThresholdProbePath = Join-Path $settlementThresholdDirectory 'settlement-threshold-positive.js'
+    [System.IO.File]::WriteAllText($settlementThresholdProbePath, @'
+import { check } from 'k6';
+import {
+  settlementScenario,
+  settlementImportedRecords,
+  settlementImportRate,
+  settlementImportLag,
+} from '/scripts/lib/milestone7.js';
+
+export const options = settlementScenario('settlementMetricProbe');
+
+export function settlementMetricProbe() {
+  settlementImportedRecords.add(3);
+  settlementImportRate.add(1.5);
+  settlementImportLag.add(0.25);
+  check({ valid: true }, {
+    'settlement metric probe emits valid samples': (value) => value.valid,
+  });
+}
+'@, [System.Text.UTF8Encoding]::new($false))
+
+    $settlementRepoMount = "type=bind,src=$(Join-Path $root 'loadtest/k6'),dst=/scripts,readonly"
+    $settlementProbeMount = "type=bind,src=$settlementThresholdDirectory,dst=/probe,readonly"
+    $settlementProbe = Invoke-M7DiagnosticDocker -Arguments @(
+        'run','--name',$settlementThresholdContainer,'--label',"m7.focused.project=$settlementThresholdToken",
+        '--network','none','--user','12345:12345',
+        '--security-opt','no-new-privileges','--cap-drop','ALL','--mount',$settlementRepoMount,'--mount',$settlementProbeMount,
+        '--entrypoint','sh','grafana/k6:0.57.0','-c','umask 022; exec k6 "$@"',
+        'sh','run','--quiet','--summary-export','/tmp/settlement-threshold-summary.json','/probe/settlement-threshold-positive.js'
+    )
+    if ($settlementProbe.ExitCode -ne 0) {
+        $boundedProbeOutput = [string](@($settlementProbe.Output | Select-Object -Last 4) -join "`n")
+        if ($boundedProbeOutput.Length -gt 2048) { $boundedProbeOutput = $boundedProbeOutput.Substring($boundedProbeOutput.Length - 2048) }
+        throw "pinned settlement metric threshold contract failed to execute; exit=$($settlementProbe.ExitCode); output=$boundedProbeOutput"
+    }
+    $settlementCopy = Invoke-M7DiagnosticDocker -Arguments @('cp',"${settlementThresholdContainer}:/tmp/settlement-threshold-summary.json",$settlementThresholdSummaryPath)
+    if ($settlementCopy.ExitCode -ne 0 -or -not [System.IO.File]::Exists($settlementThresholdSummaryPath)) {
+        throw 'pinned settlement metric threshold summary was not copied to host evidence'
+    }
+    $settlementSummary = Get-Content -Raw -LiteralPath $settlementThresholdSummaryPath | ConvertFrom-Json
+    $settlementDiagnostic = Get-M7K6Diagnostic -Script 'settlement-import.js' -ExitCode $settlementProbe.ExitCode `
+        -SummaryPath $settlementThresholdSummaryPath -LogLines ([string[]]$settlementProbe.Output)
+    if (-not [bool]$settlementDiagnostic.summary_present -or -not [bool]$settlementDiagnostic.summary_valid -or
+        [bool]$settlementDiagnostic.diagnostic_truncated -or -not [bool]$settlementDiagnostic.summary_inspection_complete -or
+        [int64]$settlementDiagnostic.iterations -ne 1 -or [int64]$settlementDiagnostic.check_passes -ne 1 -or
+        [int64]$settlementDiagnostic.check_failures -ne 0 -or @($settlementDiagnostic.failed_thresholds).Count -ne 0) {
+        throw 'pinned settlement metric threshold diagnostic did not preserve one complete successful execution'
+    }
+    $settlementRecordsMetric = $settlementSummary.metrics.PSObject.Properties['settlement_import_records_observed'].Value
+    $settlementRateMetric = $settlementSummary.metrics.PSObject.Properties['settlement_import_rate_records_per_second'].Value
+    $settlementLagMetric = $settlementSummary.metrics.PSObject.Properties['settlement_import_lag_seconds_observed'].Value
+    if ([int64]$settlementRecordsMetric.count -lt 1 -or [double]$settlementRecordsMetric.rate -le 0 -or
+        [int64]$settlementRateMetric.count -lt 1 -or [double]$settlementRateMetric.avg -le 0 -or
+        [int64]$settlementLagMetric.count -lt 1 -or [double]$settlementLagMetric.min -lt 0) {
+        throw 'pinned settlement metric summary omitted the authoritative post-summary count/value fields'
+    }
+    $recordThresholdNames = @($settlementRecordsMetric.thresholds.PSObject.Properties.Name | Sort-Object)
+    $rateThresholdNames = @($settlementRateMetric.thresholds.PSObject.Properties.Name | Sort-Object)
+    $lagThresholdNames = @($settlementLagMetric.thresholds.PSObject.Properties.Name | Sort-Object)
+    if (($recordThresholdNames -join ',') -cne 'count>0' -or [bool]$settlementRecordsMetric.thresholds.'count>0' -or
+        ($rateThresholdNames -join ',') -cne 'avg>0' -or [bool]$settlementRateMetric.thresholds.'avg>0' -or
+        ($lagThresholdNames -join ',') -cne 'min>=0' -or [bool]$settlementLagMetric.thresholds.'min>=0') {
+        throw 'pinned settlement metric type-specific thresholds were not preserved exactly'
+    }
+} finally {
+    [void](Invoke-M7DiagnosticDocker -Arguments @('rm','-f',$settlementThresholdContainer))
+    $remainingSettlementContainers = Invoke-M7DiagnosticDocker -Arguments @('ps','-aq','--filter',"label=m7.focused.project=$settlementThresholdToken")
+    $settlementThresholdContainerRemoved = ($remainingSettlementContainers.ExitCode -eq 0 -and @($remainingSettlementContainers.Output).Count -eq 0)
+    if ([System.IO.Directory]::Exists($settlementThresholdDirectory)) { [System.IO.Directory]::Delete($settlementThresholdDirectory, $true) }
+}
+if (-not $settlementThresholdContainerRemoved) {
+    throw 'pinned settlement metric threshold regression did not remove its exact test container'
+}
+
 $diagnosticFixtureDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "railway-m7-k6-diagnostic-test-$([guid]::NewGuid().ToString('N'))"
 [System.IO.Directory]::CreateDirectory($diagnosticFixtureDirectory) | Out-Null
 try {
